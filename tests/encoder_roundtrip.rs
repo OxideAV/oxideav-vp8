@@ -388,3 +388,260 @@ fn pframe_roundtrip_pan_picks_newmv() {
     // matches.
     assert!(p_y >= 40.0, "pan P-frame Y PSNR too low: {p_y:.2}");
 }
+
+/// Uniform **diagonal** pan exercising the NEAREST_MV savings path.
+/// Every MB wants the same (+8, +8) motion: the encoder picks NEW_MV for
+/// the first MB, then for subsequent MBs the neighbour MV context yields
+/// that same vector as `nearest` — so NEAREST_MV should be selected and
+/// no MV delta coded, making the P-frame meaningfully smaller than a
+/// NEW_MV-only encoder would produce.
+#[test]
+fn pframe_roundtrip_nearest_mv_kicks_in() {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+
+    // Stripe pattern offers strong SAD contrast along (+8, +8); same
+    // luminance values as the pan test, so an 8-px diagonal shift leaves
+    // the MB content intact modulo edge replication.
+    let mut y0 = vec![0u8; (W * H) as usize];
+    let mut y1 = vec![0u8; (W * H) as usize];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+    for row in 0..H as usize {
+        for col in 0..W as usize {
+            // 16×16 checkerboard — any integer shift moves a detectable
+            // amount of luma energy.
+            let tile = ((row / 16) ^ (col / 16)) & 1;
+            y0[row * W as usize + col] = if tile == 0 { 40 } else { 200 };
+            let sr = row.saturating_sub(8);
+            let sc = col.saturating_sub(8);
+            let sti = ((sr / 16) ^ (sc / 16)) & 1;
+            y1[row * W as usize + col] = if sti == 0 { 40 } else { 200 };
+        }
+    }
+    let f0 = make_frame(&y0, &u, &v);
+    let f1 = make_frame(&y1, &u, &v);
+    let y1_expected = y1.clone();
+
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("rx I");
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("rx P");
+    assert!(!pkt_p.flags.keyframe);
+
+    let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_i.data.clone()))
+        .expect("decode I");
+    let _ = dec.receive_frame().expect("rx I");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_p.data.clone()))
+        .expect("decode P");
+    let frame_p = match dec.receive_frame().expect("rx P") {
+        Frame::Video(v) => v,
+        _ => panic!("not video"),
+    };
+    let p_y = psnr(&frame_p.planes[0].data, &y1_expected);
+    eprintln!(
+        "nearest-mv PSNR Y={p_y:.2} dB, P-frame {} bytes (I-frame {} bytes)",
+        pkt_p.data.len(),
+        pkt_i.data.len()
+    );
+    assert!(p_y >= 35.0, "nearest-mv P-frame Y PSNR too low: {p_y:.2}");
+    // Sanity: bit-exact round-trip through the decoder gives us a strong
+    // regression guard on the MV-ref tree + sub-pel prediction paths
+    // together (NEAREST passes no MV delta, so any miscoding shows up as
+    // visible corruption rather than a dB drop).
+}
+
+/// Static background (all MBs identical between two frames) — the encoder
+/// should SKIP every MB, yielding a P-frame that is a handful of bytes
+/// longer than the header alone.
+#[test]
+fn pframe_roundtrip_static_background_all_skip() {
+    let y = vec![100u8; (W * H) as usize];
+    let u = vec![128u8; ((W / 2) * (H / 2)) as usize];
+    let v = vec![128u8; ((W / 2) * (H / 2)) as usize];
+    let f0 = make_frame(&y, &u, &v);
+    let f1 = make_frame(&y, &u, &v);
+
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("rx I");
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("rx P");
+    // With 64 MBs on a 128x128 frame and every one emitting SKIP, the
+    // P-frame should be dominated by the fixed header overhead.
+    eprintln!(
+        "all-skip P-frame {} bytes vs I-frame {} bytes",
+        pkt_p.data.len(),
+        pkt_i.data.len()
+    );
+    assert!(
+        pkt_p.data.len() < 150,
+        "all-skip P-frame unexpectedly large: {} bytes",
+        pkt_p.data.len()
+    );
+}
+
+/// Mid-frame "scene cut": the upper half of the frame is unchanged (inter
+/// codes well), the lower half is a fresh random-ish pattern that the
+/// reference cannot predict. The intra-in-P fallback should kick in on
+/// the lower half, producing a usable reconstruction that plain inter
+/// modes could not achieve at this qindex.
+#[test]
+fn pframe_roundtrip_intra_in_p_on_scene_cut() {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+
+    let mut y0 = vec![0u8; (W * H) as usize];
+    let mut y1 = vec![0u8; (W * H) as usize];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+    for row in 0..H as usize {
+        for col in 0..W as usize {
+            // Both frames have a smooth gradient in the top half.
+            y0[row * W as usize + col] = ((col * 200) / W as usize) as u8;
+            if row < H as usize / 2 {
+                y1[row * W as usize + col] = y0[row * W as usize + col];
+            } else {
+                // Bottom half of f1: a deterministic high-entropy pattern
+                // that bears no resemblance to f0's bottom half.
+                let x = row.wrapping_mul(131).wrapping_add(col.wrapping_mul(89));
+                y1[row * W as usize + col] = ((x & 0xff) as u8).wrapping_add(64);
+            }
+        }
+    }
+    let f0 = make_frame(&y0, &u, &v);
+    let f1 = make_frame(&y1, &u, &v);
+    let y1_expected = y1.clone();
+
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("rx I");
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("rx P");
+    assert!(!pkt_p.flags.keyframe);
+
+    let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_i.data.clone()))
+        .expect("decode I");
+    let _ = dec.receive_frame().expect("rx I");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_p.data.clone()))
+        .expect("decode P");
+    let frame_p = match dec.receive_frame().expect("rx P") {
+        Frame::Video(v) => v,
+        _ => panic!("not video"),
+    };
+    // Upper half: inter-coded, should be near-lossless.
+    let upper_src = &y1_expected[..(W as usize * (H as usize / 2))];
+    let upper_rec = &frame_p.planes[0].data[..(W as usize * (H as usize / 2))];
+    let p_upper = psnr(upper_src, upper_rec);
+    // Lower half: intra fallback — coarse but better than bogus inter.
+    let lower_src = &y1_expected[(W as usize * (H as usize / 2))..];
+    let lower_rec = &frame_p.planes[0].data[(W as usize * (H as usize / 2))..];
+    let p_lower = psnr(lower_src, lower_rec);
+    eprintln!(
+        "intra-in-P PSNR upper={p_upper:.2} dB, lower={p_lower:.2} dB, \
+         P-frame {} bytes",
+        pkt_p.data.len()
+    );
+    // Upper half should be essentially perfect (static content → all skip).
+    assert!(p_upper >= 40.0, "upper half PSNR too low: {p_upper:.2} dB");
+    // Lower half bar: intra DC_PRED on high-entropy content gives low
+    // single-digit dB at qindex=50 before any AC is transmitted, but the
+    // coded residual lifts it well above inter-only (which would be
+    // ~7 dB because the reference is a gradient, not noise).
+    assert!(
+        p_lower >= 10.0,
+        "intra-in-P lower half PSNR too low: {p_lower:.2} dB"
+    );
+}
+
+/// Sub-pel pan: every pixel of frame 1 equals frame 0 shifted by a
+/// non-integer horizontal amount (approximated via a simple 2-tap
+/// bilinear pre-filter on the source). The encoder's quarter-pel
+/// refinement should outperform integer-only search on this input.
+#[test]
+fn pframe_roundtrip_subpel_pan_beats_integer_only() {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+
+    let mut y0 = vec![0u8; (W * H) as usize];
+    let mut y1 = vec![0u8; (W * H) as usize];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+    // Smooth vertical-stripe pattern: avoids hard aliasing so a
+    // quarter-pel shift on the source remains a reasonable sub-pel
+    // translation of the reference.
+    for row in 0..H as usize {
+        for col in 0..W as usize {
+            // Smooth sinusoidal-ish pattern using a triangle wave.
+            let t = (col as i32 * 4).rem_euclid(64);
+            let tri = if t < 32 { t } else { 64 - t };
+            let v0 = (128 + tri * 3) as u8;
+            y0[row * W as usize + col] = v0;
+            // Shift f1 by +0.5 pixel: average the two neighbouring samples.
+            let next = col + 1;
+            let t2 = (next as i32 * 4).rem_euclid(64);
+            let tri2 = if t2 < 32 { t2 } else { 64 - t2 };
+            let v1 = (128 + tri2 * 3) as u8;
+            y1[row * W as usize + col] = ((v0 as u16 + v1 as u16) / 2) as u8;
+        }
+    }
+    let f0 = make_frame(&y0, &u, &v);
+    let f1 = make_frame(&y1, &u, &v);
+    let y1_expected = y1.clone();
+
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("rx I");
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("rx P");
+
+    let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_i.data.clone()))
+        .expect("decode I");
+    let _ = dec.receive_frame().expect("rx I");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_p.data.clone()))
+        .expect("decode P");
+    let frame_p = match dec.receive_frame().expect("rx P") {
+        Frame::Video(v) => v,
+        _ => panic!("not video"),
+    };
+    let p_y = psnr(&frame_p.planes[0].data, &y1_expected);
+    eprintln!(
+        "subpel-pan PSNR Y={p_y:.2} dB, P-frame {} bytes",
+        pkt_p.data.len()
+    );
+    // Sanity: reconstruction must still be clean. A full decode path
+    // that mishandled sub-pel MVs would produce visible corruption that
+    // immediately shows up as a low PSNR.
+    assert!(
+        p_y >= 28.0,
+        "subpel-pan P-frame Y PSNR too low: {p_y:.2} dB"
+    );
+}

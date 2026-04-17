@@ -32,15 +32,16 @@ deblocking filter (simple + normal modes). Parses all inter MB modes
 | Path     | What's emitted                                                  |
 | -------- | --------------------------------------------------------------- |
 | I-frame  | DC_PRED 16x16 luma + 8x8 chroma, fixed qindex, default coef probs, single partition. |
-| P-frame  | REF_LAST with per-MB choice of SKIP, ZERO_MV, or NEW_MV. NEW_MV runs a full integer-pel SAD search over +-8 luma pixels and emits the MV via the bit-exact companion encoders of the decoder's MV-component reader. |
+| P-frame  | REF_LAST with per-MB choice of SKIP, ZERO_MV, NEAREST_MV, NEAR_MV, NEW_MV, or intra-DC_PRED fallback. NEW_MV runs a full integer-pel SAD search over +-8 luma pixels then a quarter-pel 3x3 refinement using the same 6-tap filter the decoder applies. NEAREST / NEAR are preferred over NEW_MV when their SAD is within a small margin to save the MV-delta bits. Intra-DC_PRED kicks in when even the best inter candidate leaves a residual that is too large to code usefully (e.g. mid-frame scene cuts or uncovered regions). |
 
 Loop filter stays off on the write side (`filter_level = 0`).
 
 Not yet covered (planned follow-ups):
 
-- Sub-pel refinement after the integer search.
-- NEAREST / NEAR / SPLIT MV modes.
-- Intra-as-fallback inside P-frames.
+- SPLIT MV (per-4x4 partitioned motion).
+- B_PRED / V_PRED / H_PRED / TM_PRED intra modes on the encode side.
+- Loop-filter write path (reconstruction already tracks what the decoder
+  produces, but the encoder still emits `filter_level = 0`).
 
 ### Container
 

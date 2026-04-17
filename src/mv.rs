@@ -164,7 +164,9 @@ mod tests {
     #[test]
     fn mv_component_roundtrip_long_boundary() {
         // Covers the 8..=15 "bit-3 implicit" range and a few larger values.
-        for v in [8, -8, 15, -15, 16, -16, 17, -17, 24, 40, 127, -127, 256, 1023] {
+        for v in [
+            8, -8, 15, -15, 16, -16, 17, -17, 24, 40, 127, -127, 256, 1023,
+        ] {
             roundtrip_component(v);
         }
     }

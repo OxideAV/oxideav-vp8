@@ -271,7 +271,7 @@ impl Muxer for IvfMuxer {
         }
         // Seek back and patch the frame_count field (bytes 24..28) in the
         // file header now that we know the total.
-        let end = self.output.seek(SeekFrom::Current(0))?;
+        let end = self.output.stream_position()?;
         self.output.seek(SeekFrom::Start(24))?;
         self.output.write_all(&self.frame_count.to_le_bytes())?;
         self.output.seek(SeekFrom::Start(end))?;

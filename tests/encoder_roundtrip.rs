@@ -320,3 +320,71 @@ fn pframe_roundtrip_residual_path_exercised() {
     eprintln!("residual-path P-frame Y PSNR = {p_y:.2} dB");
     assert!(p_y > 25.0, "residual-path P-frame Y PSNR too low: {p_y:.2}");
 }
+
+/// Uniform horizontal pan (every pixel of frame 1 equals the corresponding
+/// pixel of frame 0 shifted by +8 columns, with edge replication). The
+/// encoder should find that shift via its integer motion search and emit
+/// NEWMV, reconstructing the P-frame at very high PSNR with a P-frame that
+/// is much smaller than a plain coded-residual ZERO_MV would produce.
+#[test]
+fn pframe_roundtrip_pan_picks_newmv() {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+
+    // Frame 0: vertical-stripe pattern so horizontal shifts change SAD a lot.
+    // Frame 1: same pattern shifted left by 8 columns (pan by +8 in source
+    // coordinates → ref-side MV of (0, +8 luma pixels) = mv.col = +64).
+    let mut y0 = vec![0u8; (W * H) as usize];
+    let mut y1 = vec![0u8; (W * H) as usize];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+    for row in 0..H as usize {
+        for col in 0..W as usize {
+            // 8-wide vertical stripes alternating 40/200 — strong AC energy,
+            // easy to lock onto with integer-pel SAD.
+            let stripe = (col / 8) & 1;
+            y0[row * W as usize + col] = if stripe == 0 { 40 } else { 200 };
+            let src_col = (col + 8).min(W as usize - 1);
+            y1[row * W as usize + col] = y0[row * W as usize + src_col];
+        }
+    }
+    let f0 = make_frame(&y0, &u, &v);
+    let f1 = make_frame(&y1, &u, &v);
+    let y1_expected = y1.clone();
+
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("rx I");
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("rx P");
+    assert!(!pkt_p.flags.keyframe);
+
+    let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_i.data.clone()))
+        .expect("decode I");
+    let _ = dec.receive_frame().expect("rx I");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_p.data.clone()))
+        .expect("decode P");
+    let frame_p = match dec.receive_frame().expect("rx P") {
+        Frame::Video(v) => v,
+        _ => panic!("not video"),
+    };
+    let p_y = psnr(&frame_p.planes[0].data, &y1_expected);
+    eprintln!(
+        "pan PSNR Y={p_y:.2} dB, P-frame {} bytes (I-frame {} bytes)",
+        pkt_p.data.len(),
+        pkt_i.data.len()
+    );
+    // Motion-compensated prediction should recover the pan near-losslessly
+    // (the residual is essentially zero on fully-matched blocks). Without
+    // NEWMV this value collapses to low-20 dB, so the bar doubles as a
+    // regression guard that motion search is actually selecting shifted
+    // matches.
+    assert!(p_y >= 40.0, "pan P-frame Y PSNR too low: {p_y:.2}");
+}

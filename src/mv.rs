@@ -6,6 +6,7 @@
 //! per-component probabilities (`MvContext`).
 
 use crate::bool_decoder::BoolDecoder;
+use crate::bool_encoder::BoolEncoder;
 use crate::tables::mv::{MvContext, MV_SHORT_TREE};
 use crate::tables::trees::decode_tree;
 
@@ -67,4 +68,115 @@ pub fn decode_mv(d: &mut BoolDecoder<'_>, mv_probs: &[MvContext; 2]) -> Mv {
     let row = decode_mv_component(d, &mv_probs[0]);
     let col = decode_mv_component(d, &mv_probs[1]);
     Mv::new(row, col)
+}
+
+/// Bit-exact write-side inverse of [`decode_mv_component`]. Given the same
+/// probability context, emits the boolean-coded bits that
+/// `decode_mv_component` will read back as `value`.
+pub fn encode_mv_component(enc: &mut BoolEncoder, probs: &MvContext, value: i32) {
+    let sign = value < 0;
+    let mag = value.unsigned_abs() as i32;
+    let large = mag >= 8;
+    enc.write_bool(probs[0] as u32, large);
+    if large {
+        for i in 0..3 {
+            let bit = ((mag >> i) & 1) != 0;
+            enc.write_bool(probs[9 + i] as u32, bit);
+        }
+        for i in (4..=9).rev() {
+            let bit = ((mag >> i) & 1) != 0;
+            enc.write_bool(probs[9 + i] as u32, bit);
+        }
+        // Bit 3 is implicit when bits 4..=9 are all zero: if mag in [8..=15]
+        // is represented without the bit-3 write, the decoder adds 8
+        // unconditionally. If bits 4..=9 are non-zero, bit 3 is coded
+        // explicitly.
+        let upper_any = (mag & 0xfff0) != 0;
+        if upper_any {
+            let bit3 = ((mag >> 3) & 1) != 0;
+            enc.write_bool(probs[9 + 3] as u32, bit3);
+        } else {
+            // Encoder must only take this branch when mag in [8..=15]. The
+            // decoder unconditionally adds 8 when the upper bits are all
+            // zero, so the magnitude is fully determined by bits 0..=2.
+            debug_assert!((8..=15).contains(&mag));
+        }
+    } else {
+        encode_tree_leaf(enc, &MV_SHORT_TREE, &probs[2..9], mag);
+    }
+    if mag != 0 {
+        enc.write_bool(probs[1] as u32, sign);
+    }
+}
+
+/// Write-side inverse of [`crate::tables::trees::decode_tree`]: emits the
+/// boolean branch sequence that decodes to `leaf`.
+fn encode_tree_leaf(enc: &mut BoolEncoder, tree: &[i8], probs: &[u8], leaf: i32) {
+    // Walk the tree recording the branches that reach the target leaf.
+    fn walk(tree: &[i8], leaf: i32, idx: usize) -> Option<Vec<(usize, bool)>> {
+        for bit in [false, true] {
+            let v = tree[idx + bit as usize];
+            if v <= 0 {
+                if -(v as i32) == leaf {
+                    return Some(vec![(idx >> 1, bit)]);
+                }
+            } else if let Some(mut rest) = walk(tree, leaf, v as usize) {
+                rest.insert(0, (idx >> 1, bit));
+                return Some(rest);
+            }
+        }
+        None
+    }
+    let path = walk(tree, leaf, 0).expect("leaf not in tree");
+    for (prob_idx, bit) in path {
+        enc.write_bool(probs[prob_idx] as u32, bit);
+    }
+}
+
+/// Encode a full MV (row then col) using the two-component context used by
+/// the decoder.
+pub fn encode_mv(enc: &mut BoolEncoder, mv_probs: &[MvContext; 2], mv: Mv) {
+    encode_mv_component(enc, &mv_probs[0], mv.row as i32);
+    encode_mv_component(enc, &mv_probs[1], mv.col as i32);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::mv::DEFAULT_MV_CONTEXT;
+
+    fn roundtrip_component(value: i32) {
+        let mut enc = BoolEncoder::new();
+        encode_mv_component(&mut enc, &DEFAULT_MV_CONTEXT[0], value);
+        let buf = enc.finish();
+        let mut dec = BoolDecoder::new(&buf).unwrap();
+        let got = decode_mv_component(&mut dec, &DEFAULT_MV_CONTEXT[0]);
+        assert_eq!(got, value, "mv component {value} did not round-trip");
+    }
+
+    #[test]
+    fn mv_component_roundtrip_short() {
+        for v in -7..=7 {
+            roundtrip_component(v);
+        }
+    }
+
+    #[test]
+    fn mv_component_roundtrip_long_boundary() {
+        // Covers the 8..=15 "bit-3 implicit" range and a few larger values.
+        for v in [8, -8, 15, -15, 16, -16, 17, -17, 24, 40, 127, -127, 256, 1023] {
+            roundtrip_component(v);
+        }
+    }
+
+    #[test]
+    fn mv_roundtrip_pair() {
+        let mv = Mv::new(-64, 32);
+        let mut enc = BoolEncoder::new();
+        encode_mv(&mut enc, &DEFAULT_MV_CONTEXT, mv);
+        let buf = enc.finish();
+        let mut dec = BoolDecoder::new(&buf).unwrap();
+        let got = decode_mv(&mut dec, &DEFAULT_MV_CONTEXT);
+        assert_eq!(got, mv);
+    }
 }

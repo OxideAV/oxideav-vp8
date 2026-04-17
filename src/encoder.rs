@@ -1,13 +1,12 @@
 //! VP8 encoder — key-frame + P-frame paths (RFC 6386).
 //!
-//! Scope for v2:
+//! Scope:
 //! * First frame (and on forced refresh) = key-frame (I-frame).
-//! * Subsequent frames = P-frames using the ZERO_MV mode with REF_LAST,
-//!   plus the per-MB `mb_skip` flag to fully elide residual coding for
-//!   macroblocks that match their reference well. No NEWMV / NEAREST /
-//!   NEAR / SPLIT MVs are emitted — a pure no-motion P-frame encoder.
-//!   This still gives a dramatic win over the all-keyframe baseline on
-//!   any static (or slow-moving) content.
+//! * Subsequent frames = P-frames against REF_LAST, picking the best per-MB
+//!   mode among SKIP (no residual), ZERO_MV (motion-compensated copy +
+//!   residual at `mv=0`) and NEWMV with a small integer-pel motion
+//!   search. Sub-pel search and the NEAREST / NEAR / SPLIT modes remain
+//!   planned follow-ups.
 //! * DC_PRED for every luma 16×16 MB and chroma 8×8 MB in I-frames.
 //! * Fixed quantiser (default `qindex = 50`, mid-quality).
 //! * Loop filter disabled (`filter_level = 0`).
@@ -15,8 +14,8 @@
 //! * Accepted pixel format: `PixelFormat::Yuv420P`.
 //!
 //! Not yet implemented (candidate for a follow-up):
-//! * NEWMV with diamond motion search.
-//! * NEAREST / NEAR neighbour-predicted MV modes.
+//! * Sub-pel refinement after the integer search.
+//! * NEAREST / NEAR neighbour-predicted MV modes and SPLIT MVs.
 //! * Intra-as-fallback-inside-P.
 
 use std::collections::VecDeque;
@@ -31,12 +30,14 @@ use crate::bool_encoder::BoolEncoder;
 use crate::fdct::{fdct4x4, fwht4x4};
 use crate::frame_tag::KEYFRAME_SYNC_CODE;
 use crate::intra::{predict_16x16, predict_8x8};
+use crate::mv::{encode_mv_component, Mv};
 use crate::tables::coeff_probs::{CoeffProbs, DEFAULT_COEF_PROBS};
+use crate::tables::mv::DEFAULT_MV_CONTEXT;
 use crate::tables::quant::{
     clamp_qindex, uv_ac_step, uv_dc_step, y2_ac_step, y2_dc_step, y_ac_step, y_dc_step,
 };
 use crate::tables::token_tree::{COEF_BANDS, ZIGZAG};
-use crate::tables::trees::DC_PRED;
+use crate::tables::trees::{DC_PRED, MV_COUNTS_TO_PROBS};
 use crate::transform::{idct4x4, iwht4x4};
 
 /// Default qindex. 50 ≈ mid-quality; the codec accepts 0..=127.
@@ -46,6 +47,16 @@ pub const DEFAULT_QINDEX: u8 = 50;
 /// Empirically chosen: 3 is low enough that static content always skips
 /// while modestly-changed content falls through to coded residual.
 const MB_SKIP_SAD_PER_PIXEL: u32 = 3;
+
+/// Half-range (in integer luma pixels) of the NEWMV motion search window.
+/// Search spans [-MOTION_SEARCH_RANGE, +MOTION_SEARCH_RANGE] on each axis.
+const MOTION_SEARCH_RANGE: i32 = 8;
+
+/// SAD delta, per MB, that NEWMV must beat ZERO_MV by. Tuned as a coarse
+/// proxy for the extra bitrate cost of coding the MV itself — NEWMV is
+/// only picked when motion search reduces luma SAD by at least this much
+/// versus the zero-motion prediction.
+const NEWMV_SAD_MARGIN: u32 = 64;
 
 /// Encoder factory used by [`crate::register_codecs`].
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -374,8 +385,13 @@ fn assemble_frame_keyframe(
 enum PMbDecision {
     /// Copy the reference MB verbatim — no residual coded.
     Skip,
-    /// Motion-compensated copy followed by a coded residual.
+    /// Motion-compensated copy at `mv=0` followed by a coded residual.
     ZeroMv,
+    /// Motion-compensated copy at `mv` (integer-pel) followed by a coded
+    /// residual. `mv` is in luma 1/8-pel units and row/col are both
+    /// multiples of 8 — the decoder's sub-pel filters degenerate to an
+    /// integer copy in that case.
+    NewMv(Mv),
 }
 
 /// Encode one P-frame (inter-frame). All MBs use REF_LAST + ZERO_MV.
@@ -484,57 +500,98 @@ fn encode_pframe_and_reconstruct(
     // --- Per-MB decision + reconstruction ---
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_decisions: Vec<PMbDecision> = Vec::with_capacity(mb_w * mb_h);
+    let mut mb_mvs: Vec<Mv> = vec![Mv::ZERO; mb_w * mb_h];
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            // Compute SAD over the luma MB to decide if we can skip the
-            // residual entirely.
-            let sad = mb_luma_sad(&src_y, &reference.y, y_stride, mb_x, mb_y);
-            let skip = sad <= MB_SKIP_SAD_PER_PIXEL * (16 * 16);
-            mb_decisions.push(if skip {
-                PMbDecision::Skip
+            // Zero-MV SAD — the baseline against which NEWMV must improve.
+            let zero_sad = mb_luma_sad_at(&src_y, &reference.y, y_stride, mb_x, mb_y, 0, 0);
+
+            // Decision 1: cheap skip test.
+            let skip = zero_sad <= MB_SKIP_SAD_PER_PIXEL * (16 * 16);
+
+            // Decision 2: if not skipping, try a small integer-pel search.
+            let (decision, chosen_mv) = if skip {
+                (PMbDecision::Skip, Mv::ZERO)
             } else {
-                PMbDecision::ZeroMv
-            });
+                let (best_mv_px, best_sad) = integer_motion_search(
+                    &src_y,
+                    &reference.y,
+                    y_stride,
+                    mb_x,
+                    mb_y,
+                    mb_w,
+                    mb_h,
+                    MOTION_SEARCH_RANGE,
+                );
+                if best_sad + NEWMV_SAD_MARGIN < zero_sad && best_mv_px != (0, 0) {
+                    let mv = Mv::new(best_mv_px.0 * 8, best_mv_px.1 * 8);
+                    (PMbDecision::NewMv(mv), mv)
+                } else {
+                    (PMbDecision::ZeroMv, Mv::ZERO)
+                }
+            };
+            mb_decisions.push(decision);
+            mb_mvs[mb_y * mb_w + mb_x] = chosen_mv;
+
+            // Replicate the decoder's find_near_mvs for this MB against
+            // already-emitted neighbour MVs so that the probabilities +
+            // best-MV delta match.
+            let (_nearest, _near, best_for_newmv, cnt) =
+                find_near_mvs_enc(&mb_mvs, &mb_decisions, mb_x, mb_y, mb_w);
+            let ref_probs = mv_ref_probs_enc(&cnt);
 
             // Mode-info bits.
             // 1) segment id (skipped — seg disabled).
             // 2) skip flag (mb_skip_enabled=1 so this is coded).
-            hdr_enc.write_bool(mb_skip_prob as u32, skip);
+            hdr_enc.write_bool(mb_skip_prob as u32, matches!(decision, PMbDecision::Skip));
             // 3) is_inter = true.
             hdr_enc.write_bool(prob_intra as u32, true);
             // 4) ref_frame bits: prob_last "is not last" = false (→ REF_LAST).
             hdr_enc.write_bool(prob_last as u32, false);
-            // 5) MV_REF_TREE: for ZERO_MV with all-ZERO neighbours, cnt[0]=5
-            //    is the only possible value (every neighbour is either
-            //    off-image, or has (ref=LAST, mv=0)). Probs come from row 5
-            //    of MV_COUNTS_TO_PROBS = [234, 188, 128, 28]. Walking to
-            //    ZERO_MV: leaf 0 at tree index 0 → `read_bool(probs[0])`=false.
-            use crate::tables::trees::MV_COUNTS_TO_PROBS;
-            let probs = &MV_COUNTS_TO_PROBS[5];
-            hdr_enc.write_bool(probs[0] as u32, false);
-            // ZERO_MV doesn't emit an MV.
 
-            // Per-MB encode: compute residual between src and reference,
-            // quantise, reconstruct.
-            let mb_rec = if skip {
-                // Skipped MB: reconstruction is the motion-compensated
-                // prediction (integer copy from reference at zero MV),
-                // with no residual added.
-                copy_ref_into_rec(
-                    &reference.y,
-                    &reference.u,
-                    &reference.v,
-                    &mut rec_y,
-                    &mut rec_u,
-                    &mut rec_v,
-                    y_stride,
-                    uv_stride,
-                    mb_x,
-                    mb_y,
-                );
-                MbEncoded::zero()
-            } else {
-                encode_inter_mb_zero(
+            // 5) MV_REF_TREE leaves (RFC §16.3):
+            //      leaf 0 = ZERO_MV  (tree path: 0)
+            //      leaf 3 = NEW_MV   (tree path: 1, 1, 1)
+            //    Skip & ZeroMv both take the ZERO_MV leaf (no MV coded).
+            match decision {
+                PMbDecision::Skip | PMbDecision::ZeroMv => {
+                    hdr_enc.write_bool(ref_probs[0] as u32, false);
+                }
+                PMbDecision::NewMv(mv) => {
+                    // MV_REF_TREE walk to NEW_MV (leaf 3): probs[0]=true,
+                    // probs[1]=true, probs[2]=true, probs[3]=false.
+                    hdr_enc.write_bool(ref_probs[0] as u32, true);
+                    hdr_enc.write_bool(ref_probs[1] as u32, true);
+                    hdr_enc.write_bool(ref_probs[2] as u32, true);
+                    hdr_enc.write_bool(ref_probs[3] as u32, false);
+                    let dmv = Mv::new(
+                        mv.row as i32 - best_for_newmv.row as i32,
+                        mv.col as i32 - best_for_newmv.col as i32,
+                    );
+                    encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[0], dmv.row as i32);
+                    encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[1], dmv.col as i32);
+                }
+            }
+
+            // Per-MB encode: compute residual between src and the
+            // motion-compensated prediction.
+            let mb_rec = match decision {
+                PMbDecision::Skip => {
+                    copy_ref_into_rec(
+                        &reference.y,
+                        &reference.u,
+                        &reference.v,
+                        &mut rec_y,
+                        &mut rec_u,
+                        &mut rec_v,
+                        y_stride,
+                        uv_stride,
+                        mb_x,
+                        mb_y,
+                    );
+                    MbEncoded::zero()
+                }
+                PMbDecision::ZeroMv => encode_inter_mb_at_mv(
                     &src_y,
                     &src_u,
                     &src_v,
@@ -546,10 +603,32 @@ fn encode_pframe_and_reconstruct(
                     &mut rec_v,
                     y_stride,
                     uv_stride,
+                    y_buf_h,
+                    uv_buf_h,
                     mb_x,
                     mb_y,
+                    Mv::ZERO,
                     &q,
-                )
+                ),
+                PMbDecision::NewMv(mv) => encode_inter_mb_at_mv(
+                    &src_y,
+                    &src_u,
+                    &src_v,
+                    &reference.y,
+                    &reference.u,
+                    &reference.v,
+                    &mut rec_y,
+                    &mut rec_u,
+                    &mut rec_v,
+                    y_stride,
+                    uv_stride,
+                    y_buf_h,
+                    uv_buf_h,
+                    mb_x,
+                    mb_y,
+                    mv,
+                    &q,
+                ),
             };
             mb_encoded.push(mb_rec);
         }
@@ -589,18 +668,131 @@ fn encode_pframe_and_reconstruct(
     Ok((out, reference_out))
 }
 
-fn mb_luma_sad(src_y: &[u8], ref_y: &[u8], stride: usize, mb_x: usize, mb_y: usize) -> u32 {
+/// SAD of the luma MB at `(mb_x, mb_y)` against the reference plane shifted
+/// by `(dy, dx)` integer luma pixels. Out-of-bounds reference samples are
+/// clamped (edge replication) to match the decoder's `RefPlane::sample`.
+fn mb_luma_sad_at(
+    src_y: &[u8],
+    ref_y: &[u8],
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    dy: i32,
+    dx: i32,
+) -> u32 {
     let x0 = mb_x * 16;
     let y0 = mb_y * 16;
+    let w = stride as i32;
+    let h = (ref_y.len() / stride) as i32;
     let mut sad: u32 = 0;
     for r in 0..16 {
-        let row_off = (y0 + r) * stride + x0;
+        let ry = (y0 as i32 + r as i32 + dy).clamp(0, h - 1) as usize;
+        let row_off_src = (y0 + r) * stride;
         for c in 0..16 {
-            let d = src_y[row_off + c] as i32 - ref_y[row_off + c] as i32;
+            let rx = (x0 as i32 + c as i32 + dx).clamp(0, w - 1) as usize;
+            let d = src_y[row_off_src + x0 + c] as i32 - ref_y[ry * stride + rx] as i32;
             sad += d.unsigned_abs();
         }
     }
     sad
+}
+
+/// Simple full-pel motion search. Scans `[-range, +range]` on each axis
+/// around zero, returning `((dy, dx), best_sad)` for the displacement that
+/// minimises luma SAD. Ties break toward smaller magnitudes (the search
+/// starts at zero and only switches on strict improvement).
+#[allow(clippy::too_many_arguments)]
+fn integer_motion_search(
+    src_y: &[u8],
+    ref_y: &[u8],
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    _mb_w: usize,
+    _mb_h: usize,
+    range: i32,
+) -> ((i32, i32), u32) {
+    let mut best = (0, 0);
+    let mut best_sad = mb_luma_sad_at(src_y, ref_y, stride, mb_x, mb_y, 0, 0);
+    for dy in -range..=range {
+        for dx in -range..=range {
+            if dy == 0 && dx == 0 {
+                continue;
+            }
+            let sad = mb_luma_sad_at(src_y, ref_y, stride, mb_x, mb_y, dy, dx);
+            if sad < best_sad {
+                best_sad = sad;
+                best = (dy, dx);
+            }
+        }
+    }
+    (best, best_sad)
+}
+
+/// Encode-time replica of `find_near_mvs` in the decoder, restricted to
+/// the REF_LAST-only encoder. Returns `(nearest, near, best, cnt)`.
+fn find_near_mvs_enc(
+    mb_mvs: &[Mv],
+    mb_decisions: &[PMbDecision],
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+) -> (Mv, Mv, Mv, [u8; 4]) {
+    let mut cnt = [0u8; 4];
+    let mut mvs: [Mv; 3] = [Mv::ZERO; 3];
+    let mut num_mvs = 0usize;
+    let neighbours: [(isize, isize, u8); 3] = [(0, -1, 2), (-1, 0, 2), (-1, -1, 1)];
+    for &(dx, dy, weight) in &neighbours {
+        let nx = mb_x as isize + dx;
+        let ny = mb_y as isize + dy;
+        if nx < 0 || ny < 0 || (nx as usize) >= mb_w {
+            cnt[0] += weight;
+            continue;
+        }
+        let idx = (ny as usize) * mb_w + (nx as usize);
+        let nmv = match mb_decisions.get(idx) {
+            Some(PMbDecision::Skip) | Some(PMbDecision::ZeroMv) => Mv::ZERO,
+            Some(PMbDecision::NewMv(_)) => mb_mvs[idx],
+            None => Mv::ZERO,
+        };
+        if nmv.row == 0 && nmv.col == 0 {
+            cnt[0] += weight;
+        } else {
+            let mut matched = false;
+            for i in 0..num_mvs {
+                if mvs[i] == nmv {
+                    cnt[i + 1] += weight;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched && num_mvs < 2 {
+                mvs[num_mvs] = nmv;
+                cnt[num_mvs + 1] = weight;
+                num_mvs += 1;
+            }
+        }
+    }
+    let nearest = mvs[0];
+    let near = mvs[1];
+    let best = if cnt[1] >= cnt[0] { nearest } else { Mv::ZERO };
+    (nearest, near, best, cnt)
+}
+
+/// Encode-time replica of the decoder's `mv_ref_probs` — selects a row of
+/// `MV_COUNTS_TO_PROBS` by `cnt[0]`.
+fn mv_ref_probs_enc(cnt: &[u8; 4]) -> [u8; 4] {
+    let row = (cnt[0].min(5)) as usize;
+    MV_COUNTS_TO_PROBS[row]
+}
+
+/// Encode-time replica of the decoder's `chroma_round`. Converts the sum
+/// of 4 luma sub-MV components (in 1/8-pel units) into the chroma MV
+/// component that the decoder will apply to the chroma plane.
+#[inline]
+fn chroma_round_enc(sum: i32) -> i32 {
+    let sign = if sum < 0 { -1 } else { 1 };
+    ((sum + sign * 4) / 8) * 2
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -632,11 +824,11 @@ fn copy_ref_into_rec(
 }
 
 // ---------------------------------------------------------------------------
-// Inter MB encode (ZERO_MV — integer copy from reference + coded residual)
+// Inter MB encode (integer-pel MV: integer copy from reference + coded residual)
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn encode_inter_mb_zero(
+fn encode_inter_mb_at_mv(
     src_y: &[u8],
     src_u: &[u8],
     src_v: &[u8],
@@ -648,18 +840,32 @@ fn encode_inter_mb_zero(
     rec_v: &mut [u8],
     y_stride: usize,
     uv_stride: usize,
+    y_buf_h: usize,
+    uv_buf_h: usize,
     mb_x: usize,
     mb_y: usize,
+    mv: Mv,
     q: &QuantCtx,
 ) -> MbEncoded {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
 
-    // Luma prediction = reference at zero MV (integer copy).
+    // Integer-pel luma displacement in pixels (MVs come in 1/8-pel units
+    // with multiples of 8).
+    let dy = (mv.row as i32) >> 3;
+    let dx = (mv.col as i32) >> 3;
+    let ybh = y_buf_h as i32;
+    let ybw = y_stride as i32;
+
+    // Luma prediction = reference shifted by (dy, dx), edge-replicated to
+    // match the decoder's `sixtap_predict` when called with integer MVs.
     let mut pred_y = [0u8; 256];
     for r in 0..16 {
-        let src_off = (mb_yp + r) * y_stride + mb_xp;
-        pred_y[r * 16..r * 16 + 16].copy_from_slice(&ref_y[src_off..src_off + 16]);
+        for c in 0..16 {
+            let ry = ((mb_yp as i32) + r as i32 + dy).clamp(0, ybh - 1) as usize;
+            let rx = ((mb_xp as i32) + c as i32 + dx).clamp(0, ybw - 1) as usize;
+            pred_y[r * 16 + c] = ref_y[ry * y_stride + rx];
+        }
     }
 
     // 4×4 DCTs of the luma residual. For inter MBs the Y2 (WHT) path is
@@ -723,8 +929,25 @@ fn encode_inter_mb_zero(
     }
 
     // Chroma — same pipeline, integer-copy reference prediction.
+    // The decoder derives a per-4×4 chroma MV as the average of the 4
+    // covered luma sub-MVs (`chroma_round`). For a non-SPLIT MB every
+    // sub-MV equals `mv`, so `sum = 4*mv` and `chroma_round(4*mv)` gives
+    // the applied chroma displacement in 1/8-chroma-pel units. Integer
+    // luma MVs (multiples of 8) always produce integer chroma MVs
+    // (multiples of 8) under this rule, so the bilinear filter degenerates
+    // to a straight copy in the reference buffer.
+    let cmv_r = chroma_round_enc(4 * mv.row as i32);
+    let cmv_c = chroma_round_enc(4 * mv.col as i32);
+    debug_assert!(
+        (cmv_r & 7) == 0 && (cmv_c & 7) == 0,
+        "integer-pel luma MV must yield integer chroma MV"
+    );
+    let cdy_base = cmv_r >> 3;
+    let cdx_base = cmv_c >> 3;
     let mb_xc = mb_x * 8;
     let mb_yc = mb_y * 8;
+    let uvbw = uv_stride as i32;
+    let uvbh = uv_buf_h as i32;
     let mut u_q = [[0i16; 16]; 4];
     let mut v_q = [[0i16; 16]; 4];
     for plane_sel in 0..2 {
@@ -734,8 +957,11 @@ fn encode_inter_mb_zero(
         };
         let mut pred_uv = [0u8; 64];
         for r in 0..8 {
-            let src_off = (mb_yc + r) * uv_stride + mb_xc;
-            pred_uv[r * 8..r * 8 + 8].copy_from_slice(&refp[src_off..src_off + 8]);
+            for c in 0..8 {
+                let ry = ((mb_yc as i32) + r as i32 + cdy_base).clamp(0, uvbh - 1) as usize;
+                let rx = ((mb_xc as i32) + c as i32 + cdx_base).clamp(0, uvbw - 1) as usize;
+                pred_uv[r * 8 + c] = refp[ry * uv_stride + rx];
+            }
         }
         for bi in 0..4 {
             let by = bi / 2;

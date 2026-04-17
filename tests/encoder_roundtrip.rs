@@ -9,8 +9,13 @@
 //!     (show_frame set, frame_type=0) followed by the 3-byte start code
 //!     `9d 01 2a`.
 
-use oxideav_core::{PixelFormat, TimeBase, VideoFrame, VideoPlane};
-use oxideav_vp8::encoder::encode_keyframe;
+use oxideav_codec::Decoder;
+use oxideav_core::{
+    CodecId, CodecParameters, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
+    VideoPlane,
+};
+use oxideav_vp8::decoder::Vp8Decoder;
+use oxideav_vp8::encoder::{encode_keyframe, make_encoder_with_qindex};
 use oxideav_vp8::{decode_frame, parse_header, FrameType};
 
 const W: u32 = 128;
@@ -142,4 +147,176 @@ fn roundtrip_yuv_test_pattern_psnr_above_25() {
     assert!(py > 25.0, "Y PSNR too low: {py:.2} dB");
     assert!(pu > 25.0, "U PSNR too low: {pu:.2} dB");
     assert!(pv > 25.0, "V PSNR too low: {pv:.2} dB");
+}
+
+/// Encode a 2-frame sequence (I + P) of a sliding gradient, decode it
+/// through the full encoder/decoder pipeline, and check that the second
+/// (P-frame) plane recovers well.
+#[test]
+fn pframe_roundtrip_sliding_gradient_psnr_above_30() {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+
+    // Build a frame with a smooth horizontal luma gradient offset by `shift`.
+    let make_grad = |shift: usize| -> VideoFrame {
+        let mut y = vec![0u8; (W * H) as usize];
+        let mut u = vec![0u8; cw * ch];
+        let mut v = vec![0u8; cw * ch];
+        for row in 0..H as usize {
+            for col in 0..W as usize {
+                let c = (col + shift) % W as usize;
+                // Smooth 0..=255 horizontal gradient.
+                y[row * W as usize + col] = ((c * 255) / (W as usize - 1)) as u8;
+            }
+        }
+        for row in 0..ch {
+            for col in 0..cw {
+                u[row * cw + col] = 128;
+                v[row * cw + col] = 128;
+            }
+        }
+        make_frame(&y, &u, &v)
+    };
+
+    // Frame 1 is identical to frame 0 (static content exercises SKIP).
+    // Frame 2 shifts the gradient by 1 px (small change, exercises the
+    // coded-residual ZERO_MV path since motion is below the SAD skip bar).
+    let f0 = make_grad(0);
+    let f1 = make_grad(0);
+    let f0_y = f0.planes[0].data.clone();
+    let f0_u = f0.planes[1].data.clone();
+    let f0_v = f0.planes[2].data.clone();
+    let f1_y = f1.planes[0].data.clone();
+    let f1_u = f1.planes[1].data.clone();
+    let f1_v = f1.planes[2].data.clone();
+
+    // Encoder.
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("receive I");
+    assert!(pkt_i.flags.keyframe);
+    let parsed_i = parse_header(&pkt_i.data).expect("parse I");
+    assert!(matches!(parsed_i.tag.frame_type, FrameType::Key));
+
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("receive P");
+    assert!(!pkt_p.flags.keyframe);
+    let parsed_p = parse_header(&pkt_p.data).expect("parse P");
+    assert!(matches!(parsed_p.tag.frame_type, FrameType::Inter));
+
+    eprintln!(
+        "I-frame size: {} bytes, P-frame size: {} bytes",
+        pkt_i.data.len(),
+        pkt_p.data.len()
+    );
+    // For an identical frame under the skip path, the P-frame must be
+    // meaningfully smaller than the I-frame — the defining feature of
+    // inter coding.
+    assert!(
+        pkt_p.data.len() * 2 < pkt_i.data.len(),
+        "P-frame not meaningfully smaller than I-frame: P={} I={}",
+        pkt_p.data.len(),
+        pkt_i.data.len()
+    );
+
+    // Decode through the stateful decoder.
+    let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_i.data.clone()))
+        .expect("decode I");
+    let frame_i = match dec.receive_frame().expect("receive I frame") {
+        Frame::Video(v) => v,
+        _ => panic!("not a video frame"),
+    };
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_p.data.clone()))
+        .expect("decode P");
+    let frame_p = match dec.receive_frame().expect("receive P frame") {
+        Frame::Video(v) => v,
+        _ => panic!("not a video frame"),
+    };
+
+    let p_y = psnr(&frame_p.planes[0].data, &f1_y);
+    let p_u = psnr(&frame_p.planes[1].data, &f1_u);
+    let p_v = psnr(&frame_p.planes[2].data, &f1_v);
+    eprintln!("P-frame PSNR Y={p_y:.2} U={p_u:.2} V={p_v:.2}");
+    assert!(
+        p_y >= 30.0,
+        "P-frame Y PSNR too low: {p_y:.2} dB (I-frame Y PSNR was {:.2} dB)",
+        psnr(&frame_i.planes[0].data, &f0_y)
+    );
+    assert!(p_u >= 30.0, "P-frame U PSNR too low: {p_u:.2} dB");
+    assert!(p_v >= 30.0, "P-frame V PSNR too low: {p_v:.2} dB");
+
+    // I-frame PSNR sanity (should still match the existing bar).
+    let i_y = psnr(&frame_i.planes[0].data, &f0_y);
+    let i_u = psnr(&frame_i.planes[1].data, &f0_u);
+    let i_v = psnr(&frame_i.planes[2].data, &f0_v);
+    eprintln!("I-frame PSNR Y={i_y:.2} U={i_u:.2} V={i_v:.2}");
+    assert!(i_y > 25.0);
+    assert!(i_u > 25.0);
+    assert!(i_v > 25.0);
+}
+
+/// Encode a 3-frame sequence where the content actually changes between
+/// frame 1 and frame 2 by enough to defeat the SAD-based skip heuristic.
+/// This exercises the ZERO_MV residual-coding path in the P-frame encoder.
+#[test]
+fn pframe_roundtrip_residual_path_exercised() {
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+
+    let mut y0 = vec![0u8; (W * H) as usize];
+    let mut y1 = vec![0u8; (W * H) as usize];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+    for row in 0..H as usize {
+        for col in 0..W as usize {
+            y0[row * W as usize + col] = ((col * 255) / (W as usize - 1)) as u8;
+            // Shift by 8 pixels → big enough SAD that MBs cannot skip,
+            // but still small enough that the residual is compressible.
+            let c2 = (col + 8) % W as usize;
+            y1[row * W as usize + col] = ((c2 * 255) / (W as usize - 1)) as u8;
+        }
+    }
+    let f0 = make_frame(&y0, &u, &v);
+    let f1 = make_frame(&y1, &u, &v);
+    let y1_expected = y1.clone();
+
+    let mut enc_params = CodecParameters::video(CodecId::new("vp8"));
+    enc_params.width = Some(W);
+    enc_params.height = Some(H);
+    enc_params.pixel_format = Some(PixelFormat::Yuv420P);
+    enc_params.frame_rate = Some(Rational::new(30, 1));
+    let mut enc = make_encoder_with_qindex(&enc_params, QINDEX).expect("encoder");
+
+    enc.send_frame(&Frame::Video(f0)).expect("send f0");
+    let pkt_i = enc.receive_packet().expect("receive I");
+    enc.send_frame(&Frame::Video(f1)).expect("send f1");
+    let pkt_p = enc.receive_packet().expect("receive P");
+    let parsed_p = parse_header(&pkt_p.data).expect("parse P");
+    assert!(matches!(parsed_p.tag.frame_type, FrameType::Inter));
+    eprintln!(
+        "residual-path I={} bytes, P={} bytes",
+        pkt_i.data.len(),
+        pkt_p.data.len()
+    );
+
+    let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_i.data.clone()))
+        .expect("decode I");
+    let _ = dec.receive_frame().expect("rx I");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt_p.data.clone()))
+        .expect("decode P");
+    let frame_p = match dec.receive_frame().expect("rx P") {
+        Frame::Video(v) => v,
+        _ => panic!("not video"),
+    };
+    let p_y = psnr(&frame_p.planes[0].data, &y1_expected);
+    eprintln!("residual-path P-frame Y PSNR = {p_y:.2} dB");
+    assert!(p_y > 25.0, "residual-path P-frame Y PSNR too low: {p_y:.2}");
 }

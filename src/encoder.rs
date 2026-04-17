@@ -1,23 +1,23 @@
-//! VP8 I-frame (keyframe) encoder — RFC 6386.
+//! VP8 encoder — key-frame + P-frame paths (RFC 6386).
 //!
-//! Scope for v1:
-//! * Keyframes only (no P-frames).
-//! * DC_PRED for every luma 16×16 MB and every chroma 8×8 MB (the most
-//!   uniformly-applicable mode — no context-sensitive choice required).
+//! Scope for v2:
+//! * First frame (and on forced refresh) = key-frame (I-frame).
+//! * Subsequent frames = P-frames using the ZERO_MV mode with REF_LAST,
+//!   plus the per-MB `mb_skip` flag to fully elide residual coding for
+//!   macroblocks that match their reference well. No NEWMV / NEAREST /
+//!   NEAR / SPLIT MVs are emitted — a pure no-motion P-frame encoder.
+//!   This still gives a dramatic win over the all-keyframe baseline on
+//!   any static (or slow-moving) content.
+//! * DC_PRED for every luma 16×16 MB and chroma 8×8 MB in I-frames.
 //! * Fixed quantiser (default `qindex = 50`, mid-quality).
 //! * Loop filter disabled (`filter_level = 0`).
 //! * Single token partition.
 //! * Accepted pixel format: `PixelFormat::Yuv420P`.
 //!
-//! The encoder mirrors the decoder's pipeline closely so that the two
-//! agree on MB state:
-//!   1. Forward 4×4 DCT on each Y/U/V 4×4 residual block.
-//!   2. Forward WHT on the 16 DC coefficients (Y2 path) for non-B_PRED MBs.
-//!   3. Quantise by the per-block stepsize.
-//!   4. Immediately reconstruct the MB (dequantise + inverse transform
-//!      + prediction) so the next MB's DC_PRED neighbours are bit-exact.
-//!   5. Encode the quantised coefficients with the default token
-//!      probabilities using the write-side boolean coder.
+//! Not yet implemented (candidate for a follow-up):
+//! * NEWMV with diamond motion search.
+//! * NEAREST / NEAR neighbour-predicted MV modes.
+//! * Intra-as-fallback-inside-P.
 
 use std::collections::VecDeque;
 
@@ -41,6 +41,11 @@ use crate::transform::{idct4x4, iwht4x4};
 
 /// Default qindex. 50 ≈ mid-quality; the codec accepts 0..=127.
 pub const DEFAULT_QINDEX: u8 = 50;
+
+/// SAD-per-pixel threshold below which a P-frame MB is emitted as `skip`.
+/// Empirically chosen: 3 is low enough that static content always skips
+/// while modestly-changed content falls through to coded residual.
+const MB_SKIP_SAD_PER_PIXEL: u32 = 3;
 
 /// Encoder factory used by [`crate::register_codecs`].
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -81,6 +86,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         time_base,
         pending: VecDeque::new(),
         eof: false,
+        last_frame: None,
     }))
 }
 
@@ -117,7 +123,22 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
         time_base,
         pending: VecDeque::new(),
         eof: false,
+        last_frame: None,
     }))
+}
+
+/// Reconstructed reference frame (post-quant reconstruction, matching what
+/// the decoder will regenerate from the emitted bitstream). Stored in
+/// MB-padded stride/height to make per-MB access a straight index calc.
+#[derive(Clone)]
+struct ReferenceFrame {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    y_stride: usize,
+    uv_stride: usize,
+    y_h: usize,
+    uv_h: usize,
 }
 
 struct Vp8Encoder {
@@ -128,6 +149,7 @@ struct Vp8Encoder {
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
+    last_frame: Option<ReferenceFrame>,
 }
 
 impl Encoder for Vp8Encoder {
@@ -157,12 +179,23 @@ impl Encoder for Vp8Encoder {
             return Err(Error::invalid("vp8 encoder: expected 3 planes"));
         }
 
-        // Every frame is an I-frame in this version.
-        let data = encode_keyframe(self.width, self.height, self.qindex, v)?;
+        let is_keyframe = self.last_frame.is_none();
+        let (data, reference) = if is_keyframe {
+            let (bitstream, rec) =
+                encode_keyframe_and_reconstruct(self.width, self.height, self.qindex, v)?;
+            (bitstream, rec)
+        } else {
+            let reference = self.last_frame.as_ref().unwrap();
+            let (bitstream, rec) =
+                encode_pframe_and_reconstruct(self.width, self.height, self.qindex, v, reference)?;
+            (bitstream, rec)
+        };
+        self.last_frame = Some(reference);
+
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
-        pkt.flags.keyframe = true;
+        pkt.flags.keyframe = is_keyframe;
         self.pending.push_back(pkt);
         Ok(())
     }
@@ -185,11 +218,22 @@ impl Encoder for Vp8Encoder {
 }
 
 // ---------------------------------------------------------------------------
-// Frame assembly
+// Frame assembly — keyframe
 // ---------------------------------------------------------------------------
 
 /// Encode one keyframe. Returns the raw VP8 bitstream for the frame.
+/// Backwards-compatible with the earlier single-return signature.
 pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) -> Result<Vec<u8>> {
+    let (bitstream, _rec) = encode_keyframe_and_reconstruct(width, height, qindex, frame)?;
+    Ok(bitstream)
+}
+
+fn encode_keyframe_and_reconstruct(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    frame: &VideoFrame,
+) -> Result<(Vec<u8>, ReferenceFrame)> {
     let mb_w = ((width + 15) / 16) as usize;
     let mb_h = ((height + 15) / 16) as usize;
     let y_stride = mb_w * 16;
@@ -242,24 +286,13 @@ pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) 
     hdr_enc.write_bool(128, false);
     // Skip per-prob coefficient probability updates — send "no update" for all.
     emit_no_coef_prob_updates(&mut hdr_enc);
-    // mb_skip_enabled = 0.
+    // mb_skip_enabled = 0 (keyframes have no skip mode in this encoder).
     hdr_enc.write_bool(128, false);
 
     // --- MB mode info (still boolean-coded into the same first partition) ---
     // All MBs: segment id (not written, seg disabled); skip (not written,
     // skip disabled); y_mode = DC_PRED (KF_YMODE_TREE leaf code 1, probs 145);
     // uv_mode = DC_PRED (KF_UV_MODE_TREE leaf code 0, prob 142).
-    // KF_YMODE_TREE = [-B_PRED, 2, 4, 6, -DC, -V, -H, -TM], probs = [145, 156, 163, 128].
-    //  DC_PRED path: bit0=1 (prob 145 → not B_PRED), goto idx 2, bit1=0 (prob 156 → not V/H/TM yet), goto idx 4, bit2=0 (prob 163 → DC_PRED leaf).
-    // KF_UV_MODE_TREE = [-DC, 2, -V, 4, -H, -TM], probs = [142, 114, 183].
-    //  DC_PRED path: bit0=0 (prob 142).
-    //
-    // We first walk every MB to write its mode info AND simultaneously
-    // compute + reconstruct its blocks (so DC_PRED neighbours are
-    // bit-exact for the NEXT MB). We stash the quantised coefficients
-    // per MB and emit them as a separate token partition after the
-    // first partition (matching the decoder which uses a fresh
-    // BoolDecoder for the token stream).
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
@@ -281,88 +314,29 @@ pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) 
     let first_partition = hdr_enc.finish();
 
     // --- Token partition (separate BoolEncoder) ---
-    let mut tok_enc = BoolEncoder::new();
-    let mut nz_y_above = vec![[0u8; 4]; mb_w];
-    let mut nz_uv_above = vec![[0u8; 2]; mb_w];
-    let mut nz_v_above = vec![[0u8; 2]; mb_w];
-    let mut nz_y2_above = vec![0u8; mb_w];
-    let coef_probs: &CoeffProbs = &DEFAULT_COEF_PROBS;
-
-    for mb_y in 0..mb_h {
-        let mut nz_y_left = [0u8; 4];
-        let mut nz_u_left = [0u8; 2];
-        let mut nz_v_left = [0u8; 2];
-        let mut nz_y2_left = 0u8;
-        for mb_x in 0..mb_w {
-            let mb_rec = &mb_encoded[mb_y * mb_w + mb_x];
-            // Y2 DC block.
-            let nctx = nz_y2_above[mb_x] + nz_y2_left;
-            let nz = encode_block(
-                &mut tok_enc,
-                coef_probs,
-                /*plane=*/ 1,
-                nctx as usize,
-                &mb_rec.y2_coeffs,
-                0,
-            );
-            let nzf = if nz > 0 { 1 } else { 0 };
-            nz_y2_above[mb_x] = nzf;
-            nz_y2_left = nzf;
-
-            for by in 0..4 {
-                for bx in 0..4 {
-                    let idx = by * 4 + bx;
-                    let nctx = nz_y_above[mb_x][bx] + nz_y_left[by];
-                    let nz = encode_block(
-                        &mut tok_enc,
-                        coef_probs,
-                        0,
-                        nctx as usize,
-                        &mb_rec.y_coeffs[idx],
-                        1,
-                    );
-                    let nzf = if nz > 0 { 1 } else { 0 };
-                    nz_y_above[mb_x][bx] = nzf;
-                    nz_y_left[by] = nzf;
-                }
-            }
-            // U and V are interleaved per (by, bx) position — the decoder
-            // reads U then V for each sub-block, not all U then all V.
-            for by in 0..2 {
-                for bx in 0..2 {
-                    let idx = by * 2 + bx;
-                    let nctx = nz_uv_above[mb_x][bx] + nz_u_left[by];
-                    let nz = encode_block(
-                        &mut tok_enc,
-                        coef_probs,
-                        2,
-                        nctx as usize,
-                        &mb_rec.u_coeffs[idx],
-                        0,
-                    );
-                    let nzf = if nz > 0 { 1 } else { 0 };
-                    nz_uv_above[mb_x][bx] = nzf;
-                    nz_u_left[by] = nzf;
-                    let nctx = nz_v_above[mb_x][bx] + nz_v_left[by];
-                    let nz = encode_block(
-                        &mut tok_enc,
-                        coef_probs,
-                        2,
-                        nctx as usize,
-                        &mb_rec.v_coeffs[idx],
-                        0,
-                    );
-                    let nzf = if nz > 0 { 1 } else { 0 };
-                    nz_v_above[mb_x][bx] = nzf;
-                    nz_v_left[by] = nzf;
-                }
-            }
-        }
-    }
+    let tok_enc = emit_tokens(mb_w, mb_h, &mb_encoded, &[], &DEFAULT_COEF_PROBS);
     let token_partition = tok_enc.finish();
 
-    // --- 3-byte frame tag ---
-    // frame_type=0 (I), version=0, show_frame=1, first_partition_size.
+    let out = assemble_frame_keyframe(width, height, first_partition, token_partition)?;
+
+    let reference = ReferenceFrame {
+        y: rec_y,
+        u: rec_u,
+        v: rec_v,
+        y_stride,
+        uv_stride,
+        y_h: y_buf_h,
+        uv_h: uv_buf_h,
+    };
+    Ok((out, reference))
+}
+
+fn assemble_frame_keyframe(
+    width: u32,
+    height: u32,
+    first_partition: Vec<u8>,
+    token_partition: Vec<u8>,
+) -> Result<Vec<u8>> {
     let part_size = first_partition.len() as u32;
     if part_size >= (1 << 19) {
         return Err(Error::invalid(format!(
@@ -385,8 +359,6 @@ pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) 
     out.extend_from_slice(&w.to_le_bytes());
     out.extend_from_slice(&h.to_le_bytes());
 
-    // First partition (header + mode info) then the single token partition.
-    // Since log2_nb_partitions=0 → nb_parts=1, no partition size table.
     out.extend_from_slice(&first_partition);
     out.extend_from_slice(&token_partition);
 
@@ -394,7 +366,424 @@ pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) 
 }
 
 // ---------------------------------------------------------------------------
-// Macroblock encode (DC_PRED only)
+// Frame assembly — P-frame (inter-frame, ZERO_MV + SKIP only)
+// ---------------------------------------------------------------------------
+
+/// Per-MB decision for a P-frame.
+#[derive(Clone, Copy, Debug)]
+enum PMbDecision {
+    /// Copy the reference MB verbatim — no residual coded.
+    Skip,
+    /// Motion-compensated copy followed by a coded residual.
+    ZeroMv,
+}
+
+/// Encode one P-frame (inter-frame). All MBs use REF_LAST + ZERO_MV.
+/// Returns the raw VP8 bitstream and a reconstructed reference that
+/// matches what the decoder will produce.
+fn encode_pframe_and_reconstruct(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    frame: &VideoFrame,
+    reference: &ReferenceFrame,
+) -> Result<(Vec<u8>, ReferenceFrame)> {
+    let mb_w = ((width + 15) / 16) as usize;
+    let mb_h = ((height + 15) / 16) as usize;
+    let y_stride = mb_w * 16;
+    let uv_stride = mb_w * 8;
+    let y_buf_h = mb_h * 16;
+    let uv_buf_h = mb_h * 8;
+
+    // Sanity: reference must have the same stride/geometry.
+    if reference.y_stride != y_stride
+        || reference.uv_stride != uv_stride
+        || reference.y_h != y_buf_h
+        || reference.uv_h != uv_buf_h
+    {
+        return Err(Error::invalid(
+            "vp8 encoder: reference frame geometry mismatch (reset required)",
+        ));
+    }
+
+    let (src_y, src_u, src_v) = extract_mb_padded(frame, mb_w, mb_h)?;
+
+    // Allocate reconstruction buffers.
+    let mut rec_y = vec![0u8; y_stride * y_buf_h];
+    let mut rec_u = vec![0u8; uv_stride * uv_buf_h];
+    let mut rec_v = vec![0u8; uv_stride * uv_buf_h];
+
+    let qi = clamp_qindex(qindex as i32);
+    let q = QuantCtx {
+        y_dc: y_dc_step(qi as i32),
+        y_ac: y_ac_step(qi as i32),
+        y2_dc: y2_dc_step(qi as i32),
+        y2_ac: y2_ac_step(qi as i32),
+        uv_dc: uv_dc_step(qi as i32),
+        uv_ac: uv_ac_step(qi as i32),
+    };
+
+    // --- First-partition: inter-frame header + MB mode info ---
+    let mut hdr_enc = BoolEncoder::new();
+    // Inter-header order (matching parse_inter_header exactly):
+    //   segmentation enabled=0
+    hdr_enc.write_bool(128, false);
+    //   loop filter
+    hdr_enc.write_literal(1, 0); // filter_type
+    hdr_enc.write_literal(6, 0); // level=0 (disables LF)
+    hdr_enc.write_literal(3, 0); // sharpness
+    hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
+                                    //   log2_nb_partitions = 0 (single partition)
+    hdr_enc.write_literal(2, 0);
+    //   quant: y_ac_qi + 5 "delta present" flags all 0.
+    hdr_enc.write_literal(7, qi as u32);
+    for _ in 0..5 {
+        hdr_enc.write_bool(128, false);
+    }
+    //   refresh_alt = 1 (refresh all references with the new frame)
+    hdr_enc.write_bool(128, true);
+    //   refresh_golden = 1
+    hdr_enc.write_bool(128, true);
+    //   sign_bias_golden, sign_bias_alt
+    hdr_enc.write_bool(128, false);
+    hdr_enc.write_bool(128, false);
+    //   refresh_entropy_probs = 0
+    hdr_enc.write_bool(128, false);
+    //   refresh_last = 1
+    hdr_enc.write_bool(128, true);
+    //   coef prob updates — all "no update"
+    emit_no_coef_prob_updates(&mut hdr_enc);
+    //   mb_skip_enabled = 1, skip prob literal (we use 128 — neutral).
+    let mb_skip_prob: u8 = 128;
+    hdr_enc.write_bool(128, true);
+    hdr_enc.write_literal(8, mb_skip_prob as u32);
+    //   prob_intra, prob_last, prob_gf — all literals (8 bits each).
+    // We emit inter=true for every MB and REF_LAST for every MB.
+    //   read_bool(prob_intra) == true  → inter (what we want). Pick prob_intra=1
+    //     so `write_bool(1, true)` is near-free.
+    //   read_bool(prob_last)  == false → REF_LAST (what we want). Pick prob_last=1
+    //     so `write_bool(1, false)` is near-free.
+    //   prob_gf — never read since we never take the "not last" branch.
+    let prob_intra: u8 = 1;
+    let prob_last: u8 = 1;
+    let prob_gf: u8 = 128;
+    hdr_enc.write_literal(8, prob_intra as u32);
+    hdr_enc.write_literal(8, prob_last as u32);
+    hdr_enc.write_literal(8, prob_gf as u32);
+    //   y-mode prob update flag = 0 ; uv-mode prob update flag = 0
+    hdr_enc.write_bool(128, false);
+    hdr_enc.write_bool(128, false);
+    //   MV context updates — 19 × 2, all "no update".
+    use crate::tables::mv::MV_UPDATE_PROBS;
+    for comp in 0..2 {
+        for i in 0..19 {
+            hdr_enc.write_bool(MV_UPDATE_PROBS[comp][i] as u32, false);
+        }
+    }
+
+    // --- Per-MB decision + reconstruction ---
+    let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
+    let mut mb_decisions: Vec<PMbDecision> = Vec::with_capacity(mb_w * mb_h);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            // Compute SAD over the luma MB to decide if we can skip the
+            // residual entirely.
+            let sad = mb_luma_sad(&src_y, &reference.y, y_stride, mb_x, mb_y);
+            let skip = sad <= MB_SKIP_SAD_PER_PIXEL * (16 * 16);
+            mb_decisions.push(if skip {
+                PMbDecision::Skip
+            } else {
+                PMbDecision::ZeroMv
+            });
+
+            // Mode-info bits.
+            // 1) segment id (skipped — seg disabled).
+            // 2) skip flag (mb_skip_enabled=1 so this is coded).
+            hdr_enc.write_bool(mb_skip_prob as u32, skip);
+            // 3) is_inter = true.
+            hdr_enc.write_bool(prob_intra as u32, true);
+            // 4) ref_frame bits: prob_last "is not last" = false (→ REF_LAST).
+            hdr_enc.write_bool(prob_last as u32, false);
+            // 5) MV_REF_TREE: for ZERO_MV with all-ZERO neighbours, cnt[0]=5
+            //    is the only possible value (every neighbour is either
+            //    off-image, or has (ref=LAST, mv=0)). Probs come from row 5
+            //    of MV_COUNTS_TO_PROBS = [234, 188, 128, 28]. Walking to
+            //    ZERO_MV: leaf 0 at tree index 0 → `read_bool(probs[0])`=false.
+            use crate::tables::trees::MV_COUNTS_TO_PROBS;
+            let probs = &MV_COUNTS_TO_PROBS[5];
+            hdr_enc.write_bool(probs[0] as u32, false);
+            // ZERO_MV doesn't emit an MV.
+
+            // Per-MB encode: compute residual between src and reference,
+            // quantise, reconstruct.
+            let mb_rec = if skip {
+                // Skipped MB: reconstruction is the motion-compensated
+                // prediction (integer copy from reference at zero MV),
+                // with no residual added.
+                copy_ref_into_rec(
+                    &reference.y,
+                    &reference.u,
+                    &reference.v,
+                    &mut rec_y,
+                    &mut rec_u,
+                    &mut rec_v,
+                    y_stride,
+                    uv_stride,
+                    mb_x,
+                    mb_y,
+                );
+                MbEncoded::zero()
+            } else {
+                encode_inter_mb_zero(
+                    &src_y,
+                    &src_u,
+                    &src_v,
+                    &reference.y,
+                    &reference.u,
+                    &reference.v,
+                    &mut rec_y,
+                    &mut rec_u,
+                    &mut rec_v,
+                    y_stride,
+                    uv_stride,
+                    mb_x,
+                    mb_y,
+                    &q,
+                )
+            };
+            mb_encoded.push(mb_rec);
+        }
+    }
+
+    let first_partition = hdr_enc.finish();
+
+    // --- Token partition ---
+    let tok_enc = emit_tokens(mb_w, mb_h, &mb_encoded, &mb_decisions, &DEFAULT_COEF_PROBS);
+    let token_partition = tok_enc.finish();
+
+    let part_size = first_partition.len() as u32;
+    if part_size >= (1 << 19) {
+        return Err(Error::invalid(format!(
+            "vp8 encoder: first partition too large ({} bytes)",
+            part_size
+        )));
+    }
+    // frame_type=1 (P), version=0, show_frame=1.
+    let tag_word: u32 = 1u32 | (1u32 << 4) | (part_size << 5);
+    let mut out = Vec::with_capacity(3 + first_partition.len() + token_partition.len());
+    out.push((tag_word & 0xff) as u8);
+    out.push(((tag_word >> 8) & 0xff) as u8);
+    out.push(((tag_word >> 16) & 0xff) as u8);
+    out.extend_from_slice(&first_partition);
+    out.extend_from_slice(&token_partition);
+
+    let reference_out = ReferenceFrame {
+        y: rec_y,
+        u: rec_u,
+        v: rec_v,
+        y_stride,
+        uv_stride,
+        y_h: y_buf_h,
+        uv_h: uv_buf_h,
+    };
+    Ok((out, reference_out))
+}
+
+fn mb_luma_sad(src_y: &[u8], ref_y: &[u8], stride: usize, mb_x: usize, mb_y: usize) -> u32 {
+    let x0 = mb_x * 16;
+    let y0 = mb_y * 16;
+    let mut sad: u32 = 0;
+    for r in 0..16 {
+        let row_off = (y0 + r) * stride + x0;
+        for c in 0..16 {
+            let d = src_y[row_off + c] as i32 - ref_y[row_off + c] as i32;
+            sad += d.unsigned_abs();
+        }
+    }
+    sad
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_ref_into_rec(
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+    rec_y: &mut [u8],
+    rec_u: &mut [u8],
+    rec_v: &mut [u8],
+    y_stride: usize,
+    uv_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+) {
+    let x0 = mb_x * 16;
+    let y0 = mb_y * 16;
+    for r in 0..16 {
+        let off = (y0 + r) * y_stride + x0;
+        rec_y[off..off + 16].copy_from_slice(&ref_y[off..off + 16]);
+    }
+    let xc = mb_x * 8;
+    let yc = mb_y * 8;
+    for r in 0..8 {
+        let off = (yc + r) * uv_stride + xc;
+        rec_u[off..off + 8].copy_from_slice(&ref_u[off..off + 8]);
+        rec_v[off..off + 8].copy_from_slice(&ref_v[off..off + 8]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inter MB encode (ZERO_MV — integer copy from reference + coded residual)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_mb_zero(
+    src_y: &[u8],
+    src_u: &[u8],
+    src_v: &[u8],
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+    rec_y: &mut [u8],
+    rec_u: &mut [u8],
+    rec_v: &mut [u8],
+    y_stride: usize,
+    uv_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    q: &QuantCtx,
+) -> MbEncoded {
+    let mb_xp = mb_x * 16;
+    let mb_yp = mb_y * 16;
+
+    // Luma prediction = reference at zero MV (integer copy).
+    let mut pred_y = [0u8; 256];
+    for r in 0..16 {
+        let src_off = (mb_yp + r) * y_stride + mb_xp;
+        pred_y[r * 16..r * 16 + 16].copy_from_slice(&ref_y[src_off..src_off + 16]);
+    }
+
+    // 4×4 DCTs of the luma residual. For inter MBs the Y2 (WHT) path is
+    // used exactly as in intra 16×16 DC_PRED.
+    let mut raw_dc_y = [0i32; 16];
+    let mut raw_ac_y = [[0i32; 16]; 16];
+    for bi in 0..16 {
+        let by = bi / 4;
+        let bx = bi % 4;
+        let mut blk = [0i32; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                let src = src_y[(mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c] as i32;
+                let p = pred_y[(by * 4 + r) * 16 + bx * 4 + c] as i32;
+                blk[r * 4 + c] = src - p;
+            }
+        }
+        let coeffs = fdct4x4(&blk);
+        raw_dc_y[bi] = coeffs[0];
+        raw_ac_y[bi] = coeffs;
+    }
+
+    let y2_raw = fwht4x4(&raw_dc_y);
+    let mut y2_q = [0i16; 16];
+    for i in 0..16 {
+        let step = if i == 0 { q.y2_dc } else { q.y2_ac };
+        y2_q[i] = quant(y2_raw[i], step);
+    }
+    let mut y2_deq = [0i16; 16];
+    for i in 0..16 {
+        let step = if i == 0 { q.y2_dc } else { q.y2_ac };
+        y2_deq[i] = (y2_q[i] as i32 * step) as i16;
+    }
+    let rec_dc = iwht4x4(&y2_deq);
+
+    let mut y_q = [[0i16; 16]; 16];
+    for bi in 0..16 {
+        for k in 1..16 {
+            y_q[bi][k] = quant(raw_ac_y[bi][k], q.y_ac);
+        }
+        y_q[bi][0] = 0;
+    }
+
+    for bi in 0..16 {
+        let by = bi / 4;
+        let bx = bi % 4;
+        let mut deq = [0i16; 16];
+        deq[0] = rec_dc[bi];
+        for k in 1..16 {
+            deq[k] = (y_q[bi][k] as i32 * q.y_ac) as i16;
+        }
+        let res = idct4x4(&deq);
+        for r in 0..4 {
+            for c in 0..4 {
+                let p = pred_y[(by * 4 + r) * 16 + bx * 4 + c] as i32;
+                let rr = res[r * 4 + c] as i32;
+                let dst_y_idx = (mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c;
+                rec_y[dst_y_idx] = (p + rr).clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    // Chroma — same pipeline, integer-copy reference prediction.
+    let mb_xc = mb_x * 8;
+    let mb_yc = mb_y * 8;
+    let mut u_q = [[0i16; 16]; 4];
+    let mut v_q = [[0i16; 16]; 4];
+    for plane_sel in 0..2 {
+        let (src, refp, rec, q_coeffs) = match plane_sel {
+            0 => (src_u, ref_u, &mut *rec_u, &mut u_q),
+            _ => (src_v, ref_v, &mut *rec_v, &mut v_q),
+        };
+        let mut pred_uv = [0u8; 64];
+        for r in 0..8 {
+            let src_off = (mb_yc + r) * uv_stride + mb_xc;
+            pred_uv[r * 8..r * 8 + 8].copy_from_slice(&refp[src_off..src_off + 8]);
+        }
+        for bi in 0..4 {
+            let by = bi / 2;
+            let bx = bi % 2;
+            let mut blk = [0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let sidx = (mb_yc + by * 4 + r) * uv_stride + mb_xc + bx * 4 + c;
+                    let s = src[sidx] as i32;
+                    let p = pred_uv[(by * 4 + r) * 8 + bx * 4 + c] as i32;
+                    blk[r * 4 + c] = s - p;
+                }
+            }
+            let coeffs = fdct4x4(&blk);
+            let mut blk_q = [0i16; 16];
+            blk_q[0] = quant(coeffs[0], q.uv_dc);
+            for k in 1..16 {
+                blk_q[k] = quant(coeffs[k], q.uv_ac);
+            }
+            q_coeffs[bi] = blk_q;
+            let mut deq = [0i16; 16];
+            deq[0] = (blk_q[0] as i32 * q.uv_dc) as i16;
+            for k in 1..16 {
+                deq[k] = (blk_q[k] as i32 * q.uv_ac) as i16;
+            }
+            let res = idct4x4(&deq);
+            for r in 0..4 {
+                for c in 0..4 {
+                    let pidx = (by * 4 + r) * 8 + bx * 4 + c;
+                    let p = pred_uv[pidx] as i32;
+                    let rr = res[r * 4 + c] as i32;
+                    let didx = (mb_yc + by * 4 + r) * uv_stride + mb_xc + bx * 4 + c;
+                    rec[didx] = (p + rr).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+
+    MbEncoded {
+        y2_coeffs: y2_q,
+        y_coeffs: y_q,
+        u_coeffs: u_q,
+        v_coeffs: v_q,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Macroblock encode (intra DC_PRED — used by key-frames)
 // ---------------------------------------------------------------------------
 
 struct QuantCtx {
@@ -417,6 +806,17 @@ struct MbEncoded {
     y_coeffs: [[i16; 16]; 16],
     u_coeffs: [[i16; 16]; 4],
     v_coeffs: [[i16; 16]; 4],
+}
+
+impl MbEncoded {
+    fn zero() -> Self {
+        Self {
+            y2_coeffs: [0; 16],
+            y_coeffs: [[0; 16]; 16],
+            u_coeffs: [[0; 16]; 4],
+            v_coeffs: [[0; 16]; 4],
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -474,16 +874,8 @@ fn encode_intra_mb_dc(
         16,
     );
 
-    // Compute 4×4 residuals and apply fdct.
-    // We'll produce:
-    //   raw_dc[16] = DC coefficient (position 0) of each 4x4 block, pre-quant
-    //   raw_ac[16][15] = AC coefficients, pre-quant
-    // Then forward-WHT over the 16 DCs to produce the Y2 block, quantise
-    // that, inverse-WHT to get reconstructed DCs, combine with quantised AC
-    // for the final per-sub-block dequantised transform + residual apply.
-
     let mut raw_dc_y = [0i32; 16];
-    let mut raw_ac_y = [[0i32; 16]; 16]; // index [block][pos] — pos 0 is the DC slot (unused: Y2 carries DC).
+    let mut raw_ac_y = [[0i32; 16]; 16];
     for bi in 0..16 {
         let by = bi / 4;
         let bx = bi % 4;
@@ -516,18 +908,14 @@ fn encode_intra_mb_dc(
     }
     let rec_dc = iwht4x4(&y2_deq);
 
-    // Quantise AC of every 4x4 block (position >= 1 with y_ac step).
     let mut y_q = [[0i16; 16]; 16];
     for bi in 0..16 {
-        // AC positions only (1..16).
         for k in 1..16 {
             y_q[bi][k] = quant(raw_ac_y[bi][k], q.y_ac);
         }
-        // DC position 0 is ignored in the token stream (skipped via start=1).
         y_q[bi][0] = 0;
     }
 
-    // Reconstruct each 4x4: deq = [rec_dc[bi], y_q[bi][1]*y_ac, ...]; res = idct(deq); out = pred + res.
     for bi in 0..16 {
         let by = bi / 4;
         let bx = bi % 4;
@@ -635,6 +1023,119 @@ fn encode_intra_mb_dc(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Token partition encoding shared between I and P frames.
+// ---------------------------------------------------------------------------
+
+/// Emit the token partition for every MB in raster scan. If `decisions`
+/// is empty, every MB contributes its tokens (I-frame path). If
+/// `decisions` is populated, SKIP MBs contribute no tokens and still
+/// reset their neighbour non-zero contexts to 0.
+fn emit_tokens(
+    mb_w: usize,
+    mb_h: usize,
+    mb_encoded: &[MbEncoded],
+    decisions: &[PMbDecision],
+    coef_probs: &CoeffProbs,
+) -> BoolEncoder {
+    let mut tok_enc = BoolEncoder::new();
+    let mut nz_y_above = vec![[0u8; 4]; mb_w];
+    let mut nz_uv_above = vec![[0u8; 2]; mb_w];
+    let mut nz_v_above = vec![[0u8; 2]; mb_w];
+    let mut nz_y2_above = vec![0u8; mb_w];
+
+    for mb_y in 0..mb_h {
+        let mut nz_y_left = [0u8; 4];
+        let mut nz_u_left = [0u8; 2];
+        let mut nz_v_left = [0u8; 2];
+        let mut nz_y2_left = 0u8;
+        for mb_x in 0..mb_w {
+            let mb_rec = &mb_encoded[mb_y * mb_w + mb_x];
+            let is_skip = decisions
+                .get(mb_y * mb_w + mb_x)
+                .is_some_and(|d| matches!(d, PMbDecision::Skip));
+            if is_skip {
+                // Decoder: skip clears all neighbour nz for this MB.
+                nz_y2_above[mb_x] = 0;
+                nz_y2_left = 0;
+                for bx in 0..4 {
+                    nz_y_above[mb_x][bx] = 0;
+                    nz_y_left[bx] = 0;
+                }
+                for bx in 0..2 {
+                    nz_uv_above[mb_x][bx] = 0;
+                    nz_u_left[bx] = 0;
+                    nz_v_above[mb_x][bx] = 0;
+                    nz_v_left[bx] = 0;
+                }
+                continue;
+            }
+
+            // Y2 DC block.
+            let nctx = nz_y2_above[mb_x] + nz_y2_left;
+            let nz = encode_block(
+                &mut tok_enc,
+                coef_probs,
+                /*plane=*/ 1,
+                nctx as usize,
+                &mb_rec.y2_coeffs,
+                0,
+            );
+            let nzf = if nz > 0 { 1 } else { 0 };
+            nz_y2_above[mb_x] = nzf;
+            nz_y2_left = nzf;
+
+            for by in 0..4 {
+                for bx in 0..4 {
+                    let idx = by * 4 + bx;
+                    let nctx = nz_y_above[mb_x][bx] + nz_y_left[by];
+                    let nz = encode_block(
+                        &mut tok_enc,
+                        coef_probs,
+                        0,
+                        nctx as usize,
+                        &mb_rec.y_coeffs[idx],
+                        1,
+                    );
+                    let nzf = if nz > 0 { 1 } else { 0 };
+                    nz_y_above[mb_x][bx] = nzf;
+                    nz_y_left[by] = nzf;
+                }
+            }
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let idx = by * 2 + bx;
+                    let nctx = nz_uv_above[mb_x][bx] + nz_u_left[by];
+                    let nz = encode_block(
+                        &mut tok_enc,
+                        coef_probs,
+                        2,
+                        nctx as usize,
+                        &mb_rec.u_coeffs[idx],
+                        0,
+                    );
+                    let nzf = if nz > 0 { 1 } else { 0 };
+                    nz_uv_above[mb_x][bx] = nzf;
+                    nz_u_left[by] = nzf;
+                    let nctx = nz_v_above[mb_x][bx] + nz_v_left[by];
+                    let nz = encode_block(
+                        &mut tok_enc,
+                        coef_probs,
+                        2,
+                        nctx as usize,
+                        &mb_rec.v_coeffs[idx],
+                        0,
+                    );
+                    let nzf = if nz > 0 { 1 } else { 0 };
+                    nz_v_above[mb_x][bx] = nzf;
+                    nz_v_left[by] = nzf;
+                }
+            }
+        }
+    }
+    tok_enc
+}
+
 /// Quantise a single coefficient using `step`. Uses symmetric rounding
 /// towards zero with `step/2` bias — close to what libvpx's reference
 /// encoder does for intra blocks and adequate for our decoder's
@@ -673,10 +1174,6 @@ fn encode_block(
     start: usize,
 ) -> u8 {
     let plane_probs = &probs[plane];
-    // Reorder coefficients into zigzag order to match what the decoder
-    // stores at `coeffs[ZIGZAG[n]]` — but we're working with unzigzagged
-    // block-local coeffs here, so when encoding we iterate in zigzag.
-    // Find the last non-zero in zigzag order, starting at `start`.
     let mut last_nz = None::<usize>;
     for n in start..16 {
         let c = coeffs[ZIGZAG[n]];
@@ -687,7 +1184,6 @@ fn encode_block(
     let last = match last_nz {
         Some(n) => n,
         None => {
-            // EOB at the very start: emit p[0]=0 (not coded) at (band, nctx=nctx).
             let p = &plane_probs[COEF_BANDS[start]][nctx];
             enc.write_bool(p[0] as u32, false);
             return 0;
@@ -696,20 +1192,15 @@ fn encode_block(
 
     let mut n = start;
     let mut ctx = nctx;
-    // First p-vector.
     let mut p = &plane_probs[COEF_BANDS[n]][ctx];
-    // p[0] = EOB bit. We have coefficients to emit, so emit p[0]=1.
     enc.write_bool(p[0] as u32, true);
 
     loop {
-        // Zero-run loop: emit p[1]=0 for zeros.
         while coeffs[ZIGZAG[n]] == 0 {
             enc.write_bool(p[1] as u32, false);
             n += 1;
-            // Context after zero is 0.
             p = &plane_probs[COEF_BANDS[n]][0];
         }
-        // Now we have a non-zero coefficient at zigzag position n.
         enc.write_bool(p[1] as u32, true);
 
         let raw = coeffs[ZIGZAG[n]] as i32;
@@ -717,7 +1208,6 @@ fn encode_block(
         emit_magnitude(enc, p, v);
         ctx = if v == 1 { 1 } else { 2 };
 
-        // Sign bit.
         enc.write_bool(128, raw < 0);
 
         n += 1;
@@ -726,11 +1216,9 @@ fn encode_block(
         }
         p = &plane_probs[COEF_BANDS[n]][ctx];
         if n > last {
-            // Emit EOB.
             enc.write_bool(p[0] as u32, false);
             return (last + 1) as u8;
         }
-        // Continue — emit p[0]=1 (not EOB).
         enc.write_bool(p[0] as u32, true);
     }
 }
@@ -745,20 +1233,17 @@ fn emit_magnitude(enc: &mut BoolEncoder, p: &[u8; 11], v: i32) {
         return;
     }
     enc.write_bool(p[2] as u32, true);
-    // v >= 2
     if v <= 4 {
         enc.write_bool(p[3] as u32, false);
         if v == 2 {
             enc.write_bool(p[4] as u32, false);
         } else {
-            // v == 3 or 4
             enc.write_bool(p[4] as u32, true);
             enc.write_bool(p[5] as u32, v == 4);
         }
         return;
     }
     enc.write_bool(p[3] as u32, true);
-    // v >= 5
     if v <= 10 {
         enc.write_bool(p[6] as u32, false);
         if v <= 6 {
@@ -766,18 +1251,14 @@ fn emit_magnitude(enc: &mut BoolEncoder, p: &[u8; 11], v: i32) {
             enc.write_bool(159, v == 6);
         } else {
             enc.write_bool(p[7] as u32, true);
-            // v in {7,8,9,10}. Encoding: read_bool(165) gives high bit (0 → 7/8, 1 → 9/10), then read_bool(145) picks within pair.
             let hi = if v >= 9 { 1 } else { 0 };
             enc.write_bool(165, hi == 1);
-            let low = (v - 7 - 2 * hi) as u32; // 0 for 7/9, 1 for 8/10
+            let low = (v - 7 - 2 * hi) as u32;
             enc.write_bool(145, low == 1);
         }
         return;
     }
     enc.write_bool(p[6] as u32, true);
-    // v >= 11 → one of CAT3..CAT6.
-    // Categories: CAT3 base=11 (range 11..=18, 3 extra bits), CAT4 base=19 (4 bits),
-    //             CAT5 base=35 (5 bits), CAT6 base=67 (11 bits).
     let (cat, base) = if v < 19 {
         (0, 11)
     } else if v < 35 {
@@ -787,12 +1268,10 @@ fn emit_magnitude(enc: &mut BoolEncoder, p: &[u8; 11], v: i32) {
     } else {
         (3, 67)
     };
-    // cat encoded via p[8] (bit1) and p[9 + bit1] (bit0), cat = 2*bit1 + bit0.
     let bit1 = (cat >> 1) & 1;
     let bit0 = cat & 1;
     enc.write_bool(p[8] as u32, bit1 == 1);
     enc.write_bool(p[9 + bit1] as u32, bit0 == 1);
-    // Extra bits for the magnitude within this category.
     let extra_bits_tab: &[u8] = match cat {
         0 => &[173, 148, 140],
         1 => &[176, 155, 140, 135],
@@ -896,9 +1375,6 @@ mod tests {
         };
         let mut out = [0i16; 16];
         let _ = decode_block(&mut dec, &DEFAULT_COEF_PROBS, bt, nctx, &mut out, start);
-        // Only compare positions from `start` onwards — positions below
-        // `start` are reserved for (skipped) DC coefficients and the
-        // decoder zeros them.
         for i in start..16 {
             let zz_idx = crate::tables::token_tree::ZIGZAG[i];
             assert_eq!(
@@ -931,14 +1407,13 @@ mod tests {
         let mut coeffs = [0i16; 16];
         coeffs[0] = 1;
         coeffs[1] = 2;
-        coeffs[4] = 3; // zigzag index 2 → (1,0); etc.
+        coeffs[4] = 3;
         coeffs[8] = -1;
         roundtrip_one_block(&coeffs, 0, 0, 1);
     }
 
     #[test]
     fn block_roundtrip_y2_negative_dc() {
-        // Specific case observed from the single-MB uniform test.
         let mut coeffs = [0i16; 16];
         coeffs[0] = -19;
         roundtrip_one_block(&coeffs, 1, 0, 0);
@@ -946,18 +1421,13 @@ mod tests {
 
     #[test]
     fn block_roundtrip_y2_sparse_ctx1() {
-        // Case observed from multi-MB gradient test (mb 1,0 Y2).
         let coeffs: [i16; 16] = [7, -3, 0, -2, -3, 0, 0, 0, 0, 0, 0, 0, -2, 0, 0, 0];
         roundtrip_one_block(&coeffs, 1, 1, 0);
     }
 
     #[test]
     fn block_roundtrip_y_with_dc_zeroed() {
-        // When encoding Y blocks (plane=0, start=1), the decoder zeros out
-        // coeffs[0]. Double-check that our decoder interprets coefficients
-        // correctly when many blocks are written back-to-back.
         let mut y_blks = [[0i16; 16]; 16];
-        // Populate with small AC values.
         for bi in 0..16 {
             y_blks[bi][1] = -3;
             y_blks[bi][4] = -2;
@@ -1012,12 +1482,10 @@ mod tests {
 
     #[test]
     fn block_roundtrip_two_y2_back_to_back() {
-        // Mirror the multi-MB Y2 encode → decode chain.
         let a: [i16; 16] = [-79, -3, 0, -2, -3, 0, 0, 0, 0, 0, 0, 0, -2, 0, 0, 0];
         let b: [i16; 16] = [7, -3, 0, -2, -3, 0, 0, 0, 0, 0, 0, 0, -2, 0, 0, 0];
         let mut enc = BoolEncoder::new();
         encode_block(&mut enc, &DEFAULT_COEF_PROBS, 1, 0, &a, 0);
-        // Both blocks nonzero → ctx for the second is 1.
         encode_block(&mut enc, &DEFAULT_COEF_PROBS, 1, 1, &b, 0);
         let buf = enc.finish();
         let mut dec = BoolDecoder::new(&buf).unwrap();
@@ -1032,13 +1500,12 @@ mod tests {
     #[test]
     fn block_roundtrip_category_magnitudes() {
         let mut coeffs = [0i16; 16];
-        // Put values of varying category in a variety of zigzag positions.
-        coeffs[0] = 6; // cat ~ in-range of decoder path >=5
-        coeffs[1] = 9; // category within the 7..=10 range
-        coeffs[2] = 15; // CAT3
-        coeffs[3] = 25; // CAT4
-        coeffs[4] = -50; // CAT5
-        coeffs[5] = 100; // CAT6
+        coeffs[0] = 6;
+        coeffs[1] = 9;
+        coeffs[2] = 15;
+        coeffs[3] = 25;
+        coeffs[4] = -50;
+        coeffs[5] = 100;
         roundtrip_one_block(&coeffs, 1, 0, 0);
     }
 }

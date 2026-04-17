@@ -80,7 +80,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     reg.register_decoder_impl(cid.clone(), caps, make_decoder);
     let enc_caps = CodecCapabilities::video("vp8_sw_enc")
         .with_lossy(true)
-        .with_intra_only(true)
+        .with_intra_only(false)
         .with_max_size(16383, 16383);
     reg.register_encoder_impl(cid, enc_caps, make_encoder);
 }

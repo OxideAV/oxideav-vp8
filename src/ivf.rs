@@ -23,8 +23,8 @@ use std::io::{Seek, SeekFrom, Write};
 
 use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, PixelFormat, Rational, Result, StreamInfo,
-    TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Rational,
+    Result, StreamInfo, TimeBase,
 };
 
 const IVF_HEADER_LEN: usize = 32;
@@ -52,7 +52,7 @@ fn probe(p: &ProbeData) -> u8 {
     0
 }
 
-fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut hdr = [0u8; IVF_HEADER_LEN];
     read_exact(&mut input, &mut hdr)?;
     if &hdr[0..4] != b"DKIF" {
@@ -435,7 +435,11 @@ mod tests {
             "trailer must patch frame_count"
         );
 
-        let mut dmx = open(Box::new(Cursor::new(bytes))).expect("demux");
+        let mut dmx = open(
+            Box::new(Cursor::new(bytes)),
+            &oxideav_core::NullCodecResolver,
+        )
+        .expect("demux");
         let streams = dmx.streams().to_vec();
         assert_eq!(streams[0].params.width, Some(320));
         assert_eq!(streams[0].params.height, Some(240));

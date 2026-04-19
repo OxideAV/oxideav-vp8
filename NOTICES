@@ -1,0 +1,61 @@
+oxideav-vp8 third-party notices
+===============================
+
+This crate is distributed under the MIT license (see LICENSE) and
+additionally incorporates material from the following upstream
+projects. Their copyright notices and license terms are reproduced
+below and apply to the incorporated material.
+
+
+libvpx (Google / The WebM Project)
+----------------------------------
+
+The arithmetic bool encoder in `src/bool_encoder.rs` is ported from
+libvpx's `vp8_encode_bool` routine (and the surrounding boolean-coder
+state machine in `vp8/encoder/boolhuff.{c,h}`). It implements the
+same range-renormalisation and carry-propagation algorithm as the
+reference encoder.
+
+The coefficient token decoder in `src/tokens.rs` structurally mirrors
+libvpx's `GetCoeffs()` function in `vp8/decoder/detokenize.c`,
+including the branchy token-tree traversal, extra-bits handling, and
+DCT-value reconstruction sequence used by the reference decoder.
+
+The default coefficient, motion-vector, and related probability
+tables in `src/default_probs.rs` are reproduced from the VP8 Data
+Format specification (RFC 6386), which is a public standards
+document. Those tables do not require libvpx attribution; they are
+listed here only for clarity.
+
+libvpx is distributed under the following terms:
+
+    Copyright (c) 2010, The WebM Project authors. All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+      * Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+      * Redistributions in binary form must reproduce the above copyright
+        notice, this list of conditions and the following disclaimer in
+        the documentation and/or other materials provided with the
+        distribution.
+
+      * Neither the name of Google, nor the WebM Project, nor the names
+        of its contributors may be used to endorse or promote products
+        derived from this software without specific prior written
+        permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

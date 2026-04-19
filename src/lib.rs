@@ -67,7 +67,7 @@ pub mod transform;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_container::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
+use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
 pub const CODEC_ID_STR: &str = "vp8";
 
@@ -82,7 +82,13 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(16383, 16383);
-    reg.register_encoder_impl(cid, enc_caps, make_encoder);
+    reg.register_encoder_impl(cid.clone(), enc_caps, make_encoder);
+
+    // AVI FourCC claims — `VP80` is canonical, `VP8 ` (trailing space)
+    // is the Google-blessed variant found in some .avi files.
+    for fcc in &[b"VP80", b"VP8 "] {
+        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
+    }
 }
 
 pub fn register_containers(reg: &mut ContainerRegistry) {

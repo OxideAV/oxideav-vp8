@@ -4,21 +4,25 @@
 //! * First frame (and on forced refresh) = key-frame (I-frame).
 //! * Subsequent frames = P-frames against REF_LAST, picking the best per-MB
 //!   mode among SKIP, ZERO_MV, NEAREST_MV, NEAR_MV, NEW_MV (with quarter-pel
-//!   refinement after the integer-pel search) and an intra-DC_PRED fallback
-//!   for MBs whose best inter prediction is too poor to be worth coding as
-//!   a residual.
-//! * DC_PRED for every luma 16×16 MB and chroma 8×8 MB in I-frames (and in
-//!   the P-frame intra fallback path).
+//!   refinement after the integer-pel search), SPLIT_MV (16×8 / 8×16 / 8×8
+//!   / 4×4 partitions, each with its own MV) and an intra fallback for MBs
+//!   whose best inter prediction is too poor to be worth coding as a
+//!   residual.
+//! * All 5 intra 16×16 modes (DC / V / H / TM / B_PRED) plus the 10 4×4
+//!   sub-modes under B_PRED on keyframes and the P-frame intra fallback.
+//!   Chroma uses the matching 4 modes (DC / V / H / TM).
+//! * Mode selection is SSE-based on the source: for each candidate we
+//!   compute the pre-quant prediction error and pick the minimum. B_PRED
+//!   greedily picks the best sub-mode per 4×4 block against the actual
+//!   reconstructed neighbours, exactly as the decoder will see them.
 //! * Fixed quantiser (default `qindex = 50`, mid-quality).
-//! * Loop filter disabled (`filter_level = 0`).
+//! * In-loop deblocking filter enabled. Level is derived from `qindex`
+//!   (libvpx heuristic `clamp(15 + qindex / 8, 1, 63)`); sharpness is 0,
+//!   mode-ref deltas are disabled. The encoder applies the filter to its
+//!   own reconstruction so subsequent P-frames reference post-filter
+//!   pixels — exactly what the decoder will do.
 //! * Single token partition.
 //! * Accepted pixel format: `PixelFormat::Yuv420P`.
-//!
-//! Not yet implemented (candidate for a follow-up):
-//! * SPLIT MV (per-4×4 partitioned motion).
-//! * B_PRED / V_PRED / H_PRED / TM_PRED on the encode side.
-//! * Encode-side loop filter (reconstruction already tracks what the
-//!   decoder produces, but `filter_level = 0` is still emitted).
 
 use std::collections::VecDeque;
 
@@ -32,7 +36,11 @@ use crate::bool_encoder::BoolEncoder;
 use crate::fdct::{fdct4x4, fwht4x4};
 use crate::frame_tag::KEYFRAME_SYNC_CODE;
 use crate::inter::{bilinear_predict, sixtap_predict, RefPlane};
-use crate::intra::{predict_16x16, predict_8x8};
+use crate::intra::{predict_16x16, predict_4x4, predict_8x8, B4x4Neighbours};
+use crate::loopfilter::{
+    filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
+    filter_simple_vertical, FilterParams,
+};
 use crate::mv::{encode_mv_component, Mv};
 use crate::tables::coeff_probs::{CoeffProbs, DEFAULT_COEF_PROBS};
 use crate::tables::mv::DEFAULT_MV_CONTEXT;
@@ -40,7 +48,12 @@ use crate::tables::quant::{
     clamp_qindex, uv_ac_step, uv_dc_step, y2_ac_step, y2_dc_step, y_ac_step, y_dc_step,
 };
 use crate::tables::token_tree::{COEF_BANDS, ZIGZAG};
-use crate::tables::trees::{DC_PRED, MV_COUNTS_TO_PROBS};
+use crate::tables::trees::{
+    B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_PRED, B_RD_PRED, B_TM_PRED, B_VE_PRED,
+    B_VL_PRED, B_VR_PRED, DC_PRED, DEFAULT_UV_MODE_PROBS, DEFAULT_YMODE_PROBS, H_PRED,
+    KF_BMODE_PROB, KF_UV_MODE_PROBS, KF_YMODE_PROBS, MBSPLIT_PROBS, MB_SPLITS, MB_SPLIT_COUNT,
+    MV_COUNTS_TO_PROBS, SUB_MV_REF_PROBS, TM_PRED, V_PRED,
+};
 use crate::transform::{idct4x4, iwht4x4};
 
 /// Default qindex. 50 ≈ mid-quality; the codec accepts 0..=127.
@@ -86,6 +99,34 @@ const INTRA_IN_P_SAD_PER_PIXEL: u32 = 24;
 /// inter). We cannot use 1 like the earlier encoder since that makes
 /// intra-in-P arbitrarily expensive.
 const PROB_INTRA_IN_P: u8 = 200;
+
+/// Loop-filter sharpness. Keeping sharpness = 0 gives the decoder's
+/// default behaviour and is the libvpx starting point for rate-distortion
+/// tuned encoders; non-zero sharpness only matters once mode/ref deltas
+/// are also enabled, which we do not emit.
+const LOOP_FILTER_SHARPNESS: u8 = 0;
+
+/// libvpx's simple heuristic for picking a baseline loop-filter level
+/// from the quantiser index. `qindex=50` → level=21; `qindex=0` → 15;
+/// `qindex=127` → 30. Clamped to the 1..=63 VP8 range (level 0 would
+/// disable the filter).
+#[inline]
+fn loop_filter_level_for_qindex(qi: u8) -> u8 {
+    let l = 15 + (qi as i32 / 8);
+    l.clamp(1, 63) as u8
+}
+
+/// SAD threshold (per pixel) below which SPLIT_MV is not considered.
+/// When a single MV already matches the MB well, the per-partition MV
+/// bits for SPLIT are wasted — skipping the search entirely is a big
+/// speed win on the common case of smooth global motion.
+const SPLITMV_CONSIDER_SAD_PER_PIXEL: u32 = 2;
+
+/// SAD reduction that SPLIT_MV must beat NEW_MV by to be picked. SPLIT
+/// pays 2..=16 extra MV encodings on top of the split-tree leaf, so it
+/// is only worthwhile when the per-partition motion genuinely reduces
+/// SAD substantially (the exact value scales with partition count).
+const SPLITMV_SAD_MARGIN_PER_PARTITION: u32 = 96;
 
 /// Encoder factory used by [`crate::register_codecs`].
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
@@ -302,6 +343,11 @@ fn encode_keyframe_and_reconstruct(
         uv_ac: uv_ac_step(qi as i32),
     };
 
+    // Loop-filter parameters we will both signal and apply to our own
+    // reconstruction (so the next P-frame uses the post-filter pixels).
+    let lf_level = loop_filter_level_for_qindex(qi as u8);
+    let lf_sharpness = LOOP_FILTER_SHARPNESS;
+
     // --- Compressed header ---
     let mut hdr_enc = BoolEncoder::new();
     // color_space + clamping_type (1 bit each)
@@ -309,11 +355,11 @@ fn encode_keyframe_and_reconstruct(
     hdr_enc.write_literal(1, 0);
     // segmentation enabled = 0
     hdr_enc.write_bool(128, false);
-    // loop filter: filter_type=0, level=0 (disables LF), sharpness=0,
+    // loop filter: filter_type=0 (normal), level, sharpness,
     //              mode_ref_delta_enabled=0.
     hdr_enc.write_literal(1, 0);
-    hdr_enc.write_literal(6, 0);
-    hdr_enc.write_literal(3, 0);
+    hdr_enc.write_literal(6, lf_level as u32);
+    hdr_enc.write_literal(3, lf_sharpness as u32);
     hdr_enc.write_bool(128, false);
     // log2_nb_partitions = 0 (1 partition).
     hdr_enc.write_literal(2, 0);
@@ -329,32 +375,161 @@ fn encode_keyframe_and_reconstruct(
     // mb_skip_enabled = 0 (keyframes have no skip mode in this encoder).
     hdr_enc.write_bool(128, false);
 
-    // --- MB mode info (still boolean-coded into the same first partition) ---
-    // All MBs: segment id (not written, seg disabled); skip (not written,
-    // skip disabled); y_mode = DC_PRED (KF_YMODE_TREE leaf code 1, probs 145);
-    // uv_mode = DC_PRED (KF_UV_MODE_TREE leaf code 0, prob 142).
+    // --- MB mode info: pick the best intra mode (DC/V/H/TM/B_PRED) per MB
+    //     and the best chroma mode per MB, emit the tree path, then encode
+    //     the residual.
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
+    // Track the 4x4 bmode of the bottom row of each MB column (propagation
+    // context for B_PRED of the MB below). Matches decoder's `bmode_above`.
+    let mut bmode_above: Vec<[i32; 4]> = vec![[B_DC_PRED; 4]; mb_w];
+    // Track each MB's 16 bmodes so the left-MB lookup for B_PRED works.
+    let mut mb_bmodes: Vec<[i32; 16]> = vec![[B_DC_PRED; 16]; mb_w * mb_h];
+    // Track each MB's chosen Y mode so left-neighbour lookups at B_PRED
+    // boundaries can fall back to `intra_to_b(y_mode)` when the left MB
+    // was not itself B_PRED.
+    let mut mb_ymodes: Vec<i32> = vec![DC_PRED; mb_w * mb_h];
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            // Y mode (DC_PRED).
-            hdr_enc.write_bool(145, true);
-            hdr_enc.write_bool(156, false);
-            hdr_enc.write_bool(163, false);
-            // UV mode (DC_PRED).
-            hdr_enc.write_bool(142, false);
+            let mb_xp = mb_x * 16;
+            let mb_yp = mb_y * 16;
 
-            let mb_rec = encode_intra_mb_dc(
-                &src_y, &src_u, &src_v, &mut rec_y, &mut rec_u, &mut rec_v, y_stride, uv_stride,
-                y_buf_h, uv_buf_h, mb_x, mb_y, mb_w, mb_h, &q,
+            // Pick the best intra Y mode (picks among DC/V/H/TM for the
+            // 16x16 candidates — B_PRED is evaluated later against the
+            // reconstructed neighbours and wins when the per-4x4 modes
+            // predict noticeably better).
+            let y16_mode = choose_intra_16x16_y_mode(&src_y, &rec_y, y_stride, mb_xp, mb_yp);
+            // Evaluate B_PRED by greedily picking the best 4×4 mode per
+            // sub-block — since B_PRED makes different predictions in
+            // places that DC/V/H/TM do not, we compare its total SSE to
+            // the best 16×16 candidate and pick the lower.
+            let (y16_sse, _) = sse_intra_16x16(y16_mode, &src_y, &rec_y, y_stride, mb_xp, mb_yp);
+            let (bp_sse, _bp_modes) =
+                sse_intra_b_pred(&src_y, &rec_y, y_stride, mb_xp, mb_yp, mb_w, mb_h);
+            let y_mode = if bp_sse + B_PRED_SSE_MARGIN < y16_sse {
+                B_PRED
+            } else {
+                y16_mode
+            };
+
+            // Chroma mode: evaluate DC/V/H/TM over the U+V source and pick
+            // the lowest total SSE.
+            let uv_mode = choose_intra_chroma_mode(
+                &src_u,
+                &src_v,
+                &rec_u,
+                &rec_v,
+                uv_stride,
+                mb_x * 8,
+                mb_y * 8,
+            );
+
+            // Emit KF_YMODE_TREE path for the chosen y_mode.
+            emit_kf_ymode(&mut hdr_enc, y_mode);
+
+            // If B_PRED, emit per-block bmodes (using above/left context).
+            if y_mode == B_PRED {
+                // Precompute left-bmode context so we don't hold two
+                // borrows of mb_bmodes at once inside the emit helper.
+                let left_bmodes: [i32; 4] = if mb_x > 0 {
+                    let l_idx = mb_y * mb_w + mb_x - 1;
+                    let l_y = mb_ymodes[l_idx];
+                    if l_y == B_PRED {
+                        let lb = &mb_bmodes[l_idx];
+                        [lb[3], lb[7], lb[11], lb[15]]
+                    } else {
+                        [intra_to_b_mode(l_y); 4]
+                    }
+                } else {
+                    [B_DC_PRED; 4]
+                };
+                let above_for_mb = bmode_above[mb_x];
+                let bm_slot = &mut mb_bmodes[mb_y * mb_w + mb_x];
+                emit_bmodes_keyframe(
+                    &mut hdr_enc,
+                    bm_slot,
+                    &above_for_mb,
+                    &left_bmodes,
+                    // When B_PRED, the neighbour-context-driven per-4×4
+                    // decisions are made here.
+                    &src_y,
+                    &rec_y,
+                    y_stride,
+                    mb_x,
+                    mb_y,
+                    mb_w,
+                );
+                // After emission the per-block modes in mb_bmodes are
+                // populated; propagate the bottom row to bmode_above for
+                // the next MB row.
+                let bm = &mb_bmodes[mb_y * mb_w + mb_x];
+                bmode_above[mb_x] = [bm[12], bm[13], bm[14], bm[15]];
+            } else {
+                // Non-B_PRED MBs propagate their `intra_to_b(y_mode)` to
+                // both their own bmodes (for the neighbour below if that
+                // MB is B_PRED) and to bmode_above.
+                let b = intra_to_b_mode(y_mode);
+                for v in mb_bmodes[mb_y * mb_w + mb_x].iter_mut() {
+                    *v = b;
+                }
+                bmode_above[mb_x] = [b; 4];
+            }
+            mb_ymodes[mb_y * mb_w + mb_x] = y_mode;
+
+            // UV mode.
+            emit_kf_uv_mode(&mut hdr_enc, uv_mode);
+
+            // Encode + reconstruct the MB now that the mode is final.
+            let mb_rec = encode_intra_mb(
+                &src_y,
+                &src_u,
+                &src_v,
+                &mut rec_y,
+                &mut rec_u,
+                &mut rec_v,
+                y_stride,
+                uv_stride,
+                y_buf_h,
+                uv_buf_h,
+                mb_x,
+                mb_y,
+                mb_w,
+                mb_h,
+                &q,
+                y_mode,
+                uv_mode,
+                &mb_bmodes[mb_y * mb_w + mb_x],
             );
             mb_encoded.push(mb_rec);
         }
     }
 
+    // Apply the in-loop deblocking filter to our reconstruction so the
+    // next P-frame uses the same post-filter references the decoder will.
+    apply_loop_filter_enc(
+        &mut rec_y,
+        &mut rec_u,
+        &mut rec_v,
+        y_stride,
+        uv_stride,
+        y_buf_h,
+        uv_buf_h,
+        mb_w,
+        mb_h,
+        lf_level,
+        lf_sharpness,
+    );
+
     let first_partition = hdr_enc.finish();
 
     // --- Token partition (separate BoolEncoder) ---
-    let tok_enc = emit_tokens(mb_w, mb_h, &mb_encoded, &[], &DEFAULT_COEF_PROBS);
+    let tok_enc = emit_tokens(
+        mb_w,
+        mb_h,
+        &mb_encoded,
+        &[],
+        &DEFAULT_COEF_PROBS,
+        Some(&mb_ymodes),
+    );
     let token_partition = tok_enc.finish();
 
     let out = assemble_frame_keyframe(width, height, first_partition, token_partition)?;
@@ -370,6 +545,12 @@ fn encode_keyframe_and_reconstruct(
     };
     Ok((out, reference))
 }
+
+/// Minimum SSE improvement (across the full 256-pixel MB) that B_PRED
+/// must show over the best 16×16 intra candidate to be picked. B_PRED
+/// costs extra bits (per-sub-block mode + 16 DC-coded AC blocks instead
+/// of 1 Y2 WHT block), so selection needs a real distortion edge.
+const B_PRED_SSE_MARGIN: u64 = 512;
 
 fn assemble_frame_keyframe(
     width: u32,
@@ -409,6 +590,16 @@ fn assemble_frame_keyframe(
 // Frame assembly — P-frame (inter-frame, ZERO_MV + SKIP only)
 // ---------------------------------------------------------------------------
 
+/// One partition's MV in a SPLIT_MV decision. `split_mode` indexes into
+/// `MB_SPLITS`/`MB_SPLIT_COUNT` (0=16x8, 1=8x16, 2=quarters, 3=4x4).
+#[derive(Clone, Copy, Debug)]
+struct SplitMv {
+    split_mode: u8,
+    /// `MB_SPLIT_COUNT[split_mode]` entries are valid; the remainder are
+    /// left zero and unused.
+    part_mvs: [Mv; 16],
+}
+
 /// Per-MB decision for a P-frame.
 #[derive(Clone, Copy, Debug)]
 enum PMbDecision {
@@ -423,19 +614,46 @@ enum PMbDecision {
     /// Motion-compensated copy at `mv` followed by a coded residual.
     /// `mv` is in luma 1/8-pel units and may be sub-pel (any phase).
     NewMv(Mv),
-    /// Intra fallback (DC_PRED) inside a P-frame. Chosen when the best
-    /// inter prediction's residual energy is too high to be worth coding.
-    IntraDc,
+    /// Per-partition motion. Each 4×4 sub-block carries a possibly
+    /// distinct MV via `split_mode`/`part_mvs`.
+    SplitMv(SplitMv),
+    /// Intra fallback (16×16 intra mode or B_PRED) inside a P-frame.
+    /// Chosen when the best inter prediction's residual energy is too
+    /// high to be worth coding. For B_PRED the 16 per-block modes are
+    /// recomputed during reconstruction; for 16×16 modes `bmodes` is
+    /// filled with `intra_to_b_mode(y_mode)` for neighbour propagation.
+    Intra { y_mode: i32, uv_mode: i32 },
 }
 
 impl PMbDecision {
     /// The MV associated with this decision (`Mv::ZERO` for Skip / ZeroMv
-    /// / IntraDc). Used to populate the per-MB MV table for subsequent
+    /// / Intra). Used to populate the per-MB MV table for subsequent
     /// `find_near_mvs_enc` calls.
     fn mv(&self) -> Mv {
         match self {
-            PMbDecision::Skip | PMbDecision::ZeroMv | PMbDecision::IntraDc => Mv::ZERO,
+            PMbDecision::Skip | PMbDecision::ZeroMv | PMbDecision::Intra { .. } => Mv::ZERO,
             PMbDecision::NearestMv(mv) | PMbDecision::NearMv(mv) | PMbDecision::NewMv(mv) => *mv,
+            // For SPLIT we use the bottom-right sub-MV as the MB's
+            // neighbour-propagation MV — matches the decoder's rule
+            // (`info.mv = part_mvs[15]`).
+            PMbDecision::SplitMv(s) => s.part_mvs[15],
+        }
+    }
+
+    /// Per-subblock sub-MVs for this decision. For non-SPLIT inter the
+    /// whole block inherits the MB MV; for SPLIT we expand the split
+    /// partitioning; for intra every sub-MV is zero.
+    fn sub_mvs(&self) -> [Mv; 16] {
+        match self {
+            PMbDecision::SplitMv(s) => {
+                let mut out = [Mv::ZERO; 16];
+                let part = &MB_SPLITS[s.split_mode as usize];
+                for (i, cell) in out.iter_mut().enumerate() {
+                    *cell = s.part_mvs[part[i] as usize];
+                }
+                out
+            }
+            _ => [self.mv(); 16],
         }
     }
 
@@ -443,7 +661,7 @@ impl PMbDecision {
     /// treats those as zero-MV neighbours regardless of any MV in the
     /// decision (they have none in the decoder's bitstream).
     fn is_intra(&self) -> bool {
-        matches!(self, PMbDecision::IntraDc)
+        matches!(self, PMbDecision::Intra { .. })
     }
 }
 
@@ -494,15 +712,18 @@ fn encode_pframe_and_reconstruct(
         uv_ac: uv_ac_step(qi as i32),
     };
 
+    let lf_level = loop_filter_level_for_qindex(qi as u8);
+    let lf_sharpness = LOOP_FILTER_SHARPNESS;
+
     // --- First-partition: inter-frame header + MB mode info ---
     let mut hdr_enc = BoolEncoder::new();
     // Inter-header order (matching parse_inter_header exactly):
     //   segmentation enabled=0
     hdr_enc.write_bool(128, false);
     //   loop filter
-    hdr_enc.write_literal(1, 0); // filter_type
-    hdr_enc.write_literal(6, 0); // level=0 (disables LF)
-    hdr_enc.write_literal(3, 0); // sharpness
+    hdr_enc.write_literal(1, 0); // filter_type (normal)
+    hdr_enc.write_literal(6, lf_level as u32);
+    hdr_enc.write_literal(3, lf_sharpness as u32);
     hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
                                     //   log2_nb_partitions = 0 (single partition)
     hdr_enc.write_literal(2, 0);
@@ -555,6 +776,14 @@ fn encode_pframe_and_reconstruct(
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_decisions: Vec<PMbDecision> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_mvs: Vec<Mv> = vec![Mv::ZERO; mb_w * mb_h];
+    // Per-subblock MVs (needed for SPLIT's neighbour MVs when later MBs
+    // use SPLIT themselves — encoder-side replica of the decoder's
+    // `MbInfo::sub_mvs`).
+    let mut mb_sub_mvs: Vec<[Mv; 16]> = vec![[Mv::ZERO; 16]; mb_w * mb_h];
+    // B_PRED propagation buffers (parallel to keyframe path).
+    let mut bmode_above: Vec<[i32; 4]> = vec![[B_DC_PRED; 4]; mb_w];
+    let mut mb_bmodes: Vec<[i32; 16]> = vec![[B_DC_PRED; 16]; mb_w * mb_h];
+    let mut mb_ymodes: Vec<i32> = vec![DC_PRED; mb_w * mb_h];
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             // Gather the decoder-visible neighbour context for this MB so
@@ -572,15 +801,15 @@ fn encode_pframe_and_reconstruct(
                 mb_y,
                 nearest,
                 near,
+                &rec_y,
             );
             mb_decisions.push(decision);
             mb_mvs[mb_y * mb_w + mb_x] = decision.mv();
+            mb_sub_mvs[mb_y * mb_w + mb_x] = decision.sub_mvs();
 
             // Mode-info bits.
             // 1) segment id (skipped — seg disabled).
-            // 2) skip flag (mb_skip_enabled=1 so this is coded). Intra-in-P
-            //    and all non-skip paths emit skip=false; SKIP is the only
-            //    path that emits skip=true.
+            // 2) skip flag. SKIP is the only path that emits skip=true.
             hdr_enc.write_bool(mb_skip_prob as u32, matches!(decision, PMbDecision::Skip));
 
             // 3) intra-vs-inter bit.
@@ -588,13 +817,48 @@ fn encode_pframe_and_reconstruct(
             hdr_enc.write_bool(prob_intra as u32, is_inter);
 
             if !is_inter {
-                // Intra-in-P: emit the inter-frame YMODE tree + UV_MODE
-                // tree, both landing on DC_PRED (tree leaf 0, prob[0]=0).
-                // `ymode_probs` / `uv_mode_probs` default to the RFC's
-                // vp8_kf_* tables since we never emit prob-update flags.
-                use crate::tables::trees::{DEFAULT_UV_MODE_PROBS, DEFAULT_YMODE_PROBS};
-                hdr_enc.write_bool(DEFAULT_YMODE_PROBS[0] as u32, false);
-                hdr_enc.write_bool(DEFAULT_UV_MODE_PROBS[0] as u32, false);
+                // Intra-in-P: emit the inter-frame YMODE tree + BMODE
+                // sub-modes (if B_PRED) + UV_MODE tree. Probabilities
+                // default to `vp8_kf_default_*` since we send no update
+                // flags in the inter header.
+                let (y_mode, uv_mode) = match decision {
+                    PMbDecision::Intra { y_mode, uv_mode } => (y_mode, uv_mode),
+                    _ => unreachable!(),
+                };
+                emit_inter_ymode(&mut hdr_enc, y_mode, &DEFAULT_YMODE_PROBS);
+                if y_mode == B_PRED {
+                    // Intra-in-P uses the default (non-context-sensitive)
+                    // `vp8_bmode_prob` for each 4x4 — matches the decoder's
+                    // handling in `decode_mb_mode_info_inter`.
+                    const DEFAULT_BMODE_PROBS: [u8; 9] = [120, 90, 79, 133, 87, 85, 80, 111, 151];
+                    let bm = &mut mb_bmodes[mb_y * mb_w + mb_x];
+                    let chosen = choose_b_pred_modes(
+                        &src_y,
+                        &rec_y,
+                        y_stride,
+                        mb_x * 16,
+                        mb_y * 16,
+                        mb_w,
+                        mb_h,
+                    );
+                    for i in 0..16 {
+                        bm[i] = chosen[i];
+                        emit_tree_path(
+                            &mut hdr_enc,
+                            BMODE_PATHS[chosen[i] as usize],
+                            &DEFAULT_BMODE_PROBS,
+                        );
+                    }
+                    bmode_above[mb_x] = [bm[12], bm[13], bm[14], bm[15]];
+                } else {
+                    let b = intra_to_b_mode(y_mode);
+                    for v in mb_bmodes[mb_y * mb_w + mb_x].iter_mut() {
+                        *v = b;
+                    }
+                    bmode_above[mb_x] = [b; 4];
+                }
+                mb_ymodes[mb_y * mb_w + mb_x] = y_mode;
+                emit_inter_uv_mode(&mut hdr_enc, uv_mode, &DEFAULT_UV_MODE_PROBS);
             } else {
                 // 4) ref_frame bits: prob_last "is not last" = false (→ REF_LAST).
                 hdr_enc.write_bool(prob_last as u32, false);
@@ -604,6 +868,7 @@ fn encode_pframe_and_reconstruct(
                 //      leaf 1 = NEAREST_MV   (path: 1, 0)
                 //      leaf 2 = NEAR_MV      (path: 1, 1, 0)
                 //      leaf 3 = NEW_MV       (path: 1, 1, 1, 0)
+                //      leaf 4 = SPLIT_MV     (path: 1, 1, 1, 1)
                 match decision {
                     PMbDecision::Skip | PMbDecision::ZeroMv => {
                         hdr_enc.write_bool(ref_probs[0] as u32, false);
@@ -629,8 +894,35 @@ fn encode_pframe_and_reconstruct(
                         encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[0], dmv.row as i32);
                         encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[1], dmv.col as i32);
                     }
-                    PMbDecision::IntraDc => unreachable!("IntraDc handled in is_intra branch"),
+                    PMbDecision::SplitMv(split) => {
+                        hdr_enc.write_bool(ref_probs[0] as u32, true);
+                        hdr_enc.write_bool(ref_probs[1] as u32, true);
+                        hdr_enc.write_bool(ref_probs[2] as u32, true);
+                        hdr_enc.write_bool(ref_probs[3] as u32, true);
+                        emit_split_mb_tree(&mut hdr_enc, split.split_mode);
+                        // Per-partition sub-MV refs. Each partition's
+                        // neighbours come from earlier partitions (or from
+                        // neighbouring MBs' bottom/right sub-MV rows).
+                        emit_split_submvs(
+                            &mut hdr_enc,
+                            &split,
+                            &mb_sub_mvs,
+                            &mb_decisions,
+                            mb_x,
+                            mb_y,
+                            mb_w,
+                            best_for_newmv,
+                        );
+                    }
+                    PMbDecision::Intra { .. } => unreachable!("intra handled elsewhere"),
                 }
+                // Inter MBs: reset bmodes propagation to DC (decoder does
+                // the same after reconstructing an inter MB).
+                let b = intra_to_b_mode(DC_PRED);
+                for v in mb_bmodes[mb_y * mb_w + mb_x].iter_mut() {
+                    *v = b;
+                }
+                bmode_above[mb_x] = [b; 4];
             }
 
             // Per-MB reconstruction and quantised coefficients.
@@ -672,19 +964,77 @@ fn encode_pframe_and_reconstruct(
                     decision.mv(),
                     &q,
                 ),
-                PMbDecision::IntraDc => encode_intra_mb_dc(
-                    &src_y, &src_u, &src_v, &mut rec_y, &mut rec_u, &mut rec_v, y_stride,
-                    uv_stride, y_buf_h, uv_buf_h, mb_x, mb_y, mb_w, mb_h, &q,
+                PMbDecision::SplitMv(split) => encode_inter_mb_split(
+                    &src_y,
+                    &src_u,
+                    &src_v,
+                    &reference.y,
+                    &reference.u,
+                    &reference.v,
+                    &mut rec_y,
+                    &mut rec_u,
+                    &mut rec_v,
+                    y_stride,
+                    uv_stride,
+                    y_buf_h,
+                    uv_buf_h,
+                    mb_x,
+                    mb_y,
+                    &split,
+                    &q,
+                ),
+                PMbDecision::Intra { y_mode, uv_mode } => encode_intra_mb(
+                    &src_y,
+                    &src_u,
+                    &src_v,
+                    &mut rec_y,
+                    &mut rec_u,
+                    &mut rec_v,
+                    y_stride,
+                    uv_stride,
+                    y_buf_h,
+                    uv_buf_h,
+                    mb_x,
+                    mb_y,
+                    mb_w,
+                    mb_h,
+                    &q,
+                    y_mode,
+                    uv_mode,
+                    &mb_bmodes[mb_y * mb_w + mb_x],
                 ),
             };
             mb_encoded.push(mb_rec);
         }
     }
 
+    // Apply in-loop deblocking to our reconstruction (so the next
+    // reference frame tracks the decoder).
+    apply_loop_filter_enc(
+        &mut rec_y,
+        &mut rec_u,
+        &mut rec_v,
+        y_stride,
+        uv_stride,
+        y_buf_h,
+        uv_buf_h,
+        mb_w,
+        mb_h,
+        lf_level,
+        lf_sharpness,
+    );
+
     let first_partition = hdr_enc.finish();
 
     // --- Token partition ---
-    let tok_enc = emit_tokens(mb_w, mb_h, &mb_encoded, &mb_decisions, &DEFAULT_COEF_PROBS);
+    let tok_enc = emit_tokens(
+        mb_w,
+        mb_h,
+        &mb_encoded,
+        &mb_decisions,
+        &DEFAULT_COEF_PROBS,
+        Some(&mb_ymodes),
+    );
     let token_partition = tok_enc.finish();
 
     let part_size = first_partition.len() as u32;
@@ -718,10 +1068,12 @@ fn encode_pframe_and_reconstruct(
 /// Pick the best P-frame decision for one MB.
 ///
 /// The search proceeds SKIP → ZERO_MV / NEAREST / NEAR (free-MV paths) →
-/// NEW_MV (integer-pel search + quarter-pel refinement) → IntraDc fallback
-/// if every inter option has a very high SAD. NEAREST/NEAR are preferred
-/// over NEW_MV when their SAD is within `NEIGHBOUR_MV_MARGIN` of the
-/// post-refinement NEW_MV SAD, since they do not code an MV delta.
+/// NEW_MV (integer-pel search + quarter-pel refinement) → SPLIT_MV
+/// (per-partition integer + quarter-pel search for each of the 4 split
+/// modes) → intra (DC/V/H/TM/B_PRED) fallback if every inter option has
+/// a very high SAD. NEAREST/NEAR are preferred over NEW_MV when their
+/// SAD is within `NEIGHBOUR_MV_MARGIN` of the post-refinement NEW_MV
+/// SAD, since they do not code an MV delta.
 #[allow(clippy::too_many_arguments)]
 fn choose_pmb_decision(
     src_y: &[u8],
@@ -732,6 +1084,7 @@ fn choose_pmb_decision(
     mb_y: usize,
     nearest: Mv,
     near: Mv,
+    rec_y: &[u8],
 ) -> PMbDecision {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
@@ -812,20 +1165,44 @@ fn choose_pmb_decision(
         _ => 0,
     };
     let total_margin = NEWMV_SAD_MARGIN + extra_margin;
-    let best_decision = if refined_sad + total_margin < best_free.0 && refined_mv != Mv::ZERO {
-        PMbDecision::NewMv(refined_mv)
-    } else {
-        best_free.1
-    };
-    let best_sad = match best_decision {
-        PMbDecision::NewMv(_) => refined_sad,
-        _ => best_free.0,
-    };
+    let (mut best_decision, mut best_sad) =
+        if refined_sad + total_margin < best_free.0 && refined_mv != Mv::ZERO {
+            (PMbDecision::NewMv(refined_mv), refined_sad)
+        } else {
+            (best_free.1, best_free.0)
+        };
+
+    // 5.5) SPLIT_MV: per-partition motion search, considered when the
+    //      single-MV NEW_MV residual is still noticeable. Each of the 4
+    //      split modes (16×8, 8×16, 8×8, 4×4) gets its own per-partition
+    //      search; the cheapest total-SAD split wins only if it beats
+    //      the current best decision by at least
+    //      `n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION`.
+    if best_sad > SPLITMV_CONSIDER_SAD_PER_PIXEL * (16 * 16) {
+        if let Some((split, split_sad)) = search_split_mv(src_y, &ref_plane, y_stride, mb_xp, mb_yp)
+        {
+            let n_parts = MB_SPLIT_COUNT[split.split_mode as usize] as u32;
+            let split_margin = n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION;
+            if split_sad + split_margin < best_sad {
+                best_decision = PMbDecision::SplitMv(split);
+                best_sad = split_sad;
+            }
+        }
+    }
 
     // 6) intra fallback when even the best inter prediction is very poor —
     //    e.g. uncovered regions, mid-frame scene cuts, heavy texture.
     if best_sad > INTRA_IN_P_SAD_PER_PIXEL * (16 * 16) {
-        return PMbDecision::IntraDc;
+        // Pick the best intra mode for this MB's Y plane against the
+        // reconstruction we have so far. B_PRED is skipped in the
+        // intra-in-P path — its bit cost outweighs the quality bump
+        // when the residual already dominates. Chroma uses DC_PRED
+        // for the same reason.
+        let y_mode = choose_intra_16x16_y_mode(src_y, rec_y, y_stride, mb_xp, mb_yp);
+        return PMbDecision::Intra {
+            y_mode,
+            uv_mode: DC_PRED,
+        };
     }
 
     best_decision
@@ -1276,10 +1653,10 @@ fn encode_inter_mb_at_mv(
 // ---------------------------------------------------------------------------
 
 struct QuantCtx {
-    /// Not used by the encoder directly (the decoder ignores Y-block DC
-    /// for non-B_PRED MBs and uses the Y2-derived DC instead) — kept for
-    /// documentation / future use by a B_PRED path.
-    #[allow(dead_code)]
+    /// Y-block DC step — used only by B_PRED and SPLIT_MV paths where
+    /// each 4×4 block carries its own DC coefficient (no Y2 pool). For
+    /// 16×16 intra and non-SPLIT inter the Y-block DC is zeroed and the
+    /// Y2-derived DC is added instead.
     y_dc: i32,
     y_ac: i32,
     y2_dc: i32,
@@ -1308,8 +1685,91 @@ impl MbEncoded {
     }
 }
 
+/// Gather DC/V/H/TM-capable 16-sample above row, left column and TL for
+/// a 16×16 intra MB at `(mb_xp, mb_yp)`.
+fn gather_16x16_neighbours(
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+) -> (Option<[u8; 16]>, Option<[u8; 16]>, Option<u8>) {
+    let above_avail = mb_yp > 0;
+    let left_avail = mb_xp > 0;
+    let above = if above_avail {
+        let mut a = [0u8; 16];
+        for i in 0..16 {
+            a[i] = rec_y[(mb_yp - 1) * y_stride + mb_xp + i];
+        }
+        Some(a)
+    } else {
+        None
+    };
+    let left = if left_avail {
+        let mut l = [0u8; 16];
+        for j in 0..16 {
+            l[j] = rec_y[(mb_yp + j) * y_stride + mb_xp - 1];
+        }
+        Some(l)
+    } else {
+        None
+    };
+    let tl = if above_avail && left_avail {
+        Some(rec_y[(mb_yp - 1) * y_stride + mb_xp - 1])
+    } else if above_avail {
+        Some(127)
+    } else if left_avail {
+        Some(129)
+    } else {
+        None
+    };
+    (above, left, tl)
+}
+
+/// Gather 8-sample neighbours for an 8×8 chroma intra block.
+fn gather_8x8_neighbours(
+    rec: &[u8],
+    uv_stride: usize,
+    mb_xc: usize,
+    mb_yc: usize,
+) -> (Option<[u8; 8]>, Option<[u8; 8]>, Option<u8>) {
+    let above_avail = mb_yc > 0;
+    let left_avail = mb_xc > 0;
+    let above = if above_avail {
+        let mut a = [0u8; 8];
+        for i in 0..8 {
+            a[i] = rec[(mb_yc - 1) * uv_stride + mb_xc + i];
+        }
+        Some(a)
+    } else {
+        None
+    };
+    let left = if left_avail {
+        let mut l = [0u8; 8];
+        for j in 0..8 {
+            l[j] = rec[(mb_yc + j) * uv_stride + mb_xc - 1];
+        }
+        Some(l)
+    } else {
+        None
+    };
+    let tl = if above_avail && left_avail {
+        Some(rec[(mb_yc - 1) * uv_stride + mb_xc - 1])
+    } else if above_avail {
+        Some(127)
+    } else if left_avail {
+        Some(129)
+    } else {
+        None
+    };
+    (above, left, tl)
+}
+
+/// Encode one intra MB with the given Y mode (DC / V / H / TM / B_PRED)
+/// and UV mode (DC / V / H / TM). For B_PRED, `bmodes` supplies the per
+/// 4×4 sub-block modes that the caller has already picked and emitted
+/// on the header side.
 #[allow(clippy::too_many_arguments)]
-fn encode_intra_mb_dc(
+fn encode_intra_mb(
     src_y: &[u8],
     src_u: &[u8],
     src_v: &[u8],
@@ -1322,109 +1782,155 @@ fn encode_intra_mb_dc(
     _uv_buf_h: usize,
     mb_x: usize,
     mb_y: usize,
-    _mb_w: usize,
+    mb_w: usize,
     _mb_h: usize,
     q: &QuantCtx,
+    y_mode: i32,
+    uv_mode: i32,
+    bmodes: &[i32; 16],
 ) -> MbEncoded {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
 
-    // Gather DC_PRED neighbours for the 16x16 luma prediction.
-    let mut above_arr = [0u8; 16];
-    let mut left_arr = [0u8; 16];
-    let above_avail = mb_yp > 0;
-    let left_avail = mb_xp > 0;
-    if above_avail {
-        for i in 0..16 {
-            above_arr[i] = rec_y[(mb_yp - 1) * y_stride + mb_xp + i];
-        }
-    }
-    if left_avail {
-        for j in 0..16 {
-            left_arr[j] = rec_y[(mb_yp + j) * y_stride + mb_xp - 1];
-        }
-    }
-    let tl = if above_avail && left_avail {
-        Some(rec_y[(mb_yp - 1) * y_stride + mb_xp - 1])
-    } else if above_avail {
-        Some(127)
-    } else if left_avail {
-        Some(129)
-    } else {
-        None
-    };
-    let mut pred = vec![0u8; 16 * 16];
-    predict_16x16(
-        DC_PRED,
-        if above_avail { Some(&above_arr) } else { None },
-        if left_avail { Some(&left_arr) } else { None },
-        tl,
-        &mut pred,
-        16,
-    );
-
-    let mut raw_dc_y = [0i32; 16];
-    let mut raw_ac_y = [[0i32; 16]; 16];
-    for bi in 0..16 {
-        let by = bi / 4;
-        let bx = bi % 4;
-        let mut blk = [0i32; 16];
-        for r in 0..4 {
-            for c in 0..4 {
-                let src = src_y[(mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c] as i32;
-                let p = pred[(by * 4 + r) * 16 + bx * 4 + c] as i32;
-                blk[r * 4 + c] = src - p;
-            }
-        }
-        let coeffs = fdct4x4(&blk);
-        raw_dc_y[bi] = coeffs[0];
-        raw_ac_y[bi] = coeffs;
-    }
-
-    // Forward WHT on the 16 DC values.
-    let y2_raw = fwht4x4(&raw_dc_y);
-    // Quantise Y2 (DC step = y2_dc, AC step = y2_ac).
-    let mut y2_q = [0i16; 16];
-    for i in 0..16 {
-        let step = if i == 0 { q.y2_dc } else { q.y2_ac };
-        y2_q[i] = quant(y2_raw[i], step);
-    }
-    // Dequantise + inverse WHT → reconstructed DCs.
-    let mut y2_deq = [0i16; 16];
-    for i in 0..16 {
-        let step = if i == 0 { q.y2_dc } else { q.y2_ac };
-        y2_deq[i] = (y2_q[i] as i32 * step) as i16;
-    }
-    let rec_dc = iwht4x4(&y2_deq);
-
+    // --- Luma: either 16×16 intra mode or B_PRED (per 4×4). ---
     let mut y_q = [[0i16; 16]; 16];
-    for bi in 0..16 {
-        for k in 1..16 {
-            y_q[bi][k] = quant(raw_ac_y[bi][k], q.y_ac);
-        }
-        y_q[bi][0] = 0;
-    }
+    let y2_q;
 
-    for bi in 0..16 {
-        let by = bi / 4;
-        let bx = bi % 4;
-        let mut deq = [0i16; 16];
-        deq[0] = rec_dc[bi];
-        for k in 1..16 {
-            deq[k] = (y_q[bi][k] as i32 * q.y_ac) as i16;
-        }
-        let res = idct4x4(&deq);
-        for r in 0..4 {
-            for c in 0..4 {
-                let p = pred[(by * 4 + r) * 16 + bx * 4 + c] as i32;
-                let rr = res[r * 4 + c] as i32;
-                let dst_y_idx = (mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c;
-                rec_y[dst_y_idx] = (p + rr).clamp(0, 255) as u8;
+    if y_mode == B_PRED {
+        // Per 4×4 reconstruction: each sub-block predicts from its own
+        // post-reconstruction neighbours (which land in `rec_y` as we go).
+        y2_q = [0i16; 16];
+        // Above-right extension at MB-row boundary (matches decoder).
+        let above_right_extension: [u8; 4] = if mb_yp > 0 {
+            let row = mb_yp - 1;
+            let mut ext = [0u8; 4];
+            for k in 0..4 {
+                let xx = mb_xp + 16 + k;
+                if xx < mb_w * 16 {
+                    ext[k] = rec_y[row * y_stride + xx];
+                } else {
+                    ext[k] = rec_y[row * y_stride + (mb_xp + 15)];
+                }
+            }
+            ext
+        } else {
+            [127; 4]
+        };
+        for i in 0..16 {
+            let by = i / 4;
+            let bx = i % 4;
+            let dst_x = mb_xp + bx * 4;
+            let dst_y = mb_yp + by * 4;
+            let neigh = gather_4x4_neighbours(
+                rec_y,
+                y_stride,
+                mb_xp,
+                mb_yp,
+                bx,
+                by,
+                mb_w,
+                &above_right_extension,
+            );
+            let mut pred = [0u8; 16];
+            predict_4x4(bmodes[i], &neigh, &mut pred, 4);
+
+            let mut blk = [0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let src = src_y[(dst_y + r) * y_stride + dst_x + c] as i32;
+                    let p = pred[r * 4 + c] as i32;
+                    blk[r * 4 + c] = src - p;
+                }
+            }
+            let coeffs = fdct4x4(&blk);
+            // B_PRED: no Y2. Quantise DC + AC with their respective steps.
+            let mut blk_q = [0i16; 16];
+            blk_q[0] = quant(coeffs[0], q.y_dc);
+            for k in 1..16 {
+                blk_q[k] = quant(coeffs[k], q.y_ac);
+            }
+            y_q[i] = blk_q;
+
+            let mut deq = [0i16; 16];
+            deq[0] = (blk_q[0] as i32 * q.y_dc) as i16;
+            for k in 1..16 {
+                deq[k] = (blk_q[k] as i32 * q.y_ac) as i16;
+            }
+            let res = idct4x4(&deq);
+            for r in 0..4 {
+                for c in 0..4 {
+                    let p = pred[r * 4 + c] as i32;
+                    let rr = res[r * 4 + c] as i32;
+                    rec_y[(dst_y + r) * y_stride + dst_x + c] = (p + rr).clamp(0, 255) as u8;
+                }
             }
         }
+    } else {
+        // 16×16 intra with Y2.
+        let (above, left, tl) = gather_16x16_neighbours(rec_y, y_stride, mb_xp, mb_yp);
+        let mut pred = vec![0u8; 16 * 16];
+        predict_16x16(y_mode, above.as_ref(), left.as_ref(), tl, &mut pred, 16);
+
+        let mut raw_dc_y = [0i32; 16];
+        let mut raw_ac_y = [[0i32; 16]; 16];
+        for bi in 0..16 {
+            let by = bi / 4;
+            let bx = bi % 4;
+            let mut blk = [0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let src = src_y[(mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c] as i32;
+                    let p = pred[(by * 4 + r) * 16 + bx * 4 + c] as i32;
+                    blk[r * 4 + c] = src - p;
+                }
+            }
+            let coeffs = fdct4x4(&blk);
+            raw_dc_y[bi] = coeffs[0];
+            raw_ac_y[bi] = coeffs;
+        }
+
+        let y2_raw = fwht4x4(&raw_dc_y);
+        let mut y2_qq = [0i16; 16];
+        for i in 0..16 {
+            let step = if i == 0 { q.y2_dc } else { q.y2_ac };
+            y2_qq[i] = quant(y2_raw[i], step);
+        }
+        let mut y2_deq = [0i16; 16];
+        for i in 0..16 {
+            let step = if i == 0 { q.y2_dc } else { q.y2_ac };
+            y2_deq[i] = (y2_qq[i] as i32 * step) as i16;
+        }
+        let rec_dc = iwht4x4(&y2_deq);
+
+        for bi in 0..16 {
+            for k in 1..16 {
+                y_q[bi][k] = quant(raw_ac_y[bi][k], q.y_ac);
+            }
+            y_q[bi][0] = 0;
+        }
+
+        for bi in 0..16 {
+            let by = bi / 4;
+            let bx = bi % 4;
+            let mut deq = [0i16; 16];
+            deq[0] = rec_dc[bi];
+            for k in 1..16 {
+                deq[k] = (y_q[bi][k] as i32 * q.y_ac) as i16;
+            }
+            let res = idct4x4(&deq);
+            for r in 0..4 {
+                for c in 0..4 {
+                    let p = pred[(by * 4 + r) * 16 + bx * 4 + c] as i32;
+                    let rr = res[r * 4 + c] as i32;
+                    let dst_y_idx = (mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c;
+                    rec_y[dst_y_idx] = (p + rr).clamp(0, 255) as u8;
+                }
+            }
+        }
+        y2_q = y2_qq;
     }
 
-    // --- Chroma (8x8 DC_PRED) ---
+    // --- Chroma (8×8 intra with chosen uv_mode). ---
     let mut u_q = [[0i16; 16]; 4];
     let mut v_q = [[0i16; 16]; 4];
     let mb_xc = mb_x * 8;
@@ -1434,38 +1940,9 @@ fn encode_intra_mb_dc(
             0 => (src_u, &mut *rec_u, &mut u_q),
             _ => (src_v, &mut *rec_v, &mut v_q),
         };
-        let above_avail_c = mb_yc > 0;
-        let left_avail_c = mb_xc > 0;
-        let mut above = [0u8; 8];
-        let mut left = [0u8; 8];
-        if above_avail_c {
-            for i in 0..8 {
-                above[i] = rec[(mb_yc - 1) * uv_stride + mb_xc + i];
-            }
-        }
-        if left_avail_c {
-            for j in 0..8 {
-                left[j] = rec[(mb_yc + j) * uv_stride + mb_xc - 1];
-            }
-        }
-        let tl = if above_avail_c && left_avail_c {
-            Some(rec[(mb_yc - 1) * uv_stride + mb_xc - 1])
-        } else if above_avail_c {
-            Some(127)
-        } else if left_avail_c {
-            Some(129)
-        } else {
-            None
-        };
+        let (above, left, tl) = gather_8x8_neighbours(rec, uv_stride, mb_xc, mb_yc);
         let mut pred_uv = vec![0u8; 8 * 8];
-        predict_8x8(
-            DC_PRED,
-            if above_avail_c { Some(&above) } else { None },
-            if left_avail_c { Some(&left) } else { None },
-            tl,
-            &mut pred_uv,
-            8,
-        );
+        predict_8x8(uv_mode, above.as_ref(), left.as_ref(), tl, &mut pred_uv, 8);
         for bi in 0..4 {
             let by = bi / 2;
             let bx = bi % 2;
@@ -1485,7 +1962,6 @@ fn encode_intra_mb_dc(
                 blk_q[k] = quant(coeffs[k], q.uv_ac);
             }
             q_coeffs[bi] = blk_q;
-            // Reconstruct.
             let mut deq = [0i16; 16];
             deq[0] = (blk_q[0] as i32 * q.uv_dc) as i16;
             for k in 1..16 {
@@ -1512,6 +1988,60 @@ fn encode_intra_mb_dc(
     }
 }
 
+/// Build 4×4 neighbour array for a sub-block. Matches the decoder's
+/// logic in `reconstruct_intra_mb` (including the above-right extension
+/// special-case).
+fn gather_4x4_neighbours(
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    bx: usize,
+    by: usize,
+    mb_w: usize,
+    above_right_extension: &[u8; 4],
+) -> B4x4Neighbours {
+    let dst_x = mb_xp + bx * 4;
+    let dst_y = mb_yp + by * 4;
+    let mut neigh = B4x4Neighbours {
+        above: [127; 8],
+        left: [129; 4],
+        tl: 127,
+    };
+    if dst_y > 0 {
+        for k in 0..4 {
+            neigh.above[k] = rec_y[(dst_y - 1) * y_stride + dst_x + k];
+        }
+        if bx == 3 && by > 0 {
+            neigh.above[4..8].copy_from_slice(above_right_extension);
+        } else {
+            for k in 4..8 {
+                let xx = dst_x + k;
+                if xx < mb_xp + 16 {
+                    neigh.above[k] = rec_y[(dst_y - 1) * y_stride + xx];
+                } else if by == 0 {
+                    if xx < mb_w * 16 {
+                        neigh.above[k] = rec_y[(dst_y - 1) * y_stride + xx];
+                    } else {
+                        neigh.above[k] = rec_y[(dst_y - 1) * y_stride + (mb_xp + 15)];
+                    }
+                } else {
+                    neigh.above[k] = above_right_extension[(xx - mb_xp) - 16];
+                }
+            }
+        }
+    }
+    if dst_x > 0 {
+        for k in 0..4 {
+            neigh.left[k] = rec_y[(dst_y + k) * y_stride + dst_x - 1];
+        }
+    }
+    if dst_x > 0 && dst_y > 0 {
+        neigh.tl = rec_y[(dst_y - 1) * y_stride + dst_x - 1];
+    }
+    neigh
+}
+
 // ---------------------------------------------------------------------------
 // Token partition encoding shared between I and P frames.
 // ---------------------------------------------------------------------------
@@ -1520,12 +2050,17 @@ fn encode_intra_mb_dc(
 /// is empty, every MB contributes its tokens (I-frame path). If
 /// `decisions` is populated, SKIP MBs contribute no tokens and still
 /// reset their neighbour non-zero contexts to 0.
+///
+/// `ymodes` supplies each MB's Y mode. B_PRED MBs have no Y2 block; their
+/// 16 Y blocks use `BlockType::YNoY2` (plane 3 in the coef_probs table)
+/// and start at coefficient 0 rather than 1.
 fn emit_tokens(
     mb_w: usize,
     mb_h: usize,
     mb_encoded: &[MbEncoded],
     decisions: &[PMbDecision],
     coef_probs: &CoeffProbs,
+    ymodes: Option<&[i32]>,
 ) -> BoolEncoder {
     let mut tok_enc = BoolEncoder::new();
     let mut nz_y_above = vec![[0u8; 4]; mb_w];
@@ -1540,13 +2075,24 @@ fn emit_tokens(
         let mut nz_y2_left = 0u8;
         for mb_x in 0..mb_w {
             let mb_rec = &mb_encoded[mb_y * mb_w + mb_x];
-            let is_skip = decisions
-                .get(mb_y * mb_w + mb_x)
-                .is_some_and(|d| matches!(d, PMbDecision::Skip));
+            let decision = decisions.get(mb_y * mb_w + mb_x);
+            let is_skip = decision.is_some_and(|d| matches!(d, PMbDecision::Skip));
+            // B_PRED MBs (intra or intra-in-P) have no Y2 block. Decoder:
+            // `has_y2 = info.y_mode != B_PRED` for intra / non-SPLIT inter.
+            // SPLIT MBs also have no Y2. All other cases get a Y2 block.
+            let y_mode = ymodes
+                .and_then(|m| m.get(mb_y * mb_w + mb_x))
+                .copied()
+                .unwrap_or(DC_PRED);
+            let is_split = matches!(decision, Some(PMbDecision::SplitMv(_)));
+            let has_y2 = !matches!(y_mode, x if x == B_PRED) && !is_split;
+
             if is_skip {
                 // Decoder: skip clears all neighbour nz for this MB.
-                nz_y2_above[mb_x] = 0;
-                nz_y2_left = 0;
+                if has_y2 {
+                    nz_y2_above[mb_x] = 0;
+                    nz_y2_left = 0;
+                }
                 for bx in 0..4 {
                     nz_y_above[mb_x][bx] = 0;
                     nz_y_left[bx] = 0;
@@ -1560,20 +2106,29 @@ fn emit_tokens(
                 continue;
             }
 
-            // Y2 DC block.
-            let nctx = nz_y2_above[mb_x] + nz_y2_left;
-            let nz = encode_block(
-                &mut tok_enc,
-                coef_probs,
-                /*plane=*/ 1,
-                nctx as usize,
-                &mb_rec.y2_coeffs,
-                0,
-            );
-            let nzf = if nz > 0 { 1 } else { 0 };
-            nz_y2_above[mb_x] = nzf;
-            nz_y2_left = nzf;
+            // Y2 DC block (only when applicable).
+            if has_y2 {
+                let nctx = nz_y2_above[mb_x] + nz_y2_left;
+                let nz = encode_block(
+                    &mut tok_enc,
+                    coef_probs,
+                    /*plane=*/ 1,
+                    nctx as usize,
+                    &mb_rec.y2_coeffs,
+                    0,
+                );
+                let nzf = if nz > 0 { 1 } else { 0 };
+                nz_y2_above[mb_x] = nzf;
+                nz_y2_left = nzf;
+            }
 
+            // Y blocks. `plane=0` (YAfterY2) and `start=1` when has_y2;
+            // `plane=3` (YNoY2) and `start=0` otherwise.
+            let (y_plane, y_start) = if has_y2 {
+                (0usize, 1usize)
+            } else {
+                (3usize, 0usize)
+            };
             for by in 0..4 {
                 for bx in 0..4 {
                     let idx = by * 4 + bx;
@@ -1581,10 +2136,10 @@ fn emit_tokens(
                     let nz = encode_block(
                         &mut tok_enc,
                         coef_probs,
-                        0,
+                        y_plane,
                         nctx as usize,
                         &mb_rec.y_coeffs[idx],
-                        1,
+                        y_start,
                     );
                     let nzf = if nz > 0 { 1 } else { 0 };
                     nz_y_above[mb_x][bx] = nzf;
@@ -1791,6 +2346,1139 @@ fn emit_no_coef_prob_updates(enc: &mut BoolEncoder) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Intra mode selection + emission
+// ---------------------------------------------------------------------------
+
+/// Map intra 16×16 mode → the 4×4 mode value propagated to the neighbour
+/// B_PRED context (matches decoder's `intra_to_b`).
+fn intra_to_b_mode(y_mode: i32) -> i32 {
+    match y_mode {
+        DC_PRED => B_DC_PRED,
+        V_PRED => B_VE_PRED,
+        H_PRED => B_HE_PRED,
+        TM_PRED => B_TM_PRED,
+        _ => B_DC_PRED,
+    }
+}
+
+/// Emit a keyframe Y-mode tree path for `y_mode`.
+fn emit_kf_ymode(enc: &mut BoolEncoder, y_mode: i32) {
+    let p = &KF_YMODE_PROBS;
+    match y_mode {
+        B_PRED => {
+            enc.write_bool(p[0] as u32, false);
+        }
+        DC_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, false);
+            enc.write_bool(p[2] as u32, false);
+        }
+        V_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, false);
+            enc.write_bool(p[2] as u32, true);
+        }
+        H_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, true);
+            enc.write_bool(p[3] as u32, false);
+        }
+        TM_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, true);
+            enc.write_bool(p[3] as u32, true);
+        }
+        _ => unreachable!("invalid Y mode {}", y_mode),
+    }
+}
+
+/// Emit a keyframe UV-mode tree path for `uv_mode`.
+fn emit_kf_uv_mode(enc: &mut BoolEncoder, uv_mode: i32) {
+    let p = &KF_UV_MODE_PROBS;
+    match uv_mode {
+        DC_PRED => {
+            enc.write_bool(p[0] as u32, false);
+        }
+        V_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, false);
+        }
+        H_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, true);
+            enc.write_bool(p[2] as u32, false);
+        }
+        TM_PRED => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, true);
+            enc.write_bool(p[2] as u32, true);
+        }
+        _ => unreachable!("invalid UV mode {}", uv_mode),
+    }
+}
+
+/// Emit an inter-frame Y-mode tree path (YMODE_TREE: DC/V/H/TM/B_PRED).
+/// The tree structure is `[-DC, 2, 4, 6, -V, -H, -TM, -B_PRED]` — same
+/// branching shape as keyframes but different probabilities.
+fn emit_inter_ymode(enc: &mut BoolEncoder, y_mode: i32, probs: &[u8; 4]) {
+    match y_mode {
+        DC_PRED => {
+            enc.write_bool(probs[0] as u32, false);
+        }
+        V_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, false);
+            enc.write_bool(probs[2] as u32, false);
+        }
+        H_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, false);
+            enc.write_bool(probs[2] as u32, true);
+        }
+        TM_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, true);
+            enc.write_bool(probs[3] as u32, false);
+        }
+        B_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, true);
+            enc.write_bool(probs[3] as u32, true);
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Emit an inter-frame UV-mode tree path.
+fn emit_inter_uv_mode(enc: &mut BoolEncoder, uv_mode: i32, probs: &[u8; 3]) {
+    match uv_mode {
+        DC_PRED => {
+            enc.write_bool(probs[0] as u32, false);
+        }
+        V_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, false);
+        }
+        H_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, true);
+            enc.write_bool(probs[2] as u32, false);
+        }
+        TM_PRED => {
+            enc.write_bool(probs[0] as u32, true);
+            enc.write_bool(probs[1] as u32, true);
+            enc.write_bool(probs[2] as u32, true);
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Tree path for each 4×4 B-mode under BMODE_TREE (§11.5).
+/// Each entry is `(prob_index, bit)` — written with `probs[prob_index]`.
+type BModePath = &'static [(u8, bool)];
+static BMODE_PATHS: [BModePath; 10] = [
+    // B_DC_PRED: tree start, bit=false → leaf -B_DC_PRED.
+    &[(0, false)],
+    // B_TM_PRED: true, false → -B_TM_PRED.
+    &[(0, true), (1, false)],
+    // B_VE_PRED: true, true, false → leaf at idx=4: -B_VE_PRED.
+    &[(0, true), (1, true), (2, false)],
+    // B_HE_PRED: true, true, true, false → (idx=6 pair @ prob 3) then leaf path.
+    //   BMODE_TREE at idx 6: [8, 12]. Reading false → idx 8: [-B_HE_PRED, 10] → leaf at bit=false.
+    &[(0, true), (1, true), (2, true), (3, false), (4, false)],
+    // B_LD_PRED: walking through BMODE_TREE to reach leaf -B_LD_PRED at idx 12.
+    //   Path: 0→true, 1→true, 2→true, 3(idx=6 pair)→true→idx 12 [-B_LD_PRED, 14], then false.
+    &[(0, true), (1, true), (2, true), (3, true), (6, false)],
+    // B_RD_PRED: idx 8: [ -B_HE_PRED, 10] → 10: [ -B_RD_PRED, -B_VR_PRED ].
+    //   Path: 0,1,2→true,true,true; 3→false; 4→true→idx 10 [-B_RD_PRED, -B_VR_PRED], then false.
+    &[
+        (0, true),
+        (1, true),
+        (2, true),
+        (3, false),
+        (4, true),
+        (5, false),
+    ],
+    // B_VR_PRED:
+    &[
+        (0, true),
+        (1, true),
+        (2, true),
+        (3, false),
+        (4, true),
+        (5, true),
+    ],
+    // B_VL_PRED: leaves at idx 14: [-B_VL_PRED, 16]; reach via path (0,1,2=true; 3=true @ idx6; 6=true @idx12→14: [-B_LD_PRED, 14]; 14: [-B_VL_PRED, 16])
+    &[
+        (0, true),
+        (1, true),
+        (2, true),
+        (3, true),
+        (6, true),
+        (7, false),
+    ],
+    // B_HD_PRED: idx 16: [-B_HD_PRED, -B_HU_PRED].
+    &[
+        (0, true),
+        (1, true),
+        (2, true),
+        (3, true),
+        (6, true),
+        (7, true),
+        (8, false),
+    ],
+    // B_HU_PRED:
+    &[
+        (0, true),
+        (1, true),
+        (2, true),
+        (3, true),
+        (6, true),
+        (7, true),
+        (8, true),
+    ],
+];
+
+/// Generic: emit a precomputed tree path `path` using probs indexed by
+/// `path[i].0` and a bit value `path[i].1`.
+fn emit_tree_path(enc: &mut BoolEncoder, path: &[(u8, bool)], probs: &[u8]) {
+    for &(idx, bit) in path {
+        enc.write_bool(probs[idx as usize] as u32, bit);
+    }
+}
+
+/// Emit the mb-split-tree leaf.
+fn emit_split_mb_tree(enc: &mut BoolEncoder, split_mode: u8) {
+    let p = &MBSPLIT_PROBS;
+    match split_mode {
+        // MB_SPLIT_4X4 = 3 → path: false.
+        3 => {
+            enc.write_bool(p[0] as u32, false);
+        }
+        // MB_SPLIT_16X8 = 0 → path: true, false.
+        0 => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, false);
+        }
+        // MB_SPLIT_8X16 = 1 → path: true, true, false.
+        1 => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, true);
+            enc.write_bool(p[2] as u32, false);
+        }
+        // MB_SPLIT_QUARTERS = 2 → path: true, true, true.
+        2 => {
+            enc.write_bool(p[0] as u32, true);
+            enc.write_bool(p[1] as u32, true);
+            enc.write_bool(p[2] as u32, true);
+        }
+        _ => unreachable!("invalid split_mode {}", split_mode),
+    }
+}
+
+/// Emit per-partition sub-MV ref trees + optional MV diffs for a SPLIT
+/// MB. Partitions emit in the same iteration order as the decoder: for
+/// each partition `p` in 0..n, walk the 16 sub-blocks in raster order
+/// and emit the first one whose partition id equals `p`.
+#[allow(clippy::too_many_arguments)]
+fn emit_split_submvs(
+    enc: &mut BoolEncoder,
+    split: &SplitMv,
+    mb_sub_mvs: &[[Mv; 16]],
+    mb_decisions: &[PMbDecision],
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+    best_for_newmv: Mv,
+) {
+    let partition = &MB_SPLITS[split.split_mode as usize];
+    let n = MB_SPLIT_COUNT[split.split_mode as usize] as usize;
+    // Track the running sub_mvs as we emit each partition so that
+    // subsequent partitions see the correct left/above sub-MV neighbour.
+    let mut part_mvs_running = [Mv::ZERO; 16];
+    for p in 0..n {
+        let first_idx = (0..16).find(|&i| partition[i] as usize == p).unwrap_or(0);
+        let row = first_idx / 4;
+        let col = first_idx % 4;
+        // Left sub-MV: either from within this MB (if col > 0) or from
+        // the MB immediately to the left (row `row`, col `3`).
+        let left_mv = if col == 0 {
+            if mb_x > 0 {
+                let lidx = mb_y * mb_w + mb_x - 1;
+                edge_left_sub_mv(mb_sub_mvs, mb_decisions, lidx, row)
+            } else {
+                Mv::ZERO
+            }
+        } else {
+            part_mvs_running[row * 4 + col - 1]
+        };
+        let above_mv = if row == 0 {
+            if mb_y > 0 {
+                let aidx = (mb_y - 1) * mb_w + mb_x;
+                edge_above_sub_mv(mb_sub_mvs, mb_decisions, aidx, col)
+            } else {
+                Mv::ZERO
+            }
+        } else {
+            part_mvs_running[(row - 1) * 4 + col]
+        };
+        let chosen = split.part_mvs[p];
+        // Determine which SUB_MV_REF leaf we need.
+        let leaf: i32 = if chosen == left_mv {
+            0 // LEFT_4X4
+        } else if chosen == above_mv {
+            1 // ABOVE_4X4
+        } else if chosen == Mv::ZERO {
+            2 // ZERO_4X4
+        } else {
+            3 // NEW_4X4
+        };
+        let sub_prob_row = sub_mv_context_enc(&left_mv, &above_mv);
+        let probs = &SUB_MV_REF_PROBS[sub_prob_row];
+        // SUB_MV_REF_TREE: [-LEFT, 2, -ABOVE, 4, -ZERO, -NEW]. Paths:
+        //   LEFT:  false
+        //   ABOVE: true, false
+        //   ZERO:  true, true, false
+        //   NEW:   true, true, true
+        match leaf {
+            0 => {
+                enc.write_bool(probs[0] as u32, false);
+            }
+            1 => {
+                enc.write_bool(probs[0] as u32, true);
+                enc.write_bool(probs[1] as u32, false);
+            }
+            2 => {
+                enc.write_bool(probs[0] as u32, true);
+                enc.write_bool(probs[1] as u32, true);
+                enc.write_bool(probs[2] as u32, false);
+            }
+            3 => {
+                enc.write_bool(probs[0] as u32, true);
+                enc.write_bool(probs[1] as u32, true);
+                enc.write_bool(probs[2] as u32, true);
+                let dmv = Mv::new(
+                    chosen.row as i32 - best_for_newmv.row as i32,
+                    chosen.col as i32 - best_for_newmv.col as i32,
+                );
+                encode_mv_component(enc, &DEFAULT_MV_CONTEXT[0], dmv.row as i32);
+                encode_mv_component(enc, &DEFAULT_MV_CONTEXT[1], dmv.col as i32);
+            }
+            _ => unreachable!(),
+        }
+        // Update running MVs.
+        for i in 0..16 {
+            if partition[i] as usize == p {
+                part_mvs_running[i] = chosen;
+            }
+        }
+    }
+}
+
+/// Encoder replica of the decoder's `sub_mv_context`: picks a row of
+/// `SUB_MV_REF_PROBS` based on the (left, above) neighbour pair.
+fn sub_mv_context_enc(left: &Mv, above: &Mv) -> usize {
+    let l_zero = left.row == 0 && left.col == 0;
+    let a_zero = above.row == 0 && above.col == 0;
+    if l_zero && a_zero {
+        0
+    } else if !l_zero && a_zero {
+        1
+    } else if l_zero && !a_zero {
+        2
+    } else if left == above {
+        4
+    } else {
+        3
+    }
+}
+
+/// Left-neighbour MB's right-edge sub-MV for `row` within this MB.
+fn edge_left_sub_mv(
+    mb_sub_mvs: &[[Mv; 16]],
+    mb_decisions: &[PMbDecision],
+    lidx: usize,
+    row: usize,
+) -> Mv {
+    if let Some(d) = mb_decisions.get(lidx) {
+        if d.is_intra() {
+            Mv::ZERO
+        } else {
+            mb_sub_mvs[lidx][row * 4 + 3]
+        }
+    } else {
+        Mv::ZERO
+    }
+}
+
+/// Above-neighbour MB's bottom-edge sub-MV for `col` within this MB.
+fn edge_above_sub_mv(
+    mb_sub_mvs: &[[Mv; 16]],
+    mb_decisions: &[PMbDecision],
+    aidx: usize,
+    col: usize,
+) -> Mv {
+    if let Some(d) = mb_decisions.get(aidx) {
+        if d.is_intra() {
+            Mv::ZERO
+        } else {
+            mb_sub_mvs[aidx][12 + col]
+        }
+    } else {
+        Mv::ZERO
+    }
+}
+
+/// Pick the best 16×16 Y mode by SSE against the source.
+fn choose_intra_16x16_y_mode(
+    src_y: &[u8],
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+) -> i32 {
+    let mut best = DC_PRED;
+    let mut best_sse = u64::MAX;
+    for m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
+        let (sse, _) = sse_intra_16x16(*m, src_y, rec_y, y_stride, mb_xp, mb_yp);
+        if sse < best_sse {
+            best_sse = sse;
+            best = *m;
+        }
+    }
+    best
+}
+
+/// SSE of 16×16 intra prediction vs source (pre-residual — measures the
+/// quality of the prediction alone).
+fn sse_intra_16x16(
+    mode: i32,
+    src_y: &[u8],
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+) -> (u64, [u8; 256]) {
+    let (above, left, tl) = gather_16x16_neighbours(rec_y, y_stride, mb_xp, mb_yp);
+    let mut pred = [0u8; 256];
+    predict_16x16(mode, above.as_ref(), left.as_ref(), tl, &mut pred, 16);
+    let mut sse = 0u64;
+    for r in 0..16 {
+        for c in 0..16 {
+            let s = src_y[(mb_yp + r) * y_stride + mb_xp + c] as i32;
+            let p = pred[r * 16 + c] as i32;
+            let d = s - p;
+            sse += (d * d) as u64;
+        }
+    }
+    (sse, pred)
+}
+
+/// Evaluate B_PRED greedily: for each 4×4 sub-block, pick the mode that
+/// minimises SSE against the true source. Returns total SSE and the 16
+/// chosen modes. Uses the running `rec_y` so neighbour propagation
+/// matches what the decoder sees. The per-4×4 SSEs summed inside
+/// `choose_b_pred_modes` are what the best-mode-selection used, so we
+/// recompute them here in a single pass to keep the output tight.
+fn sse_intra_b_pred(
+    src_y: &[u8],
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    mb_w: usize,
+    mb_h: usize,
+) -> (u64, [i32; 16]) {
+    let modes = choose_b_pred_modes(src_y, rec_y, y_stride, mb_xp, mb_yp, mb_w, mb_h);
+    let above_right_extension: [u8; 4] = if mb_yp > 0 {
+        let row = mb_yp - 1;
+        let mut ext = [0u8; 4];
+        for k in 0..4 {
+            let xx = mb_xp + 16 + k;
+            if xx < mb_w * 16 {
+                ext[k] = rec_y[row * y_stride + xx];
+            } else {
+                ext[k] = rec_y[row * y_stride + (mb_xp + 15)];
+            }
+        }
+        ext
+    } else {
+        [127; 4]
+    };
+    let mut total = 0u64;
+    for i in 0..16 {
+        let by = i / 4;
+        let bx = i % 4;
+        let dst_x = mb_xp + bx * 4;
+        let dst_y = mb_yp + by * 4;
+        let neigh = gather_4x4_neighbours(
+            rec_y,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            bx,
+            by,
+            mb_w,
+            &above_right_extension,
+        );
+        let mut pred = [0u8; 16];
+        predict_4x4(modes[i], &neigh, &mut pred, 4);
+        for r in 0..4 {
+            for c in 0..4 {
+                let s = src_y[(dst_y + r) * y_stride + dst_x + c] as i32;
+                let p = pred[r * 4 + c] as i32;
+                let d = s - p;
+                total += (d * d) as u64;
+            }
+        }
+    }
+    (total, modes)
+}
+
+/// Pick the 16 4×4 sub-block modes for a B_PRED MB by greedy SSE
+/// minimisation against the source. Uses the current (pre-residual)
+/// `rec_y` for neighbour context — close enough for a first-pass
+/// selection, and consistent for the later reconstruction since the
+/// encoder proceeds sub-block by sub-block.
+fn choose_b_pred_modes(
+    src_y: &[u8],
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    mb_w: usize,
+    _mb_h: usize,
+) -> [i32; 16] {
+    let above_right_extension: [u8; 4] = if mb_yp > 0 {
+        let row = mb_yp - 1;
+        let mut ext = [0u8; 4];
+        for k in 0..4 {
+            let xx = mb_xp + 16 + k;
+            if xx < mb_w * 16 {
+                ext[k] = rec_y[row * y_stride + xx];
+            } else {
+                ext[k] = rec_y[row * y_stride + (mb_xp + 15)];
+            }
+        }
+        ext
+    } else {
+        [127; 4]
+    };
+    let mut modes = [B_DC_PRED; 16];
+    for i in 0..16 {
+        let by = i / 4;
+        let bx = i % 4;
+        let dst_x = mb_xp + bx * 4;
+        let dst_y = mb_yp + by * 4;
+        let neigh = gather_4x4_neighbours(
+            rec_y,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            bx,
+            by,
+            mb_w,
+            &above_right_extension,
+        );
+        let mut best_mode = B_DC_PRED;
+        let mut best_sse = u64::MAX;
+        for &m in &[
+            B_DC_PRED, B_TM_PRED, B_VE_PRED, B_HE_PRED, B_LD_PRED, B_RD_PRED, B_VR_PRED, B_VL_PRED,
+            B_HD_PRED, B_HU_PRED,
+        ] {
+            let mut pred = [0u8; 16];
+            predict_4x4(m, &neigh, &mut pred, 4);
+            let mut sse = 0u64;
+            for r in 0..4 {
+                for c in 0..4 {
+                    let s = src_y[(dst_y + r) * y_stride + dst_x + c] as i32;
+                    let p = pred[r * 4 + c] as i32;
+                    let d = s - p;
+                    sse += (d * d) as u64;
+                }
+            }
+            if sse < best_sse {
+                best_sse = sse;
+                best_mode = m;
+            }
+        }
+        modes[i] = best_mode;
+    }
+    modes
+}
+
+/// Pick the best chroma intra mode (DC/V/H/TM) for a keyframe by SSE
+/// of the prediction vs the source U + V planes.
+#[allow(clippy::too_many_arguments)]
+fn choose_intra_chroma_mode(
+    src_u: &[u8],
+    src_v: &[u8],
+    rec_u: &[u8],
+    rec_v: &[u8],
+    uv_stride: usize,
+    mb_xc: usize,
+    mb_yc: usize,
+) -> i32 {
+    let mut best = DC_PRED;
+    let mut best_sse = u64::MAX;
+    for &m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
+        let sse = sse_intra_8x8_both(m, src_u, rec_u, uv_stride, mb_xc, mb_yc)
+            + sse_intra_8x8_both(m, src_v, rec_v, uv_stride, mb_xc, mb_yc);
+        if sse < best_sse {
+            best_sse = sse;
+            best = m;
+        }
+    }
+    best
+}
+
+fn sse_intra_8x8_both(
+    mode: i32,
+    src: &[u8],
+    rec: &[u8],
+    uv_stride: usize,
+    mb_xc: usize,
+    mb_yc: usize,
+) -> u64 {
+    let (above, left, tl) = gather_8x8_neighbours(rec, uv_stride, mb_xc, mb_yc);
+    let mut pred = [0u8; 64];
+    predict_8x8(mode, above.as_ref(), left.as_ref(), tl, &mut pred, 8);
+    let mut sse = 0u64;
+    for r in 0..8 {
+        for c in 0..8 {
+            let s = src[(mb_yc + r) * uv_stride + mb_xc + c] as i32;
+            let p = pred[r * 8 + c] as i32;
+            let d = s - p;
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
+/// Emit the 16 4×4 BMODE tree paths for a keyframe B_PRED MB, using
+/// `KF_BMODE_PROB[above][left]` context probabilities for each sub-block.
+/// Also populates `this_mb_bmodes` so the caller can propagate the
+/// bottom row to `bmode_above` and reconstruct with the same modes.
+#[allow(clippy::too_many_arguments)]
+fn emit_bmodes_keyframe(
+    enc: &mut BoolEncoder,
+    this_mb_bmodes: &mut [i32; 16],
+    bmode_above_for_mb: &[i32; 4],
+    left_bmodes_in: &[i32; 4],
+    src_y: &[u8],
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+) {
+    // Pick per-sub-block modes greedily against the source.
+    let chosen = choose_b_pred_modes(src_y, rec_y, y_stride, mb_x * 16, mb_y * 16, mb_w, 0);
+    let mut left_bmodes = *left_bmodes_in;
+    for i in 0..16 {
+        let row = i / 4;
+        let col = i % 4;
+        let above_mode = if row == 0 {
+            bmode_above_for_mb[col]
+        } else {
+            this_mb_bmodes[(row - 1) * 4 + col]
+        };
+        let left_mode = if col == 0 {
+            left_bmodes[row]
+        } else {
+            this_mb_bmodes[row * 4 + col - 1]
+        };
+        let probs = &KF_BMODE_PROB[above_mode as usize][left_mode as usize];
+        let m = chosen[i];
+        emit_tree_path(enc, BMODE_PATHS[m as usize], probs);
+        this_mb_bmodes[i] = m;
+        if col == 3 {
+            left_bmodes[row] = m;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SPLIT_MV search
+// ---------------------------------------------------------------------------
+
+/// For a given SPLIT mode (16×8 / 8×16 / 8×8 / 4×4), search the best
+/// per-partition MV and compute the total SAD.
+fn search_split_mv(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+) -> Option<(SplitMv, u32)> {
+    let mut best: Option<(SplitMv, u32)> = None;
+    for split_mode in 0..4u8 {
+        let (part_mvs, total_sad) =
+            search_split_partitions(split_mode, src_y, ref_plane, y_stride, mb_xp, mb_yp);
+        let split = SplitMv {
+            split_mode,
+            part_mvs,
+        };
+        match &best {
+            None => best = Some((split, total_sad)),
+            Some((_, bs)) if total_sad < *bs => best = Some((split, total_sad)),
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Search best per-partition MVs for one particular split mode.
+/// Each partition is described by the set of 4×4 sub-blocks (from
+/// `MB_SPLITS[split_mode]`) belonging to it; we search over a small
+/// integer-pel window around zero then refine at quarter-pel, and sum
+/// the SAD contributions.
+fn search_split_partitions(
+    split_mode: u8,
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+) -> ([Mv; 16], u32) {
+    let partition = &MB_SPLITS[split_mode as usize];
+    let n = MB_SPLIT_COUNT[split_mode as usize] as usize;
+    let mut part_mvs = [Mv::ZERO; 16];
+    let mut total_sad = 0u32;
+    for p in 0..n {
+        // Determine bounding box of partition `p`.
+        let mut indices: Vec<usize> = Vec::with_capacity(16);
+        let mut min_by = 4usize;
+        let mut max_by = 0usize;
+        let mut min_bx = 4usize;
+        let mut max_bx = 0usize;
+        for i in 0..16 {
+            if partition[i] as usize == p {
+                indices.push(i);
+                let by = i / 4;
+                let bx = i % 4;
+                min_by = min_by.min(by);
+                max_by = max_by.max(by);
+                min_bx = min_bx.min(bx);
+                max_bx = max_bx.max(bx);
+            }
+        }
+        // Integer-pel search.
+        let (best_int_px, best_int_sad) = integer_partition_search(
+            src_y,
+            ref_plane,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            &indices,
+            MOTION_SEARCH_RANGE,
+        );
+        let int_mv = Mv::new(best_int_px.0 * 8, best_int_px.1 * 8);
+        // Sub-pel refinement (reuses the 3×3 neighbourhood).
+        let (refined_mv, refined_sad) = subpel_refine_partition(
+            src_y,
+            ref_plane,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            &indices,
+            int_mv,
+            best_int_sad,
+        );
+        for i in &indices {
+            part_mvs[*i] = refined_mv;
+        }
+        let _ = (min_bx, min_by, max_bx, max_by);
+        total_sad += refined_sad;
+    }
+    (part_mvs, total_sad)
+}
+
+/// Integer-pel SAD search for a partition consisting of `indices` of
+/// 4×4 sub-blocks. Uses edge-clamped sampling via `mb_luma_sad_at` at
+/// 4×4 granularity.
+fn integer_partition_search(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    indices: &[usize],
+    range: i32,
+) -> ((i32, i32), u32) {
+    let mut best = (0, 0);
+    let mut best_sad =
+        partition_sad_at_int(src_y, ref_plane, y_stride, mb_xp, mb_yp, indices, 0, 0);
+    for dy in -range..=range {
+        for dx in -range..=range {
+            if dy == 0 && dx == 0 {
+                continue;
+            }
+            let sad =
+                partition_sad_at_int(src_y, ref_plane, y_stride, mb_xp, mb_yp, indices, dy, dx);
+            if sad < best_sad {
+                best_sad = sad;
+                best = (dy, dx);
+            }
+        }
+    }
+    (best, best_sad)
+}
+
+/// SAD of a partition vs its reference shifted by (dy, dx) integer pels.
+fn partition_sad_at_int(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    indices: &[usize],
+    dy: i32,
+    dx: i32,
+) -> u32 {
+    let mut sad: u32 = 0;
+    for &i in indices {
+        let by = i / 4;
+        let bx = i % 4;
+        let sy = mb_yp + by * 4;
+        let sx = mb_xp + bx * 4;
+        for r in 0..4 {
+            for c in 0..4 {
+                let ry = (sy as i32 + r as i32 + dy).clamp(0, ref_plane.height as i32 - 1) as usize;
+                let rx = (sx as i32 + c as i32 + dx).clamp(0, ref_plane.width as i32 - 1) as usize;
+                let s = src_y[(sy + r) * y_stride + sx + c] as i32;
+                let p = ref_plane.data[ry * ref_plane.stride + rx] as i32;
+                sad += (s - p).unsigned_abs();
+            }
+        }
+    }
+    sad
+}
+
+/// Sub-pel refinement for a partition using the sixtap filter path.
+fn subpel_refine_partition(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    indices: &[usize],
+    int_mv: Mv,
+    int_sad: u32,
+) -> (Mv, u32) {
+    let mut best_mv = int_mv;
+    let mut best_sad = int_sad;
+    let step = SUBPEL_REFINE_STEP;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dy == 0 && dx == 0 {
+                continue;
+            }
+            let mv = Mv::new(int_mv.row as i32 + dy * step, int_mv.col as i32 + dx * step);
+            let sad = subpel_partition_sad(src_y, ref_plane, y_stride, mb_xp, mb_yp, indices, mv);
+            if sad < best_sad {
+                best_sad = sad;
+                best_mv = mv;
+            }
+        }
+    }
+    (best_mv, best_sad)
+}
+
+fn subpel_partition_sad(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    indices: &[usize],
+    mv: Mv,
+) -> u32 {
+    let mut sad = 0u32;
+    for &i in indices {
+        let by = i / 4;
+        let bx = i % 4;
+        let sy = mb_yp + by * 4;
+        let sx = mb_xp + bx * 4;
+        let mut pred = [0u8; 16];
+        let ref_x_fp = sx as i32 * 8 + mv.col as i32;
+        let ref_y_fp = sy as i32 * 8 + mv.row as i32;
+        sixtap_predict(ref_plane, ref_x_fp, ref_y_fp, &mut pred, 4, 0, 0, 4, 4);
+        for r in 0..4 {
+            for c in 0..4 {
+                let s = src_y[(sy + r) * y_stride + sx + c] as i32;
+                let p = pred[r * 4 + c] as i32;
+                sad += (s - p).unsigned_abs();
+            }
+        }
+    }
+    sad
+}
+
+// ---------------------------------------------------------------------------
+// Inter MB encode — SPLIT variant (per-subblock MV).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn encode_inter_mb_split(
+    src_y: &[u8],
+    src_u: &[u8],
+    src_v: &[u8],
+    ref_y: &[u8],
+    ref_u: &[u8],
+    ref_v: &[u8],
+    rec_y: &mut [u8],
+    rec_u: &mut [u8],
+    rec_v: &mut [u8],
+    y_stride: usize,
+    uv_stride: usize,
+    y_buf_h: usize,
+    uv_buf_h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    split: &SplitMv,
+    q: &QuantCtx,
+) -> MbEncoded {
+    let mb_xp = mb_x * 16;
+    let mb_yp = mb_y * 16;
+
+    let ref_plane_y = RefPlane {
+        data: ref_y,
+        stride: y_stride,
+        width: y_stride,
+        height: y_buf_h,
+    };
+
+    // Expand per-subblock MVs from the split-mode partitioning.
+    let partition = &MB_SPLITS[split.split_mode as usize];
+    let mut sub_mvs = [Mv::ZERO; 16];
+    for i in 0..16 {
+        sub_mvs[i] = split.part_mvs[partition[i] as usize];
+    }
+
+    // --- Luma prediction per 4×4 sub-block using its own MV ---
+    let mut pred_y = [0u8; 256];
+    for i in 0..16 {
+        let by = i / 4;
+        let bx = i % 4;
+        let dst_x = bx * 4;
+        let dst_y = by * 4;
+        let mv = sub_mvs[i];
+        let ref_x_fp = (mb_xp + dst_x) as i32 * 8 + mv.col as i32;
+        let ref_y_fp = (mb_yp + dst_y) as i32 * 8 + mv.row as i32;
+        sixtap_predict(
+            &ref_plane_y,
+            ref_x_fp,
+            ref_y_fp,
+            &mut pred_y,
+            16,
+            dst_x,
+            dst_y,
+            4,
+            4,
+        );
+    }
+
+    // --- Y residual. SPLIT MBs do NOT have a Y2 block — per 4×4 block
+    //     we quantise DC + AC with their respective steps.
+    let mut y_q = [[0i16; 16]; 16];
+    for bi in 0..16 {
+        let by = bi / 4;
+        let bx = bi % 4;
+        let mut blk = [0i32; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                let src = src_y[(mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c] as i32;
+                let p = pred_y[(by * 4 + r) * 16 + bx * 4 + c] as i32;
+                blk[r * 4 + c] = src - p;
+            }
+        }
+        let coeffs = fdct4x4(&blk);
+        let mut blk_q = [0i16; 16];
+        blk_q[0] = quant(coeffs[0], q.y_dc);
+        for k in 1..16 {
+            blk_q[k] = quant(coeffs[k], q.y_ac);
+        }
+        y_q[bi] = blk_q;
+
+        let mut deq = [0i16; 16];
+        deq[0] = (blk_q[0] as i32 * q.y_dc) as i16;
+        for k in 1..16 {
+            deq[k] = (blk_q[k] as i32 * q.y_ac) as i16;
+        }
+        let res = idct4x4(&deq);
+        for r in 0..4 {
+            for c in 0..4 {
+                let p = pred_y[(by * 4 + r) * 16 + bx * 4 + c] as i32;
+                let rr = res[r * 4 + c] as i32;
+                let dst_y_idx = (mb_yp + by * 4 + r) * y_stride + mb_xp + bx * 4 + c;
+                rec_y[dst_y_idx] = (p + rr).clamp(0, 255) as u8;
+            }
+        }
+    }
+
+    // --- Chroma prediction: each 4×4 chroma uses `chroma_round` of sum
+    //     of covered luma sub-MVs (matches the decoder exactly).
+    let mb_xc = mb_x * 8;
+    let mb_yc = mb_y * 8;
+    let mut u_q = [[0i16; 16]; 4];
+    let mut v_q = [[0i16; 16]; 4];
+    for plane_sel in 0..2 {
+        let (src, refp, rec, q_coeffs) = match plane_sel {
+            0 => (src_u, ref_u, &mut *rec_u, &mut u_q),
+            _ => (src_v, ref_v, &mut *rec_v, &mut v_q),
+        };
+        let ref_plane_uv = RefPlane {
+            data: refp,
+            stride: uv_stride,
+            width: uv_stride,
+            height: uv_buf_h,
+        };
+        let mut pred_uv = [0u8; 64];
+        for i in 0..4 {
+            let by = i / 2;
+            let bx = i % 2;
+            let mut sum_r = 0i32;
+            let mut sum_c = 0i32;
+            for rr in 0..2 {
+                for cc in 0..2 {
+                    let li = (2 * by + rr) * 4 + (2 * bx + cc);
+                    sum_r += sub_mvs[li].row as i32;
+                    sum_c += sub_mvs[li].col as i32;
+                }
+            }
+            let cmv_r = chroma_round_enc(sum_r);
+            let cmv_c = chroma_round_enc(sum_c);
+            let dst_x = bx * 4;
+            let dst_y = by * 4;
+            let ref_x_fp = (mb_xc + dst_x) as i32 * 8 + cmv_c;
+            let ref_y_fp = (mb_yc + dst_y) as i32 * 8 + cmv_r;
+            bilinear_predict(
+                &ref_plane_uv,
+                ref_x_fp,
+                ref_y_fp,
+                &mut pred_uv,
+                8,
+                dst_x,
+                dst_y,
+                4,
+                4,
+            );
+        }
+        for bi in 0..4 {
+            let by = bi / 2;
+            let bx = bi % 2;
+            let mut blk = [0i32; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let sidx = (mb_yc + by * 4 + r) * uv_stride + mb_xc + bx * 4 + c;
+                    let s = src[sidx] as i32;
+                    let p = pred_uv[(by * 4 + r) * 8 + bx * 4 + c] as i32;
+                    blk[r * 4 + c] = s - p;
+                }
+            }
+            let coeffs = fdct4x4(&blk);
+            let mut blk_q = [0i16; 16];
+            blk_q[0] = quant(coeffs[0], q.uv_dc);
+            for k in 1..16 {
+                blk_q[k] = quant(coeffs[k], q.uv_ac);
+            }
+            q_coeffs[bi] = blk_q;
+            let mut deq = [0i16; 16];
+            deq[0] = (blk_q[0] as i32 * q.uv_dc) as i16;
+            for k in 1..16 {
+                deq[k] = (blk_q[k] as i32 * q.uv_ac) as i16;
+            }
+            let res = idct4x4(&deq);
+            for r in 0..4 {
+                for c in 0..4 {
+                    let pidx = (by * 4 + r) * 8 + bx * 4 + c;
+                    let p = pred_uv[pidx] as i32;
+                    let rr = res[r * 4 + c] as i32;
+                    let didx = (mb_yc + by * 4 + r) * uv_stride + mb_xc + bx * 4 + c;
+                    rec[didx] = (p + rr).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+
+    MbEncoded {
+        y2_coeffs: [0; 16],
+        y_coeffs: y_q,
+        u_coeffs: u_q,
+        v_coeffs: v_q,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder-side loop filter (applied to reconstruction so the next P-frame
+// sees post-filter samples).
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn apply_loop_filter_enc(
+    y_plane: &mut [u8],
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+    y_stride: usize,
+    uv_stride: usize,
+    y_buf_h: usize,
+    uv_buf_h: usize,
+    mb_w: usize,
+    mb_h: usize,
+    level: u8,
+    sharpness: u8,
+) {
+    if level == 0 {
+        return;
+    }
+    let params_mb = FilterParams::for_mb(level, sharpness, true);
+    let params_sb = FilterParams::for_mb(level, sharpness, false);
+    // filter_type = 0 (normal) — matches what the encoder signals.
+    for mb_y in 0..mb_h {
+        for mb_x in 1..mb_w {
+            let x = mb_x * 16;
+            let y0 = mb_y * 16;
+            filter_normal_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb, true);
+        }
+    }
+    for mb_y in 1..mb_h {
+        let y = mb_y * 16;
+        filter_normal_horizontal(y_plane, y_stride, y, y_stride, y_buf_h, params_mb, true);
+    }
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let bx0 = mb_x * 16;
+            let by0 = mb_y * 16;
+            for k in 1..4 {
+                let xv = bx0 + k * 4;
+                filter_normal_vertical(y_plane, y_stride, xv, y_stride, by0 + 16, params_sb, false);
+                let yh = by0 + k * 4;
+                filter_normal_horizontal(
+                    y_plane, y_stride, yh, y_stride, y_buf_h, params_sb, false,
+                );
+            }
+        }
+    }
+    for mb_y in 0..mb_h {
+        for mb_x in 1..mb_w {
+            let x = mb_x * 8;
+            let y0 = mb_y * 8;
+            filter_normal_vertical(u_plane, uv_stride, x, uv_stride, y0 + 8, params_mb, true);
+            filter_normal_vertical(v_plane, uv_stride, x, uv_stride, y0 + 8, params_mb, true);
+        }
+    }
+    for mb_y in 1..mb_h {
+        let y = mb_y * 8;
+        filter_normal_horizontal(u_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb, true);
+        filter_normal_horizontal(v_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb, true);
+    }
+    // Suppress unused imports when both paths route through normal mode.
+    let _ = filter_simple_vertical;
+    let _ = filter_simple_horizontal;
 }
 
 /// Copy the 3 planes of a video frame into MB-aligned (16/8 pixel) buffers.
@@ -2013,7 +3701,8 @@ mod tests {
         }
 
         // First MB — no neighbour MVs yet, NEAREST cannot apply.
-        let d0 = choose_pmb_decision(&src, &refp, stride, h, 0, 0, Mv::ZERO, Mv::ZERO);
+        let rec_y = vec![128u8; stride * h];
+        let d0 = choose_pmb_decision(&src, &refp, stride, h, 0, 0, Mv::ZERO, Mv::ZERO, &rec_y);
         assert!(
             matches!(d0, PMbDecision::NewMv(_)),
             "first MB should pick NEW_MV, got {:?}",
@@ -2024,7 +3713,7 @@ mod tests {
 
         // Second MB on the same row — neighbour chain now exposes
         // `first_mv` as `nearest`; NEAREST is free so it must win.
-        let d1 = choose_pmb_decision(&src, &refp, stride, h, 1, 0, first_mv, Mv::ZERO);
+        let d1 = choose_pmb_decision(&src, &refp, stride, h, 1, 0, first_mv, Mv::ZERO, &rec_y);
         assert!(
             matches!(d1, PMbDecision::NearestMv(_)),
             "second MB should pick NEAREST_MV, got {:?}",
@@ -2038,7 +3727,7 @@ mod tests {
         let h = 32;
         let buf = vec![100u8; stride * h];
         // Identical source = reference → zero SAD → SKIP.
-        let d = choose_pmb_decision(&buf, &buf, stride, h, 0, 0, Mv::ZERO, Mv::ZERO);
+        let d = choose_pmb_decision(&buf, &buf, stride, h, 0, 0, Mv::ZERO, Mv::ZERO, &buf);
         assert!(matches!(d, PMbDecision::Skip), "got {:?}", d);
     }
 
@@ -2057,10 +3746,11 @@ mod tests {
                 src[r * stride + c] = v;
             }
         }
-        let d = choose_pmb_decision(&src, &refp, stride, h, 0, 0, Mv::ZERO, Mv::ZERO);
+        let rec_y = vec![128u8; stride * h];
+        let d = choose_pmb_decision(&src, &refp, stride, h, 0, 0, Mv::ZERO, Mv::ZERO, &rec_y);
         assert!(
-            matches!(d, PMbDecision::IntraDc),
-            "expected IntraDc fallback, got {:?}",
+            matches!(d, PMbDecision::Intra { .. }),
+            "expected Intra fallback, got {:?}",
             d
         );
     }

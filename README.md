@@ -31,17 +31,21 @@ deblocking filter (simple + normal modes). Parses all inter MB modes
 
 | Path     | What's emitted                                                  |
 | -------- | --------------------------------------------------------------- |
-| I-frame  | DC_PRED 16x16 luma + 8x8 chroma, fixed qindex, default coef probs, single partition. |
-| P-frame  | REF_LAST with per-MB choice of SKIP, ZERO_MV, NEAREST_MV, NEAR_MV, NEW_MV, or intra-DC_PRED fallback. NEW_MV runs a full integer-pel SAD search over +-8 luma pixels then a quarter-pel 3x3 refinement using the same 6-tap filter the decoder applies. NEAREST / NEAR are preferred over NEW_MV when their SAD is within a small margin to save the MV-delta bits. Intra-DC_PRED kicks in when even the best inter candidate leaves a residual that is too large to code usefully (e.g. mid-frame scene cuts or uncovered regions). |
+| I-frame  | Per-MB choice among all 5 intra modes: DC / V / H / TM 16x16 plus B_PRED (10 per-4x4 sub-modes, greedy SSE-per-block selection), 8x8 chroma in DC / V / H / TM, fixed qindex, default coef probs, single partition. |
+| P-frame  | REF_LAST with per-MB choice of SKIP, ZERO_MV, NEAREST_MV, NEAR_MV, NEW_MV, SPLIT_MV (16x8 / 8x16 / 8x8 / 4x4 partitionings with per-partition integer + quarter-pel motion search), or an intra fallback (DC/V/H/TM picked by SSE) for MBs the inter candidates cannot reconstruct. NEW_MV runs a full integer-pel SAD search over +-8 luma pixels then a quarter-pel 3x3 refinement using the same 6-tap filter the decoder applies. NEAREST / NEAR are preferred over NEW_MV when their SAD is within a small margin to save the MV-delta bits. |
 
-Loop filter stays off on the write side (`filter_level = 0`).
+**Loop filter on the write side**: enabled, level derived from `qindex`
+via libvpx's heuristic `clamp(15 + qindex/8, 1, 63)`, sharpness 0,
+mode/ref deltas disabled. The encoder applies the same deblocking to
+its own reconstruction so subsequent P-frames reference post-filter
+samples — bit-exact with what the decoder produces.
 
-Not yet covered (planned follow-ups):
-
-- SPLIT MV (per-4x4 partitioned motion).
-- B_PRED / V_PRED / H_PRED / TM_PRED intra modes on the encode side.
-- Loop-filter write path (reconstruction already tracks what the decoder
-  produces, but the encoder still emits `filter_level = 0`).
+**Mode selection** is SSE-on-source for every candidate: each intra
+mode is predicted from the running reconstruction and the 16x16 / 8x8
+/ 4x4 SSE is summed; the lowest wins. B_PRED pays a fixed extra-bit
+margin before it can beat the best 16x16 mode. SPLIT_MV pays a
+per-partition margin over NEW_MV so it only wins when the per-partition
+motion reduces SAD substantially.
 
 ### Container
 

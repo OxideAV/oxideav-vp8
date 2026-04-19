@@ -65,7 +65,7 @@ pub mod tables;
 pub mod tokens;
 pub mod transform;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_container::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
 
@@ -77,18 +77,24 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(16384, 16384);
-    reg.register_decoder_impl(cid.clone(), caps, make_decoder);
+    // AVI FourCC claims — `VP80` is canonical, `VP8 ` (trailing space)
+    // is the Google-blessed variant found in some .avi files.
+    reg.register(
+        CodecInfo::new(cid.clone())
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .tags([CodecTag::fourcc(b"VP80"), CodecTag::fourcc(b"VP8 ")]),
+    );
+
     let enc_caps = CodecCapabilities::video("vp8_sw_enc")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(16383, 16383);
-    reg.register_encoder_impl(cid.clone(), enc_caps, make_encoder);
-
-    // AVI FourCC claims — `VP80` is canonical, `VP8 ` (trailing space)
-    // is the Google-blessed variant found in some .avi files.
-    for fcc in &[b"VP80", b"VP8 "] {
-        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
-    }
+    reg.register(
+        CodecInfo::new(cid)
+            .capabilities(enc_caps)
+            .encoder(make_encoder),
+    );
 }
 
 pub fn register_containers(reg: &mut ContainerRegistry) {

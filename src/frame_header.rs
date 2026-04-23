@@ -200,14 +200,20 @@ pub fn parse_inter_header(d: &mut BoolDecoder<'_>, probs: &PersistentProbs) -> R
     let log2_nb_partitions = d.read_literal(2) as u8;
     let quant = parse_quant(d)?;
 
+    // Per RFC 6386 §19.2 the order is:
+    //   refresh_golden_frame, refresh_alternate_frame,
+    //   [if !refresh_golden] copy_buffer_to_golden,
+    //   [if !refresh_alternate] copy_buffer_to_alternate,
+    //   sign_bias_golden, sign_bias_alternate,
+    //   refresh_entropy_probs, refresh_last.
+    let refresh_golden = d.read_bool(128);
     let refresh_alt = d.read_bool(128);
-    let copy_alt = if !refresh_alt {
+    let copy_golden = if !refresh_golden {
         d.read_literal(2) as u8
     } else {
         0
     };
-    let refresh_golden = d.read_bool(128);
-    let copy_golden = if !refresh_golden {
+    let copy_alt = if !refresh_alt {
         d.read_literal(2) as u8
     } else {
         0

@@ -2146,6 +2146,8 @@ fn emit_tokens(
                     nz_y_left[by] = nzf;
                 }
             }
+            // Per RFC 6386 §13.1: U subblocks (all 4 in raster order)
+            // precede V subblocks; they are NOT interleaved.
             for by in 0..2 {
                 for bx in 0..2 {
                     let idx = by * 2 + bx;
@@ -2161,6 +2163,11 @@ fn emit_tokens(
                     let nzf = if nz > 0 { 1 } else { 0 };
                     nz_uv_above[mb_x][bx] = nzf;
                     nz_u_left[by] = nzf;
+                }
+            }
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let idx = by * 2 + bx;
                     let nctx = nz_v_above[mb_x][bx] + nz_v_left[by];
                     let nz = encode_block(
                         &mut tok_enc,

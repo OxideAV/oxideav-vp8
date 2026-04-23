@@ -404,6 +404,11 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                     }
                 }
 
+                // Per RFC 6386 §13.1: the residue record has 4 DCTs for
+                // all U subblocks (raster order) followed by 4 DCTs for
+                // all V subblocks. Do NOT interleave U/V — they are
+                // separate contiguous groups in the bitstream, and they
+                // also maintain independent above/left nz-flag contexts.
                 for by in 0..2 {
                     for bx in 0..2 {
                         let idx = by * 2 + bx;
@@ -421,6 +426,11 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                         let nz_flag = if nz > 0 { 1 } else { 0 };
                         nz_uv_above[mb_x][bx] = nz_flag;
                         nz_u_left[by] = nz_flag;
+                    }
+                }
+                for by in 0..2 {
+                    for bx in 0..2 {
+                        let idx = by * 2 + bx;
                         let above_nz = nz_v_above[mb_x][bx];
                         let left_nz = nz_v_left[by];
                         let nctx = above_nz + left_nz;
@@ -1117,9 +1127,23 @@ fn reconstruct_intra_mb(
                     neigh.left[k] = y_plane[(dst_y + k) * y_stride + dst_x - 1];
                 }
             }
-            if dst_x > 0 && dst_y > 0 {
-                neigh.tl = y_plane[(dst_y - 1) * y_stride + dst_x - 1];
-            }
+            // Top-left "P" pixel. Per RFC 6386 §16.2 and libvpx, the TL
+            // defaults depend on availability:
+            //   * both available → actual pixel at (dst_y-1, dst_x-1)
+            //   * only above available (dst_x == 0, dst_y > 0) → 129
+            //     (matches the default for the left column)
+            //   * only left available (dst_x > 0, dst_y == 0) → 127
+            //     (matches the default for the above row)
+            //   * neither (top-left of frame) → 127
+            neigh.tl = if dst_x > 0 && dst_y > 0 {
+                y_plane[(dst_y - 1) * y_stride + dst_x - 1]
+            } else if dst_y > 0 {
+                // left column unavailable → default 129
+                129
+            } else {
+                // above unavailable → default 127
+                127
+            };
 
             let mut pred = [0u8; 16];
             predict_4x4(info.bmodes[i], &neigh, &mut pred, 4);
@@ -1153,12 +1177,17 @@ fn reconstruct_intra_mb(
                 left[j] = y_plane[(mb_y_px + j) * y_stride + mb_x_px - 1];
             }
         }
+        // TL pixel defaults: when only one neighbour is available, TL
+        // takes the *other* neighbour's default (127 for above-default
+        // row, 129 for left-default column).
         let tl = if above_avail && left_avail {
             Some(y_plane[(mb_y_px - 1) * y_stride + mb_x_px - 1])
         } else if above_avail {
-            Some(127)
-        } else if left_avail {
+            // left unavailable → default left column is 129
             Some(129)
+        } else if left_avail {
+            // above unavailable → default above row is 127
+            Some(127)
         } else {
             None
         };
@@ -1215,12 +1244,17 @@ fn reconstruct_intra_mb(
                 left[j] = plane[(mb_yc + j) * uv_stride + mb_xc - 1];
             }
         }
+        // TL pixel defaults: see matching logic in the B_PRED 4×4 path.
+        // When only one neighbour is available, TL takes the *other*
+        // neighbour's default (127 for above-default, 129 for left-default).
         let tl = if above_avail && left_avail {
             Some(plane[(mb_yc - 1) * uv_stride + mb_xc - 1])
         } else if above_avail {
-            Some(127)
-        } else if left_avail {
+            // left unavailable → default left column is 129
             Some(129)
+        } else if left_avail {
+            // above unavailable → default above row is 127
+            Some(127)
         } else {
             None
         };

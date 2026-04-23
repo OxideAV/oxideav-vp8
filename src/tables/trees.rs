@@ -154,18 +154,20 @@ pub const SUB_MV_REF_TREE: [i8; 6] = [
     -NEW_4X4 as i8,
 ];
 
-/// MV ref context probabilities. 4 probabilities × 6 contexts — RFC 6386 §16.3.
+/// MV ref context probabilities. 4 probabilities × 6 contexts — RFC 6386 §16.3
+/// `mv_counts_to_probs`. Each row is indexed by the corresponding cnt[i],
+/// NOT by cnt[0] — `probs[i] = mv_counts_to_probs[cnt[i]][i]`.
 pub const MV_COUNTS_TO_PROBS: [[u8; 4]; 6] = [
     [7, 1, 1, 143],
     [14, 18, 14, 107],
     [135, 64, 57, 68],
-    [60, 56, 108, 164],
+    [60, 56, 128, 65],
     [159, 134, 128, 34],
     [234, 188, 128, 28],
 ];
 
-/// MB split probabilities (§17.2 `mbsplit_probs`).
-pub const MBSPLIT_PROBS: [u8; 3] = [110, 111, 165];
+/// MB split probabilities (RFC 6386 §16.3 `split_mv_probs`).
+pub const MBSPLIT_PROBS: [u8; 3] = [110, 111, 150];
 
 /// Sub-MV reference probabilities given neighbour MVs.
 ///   Row 0: left == above == 0      → probs for [LEFT_4X4, ABOVE_4X4, ZERO_4X4]

@@ -1337,9 +1337,9 @@ fn integer_motion_search(
 /// Encode-time replica of `find_near_mvs` in the decoder, restricted to
 /// the REF_LAST-only encoder. Returns `(nearest, near, best, cnt)`.
 ///
-/// The neighbour MV is the decoder-visible MV: intra-in-P neighbours
-/// always contribute `Mv::ZERO` and count towards `cnt[0]` (matching the
-/// decoder's `REF_INTRA` branch).
+/// Must mirror the decoder's `find_near_mvs` bit-for-bit — out-of-frame
+/// and intra neighbours contribute NOTHING (not a ZERO MV). See the
+/// decoder's implementation for the full RFC 6386 §16.3 walk.
 fn find_near_mvs_enc(
     mb_mvs: &[Mv],
     mb_decisions: &[PMbDecision],
@@ -1347,55 +1347,70 @@ fn find_near_mvs_enc(
     mb_y: usize,
     mb_w: usize,
 ) -> (Mv, Mv, Mv, [u8; 4]) {
+    let mut mvs: [Mv; 4] = [Mv::ZERO; 4];
     let mut cnt = [0u8; 4];
-    let mut mvs: [Mv; 3] = [Mv::ZERO; 3];
-    let mut num_mvs = 0usize;
+    let mut mv_idx: usize = 0;
     let neighbours: [(isize, isize, u8); 3] = [(0, -1, 2), (-1, 0, 2), (-1, -1, 1)];
-    for &(dx, dy, weight) in &neighbours {
+
+    for (nb_idx, &(dx, dy, weight)) in neighbours.iter().enumerate() {
         let nx = mb_x as isize + dx;
         let ny = mb_y as isize + dy;
         if nx < 0 || ny < 0 || (nx as usize) >= mb_w {
-            cnt[0] += weight;
-            continue;
+            continue; // out-of-frame = intra, no contribution
         }
         let idx = (ny as usize) * mb_w + (nx as usize);
         let nmv = match mb_decisions.get(idx) {
-            Some(d) if d.is_intra() => {
-                cnt[0] += weight;
-                continue;
-            }
+            Some(d) if d.is_intra() => continue, // intra, no contribution
             Some(_) => mb_mvs[idx],
-            None => Mv::ZERO,
+            None => continue,
         };
+
         if nmv.row == 0 && nmv.col == 0 {
             cnt[0] += weight;
+            continue;
+        }
+
+        if nb_idx == 0 {
+            mv_idx = 1;
+            mvs[1] = nmv;
+            cnt[1] += weight;
         } else {
-            let mut matched = false;
-            for i in 0..num_mvs {
-                if mvs[i] == nmv {
-                    cnt[i + 1] += weight;
-                    matched = true;
-                    break;
-                }
+            if mvs[mv_idx] != nmv {
+                mv_idx += 1;
+                mvs[mv_idx] = nmv;
             }
-            if !matched && num_mvs < 2 {
-                mvs[num_mvs] = nmv;
-                cnt[num_mvs + 1] = weight;
-                num_mvs += 1;
-            }
+            cnt[mv_idx] += weight;
         }
     }
-    let nearest = mvs[0];
-    let near = mvs[1];
-    let best = if cnt[1] >= cnt[0] { nearest } else { Mv::ZERO };
-    (nearest, near, best, cnt)
+
+    // REF_LAST-only encoder never emits SPLITMV, so the post-pass to
+    // merge aboveleft-into-nearest based on cnt[CNT_SPLITMV] is a no-op
+    // here — but keep the same shape as the decoder.
+    if mv_idx == 3 && mvs[3] == mvs[1] {
+        cnt[1] += 1;
+    }
+    cnt[3] = 0; // no SPLITMV neighbours in REF_LAST-only encoder
+
+    if cnt[2] > cnt[1] {
+        cnt.swap(1, 2);
+        mvs.swap(1, 2);
+    }
+    if cnt[1] >= cnt[0] {
+        mvs[0] = mvs[1];
+    }
+
+    (mvs[1], mvs[2], mvs[0], cnt)
 }
 
-/// Encode-time replica of the decoder's `mv_ref_probs` — selects a row of
-/// `MV_COUNTS_TO_PROBS` by `cnt[0]`.
+/// Encode-time replica of the decoder's `mv_ref_probs`. Each `cnt[i]`
+/// indexes a row of `MV_COUNTS_TO_PROBS` and selects column `i`.
 fn mv_ref_probs_enc(cnt: &[u8; 4]) -> [u8; 4] {
-    let row = (cnt[0].min(5)) as usize;
-    MV_COUNTS_TO_PROBS[row]
+    [
+        MV_COUNTS_TO_PROBS[cnt[0].min(5) as usize][0],
+        MV_COUNTS_TO_PROBS[cnt[1].min(5) as usize][1],
+        MV_COUNTS_TO_PROBS[cnt[2].min(5) as usize][2],
+        MV_COUNTS_TO_PROBS[cnt[3].min(5) as usize][3],
+    ]
 }
 
 /// Encode-time replica of the decoder's `chroma_avg4`. Averages 4 luma

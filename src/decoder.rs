@@ -920,9 +920,30 @@ fn sub_mv_context(left: &Mv, above: &Mv) -> usize {
     }
 }
 
-/// Approximate RFC §16.3 `find_near_mvs`. Returns (nearest, near, best, cnt)
-/// where `cnt` is a 4-entry neighbour-count vector used to derive the MV
-/// mode reference probabilities.
+/// RFC 6386 §16.3 `find_near_mvs`. Returns (nearest, near, best, cnt)
+/// where `cnt` is the 4-entry neighbour-count vector used to derive the
+/// MV mode reference probabilities.
+///
+/// This follows the reference C pseudo-code near-verbatim:
+///   * `mv` and `cntx` start pointing at slot 0 (ZEROZERO / BEST).
+///   * For each of the three neighbours (above, left, aboveleft with
+///     weights 2, 2, 1):
+///     - If the neighbour is INTRA (`ref_frame == CURRENT_FRAME`), it
+///       contributes nothing.
+///     - Else if the neighbour's MV (after sign-bias normalisation) is
+///       (0,0), its weight is added to `cnt[CNT_ZEROZERO]`.
+///     - Else the MV is added as the next distinct candidate (NEAREST
+///       → NEAR → a transient slot used as a merge check).
+///   * After aboveleft: if a 3rd distinct candidate landed in the
+///     SPLITMV temp slot and it equals NEAREST, merge it. Then reset
+///     `cnt[CNT_SPLITMV]` to the weighted count of neighbours whose
+///     y_mode is SPLITMV.
+///   * Swap NEAR/NEAREST if cnt[NEAR] > cnt[NEAREST].
+///   * `best` is NEAREST if `cnt[NEAREST] >= cnt[BEST]`, else ZERO.
+///
+/// Out-of-frame neighbours are treated like INTRA neighbours (they
+/// contribute nothing). This is what libvpx does via its mb_info
+/// storage layout (the frame border MBs are pre-zeroed as intra).
 fn find_near_mvs(
     mb_info: &[MbInfo],
     mb_x: usize,
@@ -931,88 +952,113 @@ fn find_near_mvs(
     ref_frame: u8,
     header: &FrameHeader,
 ) -> (Mv, Mv, Mv, [u8; 4]) {
-    // cnt[0] = counts of "same ref, zero mv"
-    // cnt[1] = counts of nearest candidate
-    // cnt[2] = counts of near candidate
-    // cnt[3] = SPLIT_MV flag counter
+    // mvs[0]=BEST/ZEROZERO, mvs[1]=NEAREST, mvs[2]=NEAR, mvs[3]=SPLITMV-temp
+    let mut mvs: [Mv; 4] = [Mv::ZERO; 4];
     let mut cnt = [0u8; 4];
-    let mut mvs: [Mv; 3] = [Mv::ZERO; 3]; // slot 0 = nearest, slot 1 = near, slot 2 = best
-    let mut num_mvs = 0;
+    // Pointer-like index into mvs/cnt — advances as new distinct MVs are seen.
+    let mut mv_idx: usize = 0;
 
-    // Iterate neighbours: above, left, above-left, with weights [2, 2, 1].
+    // Neighbours: above (0,-1,w=2), left (-1,0,w=2), aboveleft (-1,-1,w=1).
     let neighbours: [(isize, isize, u8); 3] = [(0, -1, 2), (-1, 0, 2), (-1, -1, 1)];
+    let mut splitmv_count = 0u8; // counts how many neighbours are SPLITMV (weighted)
 
-    for &(dx, dy, weight) in &neighbours {
+    for (nb_idx, &(dx, dy, weight)) in neighbours.iter().enumerate() {
         let nx = mb_x as isize + dx;
         let ny = mb_y as isize + dy;
-        if nx < 0 || ny < 0 || nx as usize >= mb_w {
-            cnt[0] += weight;
+        let out_of_frame = nx < 0 || ny < 0 || nx as usize >= mb_w;
+        // Treat out-of-frame as intra (contributes nothing).
+        if out_of_frame {
             continue;
         }
         let n = &mb_info[(ny as usize) * mb_w + (nx as usize)];
+        // Intra neighbours contribute nothing.
         if n.ref_frame == REF_INTRA {
-            cnt[0] += weight;
             continue;
         }
-        // Apply sign-bias normalisation.
-        let mut nmv = n.mv;
-        let ref_flip = (ref_frame == REF_GOLDEN) != header.sign_bias_golden
-            || (ref_frame == REF_ALT) != header.sign_bias_alternate;
-        let cur_sign = ref_frame_sign_bias(ref_frame, header);
-        let n_sign = ref_frame_sign_bias(n.ref_frame, header);
-        let _ = ref_flip;
-        if cur_sign != n_sign {
-            nmv = Mv::new(-nmv.row as i32, -nmv.col as i32);
-        }
-        if n.ref_frame != ref_frame {
-            // Different reference — counts as zero but doesn't contribute MV.
-            cnt[0] += weight;
-            continue;
-        }
-        if nmv.row == 0 && nmv.col == 0 {
-            cnt[0] += weight;
-        } else {
-            // Merge into slots 0..2 with counting.
-            let mut matched = false;
-            for i in 0..num_mvs {
-                if mvs[i] == nmv {
-                    cnt[i + 1] += weight;
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched && num_mvs < 2 {
-                mvs[num_mvs] = nmv;
-                cnt[num_mvs + 1] = weight;
-                num_mvs += 1;
-            }
-        }
+
+        // Track SPLITMV weighted count for cnt[CNT_SPLITMV] at the end.
         if n.inter_split_mode.is_some() {
-            cnt[3] += weight;
+            splitmv_count += weight;
+        }
+
+        // Apply sign-bias flip if neighbour's ref sign-bias differs from ours.
+        let mut nmv = n.mv;
+        if ref_frame_sign_bias(ref_frame, header) != ref_frame_sign_bias(n.ref_frame, header) {
+            nmv = Mv::new(-(nmv.row as i32), -(nmv.col as i32));
+        }
+
+        if nmv.row == 0 && nmv.col == 0 {
+            // Zero MV — add weight to current slot. In the RFC, this is
+            // `cnt[CNT_ZEROZERO]` for above, but for left/aboveleft, the
+            // zero-MV weight still goes to cnt[CNT_ZEROZERO] — see the
+            // explicit `cnt[CNT_ZEROZERO] += ...` lines in the left and
+            // aboveleft paths.
+            cnt[0] += weight;
+            continue;
+        }
+
+        // Non-zero MV.
+        if nb_idx == 0 {
+            // First neighbour (above) always becomes NEAREST.
+            mv_idx = 1;
+            mvs[1] = nmv;
+            cnt[1] += weight;
+        } else {
+            // Merge if matches current slot's MV, else advance slot.
+            if mvs[mv_idx] != nmv {
+                mv_idx += 1;
+                mvs[mv_idx] = nmv;
+            }
+            cnt[mv_idx] += weight;
         }
     }
-    let nearest = mvs[0];
-    let near = mvs[1];
-    let best = if cnt[1] >= cnt[0] { nearest } else { Mv::ZERO };
-    (nearest, near, best, cnt)
+
+    // Post-pass 1: if a 3rd distinct candidate was produced (landed in
+    // SPLITMV-temp slot 3) AND it equals NEAREST, merge it.
+    if mv_idx == 3 && mvs[3] == mvs[1] {
+        cnt[1] += 1;
+    }
+
+    // Post-pass 2: reset cnt[CNT_SPLITMV] to the actual weighted count of
+    // SPLITMV-mode neighbours (this overwrites any use of cnt[3] as a
+    // transient counter above).
+    cnt[3] = splitmv_count;
+
+    // Swap NEAR and NEAREST if cnt[NEAR] > cnt[NEAREST].
+    if cnt[2] > cnt[1] {
+        cnt.swap(1, 2);
+        mvs.swap(1, 2);
+    }
+
+    // Best is NEAREST if cnt[NEAREST] >= cnt[BEST], else ZERO (slot 0).
+    if cnt[1] >= cnt[0] {
+        mvs[0] = mvs[1];
+    }
+
+    (mvs[1], mvs[2], mvs[0], cnt)
 }
 
 /// Compute the MV reference tree probabilities from the neighbour-count
-/// vector. Mirrors RFC 6386 §16.3 pseudo-code.
+/// vector. RFC 6386 §16.3:
+///
+/// ```c
+/// probs[0] = mv_counts_to_probs[cnt[0]][0];
+/// probs[1] = mv_counts_to_probs[cnt[1]][1];
+/// probs[2] = mv_counts_to_probs[cnt[2]][2];
+/// probs[3] = mv_counts_to_probs[cnt[3]][3];
+/// ```
+///
+/// Each `cnt[i]` indexes a row independently of the others, and
+/// selects column `i` from that row. The max count is 2+2+1=5 (the
+/// neighbour weights), so counts ≤ 5 always — the `.min(5)` is a
+/// safety clamp against malformed input.
 fn mv_ref_probs(cnt: &[u8; 4]) -> [u8; 4] {
-    // The RFC maps cnt[0..4] into one of the 6 rows of MV_COUNTS_TO_PROBS
-    // according to the scoring function below. A simpler but
-    // still-valid mapping: pick the row based on cnt[0] alone. This
-    // approximates libvpx's behaviour and is enough for the decoder to
-    // parse the stream in the absence of exact count-table semantics.
-    let mut probs = [128u8; 4];
-    let row = (cnt[0].min(5)) as usize;
-    let r = &MV_COUNTS_TO_PROBS[row];
-    probs[0] = r[0];
-    probs[1] = r[1];
-    probs[2] = r[2];
-    probs[3] = r[3];
-    probs
+    [
+        MV_COUNTS_TO_PROBS[cnt[0].min(5) as usize][0],
+        MV_COUNTS_TO_PROBS[cnt[1].min(5) as usize][1],
+        MV_COUNTS_TO_PROBS[cnt[2].min(5) as usize][2],
+        MV_COUNTS_TO_PROBS[cnt[3].min(5) as usize][3],
+    ]
 }
 
 fn ref_frame_sign_bias(rf: u8, header: &FrameHeader) -> bool {

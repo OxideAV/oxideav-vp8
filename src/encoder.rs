@@ -1398,13 +1398,16 @@ fn mv_ref_probs_enc(cnt: &[u8; 4]) -> [u8; 4] {
     MV_COUNTS_TO_PROBS[row]
 }
 
-/// Encode-time replica of the decoder's `chroma_round`. Converts the sum
-/// of 4 luma sub-MV components (in 1/8-pel units) into the chroma MV
-/// component that the decoder will apply to the chroma plane.
+/// Encode-time replica of the decoder's `chroma_avg4`. Averages 4 luma
+/// sub-MV components into the 1/8-chroma-pel MV component per RFC 6386
+/// §18.1 (the `avg` function with the negative-branch sign fixup).
 #[inline]
 fn chroma_round_enc(sum: i32) -> i32 {
-    let sign = if sum < 0 { -1 } else { 1 };
-    ((sum + sign * 4) / 8) * 2
+    if sum >= 0 {
+        (sum + 4) / 8
+    } else {
+        -((-sum + 4) / 8)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

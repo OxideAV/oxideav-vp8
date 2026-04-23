@@ -1338,8 +1338,11 @@ fn reconstruct_inter_mb(
     let mb_y_px = mb_y * 16;
 
     // --- Luma prediction via sub-pel 6-tap filter ---
-    // Each 4×4 luma sub-block has its own MV (either derived from the MB
-    // MV or from SPLITMV sub-partitions).
+    // Each 4×4 luma sub-block has its own MV. We keep MVs throughout in
+    // 1/8-luma-pel units (matching the 8-phase sixtap filter), which is
+    // what the stream uses after the §18.1 "motion vectors are all
+    // doubled" transform. The encoder side stores and emits MVs the
+    // same way.
     for i in 0..16 {
         let by = i / 4;
         let bx = i % 4;
@@ -1363,7 +1366,12 @@ fn reconstruct_inter_mb(
 
     // --- Chroma prediction via bilinear 2-tap filter ---
     // Each 4×4 chroma sub-block covers 2×2 luma sub-blocks. The chroma
-    // MV is the average of the 4 luma sub-MVs it covers.
+    // MV is the average of the 4 luma sub-MVs it covers (RFC 6386 §18.1):
+    //
+    //   chroma_mv = (sum + 4) / 8   for sum >= 0
+    //   chroma_mv = -((-sum + 4) / 8)   for sum < 0
+    //
+    // Result is already in 1/8-chroma-pel units (no further scaling).
     let mb_xc = mb_x * 8;
     let mb_yc = mb_y * 8;
     for i in 0..4 {
@@ -1379,9 +1387,8 @@ fn reconstruct_inter_mb(
                 sum_c += info.sub_mvs[li].col as i32;
             }
         }
-        // Round-half-to-zero like libvpx.
-        let cmv_r = chroma_round(sum_r);
-        let cmv_c = chroma_round(sum_c);
+        let cmv_r = chroma_avg4(sum_r);
+        let cmv_c = chroma_avg4(sum_c);
         let dst_x = mb_xc + bx * 4;
         let dst_y = mb_yc + by * 4;
         let ref_x_fp = (dst_x as i32) * 8 + cmv_c;
@@ -1460,16 +1467,26 @@ fn reconstruct_inter_mb(
     }
 }
 
-/// Round a sum of 4 luma 1/8-pel MV components to a chroma 1/8-pel value.
-/// libvpx's rule (RFC 6386 §14): divide by 4, rounding towards zero. The
-/// sub-pel phase is preserved since chroma is on a 2× coarser grid.
+/// Average 4 luma MVs (1/4-luma-pel units) into one chroma MV
+/// (1/8-chroma-pel units), per RFC 6386 §18.1:
+///
+/// ```text
+/// chroma_mv = (sum + 4) / 8    if sum >= 0
+///           = -((-sum + 4) / 8) if sum < 0
+/// ```
+///
+/// The shift divides by 8 rather than 4 because chroma pixels have
+/// twice the diameter of luma pixels (so halving is "baked in"). The
+/// asymmetric negative-branch handling matches `(s + 4) >> 3` with
+/// explicit sign propagation, avoiding the C-undefined-for-negatives
+/// right-shift.
 #[inline]
-fn chroma_round(sum: i32) -> i32 {
-    // Match libvpx's `mv_as_chroma`: `((sum + sign * 4) / 8) * 2` — that
-    // is, average of 4 MVs with rounding-toward-zero scaled from 1/8-pel
-    // luma to 1/8-pel chroma (same units, coarser grid halves the MV).
-    let sign = if sum < 0 { -1 } else { 1 };
-    ((sum + sign * 4) / 8) * 2
+fn chroma_avg4(sum: i32) -> i32 {
+    if sum >= 0 {
+        (sum + 4) / 8
+    } else {
+        -((-sum + 4) / 8)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

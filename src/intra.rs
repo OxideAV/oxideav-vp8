@@ -314,7 +314,10 @@ pub fn predict_4x4(mode: i32, n: &B4x4Neighbours, out: &mut [u8], stride: usize)
             }
         }
         B_VR_PRED => {
-            // mode 6
+            // B_VR_PRED — "SSE (vertical right)" diagonal, slope +1/2.
+            // Formulas from RFC 6386 §12.4 (the `E` array is the
+            // concatenated [L3,L2,L1,L0,TL,A0..A3] edge); derived table
+            // below spells it out per-cell.
             set!(0, 0, avg2(lp, p0));
             set!(0, 1, avg2(p0, p1));
             set!(0, 2, avg2(p1, p2));
@@ -323,17 +326,21 @@ pub fn predict_4x4(mode: i32, n: &B4x4Neighbours, out: &mut [u8], stride: usize)
             set!(1, 1, avg3(lp, p0, p1));
             set!(1, 2, avg3(p0, p1, p2));
             set!(1, 3, avg3(p1, p2, p3));
-            set!(2, 0, avg2(l0, lp));
+            set!(2, 0, avg3(l1, l0, lp));
             set!(2, 1, avg2(lp, p0));
             set!(2, 2, avg2(p0, p1));
             set!(2, 3, avg2(p1, p2));
-            set!(3, 0, avg3(l1, l0, lp));
+            set!(3, 0, avg3(l2, l1, l0));
             set!(3, 1, avg3(l0, lp, p0));
             set!(3, 2, avg3(lp, p0, p1));
             set!(3, 3, avg3(p0, p1, p2));
         }
         B_VL_PRED => {
-            // mode 7
+            // B_VL_PRED — "SSW (vertical left)" diagonal. Per RFC 6386
+            // §12.4, B[2][3] and B[3][3] do NOT strictly follow the
+            // diagonal pattern — they instead use avg3 of A[4..7] and
+            // avg3 of A[5..8] respectively. All other cells match the
+            // pattern laid out below.
             set!(0, 0, avg2(p0, p1));
             set!(0, 1, avg2(p1, p2));
             set!(0, 2, avg2(p2, p3));
@@ -345,30 +352,42 @@ pub fn predict_4x4(mode: i32, n: &B4x4Neighbours, out: &mut [u8], stride: usize)
             set!(2, 0, avg2(p1, p2));
             set!(2, 1, avg2(p2, p3));
             set!(2, 2, avg2(p3, p4));
-            set!(2, 3, avg2(p4, p5));
+            set!(2, 3, avg3(p4, p5, p6)); // RFC: B[2][3] = avg3p(A+5)
             set!(3, 0, avg3(p1, p2, p3));
             set!(3, 1, avg3(p2, p3, p4));
             set!(3, 2, avg3(p3, p4, p5));
-            set!(3, 3, avg3(p4, p5, p6));
+            set!(3, 3, avg3(p5, p6, p7)); // RFC: B[3][3] = avg3p(A+6)
         }
         B_HD_PRED => {
+            // B_HD_PRED — "ESE (horizontal down)" diagonal. Per RFC
+            // 6386 §12.4 (where E = [L3,L2,L1,L0,TL,A0..A3]):
+            //
+            //   B[0][0] = B[1][2] = avg2(L0, TL)
+            //   B[0][1] = B[1][3] = avg3(L0, TL, A0)
+            //   B[0][2]           = avg3(TL, A0, A1)
+            //   B[0][3]           = avg3(A0, A1, A2)
+            //   B[1][0] = B[2][2] = avg2(L1, L0)
+            //   B[1][1] = B[2][3] = avg3(L1, L0, TL)
+            //   B[2][0] = B[3][2] = avg2(L2, L1)
+            //   B[2][1] = B[3][3] = avg3(L2, L1, L0)
+            //   B[3][0]           = avg2(L3, L2)
+            //   B[3][1]           = avg3(L3, L2, L1)
             set!(0, 0, avg2(l0, lp));
-            set!(0, 1, avg3(l1, l0, lp));
-            set!(0, 2, avg3(l0, lp, p0));
-            set!(0, 3, avg3(lp, p0, p1));
+            set!(0, 1, avg3(l0, lp, p0));
+            set!(0, 2, avg3(lp, p0, p1));
+            set!(0, 3, avg3(p0, p1, p2));
             set!(1, 0, avg2(l1, l0));
-            set!(1, 1, avg3(l2, l1, l0));
-            set!(1, 2, avg3(l0, lp, p0));
-            set!(1, 3, avg3(lp, p0, p1));
+            set!(1, 1, avg3(l1, l0, lp));
+            set!(1, 2, avg2(l0, lp));
+            set!(1, 3, avg3(l0, lp, p0));
             set!(2, 0, avg2(l2, l1));
-            set!(2, 1, avg3(l3, l2, l1));
+            set!(2, 1, avg3(l2, l1, l0));
             set!(2, 2, avg2(l1, l0));
             set!(2, 3, avg3(l1, l0, lp));
             set!(3, 0, avg2(l3, l2));
-            set!(3, 1, avg3(l3, l2, l3));
+            set!(3, 1, avg3(l3, l2, l1));
             set!(3, 2, avg2(l2, l1));
             set!(3, 3, avg3(l2, l1, l0));
-            // Adjust the duplicates per RFC 6386 §16.2 figure.
         }
         B_HU_PRED => {
             set!(0, 0, avg2(l0, l1));

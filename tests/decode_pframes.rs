@@ -171,25 +171,24 @@ fn decode_gray_pframes_matches_reference() {
 #[test]
 fn decode_smpte_pframes_matches_reference() {
     // Static SMPTE bars — no motion, but colour content. Exercises
-    // per-MB token decode + reference copy on chroma.
-    //
-    // Note: the low PSNR bar reflects a known keyframe-decode bug in the
-    // intra-16×16 / B_PRED neighbour handling (see lib.rs header). P-
-    // frames propagate that error but should not amplify it significantly.
+    // per-MB token decode + reference copy on chroma. After the
+    // mv_ref_probs / find_near_mvs RFC-exact fix, P-frames are
+    // essentially bit-exact (≥60 dB).
     run_psnr_check(
         "tests/fixtures/smpte_pframes.ivf",
         "tests/fixtures/smpte_pframes.yuv",
-        9.0,
+        50.0,
     );
 }
 
 #[test]
 fn decode_mandel_pframes_matches_reference() {
     // Mandelbrot iteration — continuous motion, covers inter prediction
-    // with actual non-zero MVs.
+    // with actual non-zero MVs. Drift accumulates over frames but the
+    // average stays well above 25 dB post mv-ref-probs fix.
     run_psnr_check(
         "tests/fixtures/mandel.ivf",
         "tests/fixtures/mandel.yuv",
-        5.0,
+        25.0,
     );
 }

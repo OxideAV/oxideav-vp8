@@ -1623,3 +1623,65 @@ fn apply_loop_filter(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `mv_ref_probs` must follow RFC 6386 §16.3 exactly —
+    /// each `probs[i]` is taken from `MV_COUNTS_TO_PROBS[cnt[i]][i]`.
+    /// A prior version indexed all four columns by `cnt[0]`, which
+    /// caused every inter MB after the first to read mode bits with
+    /// the wrong probabilities and cascaded coefficient divergence
+    /// through the whole P-frame. See commit log.
+    #[test]
+    fn mv_ref_probs_indexes_each_row_by_matching_cnt() {
+        // Spot-check: cnt = [2, 5, 0, 0] should give
+        //   [COUNTS[2][0], COUNTS[5][1], COUNTS[0][2], COUNTS[0][3]]
+        //   = [135, 188, 1, 143].
+        let got = mv_ref_probs(&[2, 5, 0, 0]);
+        assert_eq!(
+            got,
+            [
+                MV_COUNTS_TO_PROBS[2][0],
+                MV_COUNTS_TO_PROBS[5][1],
+                MV_COUNTS_TO_PROBS[0][2],
+                MV_COUNTS_TO_PROBS[0][3],
+            ]
+        );
+        assert_eq!(got, [135, 188, 1, 143]);
+
+        // All-zero cnt → row 0 for each column.
+        let z = mv_ref_probs(&[0, 0, 0, 0]);
+        assert_eq!(z, [7, 1, 1, 143]);
+
+        // Clamping: cnt[i] > 5 should clamp to row 5.
+        let clamped = mv_ref_probs(&[6, 7, 10, 100]);
+        assert_eq!(
+            clamped,
+            [
+                MV_COUNTS_TO_PROBS[5][0],
+                MV_COUNTS_TO_PROBS[5][1],
+                MV_COUNTS_TO_PROBS[5][2],
+                MV_COUNTS_TO_PROBS[5][3],
+            ]
+        );
+    }
+
+    /// Regression: MV_COUNTS_TO_PROBS row 3 must match RFC 6386
+    /// `mv_counts_to_probs[3] = { 60, 56, 128, 65 }`. Previously the
+    /// table had [60, 56, 108, 164], causing MV mode bits to decode
+    /// at the wrong probability for certain neighbour configurations.
+    #[test]
+    fn mv_counts_to_probs_row_3_matches_rfc() {
+        assert_eq!(MV_COUNTS_TO_PROBS[3], [60, 56, 128, 65]);
+    }
+
+    /// Regression: `MBSPLIT_PROBS` must match RFC 6386
+    /// `split_mv_probs = { 110, 111, 150 }`. Previously [110, 111, 165].
+    #[test]
+    fn mbsplit_probs_match_rfc() {
+        use crate::tables::trees::MBSPLIT_PROBS;
+        assert_eq!(MBSPLIT_PROBS, [110, 111, 150]);
+    }
+}

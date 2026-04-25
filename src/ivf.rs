@@ -21,11 +21,11 @@
 
 use std::io::{Seek, SeekFrom, Write};
 
-use oxideav_container::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Rational,
     Result, StreamInfo, TimeBase,
 };
+use oxideav_core::{ContainerRegistry, Demuxer, Muxer, ProbeData, ReadSeek, WriteSeek};
 
 const IVF_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 12;

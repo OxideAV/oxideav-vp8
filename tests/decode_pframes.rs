@@ -6,7 +6,7 @@
 
 use std::fs;
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{CodecId, Frame, Packet, TimeBase};
 use oxideav_vp8::{decoder::Vp8Decoder, frame_tag, frame_tag::FrameType};
 

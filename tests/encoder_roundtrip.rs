@@ -9,7 +9,7 @@
 //!     (show_frame set, frame_type=0) followed by the 3-byte start code
 //!     `9d 01 2a`.
 
-use oxideav_codec::Decoder;
+use oxideav_core::Decoder;
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, Rational, TimeBase, VideoFrame,
     VideoPlane,

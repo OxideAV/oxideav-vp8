@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.0...v0.1.1) - 2026-04-25
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- raise pframe PSNR bars + add regressions for mv-ref-probs fix
+- fix MV ref probs to index per-column, correct RFC 6386 tables
+- correct chroma MV averaging to RFC 6386 §18.1 formula
+- fix intra-4x4 B_VR / B_VL / B_HD prediction formulas
+- fix inter-frame header field order (golden before alt)
+- fix KF_BMODE_PROB table, TL defaults, and U/V token order
+- add BSD-3-Clause attribution for libvpx-derived code
+- release v0.0.4
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-vp8/compare/v0.0.3...v0.1.0) - 2026-04-19
 
 ### Other

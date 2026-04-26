@@ -9,8 +9,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Result, TimeBase, VideoFrame,
-    VideoPlane,
+    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::bool_decoder::BoolDecoder;
@@ -146,7 +145,6 @@ impl Decoder for Vp8Decoder {
         let frame = decode_frame_with_state(&packet.data, &mut self.state)?;
         let mut vf = frame;
         vf.pts = self.pending_pts;
-        vf.time_base = self.pending_tb;
         self.queued.push_back(vf);
         Ok(())
     }
@@ -592,11 +590,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
     }
 
     Ok(VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: width as u32,
-        height: height as u32,
         pts: None,
-        time_base: TimeBase::new(1, 1000),
         planes: vec![
             VideoPlane {
                 stride: width,

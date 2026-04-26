@@ -63,9 +63,9 @@ fn decode_first_keyframe_matches_reference() {
     assert_eq!(kf.height, 64);
 
     let vf = decode_frame(&frame).expect("decode frame");
-    assert_eq!(vf.width, 64);
-    assert_eq!(vf.height, 64);
     assert_eq!(vf.planes.len(), 3);
+    assert_eq!(vf.planes[0].stride, 64);
+    assert_eq!(vf.planes[0].data.len(), 64 * 64);
 
     // Reference YUV is 64*64 + 32*32*2 = 4096 + 2048 = 6144 bytes per frame.
     let frame_size = 64 * 64 + 32 * 32 * 2;

@@ -29,11 +29,7 @@ fn make_frame(y: &[u8], u: &[u8], v: &[u8]) -> VideoFrame {
     assert_eq!(u.len(), cw * ch);
     assert_eq!(v.len(), cw * ch);
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: W,
-        height: H,
         pts: None,
-        time_base: TimeBase::new(1, 1000),
         planes: vec![
             VideoPlane {
                 stride: W as usize,
@@ -102,8 +98,7 @@ fn roundtrip_solid_color_high_psnr() {
     let frame = make_frame(&y, &u, &v);
     let encoded = encode_keyframe(W, H, QINDEX, &frame).expect("encode");
     let decoded = decode_frame(&encoded).expect("decode");
-    assert_eq!(decoded.width, W);
-    assert_eq!(decoded.height, H);
+    assert_eq!(decoded.planes[0].stride, W as usize);
     let py = psnr(&decoded.planes[0].data, &y);
     let pu = psnr(&decoded.planes[1].data, &u);
     let pv = psnr(&decoded.planes[2].data, &v);

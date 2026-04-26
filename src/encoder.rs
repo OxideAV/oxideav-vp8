@@ -247,18 +247,12 @@ impl Encoder for Vp8Encoder {
             Frame::Video(v) => v,
             _ => return Err(Error::invalid("vp8 encoder: video frames only")),
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(format!(
-                "vp8 encoder: frame dims {}x{} do not match encoder {}x{}",
-                v.width, v.height, self.width, self.height
-            )));
-        }
-        if v.format != PixelFormat::Yuv420P {
-            return Err(Error::invalid("vp8 encoder: only Yuv420P input frames"));
-        }
         if v.planes.len() < 3 {
             return Err(Error::invalid("vp8 encoder: expected 3 planes"));
         }
+        // Frame dims and pixel format are now stream-level — validated
+        // by the caller / pipeline against `output_params`. The encoder
+        // trusts the planes match `self.width × self.height` Yuv420P.
 
         let is_keyframe = self.last_frame.is_none();
         let (data, reference) = if is_keyframe {
@@ -323,7 +317,8 @@ fn encode_keyframe_and_reconstruct(
     let uv_buf_h = mb_h * 8;
 
     // Copy (and MB-pad) the source into our own buffers.
-    let (src_y, src_u, src_v) = extract_mb_padded(frame, mb_w, mb_h)?;
+    let (src_y, src_u, src_v) =
+        extract_mb_padded(frame, width as usize, height as usize, mb_w, mb_h)?;
 
     // Allocate reconstruction buffers (they track, pixel-for-pixel, what
     // the decoder will produce — needed for intra prediction context in
@@ -695,7 +690,8 @@ fn encode_pframe_and_reconstruct(
         ));
     }
 
-    let (src_y, src_u, src_v) = extract_mb_padded(frame, mb_w, mb_h)?;
+    let (src_y, src_u, src_v) =
+        extract_mb_padded(frame, width as usize, height as usize, mb_w, mb_h)?;
 
     // Allocate reconstruction buffers.
     let mut rec_y = vec![0u8; y_stride * y_buf_h];
@@ -3510,11 +3506,11 @@ fn apply_loop_filter_enc(
 /// Edge-replicate when frame dimensions are not multiples of 16.
 fn extract_mb_padded(
     v: &VideoFrame,
+    width: usize,
+    height: usize,
     mb_w: usize,
     mb_h: usize,
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let width = v.width as usize;
-    let height = v.height as usize;
     let y_stride = mb_w * 16;
     let uv_stride = mb_w * 8;
     let y_h = mb_h * 16;

@@ -1073,6 +1073,29 @@ fn intra_to_b(intra_mode: i32) -> i32 {
     }
 }
 
+/// Effective base luma AC quant index for an MB given the frame header's
+/// segmentation data and the MB's segment id. RFC 6386 §10:
+///
+///   * `enabled = false` → frame-level `quant.y_ac_qi`.
+///   * `enabled = true`, `abs_delta = false` → frame qi + per-segment delta.
+///   * `enabled = true`, `abs_delta = true`  → per-segment value (absolute).
+///
+/// The result is clamped to the legal `[0, 127]` qindex range so the
+/// quant-step LUTs stay in bounds.
+fn mb_base_qi(header: &FrameHeader, segment_id: u8) -> i32 {
+    let frame_qi = header.quant.y_ac_qi;
+    if !header.segmentation.enabled {
+        return clamp_qindex(frame_qi) as i32;
+    }
+    let s = (segment_id as usize).min(3);
+    let raw = if header.segmentation.abs_delta {
+        header.segmentation.quant[s]
+    } else {
+        frame_qi + header.segmentation.quant[s]
+    };
+    clamp_qindex(raw) as i32
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_intra_mb(
     header: &FrameHeader,
@@ -1091,13 +1114,13 @@ fn reconstruct_intra_mb(
     y_stride: usize,
     uv_stride: usize,
 ) {
-    let qi = clamp_qindex(header.quant.y_ac_qi);
-    let y_dc = y_dc_step(qi as i32 + header.quant.y_dc_delta);
-    let y_ac = y_ac_step(qi as i32);
-    let y2_dc = y2_dc_step(qi as i32 + header.quant.y2_dc_delta);
-    let y2_ac = y2_ac_step(qi as i32 + header.quant.y2_ac_delta);
-    let uv_dc = uv_dc_step(qi as i32 + header.quant.uv_dc_delta);
-    let uv_ac = uv_ac_step(qi as i32 + header.quant.uv_ac_delta);
+    let qi = mb_base_qi(header, info.segment_id);
+    let y_dc = y_dc_step(qi + header.quant.y_dc_delta);
+    let y_ac = y_ac_step(qi);
+    let y2_dc = y2_dc_step(qi + header.quant.y2_dc_delta);
+    let y2_ac = y2_ac_step(qi + header.quant.y2_ac_delta);
+    let uv_dc = uv_dc_step(qi + header.quant.uv_dc_delta);
+    let uv_ac = uv_ac_step(qi + header.quant.uv_ac_delta);
 
     let y2_dc_vals: [i16; 16] = if has_y2 {
         let mut deq = [0i16; 16];
@@ -1347,13 +1370,13 @@ fn reconstruct_inter_mb(
     y_stride: usize,
     uv_stride: usize,
 ) {
-    let qi = clamp_qindex(header.quant.y_ac_qi);
-    let y_dc = y_dc_step(qi as i32 + header.quant.y_dc_delta);
-    let y_ac = y_ac_step(qi as i32);
-    let y2_dc = y2_dc_step(qi as i32 + header.quant.y2_dc_delta);
-    let y2_ac = y2_ac_step(qi as i32 + header.quant.y2_ac_delta);
-    let uv_dc = uv_dc_step(qi as i32 + header.quant.uv_dc_delta);
-    let uv_ac = uv_ac_step(qi as i32 + header.quant.uv_ac_delta);
+    let qi = mb_base_qi(header, info.segment_id);
+    let y_dc = y_dc_step(qi + header.quant.y_dc_delta);
+    let y_ac = y_ac_step(qi);
+    let y2_dc = y2_dc_step(qi + header.quant.y2_dc_delta);
+    let y2_ac = y2_ac_step(qi + header.quant.y2_ac_delta);
+    let uv_dc = uv_dc_step(qi + header.quant.uv_dc_delta);
+    let uv_ac = uv_ac_step(qi + header.quant.uv_ac_delta);
 
     let y2_dc_vals: [i16; 16] = if has_y2 {
         let mut deq = [0i16; 16];

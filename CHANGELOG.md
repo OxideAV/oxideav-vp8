@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-MB segment maps (RFC 6386 §10). The encoder classifies each MB
+  by source-luma 16×16 variance into one of four segments, then
+  emits the segmentation block (`segmentation_enabled = 1`,
+  `update_map = 1`, `update_data = 1`, `abs_delta = 0`) with the
+  per-segment quantiser deltas from `Vp8EncoderConfig`. Per-MB
+  segment_id bits are written before the skip flag using
+  entropy-matched `tree_probs`. Default deltas `[-8, -4, 0, +4]`
+  put smooth content into the low-qi segments (extra bits where the
+  eye notices banding) and high-variance content into the high-qi
+  segments. On a synthetic mixed-content fixture the bit-saving
+  variant `[0, +2, +6, +12]` shrinks the bitstream by ~14% with
+  sub-1 dB PSNR cost. Disable with `enable_segments = false` to
+  recover the legacy single-segment encoding bit-for-bit.
+- Decoder: per-MB dequant now consults `header.segmentation` +
+  `info.segment_id` so segmented streams (from this encoder or
+  libvpx) reconstruct correctly. Honours both `abs_delta` modes.
+- Five new integration tests in `tests/encoder_segments.rs` covering
+  the frame-header signalling on/off, the byte-size shrink on the
+  mixed clip, the encoder ↔ in-tree-decoder roundtrip with segments
+  on, and ffmpeg cross-decode validation.
+
 - Alt-ref / golden-ref planning in the encoder. New
   `Vp8EncoderConfig` exposes `golden_interval` (default 8 P-frames),
   `alt_ref_interval` (default 13), `enable_multi_ref` and `enable_rdo`

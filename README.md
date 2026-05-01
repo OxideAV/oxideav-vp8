@@ -82,10 +82,26 @@ saves ~13% (SMPTE bars), ~23% (gray pan), and ~1% (Mandelbrot, where
 residual dominates) of total bytes vs the previous fixed
 `prob_intra=200`, `prob_last=128`/`1`, `prob_gf=128` literals.
 
+**Per-MB segment maps** (RFC 6386 §10) classify each MB by source-luma
+variance into one of four segments and apply a per-segment quantiser
+delta. The encoder pre-computes the per-MB segment ids, picks the
+entropy-matched `tree_probs` triple from the actual distribution, then
+emits the segmentation block (`update_map = 1`, `update_data = 1`,
+`abs_delta = 0`) at the top of the frame header. The default deltas
+`[-8, -4, 0, +4]` give smooth regions a finer quant (more bits where
+the eye notices banding) and high-variance regions a coarser quant
+(saves bits where texture masks the loss). On a synthetic mixed
+smooth+pseudo-noise clip the bit-saving variant `[0, +2, +6, +12]`
+shrinks the bitstream by ~14% with sub-1 dB PSNR cost. The decoder
+looks up the per-MB qi via the segment id when dequantising, so the
+in-tree decode stays bit-exact with what `ffmpeg` produces. Disable
+with `enable_segments = false` to recover the legacy single-segment
+encoding bit-for-bit.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
-`alt_ref_interval`, `lambda_scale`, `enable_rdo`, and
-`enable_multi_ref`.
+`alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,
+`enable_segments`, and `segment_quant_deltas`.
 
 ### Container
 

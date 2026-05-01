@@ -142,6 +142,8 @@ fn refresh_flags_follow_plan() {
         enable_rdo: true,
         lambda_scale: 218,
         enable_multi_ref: true,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -188,6 +190,8 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         enable_rdo: false,
         lambda_scale: 0,
         enable_multi_ref: false,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -222,6 +226,8 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         enable_rdo: true,
         lambda_scale: 218,
         enable_multi_ref: true,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -264,6 +270,8 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         enable_rdo: false,
         lambda_scale: 0,
         enable_multi_ref: false,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -276,6 +284,8 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         enable_rdo: true,
         lambda_scale: 218,
         enable_multi_ref: true,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -361,6 +371,8 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         enable_rdo: true,
         lambda_scale: 218,
         enable_multi_ref: true,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -406,6 +418,8 @@ fn legacy_single_ref_path_still_works() {
         enable_rdo: false,
         lambda_scale: 0,
         enable_multi_ref: false,
+        enable_segments: false,
+        segment_quant_deltas: [0; 4],
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

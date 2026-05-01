@@ -150,6 +150,25 @@ pub const DEFAULT_ALT_REF_INTERVAL: u32 = 13;
 /// the SSE accumulator while preserving its quadratic shape in QP.
 pub const LAMBDA_SCALE_DEFAULT: u32 = 218; // ≈ 0.85 * 256
 
+/// Default per-segment quantiser deltas applied to `qindex` when
+/// segmentation is enabled (RFC 6386 §10). Indexed by segment id 0..=3,
+/// where the encoder's variance-based classifier maps the lowest-variance
+/// MBs to segment 0 and the highest-variance MBs to segment 3. The deltas
+/// give the smooth-content segment a lower QP (better quality where the
+/// eye notices banding) and the high-texture segment a higher QP (saves
+/// bits where the texture masks small reconstruction errors). Bitstream
+/// `abs_delta` is signalled as 0 (= delta) so the decoder applies these
+/// on top of `header.quant.y_ac_qi`.
+pub const DEFAULT_SEGMENT_QUANT_DELTAS: [i32; 4] = [-8, -4, 0, 4];
+
+/// Variance bucket boundaries (luma, summed-square units per MB) that map
+/// each MB to a segment id. A 16×16 MB has 256 pixels so a per-pixel
+/// variance of `v_pp` corresponds to `v_pp * 256` in this metric. Picked
+/// to land roughly in equal-population quartiles on the encoder's test
+/// fixtures (gray pan, mandelbrot, mixed clip): boundaries at variances
+/// of ~80, ~640, ~3200 per pixel.
+pub const SEGMENT_VARIANCE_THRESHOLDS: [u64; 3] = [80 * 256, 640 * 256, 3200 * 256];
+
 /// Per-MB encoder configuration. Knob bag for the alt-ref / golden-ref
 /// planning + Lagrangian RDO mode decision wired up in this version.
 ///
@@ -176,6 +195,17 @@ pub struct Vp8EncoderConfig {
     /// the inter mode decision. When `false`, the encoder always uses
     /// LAST (the legacy single-reference behaviour).
     pub enable_multi_ref: bool,
+    /// Enable per-MB segment maps (RFC 6386 §10). When `true` the
+    /// encoder classifies each MB by source-luma variance into one of
+    /// four segments and applies a per-segment quantiser delta from
+    /// `segment_quant_deltas`, signalling the per-segment data and the
+    /// per-MB segment-id bits in the frame header / mode-info stream.
+    pub enable_segments: bool,
+    /// Per-segment quantiser deltas (segment id 0..=3) used when
+    /// `enable_segments` is `true`. Applied as `qindex + delta`, so e.g.
+    /// `[-8, -4, 0, +4]` gives smooth regions higher quality and
+    /// high-variance regions a coarser quant to save bits.
+    pub segment_quant_deltas: [i32; 4],
 }
 
 impl Default for Vp8EncoderConfig {
@@ -187,6 +217,8 @@ impl Default for Vp8EncoderConfig {
             enable_rdo: true,
             lambda_scale: LAMBDA_SCALE_DEFAULT,
             enable_multi_ref: true,
+            enable_segments: true,
+            segment_quant_deltas: DEFAULT_SEGMENT_QUANT_DELTAS,
         }
     }
 }
@@ -415,8 +447,12 @@ impl Encoder for Vp8Encoder {
 
         let is_keyframe = self.last_frame.is_none();
         let (data, reference, plan) = if is_keyframe {
-            let (bitstream, rec) =
-                encode_keyframe_and_reconstruct(self.width, self.height, self.config.qindex, v)?;
+            let (bitstream, rec) = encode_keyframe_and_reconstruct_with_config(
+                self.width,
+                self.height,
+                self.config,
+                v,
+            )?;
             // Keyframe refreshes all three slots.
             let plan = RefPlan {
                 refresh_last: true,
@@ -490,16 +526,22 @@ impl Encoder for Vp8Encoder {
 /// Encode one keyframe. Returns the raw VP8 bitstream for the frame.
 /// Backwards-compatible with the earlier single-return signature.
 pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) -> Result<Vec<u8>> {
-    let (bitstream, _rec) = encode_keyframe_and_reconstruct(width, height, qindex, frame)?;
+    // Honour the standalone-API contract: qindex only, segmentation off,
+    // matches the previous behaviour bit-for-bit.
+    let mut cfg = Vp8EncoderConfig::default();
+    cfg.qindex = qindex.min(127);
+    cfg.enable_segments = false;
+    let (bitstream, _rec) = encode_keyframe_and_reconstruct_with_config(width, height, cfg, frame)?;
     Ok(bitstream)
 }
 
-fn encode_keyframe_and_reconstruct(
+fn encode_keyframe_and_reconstruct_with_config(
     width: u32,
     height: u32,
-    qindex: u8,
+    config: Vp8EncoderConfig,
     frame: &VideoFrame,
 ) -> Result<(Vec<u8>, ReferenceFrame)> {
+    let qindex = config.qindex;
     let mb_w = ((width + 15) / 16) as usize;
     let mb_h = ((height + 15) / 16) as usize;
     let y_stride = mb_w * 16;
@@ -518,29 +560,42 @@ fn encode_keyframe_and_reconstruct(
     let mut rec_u = vec![0u8; uv_stride * uv_buf_h];
     let mut rec_v = vec![0u8; uv_stride * uv_buf_h];
 
-    // Pre-compute quant steps.
+    // Pre-compute per-segment quant steps. When segmentation is disabled
+    // every entry collapses to the frame-level qindex.
     let qi = clamp_qindex(qindex as i32);
-    let q = QuantCtx {
-        y_dc: y_dc_step(qi as i32),
-        y_ac: y_ac_step(qi as i32),
-        y2_dc: y2_dc_step(qi as i32),
-        y2_ac: y2_ac_step(qi as i32),
-        uv_dc: uv_dc_step(qi as i32),
-        uv_ac: uv_ac_step(qi as i32),
-    };
+    let segments = SegmentCtx::for_config(&config);
 
     // Loop-filter parameters we will both signal and apply to our own
     // reconstruction (so the next P-frame uses the post-filter pixels).
     let lf_level = loop_filter_level_for_qindex(qi as u8);
     let lf_sharpness = LOOP_FILTER_SHARPNESS;
 
+    // --- Per-MB segment classification (pre-computed so the frame
+    //     header's segment tree_probs match the actual distribution). ---
+    let mut mb_segment_ids: Vec<u8> = vec![0u8; mb_w * mb_h];
+    let mut seg_counts: [u32; 4] = [0; 4];
+    if segments.enabled {
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let s = classify_segment_id(&src_y, y_stride, mb_x, mb_y);
+                mb_segment_ids[mb_y * mb_w + mb_x] = s;
+                seg_counts[s as usize] += 1;
+            }
+        }
+    }
+    let segment_tree_probs = if segments.enabled {
+        segment_tree_probs_from_counts(&seg_counts)
+    } else {
+        [255; 3]
+    };
+
     // --- Compressed header ---
     let mut hdr_enc = BoolEncoder::new();
     // color_space + clamping_type (1 bit each)
     hdr_enc.write_literal(1, 0);
     hdr_enc.write_literal(1, 0);
-    // segmentation enabled = 0
-    hdr_enc.write_bool(128, false);
+    // Segmentation block (writes the single "enabled=0" bit when off).
+    emit_segmentation_header(&mut hdr_enc, &segments, &segment_tree_probs);
     // loop filter: filter_type=0 (normal), level, sharpness,
     //              mode_ref_delta_enabled=0.
     hdr_enc.write_literal(1, 0);
@@ -578,6 +633,16 @@ fn encode_keyframe_and_reconstruct(
         for mb_x in 0..mb_w {
             let mb_xp = mb_x * 16;
             let mb_yp = mb_y * 16;
+
+            // Per-MB segment id (0 if segmentation off — never read by
+            // the decoder in that case).
+            let segment_id = mb_segment_ids[mb_y * mb_w + mb_x];
+            // Emit per-MB segment_id bits (only when the frame header
+            // signalled `update_map = 1`).
+            if segments.enabled {
+                emit_segment_id(&mut hdr_enc, segment_id, &segment_tree_probs);
+            }
+            let q = segments.quant_for(segment_id);
 
             // Pick the best intra Y mode (picks among DC/V/H/TM for the
             // 16x16 candidates — B_PRED is evaluated later against the
@@ -680,7 +745,7 @@ fn encode_keyframe_and_reconstruct(
                 mb_y,
                 mb_w,
                 mb_h,
-                &q,
+                q,
                 y_mode,
                 uv_mode,
                 &mb_bmodes[mb_y * mb_w + mb_x],
@@ -922,17 +987,31 @@ fn encode_pframe_and_reconstruct(
     let mut rec_v = vec![0u8; uv_stride * uv_buf_h];
 
     let qi = clamp_qindex(config.qindex as i32);
-    let q = QuantCtx {
-        y_dc: y_dc_step(qi as i32),
-        y_ac: y_ac_step(qi as i32),
-        y2_dc: y2_dc_step(qi as i32),
-        y2_ac: y2_ac_step(qi as i32),
-        uv_dc: uv_dc_step(qi as i32),
-        uv_ac: uv_ac_step(qi as i32),
-    };
+    // Per-segment quant table (collapses to a single QuantCtx when
+    // segmentation is disabled).
+    let segments = SegmentCtx::for_config(&config);
 
     let lf_level = loop_filter_level_for_qindex(qi as u8);
     let lf_sharpness = LOOP_FILTER_SHARPNESS;
+
+    // --- Per-MB segment classification (pre-computed so the frame
+    //     header's segment tree_probs match the actual distribution). ---
+    let mut mb_segment_ids: Vec<u8> = vec![0u8; mb_w * mb_h];
+    let mut seg_counts: [u32; 4] = [0; 4];
+    if segments.enabled {
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let s = classify_segment_id(&src_y, y_stride, mb_x, mb_y);
+                mb_segment_ids[mb_y * mb_w + mb_x] = s;
+                seg_counts[s as usize] += 1;
+            }
+        }
+    }
+    let segment_tree_probs = if segments.enabled {
+        segment_tree_probs_from_counts(&seg_counts)
+    } else {
+        [255; 3]
+    };
 
     // The frame is encoded in two passes so we can pick the spec-correct
     // `prob_intra` / `prob_last` / `prob_gf` triple from the actual
@@ -1139,7 +1218,10 @@ fn encode_pframe_and_reconstruct(
                 bmode_above[mb_x] = [b; 4];
             }
 
-            // Per-MB reconstruction and quantised coefficients.
+            // Per-MB reconstruction and quantised coefficients. Quant
+            // step is picked from the segment table (single entry when
+            // segmentation is disabled).
+            let q = segments.quant_for(mb_segment_ids[mb_idx]);
             let mb_rec = match decision {
                 PMbDecision::Skip => {
                     copy_ref_into_rec(
@@ -1176,7 +1258,7 @@ fn encode_pframe_and_reconstruct(
                     mb_x,
                     mb_y,
                     decision.mv(),
-                    &q,
+                    q,
                 ),
                 PMbDecision::SplitMv(split) => encode_inter_mb_split(
                     &src_y,
@@ -1195,7 +1277,7 @@ fn encode_pframe_and_reconstruct(
                     mb_x,
                     mb_y,
                     &split,
-                    &q,
+                    q,
                 ),
                 PMbDecision::Intra { y_mode, uv_mode } => encode_intra_mb(
                     &src_y,
@@ -1212,7 +1294,7 @@ fn encode_pframe_and_reconstruct(
                     mb_y,
                     mb_w,
                     mb_h,
-                    &q,
+                    q,
                     y_mode,
                     uv_mode,
                     &mb_bmodes[mb_idx],
@@ -1265,8 +1347,10 @@ fn encode_pframe_and_reconstruct(
     // --- Pass 2: build the inter-frame header + emit per-MB mode info ---
     let mut hdr_enc = BoolEncoder::new();
     // Inter-header order (matching parse_inter_header exactly):
-    //   segmentation enabled=0
-    hdr_enc.write_bool(128, false);
+    //   segmentation block (writes the single "enabled=0" bit when off,
+    //   otherwise update_map + update_data + 4 quant deltas + 4 lf deltas
+    //   + 3 tree_probs).
+    emit_segmentation_header(&mut hdr_enc, &segments, &segment_tree_probs);
     //   loop filter
     hdr_enc.write_literal(1, 0); // filter_type (normal)
     hdr_enc.write_literal(6, lf_level as u32);
@@ -1334,7 +1418,11 @@ fn encode_pframe_and_reconstruct(
             let ref_probs = mv_ref_probs_enc(&info.cnt);
 
             // Mode-info bits.
-            // 1) segment id (skipped — seg disabled).
+            // 1) segment id — only emitted when the frame header
+            //    signalled `update_map = 1` (i.e. segments enabled).
+            if segments.enabled {
+                emit_segment_id(&mut hdr_enc, mb_segment_ids[mb_idx], &segment_tree_probs);
+            }
             // 2) skip flag. SKIP is the only path that emits skip=true.
             hdr_enc.write_bool(mb_skip_prob as u32, matches!(decision, PMbDecision::Skip));
 
@@ -2449,6 +2537,7 @@ fn encode_inter_mb_at_mv(
 // Macroblock encode (intra DC_PRED — used by key-frames)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 struct QuantCtx {
     /// Y-block DC step — used only by B_PRED and SPLIT_MV paths where
     /// each 4×4 block carries its own DC coefficient (no Y2 pool). For
@@ -2460,6 +2549,179 @@ struct QuantCtx {
     y2_ac: i32,
     uv_dc: i32,
     uv_ac: i32,
+}
+
+impl QuantCtx {
+    /// Build a `QuantCtx` for the given clamped luma-AC qindex. Quant
+    /// deltas (y_dc / y2_dc / y2_ac / uv_dc / uv_ac) are zero in the
+    /// encoder's emitted bitstream, so the dequant step matches what the
+    /// decoder will compute from `header.quant.y_ac_qi` alone (modulo the
+    /// per-segment delta when segmentation is enabled).
+    fn for_qindex(qi: i32) -> Self {
+        let qi = clamp_qindex(qi) as i32;
+        Self {
+            y_dc: y_dc_step(qi),
+            y_ac: y_ac_step(qi),
+            y2_dc: y2_dc_step(qi),
+            y2_ac: y2_ac_step(qi),
+            uv_dc: uv_dc_step(qi),
+            uv_ac: uv_ac_step(qi),
+        }
+    }
+}
+
+/// Per-segment encoder state derived from `Vp8EncoderConfig`. When
+/// segmentation is disabled the `quant_ctx` array contains four copies
+/// of the frame-level quantiser, so all per-MB lookups are correct
+/// regardless of the segment id.
+#[derive(Clone, Copy)]
+struct SegmentCtx {
+    enabled: bool,
+    /// Pre-computed `QuantCtx` for each of the four segments (id 0..=3).
+    quant_ctx: [QuantCtx; 4],
+    /// Per-segment qindex delta added to the frame-level `qindex`. Sent
+    /// in the segmentation header with `abs_delta = false`.
+    quant_deltas: [i32; 4],
+}
+
+impl SegmentCtx {
+    fn for_config(config: &Vp8EncoderConfig) -> Self {
+        let base_qi = clamp_qindex(config.qindex as i32) as i32;
+        if config.enable_segments {
+            let mut q: [QuantCtx; 4] = [
+                QuantCtx::for_qindex(base_qi),
+                QuantCtx::for_qindex(base_qi),
+                QuantCtx::for_qindex(base_qi),
+                QuantCtx::for_qindex(base_qi),
+            ];
+            for (i, ctx) in q.iter_mut().enumerate() {
+                *ctx = QuantCtx::for_qindex(base_qi + config.segment_quant_deltas[i]);
+            }
+            Self {
+                enabled: true,
+                quant_ctx: q,
+                quant_deltas: config.segment_quant_deltas,
+            }
+        } else {
+            let q = QuantCtx::for_qindex(base_qi);
+            Self {
+                enabled: false,
+                quant_ctx: [q, q, q, q],
+                quant_deltas: [0; 4],
+            }
+        }
+    }
+
+    fn quant_for(&self, segment_id: u8) -> &QuantCtx {
+        &self.quant_ctx[(segment_id as usize) & 3]
+    }
+}
+
+/// Compute the per-MB segment id from the source-luma 16×16 variance.
+/// Maps low-variance (smooth) MBs into the low-qi segments and
+/// high-variance (textured) MBs into the high-qi segments. Mirrors the
+/// quartile boundaries baked into `SEGMENT_VARIANCE_THRESHOLDS`.
+fn classify_segment_id(src_y: &[u8], y_stride: usize, mb_x: usize, mb_y: usize) -> u8 {
+    let mb_xp = mb_x * 16;
+    let mb_yp = mb_y * 16;
+    let mut sum: u64 = 0;
+    let mut sum2: u64 = 0;
+    for r in 0..16 {
+        let row_off = (mb_yp + r) * y_stride + mb_xp;
+        for c in 0..16 {
+            let v = src_y[row_off + c] as u64;
+            sum += v;
+            sum2 += v * v;
+        }
+    }
+    let n = 256u64;
+    // variance = E[x^2] - E[x]^2; expressed in summed-square units
+    // (not divided by n), matching SEGMENT_VARIANCE_THRESHOLDS.
+    let var_sum = sum2.saturating_sub((sum * sum) / n);
+    let t = SEGMENT_VARIANCE_THRESHOLDS;
+    if var_sum < t[0] {
+        0
+    } else if var_sum < t[1] {
+        1
+    } else if var_sum < t[2] {
+        2
+    } else {
+        3
+    }
+}
+
+/// Tree probabilities for the per-MB segment-id encoding. RFC 6386 §10
+/// codes segment_id as a 3-leaf tree:
+///   bit 0 (probs[0]) : 0 → seg 0/1 ; 1 → seg 2/3
+///   bit 1 (probs[1]) : 0 → seg 0   ; 1 → seg 1     (when bit0 == 0)
+///   bit 2 (probs[2]) : 0 → seg 2   ; 1 → seg 3     (when bit0 == 1)
+///
+/// Given the per-MB segment counts we pick the entropy-matched
+/// `round(256 * P(bit==0))` and clamp to `[1, 255]` so the bool coder
+/// never sees a degenerate single-symbol probability. This is the same
+/// trick the existing prob-intra / prob-last / prob-gf optimiser uses.
+fn segment_tree_probs_from_counts(counts: &[u32; 4]) -> [u8; 3] {
+    let n_lo = counts[0] + counts[1];
+    let n_hi = counts[2] + counts[3];
+    let p0 = optimal_prob_8(n_lo, n_hi);
+    let p1 = optimal_prob_8(counts[0], counts[1]);
+    let p2 = optimal_prob_8(counts[2], counts[3]);
+    [p0, p1, p2]
+}
+
+/// Emit the bool-coded segment_id of an MB using the frame-level tree
+/// probabilities. Pairs with the decoder's `s0 = read_bool(p0); s = (s0 ?
+/// 2 + read_bool(p2) : read_bool(p1))` decode walk.
+fn emit_segment_id(enc: &mut BoolEncoder, segment_id: u8, probs: &[u8; 3]) {
+    let s = segment_id & 3;
+    let bit0 = (s & 0b10) != 0;
+    enc.write_bool(probs[0] as u32, bit0);
+    if !bit0 {
+        // seg 0 → bit1=0 ; seg 1 → bit1=1
+        enc.write_bool(probs[1] as u32, (s & 1) != 0);
+    } else {
+        // seg 2 → bit2=0 ; seg 3 → bit2=1
+        enc.write_bool(probs[2] as u32, (s & 1) != 0);
+    }
+}
+
+/// Emit the segmentation block of the frame header. When `seg.enabled` is
+/// `false` only the single "segmentation enabled = 0" bit is written
+/// (preserving the legacy single-segment encoding bit-for-bit).
+fn emit_segmentation_header(enc: &mut BoolEncoder, seg: &SegmentCtx, tree_probs: &[u8; 3]) {
+    enc.write_bool(128, seg.enabled);
+    if !seg.enabled {
+        return;
+    }
+    // update_map = 1 (always emit per-MB segment ids in this encoder).
+    enc.write_bool(128, true);
+    // update_data = 1 (re-send per-segment data every frame for
+    // simplicity — the decoder caches them across frames otherwise).
+    enc.write_bool(128, true);
+    // abs_delta = 0 (deltas are added to header.quant.y_ac_qi).
+    enc.write_bool(128, false);
+    // 4 per-segment quant deltas (each preceded by a 1-bit "present" flag).
+    for i in 0..4 {
+        let v = seg.quant_deltas[i];
+        if v != 0 {
+            enc.write_bool(128, true);
+            enc.write_signed_literal(7, v);
+        } else {
+            enc.write_bool(128, false);
+        }
+    }
+    // 4 per-segment loop-filter deltas, all zero in this encoder.
+    for _ in 0..4 {
+        enc.write_bool(128, false);
+    }
+    // tree_probs (3 entries). 255 (= "default") is the encoder's
+    // sentinel for "no override"; we always send explicit probs since
+    // `tree_probs[i]` defaults to 255 in the decoder which would skew
+    // the segment distribution.
+    for &p in tree_probs.iter() {
+        enc.write_bool(128, true);
+        enc.write_literal(8, p as u32);
+    }
 }
 
 /// Output of per-MB encode: quantised coefficients for each block and the

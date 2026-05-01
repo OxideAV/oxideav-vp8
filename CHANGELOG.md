@@ -33,11 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `prob_last` / `prob_gf` are now signaled at 128 (neutral) when any
-  GOLDEN / ALTREF slot is populated, so the per-MB reference-frame
-  bits cost about 1 bit each on average. With multi-ref disabled we
-  retain the legacy `prob_last = 1` setting that makes
-  `read_bool(1) == false` (REF_LAST) near-free.
+- Per-MB context-adaptive `prob_intra` / `prob_last` / `prob_gf` (RFC
+  6386 §9.10 field J): the encoder now runs the P-frame in two passes
+  — pass 1 makes per-MB mode/ref decisions and accumulates the actual
+  ref-frame distribution (intra / LAST / GOLDEN / ALT counts) without
+  touching the bool encoder; pass 2 picks the entropy-matched prob
+  triple from those counts (`round(256 · n_zero / total)`, clamped to
+  1..=255) and emits the frame with the optimised probs. Replaces the
+  prior fixed `200 / 128 / 128` (multi-ref) and `200 / 1 / 128`
+  (single-ref) literals.
+- Real-content byte-size deltas on the existing fixtures: SMPTE-bars
+  30-frame clip −13.4% (1336 → 1157 B); gray 30-frame clip −22.9%
+  (782 → 603 B); Mandelbrot 30-frame clip −1.25% (14201 → 14023 B,
+  small because residual dominates intra-heavy frames). ffmpeg
+  cross-decodes every fixture cleanly.
+- New tests in `tests/encoder_ref_prob_context.rs` pin the per-frame
+  prob triple against the actual MB ref-frame distribution and the
+  total-bytes regression on the SMPTE fixture; new unit tests in
+  `encoder.rs` cover `optimal_prob_8` rounding/clamping and the
+  prob-triple emit on an all-SKIP P-frame.
 
 ## [0.1.1](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.0...v0.1.1) - 2026-04-25
 

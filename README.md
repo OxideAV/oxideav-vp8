@@ -71,6 +71,17 @@ schedule fires, with `copy_buffer_to_*` set to "no copy" otherwise.
 Disable with `enable_multi_ref = false` to recover the legacy
 single-reference behaviour.
 
+**Context-adaptive ref-frame probabilities**: each P-frame is encoded
+in two passes — pass 1 makes per-MB mode/ref decisions and tallies
+the actual ref-frame distribution (intra / LAST / GOLDEN / ALT
+counts); pass 2 picks the entropy-matched `prob_intra` / `prob_last`
+/ `prob_gf` triple from those counts (`round(256 · n_zero / total)`,
+clamped to 1..=255) and emits the frame with the optimised probs
+(RFC 6386 §9.10 field J). On the existing real-content fixtures this
+saves ~13% (SMPTE bars), ~23% (gray pan), and ~1% (Mandelbrot, where
+residual dominates) of total bytes vs the previous fixed
+`prob_intra=200`, `prob_last=128`/`1`, `prob_gf=128` literals.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, and

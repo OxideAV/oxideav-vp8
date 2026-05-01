@@ -793,6 +793,27 @@ const ENC_REF_LAST: u8 = 1;
 const ENC_REF_GOLDEN: u8 = 2;
 const ENC_REF_ALT: u8 = 3;
 
+/// Captured per-MB state from the decision/reconstruction pass needed
+/// later to emit the mode-info bool bits in the second pass (see
+/// `encode_pframe_and_reconstruct`).
+///
+/// The two-pass split lets us count the actual ref-frame distribution
+/// across the frame and pick the spec-correct `prob_intra` /
+/// `prob_last` / `prob_gf` values *before* any mode-info bits are
+/// emitted into the bool encoder. RFC 6386 §9.10 (field J) carries
+/// these as 8-bit literals at the top of the inter-frame header, so
+/// once we set them they apply uniformly to every MB in the frame.
+#[derive(Clone, Copy, Debug)]
+struct PMbModeInfo {
+    /// `cnt` from the per-ref `find_near_mvs_enc` walk that was used
+    /// for the picked reference frame; needed by `mv_ref_probs_enc` in
+    /// pass 2.
+    cnt: [u8; 4],
+    /// MV that NEW_MV would code its delta against (from the same
+    /// per-ref `find_near_mvs_enc` walk).
+    best_for_newmv: Mv,
+}
+
 /// Per-MB decision for a P-frame.
 #[derive(Clone, Copy, Debug)]
 enum PMbDecision {
@@ -913,94 +934,57 @@ fn encode_pframe_and_reconstruct(
     let lf_level = loop_filter_level_for_qindex(qi as u8);
     let lf_sharpness = LOOP_FILTER_SHARPNESS;
 
-    // --- First-partition: inter-frame header + MB mode info ---
-    let mut hdr_enc = BoolEncoder::new();
-    // Inter-header order (matching parse_inter_header exactly):
-    //   segmentation enabled=0
-    hdr_enc.write_bool(128, false);
-    //   loop filter
-    hdr_enc.write_literal(1, 0); // filter_type (normal)
-    hdr_enc.write_literal(6, lf_level as u32);
-    hdr_enc.write_literal(3, lf_sharpness as u32);
-    hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
-                                    //   log2_nb_partitions = 0 (single partition)
-    hdr_enc.write_literal(2, 0);
-    //   quant: y_ac_qi + 5 "delta present" flags all 0.
-    hdr_enc.write_literal(7, qi as u32);
-    for _ in 0..5 {
-        hdr_enc.write_bool(128, false);
-    }
-    //   refresh_golden, refresh_alt — driven by the per-frame reference
-    //   plan computed by the encoder (alt-ref / golden cadence), not
-    //   hard-wired to 1.
-    hdr_enc.write_bool(128, plan.refresh_golden);
-    hdr_enc.write_bool(128, plan.refresh_alt);
-    //   When refresh_golden / refresh_alt are 0, the decoder reads a
-    //   2-bit copy_buffer_to_* selector. We always emit "no copy" (=0)
-    //   so the slot keeps its existing contents until a future refresh
-    //   puts a new reconstruction into it.
-    if !plan.refresh_golden {
-        hdr_enc.write_literal(2, 0);
-    }
-    if !plan.refresh_alt {
-        hdr_enc.write_literal(2, 0);
-    }
-    //   sign_bias_golden, sign_bias_alt
-    hdr_enc.write_bool(128, false);
-    hdr_enc.write_bool(128, false);
-    //   refresh_entropy_probs = 0
-    hdr_enc.write_bool(128, false);
-    //   refresh_last = 1
-    hdr_enc.write_bool(128, plan.refresh_last);
-    //   coef prob updates — all "no update"
-    emit_no_coef_prob_updates(&mut hdr_enc);
-    //   mb_skip_enabled = 1, skip prob literal (we use 128 — neutral).
-    let mb_skip_prob: u8 = 128;
-    hdr_enc.write_bool(128, true);
-    hdr_enc.write_literal(8, mb_skip_prob as u32);
-    //   prob_intra, prob_last, prob_gf — all literals (8 bits each).
-    //   prob_intra is picked so `read_bool(prob_intra) == true` (inter) is
-    //   cheap in the common case while leaving intra-in-P affordable — see
-    //   PROB_INTRA_IN_P for tuning rationale.
+    // The frame is encoded in two passes so we can pick the spec-correct
+    // `prob_intra` / `prob_last` / `prob_gf` triple from the actual
+    // ref-frame distribution observed across the frame's MBs (RFC 6386
+    // §9.10 carries them as 8-bit literals at the top of the inter-frame
+    // header — once set they apply uniformly to every MB).
     //
-    //   Reference-frame probabilities: with multi-ref enabled we pick
-    //   neutral 128 for both prob_last and prob_gf so the encoder pays
-    //   ~1 bit each on average for the LAST-vs-{GOLDEN,ALT} and
-    //   GOLDEN-vs-ALT splits. With multi-ref disabled we keep the legacy
-    //   prob_last=1 path that makes `read_bool(1)==false` near-free.
-    let prob_intra: u8 = PROB_INTRA_IN_P;
-    let (prob_last, prob_gf): (u8, u8) = if plan.use_golden || plan.use_alt {
+    // Pass 1: per-MB decision, reconstruction, residual encode, and
+    // accumulation of per-MB ref-frame counts (intra / LAST / GOLDEN /
+    // ALT). Touches no bool encoder.
+    //
+    // Pass 2: build the inter-frame header (now with the optimised prob
+    // triple) and emit the per-MB mode-info bool bits using the decisions
+    // recorded in pass 1.
+    let mb_skip_prob: u8 = 128;
+    // Probabilities used for the per-MB rate model in pass 1's RDO. We
+    // intentionally use coarse default values here so that mode decision
+    // does not depend on the (unknown-yet) optimised prob triple — the
+    // actual emitted bits in pass 2 use the exact optimised probs.
+    let rdo_prob_intra: u8 = PROB_INTRA_IN_P;
+    let (rdo_prob_last, rdo_prob_gf): (u8, u8) = if plan.use_golden || plan.use_alt {
         (128, 128)
     } else {
         (1, 128)
     };
-    hdr_enc.write_literal(8, prob_intra as u32);
-    hdr_enc.write_literal(8, prob_last as u32);
-    hdr_enc.write_literal(8, prob_gf as u32);
-    //   y-mode prob update flag = 0 ; uv-mode prob update flag = 0
-    hdr_enc.write_bool(128, false);
-    hdr_enc.write_bool(128, false);
-    //   MV context updates — 19 × 2, all "no update".
-    use crate::tables::mv::MV_UPDATE_PROBS;
-    for comp in 0..2 {
-        for i in 0..19 {
-            hdr_enc.write_bool(MV_UPDATE_PROBS[comp][i] as u32, false);
-        }
-    }
 
-    // --- Per-MB decision + reconstruction ---
+    // --- Pass 1: per-MB decision, reconstruction, residual encode ---
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_decisions: Vec<PMbDecision> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_ref_frames: Vec<u8> = Vec::with_capacity(mb_w * mb_h);
+    let mut mb_mode_info: Vec<PMbModeInfo> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_mvs: Vec<Mv> = vec![Mv::ZERO; mb_w * mb_h];
     // Per-subblock MVs (needed for SPLIT's neighbour MVs when later MBs
     // use SPLIT themselves — encoder-side replica of the decoder's
     // `MbInfo::sub_mvs`).
     let mut mb_sub_mvs: Vec<[Mv; 16]> = vec![[Mv::ZERO; 16]; mb_w * mb_h];
-    // B_PRED propagation buffers (parallel to keyframe path).
+    // B_PRED propagation buffers (parallel to keyframe path). The inter
+    // path doesn't actually read `bmode_above` — `choose_b_pred_modes`
+    // pulls its 4×4 context from the reconstructed pixels — but we keep
+    // it here for symmetry with the keyframe path and the decoder.
     let mut bmode_above: Vec<[i32; 4]> = vec![[B_DC_PRED; 4]; mb_w];
     let mut mb_bmodes: Vec<[i32; 16]> = vec![[B_DC_PRED; 16]; mb_w * mb_h];
     let mut mb_ymodes: Vec<i32> = vec![DC_PRED; mb_w * mb_h];
+    // Per-MB ref-frame context counts. These drive the optimal
+    // `prob_intra` / `prob_last` / `prob_gf` triple emitted in the frame
+    // header and used by every MB's ref-frame bool tree. Each MB
+    // contributes exactly one count, mirroring the per-MB context model
+    // RFC 6386 §11.3 / §16.2 describe.
+    let mut n_intra: u32 = 0;
+    let mut n_last: u32 = 0;
+    let mut n_golden: u32 = 0;
+    let mut n_alt: u32 = 0;
     // Lambda for Lagrangian RDO (D + lambda*R). Computed once per frame
     // since QP is fixed; if RDO is disabled lambda is 0 and rate
     // contributions wash out, recovering the legacy SAD-only behaviour.
@@ -1056,9 +1040,9 @@ fn encode_pframe_and_reconstruct(
                     nearest,
                     near,
                     best_for_newmv,
-                    prob_intra,
-                    prob_last,
-                    prob_gf,
+                    rdo_prob_intra,
+                    rdo_prob_last,
+                    rdo_prob_gf,
                     mb_skip_prob,
                     lambda,
                 );
@@ -1081,8 +1065,11 @@ fn encode_pframe_and_reconstruct(
 
             let (_cost, picked_ref, decision, _nearest, _near, best_for_newmv, cnt) =
                 best_choice.expect("LAST must always produce a candidate");
-            let ref_probs = mv_ref_probs_enc(&cnt);
             mb_decisions.push(decision);
+            mb_mode_info.push(PMbModeInfo {
+                cnt,
+                best_for_newmv,
+            });
             // Skip / ZeroMv on a non-LAST reference would still need
             // a `prob_last==true` ref-frame bit emitted — keep that
             // information so the bitstream emit code below picks the
@@ -1095,6 +1082,15 @@ fn encode_pframe_and_reconstruct(
             mb_ref_frames.push(stored_ref);
             mb_mvs[mb_idx] = decision.mv();
             mb_sub_mvs[mb_idx] = decision.sub_mvs();
+            // Accumulate per-MB ref-frame counts. These drive the optimal
+            // `prob_intra` / `prob_last` / `prob_gf` triple emitted in
+            // pass 2's frame header.
+            match stored_ref {
+                ENC_REF_INTRA => n_intra += 1,
+                ENC_REF_GOLDEN => n_golden += 1,
+                ENC_REF_ALT => n_alt += 1,
+                _ => n_last += 1,
+            }
             // Pick the right reference plane for the residual encode below.
             let used_ref: &ReferenceFrame = match picked_ref {
                 ENC_REF_GOLDEN => golden_ref.expect("plan.use_golden was true"),
@@ -1102,31 +1098,17 @@ fn encode_pframe_and_reconstruct(
                 _ => last_ref,
             };
 
-            // Mode-info bits.
-            // 1) segment id (skipped — seg disabled).
-            // 2) skip flag. SKIP is the only path that emits skip=true.
-            hdr_enc.write_bool(mb_skip_prob as u32, matches!(decision, PMbDecision::Skip));
-
-            // 3) intra-vs-inter bit.
+            // Pre-compute B_PRED bmodes for intra-in-P (the reconstruction
+            // step needs them, and pass 2 needs the same modes for its
+            // mode-info bool emit). Non-B_PRED intra and inter MBs get a
+            // static per-MB bmode propagation matching the decoder.
             let is_inter = !decision.is_intra();
-            hdr_enc.write_bool(prob_intra as u32, is_inter);
-
             if !is_inter {
-                // Intra-in-P: emit the inter-frame YMODE tree + BMODE
-                // sub-modes (if B_PRED) + UV_MODE tree. Probabilities
-                // default to `vp8_kf_default_*` since we send no update
-                // flags in the inter header.
-                let (y_mode, uv_mode) = match decision {
+                let (y_mode, _uv_mode) = match decision {
                     PMbDecision::Intra { y_mode, uv_mode } => (y_mode, uv_mode),
                     _ => unreachable!(),
                 };
-                emit_inter_ymode(&mut hdr_enc, y_mode, &DEFAULT_YMODE_PROBS);
                 if y_mode == B_PRED {
-                    // Intra-in-P uses the default (non-context-sensitive)
-                    // `vp8_bmode_prob` for each 4x4 — matches the decoder's
-                    // handling in `decode_mb_mode_info_inter`.
-                    const DEFAULT_BMODE_PROBS: [u8; 9] = [120, 90, 79, 133, 87, 85, 80, 111, 151];
-                    let bm = &mut mb_bmodes[mb_y * mb_w + mb_x];
                     let chosen = choose_b_pred_modes(
                         &src_y,
                         &rec_y,
@@ -1136,102 +1118,22 @@ fn encode_pframe_and_reconstruct(
                         mb_w,
                         mb_h,
                     );
-                    for i in 0..16 {
-                        bm[i] = chosen[i];
-                        emit_tree_path(
-                            &mut hdr_enc,
-                            BMODE_PATHS[chosen[i] as usize],
-                            &DEFAULT_BMODE_PROBS,
-                        );
-                    }
+                    let bm = &mut mb_bmodes[mb_idx];
+                    bm.copy_from_slice(&chosen);
                     bmode_above[mb_x] = [bm[12], bm[13], bm[14], bm[15]];
                 } else {
                     let b = intra_to_b_mode(y_mode);
-                    for v in mb_bmodes[mb_y * mb_w + mb_x].iter_mut() {
+                    for v in mb_bmodes[mb_idx].iter_mut() {
                         *v = b;
                     }
                     bmode_above[mb_x] = [b; 4];
                 }
-                mb_ymodes[mb_y * mb_w + mb_x] = y_mode;
-                emit_inter_uv_mode(&mut hdr_enc, uv_mode, &DEFAULT_UV_MODE_PROBS);
+                mb_ymodes[mb_idx] = y_mode;
             } else {
-                // 4) ref_frame bits. RFC 6386 §16.2:
-                //      prob_last     : 0 → REF_LAST
-                //      prob_last     : 1 → read prob_gf:
-                //         prob_gf    : 0 → REF_GOLDEN
-                //         prob_gf    : 1 → REF_ALT
-                match picked_ref {
-                    ENC_REF_LAST => {
-                        hdr_enc.write_bool(prob_last as u32, false);
-                    }
-                    ENC_REF_GOLDEN => {
-                        hdr_enc.write_bool(prob_last as u32, true);
-                        hdr_enc.write_bool(prob_gf as u32, false);
-                    }
-                    ENC_REF_ALT => {
-                        hdr_enc.write_bool(prob_last as u32, true);
-                        hdr_enc.write_bool(prob_gf as u32, true);
-                    }
-                    _ => unreachable!("inter MB must have a non-intra ref_frame"),
-                }
-
-                // 5) MV_REF_TREE leaves (RFC §16.3):
-                //      leaf 0 = ZERO_MV      (path: 0)
-                //      leaf 1 = NEAREST_MV   (path: 1, 0)
-                //      leaf 2 = NEAR_MV      (path: 1, 1, 0)
-                //      leaf 3 = NEW_MV       (path: 1, 1, 1, 0)
-                //      leaf 4 = SPLIT_MV     (path: 1, 1, 1, 1)
-                match decision {
-                    PMbDecision::Skip | PMbDecision::ZeroMv => {
-                        hdr_enc.write_bool(ref_probs[0] as u32, false);
-                    }
-                    PMbDecision::NearestMv(_) => {
-                        hdr_enc.write_bool(ref_probs[0] as u32, true);
-                        hdr_enc.write_bool(ref_probs[1] as u32, false);
-                    }
-                    PMbDecision::NearMv(_) => {
-                        hdr_enc.write_bool(ref_probs[0] as u32, true);
-                        hdr_enc.write_bool(ref_probs[1] as u32, true);
-                        hdr_enc.write_bool(ref_probs[2] as u32, false);
-                    }
-                    PMbDecision::NewMv(mv) => {
-                        hdr_enc.write_bool(ref_probs[0] as u32, true);
-                        hdr_enc.write_bool(ref_probs[1] as u32, true);
-                        hdr_enc.write_bool(ref_probs[2] as u32, true);
-                        hdr_enc.write_bool(ref_probs[3] as u32, false);
-                        let dmv = Mv::new(
-                            mv.row as i32 - best_for_newmv.row as i32,
-                            mv.col as i32 - best_for_newmv.col as i32,
-                        );
-                        encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[0], dmv.row as i32);
-                        encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[1], dmv.col as i32);
-                    }
-                    PMbDecision::SplitMv(split) => {
-                        hdr_enc.write_bool(ref_probs[0] as u32, true);
-                        hdr_enc.write_bool(ref_probs[1] as u32, true);
-                        hdr_enc.write_bool(ref_probs[2] as u32, true);
-                        hdr_enc.write_bool(ref_probs[3] as u32, true);
-                        emit_split_mb_tree(&mut hdr_enc, split.split_mode);
-                        // Per-partition sub-MV refs. Each partition's
-                        // neighbours come from earlier partitions (or from
-                        // neighbouring MBs' bottom/right sub-MV rows).
-                        emit_split_submvs(
-                            &mut hdr_enc,
-                            &split,
-                            &mb_sub_mvs,
-                            &mb_decisions,
-                            mb_x,
-                            mb_y,
-                            mb_w,
-                            best_for_newmv,
-                        );
-                    }
-                    PMbDecision::Intra { .. } => unreachable!("intra handled elsewhere"),
-                }
-                // Inter MBs: reset bmodes propagation to DC (decoder does
+                // Inter MBs reset bmodes propagation to DC (decoder does
                 // the same after reconstructing an inter MB).
                 let b = intra_to_b_mode(DC_PRED);
-                for v in mb_bmodes[mb_y * mb_w + mb_x].iter_mut() {
+                for v in mb_bmodes[mb_idx].iter_mut() {
                     *v = b;
                 }
                 bmode_above[mb_x] = [b; 4];
@@ -1313,12 +1215,36 @@ fn encode_pframe_and_reconstruct(
                     &q,
                     y_mode,
                     uv_mode,
-                    &mb_bmodes[mb_y * mb_w + mb_x],
+                    &mb_bmodes[mb_idx],
                 ),
             };
             mb_encoded.push(mb_rec);
         }
     }
+
+    // --- Compute optimal frame-level ref-frame probabilities ---
+    //
+    // RFC 6386 §16.2 codes the per-MB ref-frame as a 3-leaf tree:
+    //   bit0 (`prob_intra`)  : 0 → intra, 1 → inter
+    //   bit1 (`prob_last`)   : 0 → REF_LAST, 1 → REF_GOLDEN | REF_ALT
+    //   bit2 (`prob_gf`)     : 0 → REF_GOLDEN, 1 → REF_ALT
+    //
+    // Bool-coder convention: `prob = round(256 * P(bit==0))`. The optimal
+    // code-length is achieved by setting each prob to match the actual
+    // observed P(bit==0) in the frame. Counts that are entirely zero
+    // (e.g. no GOLDEN/ALT frame available) collapse to a sensible
+    // default (`128 / 128 / 128` for the prior, then floored at 1 / 255
+    // to avoid the bool coder's degenerate single-symbol case).
+    let n_inter = n_last + n_golden + n_alt;
+    let n_total = n_intra + n_inter;
+    let prob_intra = optimal_prob_8(n_intra, n_inter);
+    // For prob_last / prob_gf we only have observations from inter MBs.
+    // If every inter MB used LAST, prob_last → 255 (REF_LAST near-free)
+    // matching the libvpx single-ref convention. With no inter MBs at
+    // all we fall back to neutral 128.
+    let prob_last = optimal_prob_8(n_last, n_golden + n_alt);
+    let prob_gf = optimal_prob_8(n_golden, n_alt);
+    let _ = n_total; // silence dead-store lint when assertions disabled
 
     // Apply in-loop deblocking to our reconstruction (so the next
     // reference frame tracks the decoder).
@@ -1335,6 +1261,189 @@ fn encode_pframe_and_reconstruct(
         lf_level,
         lf_sharpness,
     );
+
+    // --- Pass 2: build the inter-frame header + emit per-MB mode info ---
+    let mut hdr_enc = BoolEncoder::new();
+    // Inter-header order (matching parse_inter_header exactly):
+    //   segmentation enabled=0
+    hdr_enc.write_bool(128, false);
+    //   loop filter
+    hdr_enc.write_literal(1, 0); // filter_type (normal)
+    hdr_enc.write_literal(6, lf_level as u32);
+    hdr_enc.write_literal(3, lf_sharpness as u32);
+    hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
+                                    //   log2_nb_partitions = 0 (single partition)
+    hdr_enc.write_literal(2, 0);
+    //   quant: y_ac_qi + 5 "delta present" flags all 0.
+    hdr_enc.write_literal(7, qi as u32);
+    for _ in 0..5 {
+        hdr_enc.write_bool(128, false);
+    }
+    //   refresh_golden, refresh_alt — driven by the per-frame reference
+    //   plan computed by the encoder (alt-ref / golden cadence), not
+    //   hard-wired to 1.
+    hdr_enc.write_bool(128, plan.refresh_golden);
+    hdr_enc.write_bool(128, plan.refresh_alt);
+    //   When refresh_golden / refresh_alt are 0, the decoder reads a
+    //   2-bit copy_buffer_to_* selector. We always emit "no copy" (=0)
+    //   so the slot keeps its existing contents until a future refresh
+    //   puts a new reconstruction into it.
+    if !plan.refresh_golden {
+        hdr_enc.write_literal(2, 0);
+    }
+    if !plan.refresh_alt {
+        hdr_enc.write_literal(2, 0);
+    }
+    //   sign_bias_golden, sign_bias_alt
+    hdr_enc.write_bool(128, false);
+    hdr_enc.write_bool(128, false);
+    //   refresh_entropy_probs = 0
+    hdr_enc.write_bool(128, false);
+    //   refresh_last = 1
+    hdr_enc.write_bool(128, plan.refresh_last);
+    //   coef prob updates — all "no update"
+    emit_no_coef_prob_updates(&mut hdr_enc);
+    //   mb_skip_enabled = 1, skip prob literal (we use 128 — neutral).
+    hdr_enc.write_bool(128, true);
+    hdr_enc.write_literal(8, mb_skip_prob as u32);
+    //   prob_intra, prob_last, prob_gf — picked from the actual per-MB
+    //   ref-frame distribution accumulated above.
+    hdr_enc.write_literal(8, prob_intra as u32);
+    hdr_enc.write_literal(8, prob_last as u32);
+    hdr_enc.write_literal(8, prob_gf as u32);
+    //   y-mode prob update flag = 0 ; uv-mode prob update flag = 0
+    hdr_enc.write_bool(128, false);
+    hdr_enc.write_bool(128, false);
+    //   MV context updates — 19 × 2, all "no update".
+    use crate::tables::mv::MV_UPDATE_PROBS;
+    for comp in 0..2 {
+        for i in 0..19 {
+            hdr_enc.write_bool(MV_UPDATE_PROBS[comp][i] as u32, false);
+        }
+    }
+
+    // Per-MB mode-info emit. Walks in the same order as pass 1 so
+    // `emit_split_submvs`'s neighbour walk lines up exactly with the
+    // pass-1 decision state.
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            let mb_idx = mb_y * mb_w + mb_x;
+            let decision = mb_decisions[mb_idx];
+            let info = mb_mode_info[mb_idx];
+            let stored_ref = mb_ref_frames[mb_idx];
+            let ref_probs = mv_ref_probs_enc(&info.cnt);
+
+            // Mode-info bits.
+            // 1) segment id (skipped — seg disabled).
+            // 2) skip flag. SKIP is the only path that emits skip=true.
+            hdr_enc.write_bool(mb_skip_prob as u32, matches!(decision, PMbDecision::Skip));
+
+            // 3) intra-vs-inter bit.
+            let is_inter = !decision.is_intra();
+            hdr_enc.write_bool(prob_intra as u32, is_inter);
+
+            if !is_inter {
+                // Intra-in-P: emit the inter-frame YMODE tree + BMODE
+                // sub-modes (if B_PRED) + UV_MODE tree. Probabilities
+                // default to `vp8_kf_default_*` since we send no update
+                // flags in the inter header.
+                let (y_mode, uv_mode) = match decision {
+                    PMbDecision::Intra { y_mode, uv_mode } => (y_mode, uv_mode),
+                    _ => unreachable!(),
+                };
+                emit_inter_ymode(&mut hdr_enc, y_mode, &DEFAULT_YMODE_PROBS);
+                if y_mode == B_PRED {
+                    // Intra-in-P uses the default (non-context-sensitive)
+                    // `vp8_bmode_prob` for each 4x4 — matches the decoder's
+                    // handling in `decode_mb_mode_info_inter`.
+                    const DEFAULT_BMODE_PROBS: [u8; 9] = [120, 90, 79, 133, 87, 85, 80, 111, 151];
+                    let bm = &mb_bmodes[mb_idx];
+                    for i in 0..16 {
+                        emit_tree_path(
+                            &mut hdr_enc,
+                            BMODE_PATHS[bm[i] as usize],
+                            &DEFAULT_BMODE_PROBS,
+                        );
+                    }
+                }
+                emit_inter_uv_mode(&mut hdr_enc, uv_mode, &DEFAULT_UV_MODE_PROBS);
+            } else {
+                // 4) ref_frame bits. RFC 6386 §16.2:
+                //      prob_last     : 0 → REF_LAST
+                //      prob_last     : 1 → read prob_gf:
+                //         prob_gf    : 0 → REF_GOLDEN
+                //         prob_gf    : 1 → REF_ALT
+                match stored_ref {
+                    ENC_REF_LAST => {
+                        hdr_enc.write_bool(prob_last as u32, false);
+                    }
+                    ENC_REF_GOLDEN => {
+                        hdr_enc.write_bool(prob_last as u32, true);
+                        hdr_enc.write_bool(prob_gf as u32, false);
+                    }
+                    ENC_REF_ALT => {
+                        hdr_enc.write_bool(prob_last as u32, true);
+                        hdr_enc.write_bool(prob_gf as u32, true);
+                    }
+                    _ => unreachable!("inter MB must have a non-intra ref_frame"),
+                }
+
+                // 5) MV_REF_TREE leaves (RFC §16.3):
+                //      leaf 0 = ZERO_MV      (path: 0)
+                //      leaf 1 = NEAREST_MV   (path: 1, 0)
+                //      leaf 2 = NEAR_MV      (path: 1, 1, 0)
+                //      leaf 3 = NEW_MV       (path: 1, 1, 1, 0)
+                //      leaf 4 = SPLIT_MV     (path: 1, 1, 1, 1)
+                match decision {
+                    PMbDecision::Skip | PMbDecision::ZeroMv => {
+                        hdr_enc.write_bool(ref_probs[0] as u32, false);
+                    }
+                    PMbDecision::NearestMv(_) => {
+                        hdr_enc.write_bool(ref_probs[0] as u32, true);
+                        hdr_enc.write_bool(ref_probs[1] as u32, false);
+                    }
+                    PMbDecision::NearMv(_) => {
+                        hdr_enc.write_bool(ref_probs[0] as u32, true);
+                        hdr_enc.write_bool(ref_probs[1] as u32, true);
+                        hdr_enc.write_bool(ref_probs[2] as u32, false);
+                    }
+                    PMbDecision::NewMv(mv) => {
+                        hdr_enc.write_bool(ref_probs[0] as u32, true);
+                        hdr_enc.write_bool(ref_probs[1] as u32, true);
+                        hdr_enc.write_bool(ref_probs[2] as u32, true);
+                        hdr_enc.write_bool(ref_probs[3] as u32, false);
+                        let dmv = Mv::new(
+                            mv.row as i32 - info.best_for_newmv.row as i32,
+                            mv.col as i32 - info.best_for_newmv.col as i32,
+                        );
+                        encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[0], dmv.row as i32);
+                        encode_mv_component(&mut hdr_enc, &DEFAULT_MV_CONTEXT[1], dmv.col as i32);
+                    }
+                    PMbDecision::SplitMv(split) => {
+                        hdr_enc.write_bool(ref_probs[0] as u32, true);
+                        hdr_enc.write_bool(ref_probs[1] as u32, true);
+                        hdr_enc.write_bool(ref_probs[2] as u32, true);
+                        hdr_enc.write_bool(ref_probs[3] as u32, true);
+                        emit_split_mb_tree(&mut hdr_enc, split.split_mode);
+                        // Per-partition sub-MV refs. Each partition's
+                        // neighbours come from earlier partitions (or from
+                        // neighbouring MBs' bottom/right sub-MV rows).
+                        emit_split_submvs(
+                            &mut hdr_enc,
+                            &split,
+                            &mb_sub_mvs,
+                            &mb_decisions,
+                            mb_x,
+                            mb_y,
+                            mb_w,
+                            info.best_for_newmv,
+                        );
+                    }
+                    PMbDecision::Intra { .. } => unreachable!("intra handled elsewhere"),
+                }
+            }
+        }
+    }
 
     let first_partition = hdr_enc.finish();
 
@@ -2041,6 +2150,35 @@ fn find_near_mvs_enc(
     }
 
     (mvs[1], mvs[2], mvs[0], cnt)
+}
+
+/// Pick a frame-level bool-coder probability from observed counts.
+///
+/// VP8's bool coder convention is that `prob` is the probability of the
+/// bit decoding as zero (`P(bit==0) = prob/256`). Given the frame-wide
+/// counts `n_zero` (number of MBs whose bit decodes as `false`) and
+/// `n_one` (number that decode as `true`), the optimal entropy-matched
+/// probability is `round(256 * n_zero / (n_zero + n_one))`.
+///
+/// Two boundary fixups:
+///   * `n_zero + n_one == 0`: no observations — fall back to neutral
+///     `128` so the literal still parses correctly even though no
+///     decoded bool will use it.
+///   * Result clamped to `1..=255`: the bool coder can encode either
+///     branch at any non-degenerate probability; clamping away from
+///     `0` and `256` keeps every potential outcome representable
+///     (a single rare event still has bounded cost) and matches the
+///     libvpx "always-codable" convention.
+#[inline]
+fn optimal_prob_8(n_zero: u32, n_one: u32) -> u8 {
+    let total = n_zero + n_one;
+    if total == 0 {
+        return 128;
+    }
+    // round(256 * n_zero / total) without overflow risk for plausible
+    // frame sizes (mb_w * mb_h * weight ≤ a few million).
+    let scaled = ((n_zero as u64) * 256 + (total as u64) / 2) / (total as u64);
+    scaled.clamp(1, 255) as u8
 }
 
 /// Encode-time replica of the decoder's `mv_ref_probs`. Each `cnt[i]`
@@ -4488,5 +4626,129 @@ mod tests {
         coeffs[4] = -50;
         coeffs[5] = 100;
         roundtrip_one_block(&coeffs, 1, 0, 0);
+    }
+
+    /// `optimal_prob_8` returns 128 on the empty observation, and
+    /// otherwise rounds `256 * n_zero / total` to the nearest integer
+    /// with the result clamped to 1..=255 so the bool coder can still
+    /// encode either branch (no degenerate single-symbol case).
+    #[test]
+    fn optimal_prob_8_matches_observed_distribution() {
+        // No observations → neutral 128.
+        assert_eq!(super::optimal_prob_8(0, 0), 128);
+        // Pure zero observations → clamped to 255 (not 256, so a single
+        // unexpected `true` outcome still has bounded entropy cost).
+        assert_eq!(super::optimal_prob_8(100, 0), 255);
+        // Pure one observations → clamped to 1.
+        assert_eq!(super::optimal_prob_8(0, 100), 1);
+        // 50/50 split → 128.
+        assert_eq!(super::optimal_prob_8(50, 50), 128);
+        // 80% zero → ~204/205 (256*0.8 = 204.8 → rounds to 205).
+        assert_eq!(super::optimal_prob_8(80, 20), 205);
+        // Single zero event amongst many ones → clamped to 1, not 0.
+        let p = super::optimal_prob_8(1, 99);
+        assert!((1..=3).contains(&p), "expected ~3, got {p}");
+    }
+
+    /// The `prob_intra` / `prob_last` / `prob_gf` triple in the inter
+    /// frame header should reflect the actual ref-frame distribution
+    /// of the encoded MBs — not the legacy fixed `200 / 1 / 128`
+    /// (single-ref) or `200 / 128 / 128` (multi-ref) literals.
+    ///
+    /// On a static-content P-frame *every* MB picks REF_LAST as SKIP, so
+    /// `prob_last` should land near 255 (REF_LAST near-free, the libvpx
+    /// single-ref convention) and `prob_intra` should land near 255
+    /// (intra-in-P essentially never picked).
+    /// The `prob_intra` / `prob_last` / `prob_gf` triple in the inter
+    /// frame header should reflect the actual ref-frame distribution
+    /// of the encoded MBs — not the legacy fixed `200 / 1 / 128`
+    /// (single-ref) or `200 / 128 / 128` (multi-ref) literals.
+    ///
+    /// On a static-content P-frame *every* MB picks REF_LAST as SKIP, so
+    /// `prob_last` should land near 255 (REF_LAST near-free, the libvpx
+    /// single-ref convention) and `prob_intra` should land near 255
+    /// (intra-in-P essentially never picked).
+    #[test]
+    fn header_probs_track_per_mb_ref_distribution() {
+        use crate::bool_decoder::BoolDecoder;
+        use crate::frame_header::{parse_inter_header, PersistentProbs};
+        use crate::frame_tag::{parse_header, FrameType};
+        use oxideav_core::{
+            CodecId, CodecParameters, Frame, PixelFormat, Rational, VideoFrame, VideoPlane,
+        };
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+        let cw = (W / 2) as usize;
+        let ch = (H / 2) as usize;
+        let make = || {
+            // Solid grey frame — frame N+1 == frame N for the first two
+            // frames so every MB is a perfect SKIP candidate against LAST.
+            let y = vec![128u8; (W * H) as usize];
+            let u = vec![128u8; cw * ch];
+            let v = vec![128u8; cw * ch];
+            VideoFrame {
+                pts: None,
+                planes: vec![
+                    VideoPlane {
+                        stride: W as usize,
+                        data: y,
+                    },
+                    VideoPlane {
+                        stride: cw,
+                        data: u,
+                    },
+                    VideoPlane {
+                        stride: cw,
+                        data: v,
+                    },
+                ],
+            }
+        };
+
+        let mut params = CodecParameters::video(CodecId::new("vp8"));
+        params.width = Some(W);
+        params.height = Some(H);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
+        params.frame_rate = Some(Rational::new(30, 1));
+        let mut enc = super::make_encoder_with_qindex(&params, 50).expect("encoder");
+
+        // Frame 0 = keyframe, frame 1 = identical → all-SKIP P-frame.
+        enc.send_frame(&Frame::Video(make())).expect("send 0");
+        let _kf = enc.receive_packet().expect("rx 0");
+        enc.send_frame(&Frame::Video(make())).expect("send 1");
+        let pkt = enc.receive_packet().expect("rx 1");
+
+        // Parse the P-frame's inter header and read the prob triple.
+        let parsed = parse_header(&pkt.data).expect("tag");
+        assert!(matches!(parsed.tag.frame_type, FrameType::Inter));
+        let body = &pkt.data[parsed.compressed_offset..];
+        let mut bd = BoolDecoder::new(body).expect("bd");
+        let probs = PersistentProbs::defaults();
+        let h = parse_inter_header(&mut bd, &probs).expect("hdr");
+
+        // Bool-coder convention: `prob = P(bit==0)`. The decoder reads:
+        //   is_inter        = read_bool(prob_intra)   → true ⇒ inter
+        //   not_last        = read_bool(prob_last)    → true ⇒ GOLDEN/ALT
+        //   is_alt          = read_bool(prob_gf)      → true ⇒ ALT
+        // Every MB picked LAST → 0% intra → prob_intra → 1 (inter is
+        // near-free) — exactly the opposite of the legacy `prob_intra=200`
+        // literal that biased toward intra. prob_last → 255 (LAST is
+        // near-free, the libvpx single-ref convention). prob_gf has no
+        // observations and falls back to the neutral 128 default.
+        assert!(
+            h.prob_intra <= 16,
+            "prob_intra should track all-inter distribution: got {}",
+            h.prob_intra
+        );
+        assert!(
+            h.prob_last >= 240,
+            "prob_last should track all-LAST distribution: got {}",
+            h.prob_last
+        );
+        assert_eq!(
+            h.prob_gf, 128,
+            "prob_gf should fall back to 128 with no GOLDEN/ALT observations"
+        );
     }
 }

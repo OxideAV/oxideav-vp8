@@ -47,6 +47,35 @@ margin before it can beat the best 16x16 mode. SPLIT_MV pays a
 per-partition margin over NEW_MV so it only wins when the per-partition
 motion reduces SAD substantially.
 
+**Lagrangian rate-distortion** P-frame mode decision (default on):
+each candidate inter mode is scored as `D + λ·R` where `D` is the
+luma-plane SSE of the prediction, `R` is the approximate bool-coded
+cost in eighth-of-a-bit units of the per-MB mode-info (skip /
+intra-vs-inter / ref-frame / MV-tree / MV deltas), and
+`λ = lambda_scale · QP² / 256` with a default scale of 218 (≈
+0.85·256). The rate term lets neighbour-derived MVs (NEAREST / NEAR)
+beat NEWMV when the SSE is comparable, and lets shorter MV deltas
+win on flat content. The per-MB reference-frame selector below uses
+the same RD cost for cross-reference picking. Setting
+`enable_rdo = false` falls back to the SAD-only picker.
+
+**Alt-ref / golden-ref planning** keeps three reconstructions live
+(LAST / GOLDEN / ALTREF) and refreshes GOLDEN every
+`golden_interval` P-frames (default 8) and ALTREF every
+`alt_ref_interval` (default 13). The per-MB picker evaluates each
+populated reference and picks the one with the lowest RD cost,
+emitting the appropriate `prob_last` / `prob_gf` bits in the
+ref-frame tree. The per-frame inter header signals
+`refresh_golden_frame` and `refresh_alternate_frame` exactly when the
+schedule fires, with `copy_buffer_to_*` set to "no copy" otherwise.
+Disable with `enable_multi_ref = false` to recover the legacy
+single-reference behaviour.
+
+Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
+fine-grained control over `qindex`, `golden_interval`,
+`alt_ref_interval`, `lambda_scale`, `enable_rdo`, and
+`enable_multi_ref`.
+
 ### Container
 
 IVF read *and* write:

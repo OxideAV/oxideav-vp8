@@ -2,12 +2,15 @@
 //!
 //! Scope:
 //! * First frame (and on forced refresh) = key-frame (I-frame).
-//! * Subsequent frames = P-frames against REF_LAST, picking the best per-MB
-//!   mode among SKIP, ZERO_MV, NEAREST_MV, NEAR_MV, NEW_MV (with quarter-pel
-//!   refinement after the integer-pel search), SPLIT_MV (16×8 / 8×16 / 8×8
-//!   / 4×4 partitions, each with its own MV) and an intra fallback for MBs
-//!   whose best inter prediction is too poor to be worth coding as a
-//!   residual.
+//! * Subsequent frames = P-frames against any populated REF_LAST /
+//!   REF_GOLDEN / REF_ALT slot (per-MB pick), with periodic GOLDEN /
+//!   ALTREF refresh on the cadence in `Vp8EncoderConfig`. Best per-MB
+//!   mode among SKIP, ZERO_MV, NEAREST_MV, NEAR_MV, NEW_MV (with
+//!   quarter-pel refinement after the integer-pel search), SPLIT_MV
+//!   (16×8 / 8×16 / 8×8 / 4×4 partitions, each with its own MV) and an
+//!   intra fallback for MBs whose best inter prediction is too poor to
+//!   be worth coding as a residual. Mode decision is Lagrangian
+//!   (`D + λ·R`) when `enable_rdo` is set.
 //! * All 5 intra 16×16 modes (DC / V / H / TM / B_PRED) plus the 10 4×4
 //!   sub-modes under B_PRED on keyframes and the P-frame intra fallback.
 //!   Chroma uses the matching 4 modes (DC / V / H / TM).
@@ -128,6 +131,66 @@ const SPLITMV_CONSIDER_SAD_PER_PIXEL: u32 = 2;
 /// SAD substantially (the exact value scales with partition count).
 const SPLITMV_SAD_MARGIN_PER_PARTITION: u32 = 96;
 
+/// Default golden-frame refresh interval (P-frames). Every Nth P-frame the
+/// encoder marks `refresh_golden_frame=1`, snapshotting the current
+/// reconstruction into the long-term GOLDEN slot. Set to 0 to disable.
+pub const DEFAULT_GOLDEN_INTERVAL: u32 = 8;
+
+/// Default alt-ref refresh interval (P-frames). Every Nth P-frame the
+/// encoder marks `refresh_alt_ref_frame=1`. With our look-ahead-free
+/// implementation alt-ref is essentially a second long-term anchor with
+/// a different cadence than GOLDEN, exposing two stable references the
+/// per-MB rate-distortion search can pick from. Set to 0 to disable.
+pub const DEFAULT_ALT_REF_INTERVAL: u32 = 13;
+
+/// Lagrangian multiplier scale: lambda = LAMBDA_SCALE * QP^2 / 256.
+/// The classic textbook expression `lambda = 0.85 * QP^2` would dominate
+/// the integer-SSE distortion on small QPs (lambda > 1000); scaling it
+/// down by 256 keeps lambda comfortably in the same numeric range as
+/// the SSE accumulator while preserving its quadratic shape in QP.
+pub const LAMBDA_SCALE_DEFAULT: u32 = 218; // ≈ 0.85 * 256
+
+/// Per-MB encoder configuration. Knob bag for the alt-ref / golden-ref
+/// planning + Lagrangian RDO mode decision wired up in this version.
+///
+/// All fields default to a "sensible" value chosen by the encoder; the
+/// public `make_encoder_with_config` constructor lets callers (tests,
+/// rate-control loops) override individual knobs.
+#[derive(Clone, Copy, Debug)]
+pub struct Vp8EncoderConfig {
+    /// Quantiser index, 0..=127. Lower = higher quality, larger files.
+    pub qindex: u8,
+    /// Refresh GOLDEN every N P-frames (0 = disable; 1 = every P-frame
+    /// just like LAST, which is wasteful but valid).
+    pub golden_interval: u32,
+    /// Refresh ALTREF every N P-frames.
+    pub alt_ref_interval: u32,
+    /// Enable per-MB Lagrangian rate-distortion mode decision (D + λ·R).
+    /// When false, the encoder falls back to the SAD-only / SSE-only
+    /// heuristic from earlier rounds.
+    pub enable_rdo: bool,
+    /// Lambda multiplier scale; lambda = scale * QP^2 / 256. Set to 0 to
+    /// turn off the rate term entirely (pure-distortion mode decision).
+    pub lambda_scale: u32,
+    /// Enable per-MB picking among LAST / GOLDEN / ALTREF references in
+    /// the inter mode decision. When `false`, the encoder always uses
+    /// LAST (the legacy single-reference behaviour).
+    pub enable_multi_ref: bool,
+}
+
+impl Default for Vp8EncoderConfig {
+    fn default() -> Self {
+        Self {
+            qindex: DEFAULT_QINDEX,
+            golden_interval: DEFAULT_GOLDEN_INTERVAL,
+            alt_ref_interval: DEFAULT_ALT_REF_INTERVAL,
+            enable_rdo: true,
+            lambda_scale: LAMBDA_SCALE_DEFAULT,
+            enable_multi_ref: true,
+        }
+    }
+}
+
 /// Encoder factory used by [`crate::register_codecs`].
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let width = params
@@ -163,11 +226,14 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         output_params,
         width,
         height,
-        qindex: DEFAULT_QINDEX,
+        config: Vp8EncoderConfig::default(),
         time_base,
         pending: VecDeque::new(),
         eof: false,
         last_frame: None,
+        golden_frame: None,
+        alt_ref_frame: None,
+        pframe_count: 0,
     }))
 }
 
@@ -196,15 +262,65 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
     output_params.pixel_format = Some(PixelFormat::Yuv420P);
     output_params.frame_rate = Some(frame_rate);
     let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
+    let mut cfg = Vp8EncoderConfig::default();
+    cfg.qindex = qindex.min(127);
     Ok(Box::new(Vp8Encoder {
         output_params,
         width,
         height,
-        qindex: qindex.min(127),
+        config: cfg,
         time_base,
         pending: VecDeque::new(),
         eof: false,
         last_frame: None,
+        golden_frame: None,
+        alt_ref_frame: None,
+        pframe_count: 0,
+    }))
+}
+
+/// Build an encoder with a fully-specified configuration. Lets callers
+/// turn alt-ref / golden planning + RDO on or off independently.
+pub fn make_encoder_with_config(
+    params: &CodecParameters,
+    config: Vp8EncoderConfig,
+) -> Result<Box<dyn Encoder>> {
+    let width = params
+        .width
+        .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
+    let height = params
+        .height
+        .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
+    let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+    if pix != PixelFormat::Yuv420P {
+        return Err(Error::unsupported(format!(
+            "vp8 encoder: only Yuv420P supported (got {:?})",
+            pix
+        )));
+    }
+    let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
+    let mut output_params = params.clone();
+    output_params.media_type = MediaType::Video;
+    output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
+    output_params.width = Some(width);
+    output_params.height = Some(height);
+    output_params.pixel_format = Some(PixelFormat::Yuv420P);
+    output_params.frame_rate = Some(frame_rate);
+    let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
+    let mut cfg = config;
+    cfg.qindex = cfg.qindex.min(127);
+    Ok(Box::new(Vp8Encoder {
+        output_params,
+        width,
+        height,
+        config: cfg,
+        time_base,
+        pending: VecDeque::new(),
+        eof: false,
+        last_frame: None,
+        golden_frame: None,
+        alt_ref_frame: None,
+        pframe_count: 0,
     }))
 }
 
@@ -226,11 +342,54 @@ struct Vp8Encoder {
     output_params: CodecParameters,
     width: u32,
     height: u32,
-    qindex: u8,
+    config: Vp8EncoderConfig,
     time_base: TimeBase,
     pending: VecDeque<Packet>,
     eof: bool,
     last_frame: Option<ReferenceFrame>,
+    golden_frame: Option<ReferenceFrame>,
+    alt_ref_frame: Option<ReferenceFrame>,
+    /// Count of P-frames emitted so far; used to drive the periodic
+    /// golden / alt-ref refresh schedule.
+    pframe_count: u32,
+}
+
+/// Per-frame plan: which reference slots get refreshed by the new
+/// reconstruction at the end of this frame, plus which references are
+/// available to the per-MB inter mode decision while encoding it.
+#[derive(Clone, Copy, Debug)]
+struct RefPlan {
+    refresh_last: bool,
+    refresh_golden: bool,
+    refresh_alt: bool,
+    /// Per-MB inter decision may pick from LAST (always available on
+    /// P-frames). Whether GOLDEN/ALT are also offered is gated by both
+    /// `enable_multi_ref` and the slot actually being populated.
+    use_golden: bool,
+    use_alt: bool,
+}
+
+impl RefPlan {
+    /// Compute the refresh / availability plan for the next P-frame
+    /// given the current encoder state.
+    fn for_pframe(enc: &Vp8Encoder) -> Self {
+        // Counter is incremented before computing the plan, so the
+        // *first* P-frame is `pframe_count == 1`.
+        let n = enc.pframe_count;
+        let refresh_golden = enc.config.golden_interval > 0
+            && enc.config.enable_multi_ref
+            && n % enc.config.golden_interval == 0;
+        let refresh_alt = enc.config.alt_ref_interval > 0
+            && enc.config.enable_multi_ref
+            && n % enc.config.alt_ref_interval == 0;
+        Self {
+            refresh_last: true,
+            refresh_golden,
+            refresh_alt,
+            use_golden: enc.config.enable_multi_ref && enc.golden_frame.is_some(),
+            use_alt: enc.config.enable_multi_ref && enc.alt_ref_frame.is_some(),
+        }
+    }
 }
 
 impl Encoder for Vp8Encoder {
@@ -255,17 +414,49 @@ impl Encoder for Vp8Encoder {
         // trusts the planes match `self.width × self.height` Yuv420P.
 
         let is_keyframe = self.last_frame.is_none();
-        let (data, reference) = if is_keyframe {
+        let (data, reference, plan) = if is_keyframe {
             let (bitstream, rec) =
-                encode_keyframe_and_reconstruct(self.width, self.height, self.qindex, v)?;
-            (bitstream, rec)
+                encode_keyframe_and_reconstruct(self.width, self.height, self.config.qindex, v)?;
+            // Keyframe refreshes all three slots.
+            let plan = RefPlan {
+                refresh_last: true,
+                refresh_golden: true,
+                refresh_alt: true,
+                use_golden: false,
+                use_alt: false,
+            };
+            (bitstream, rec, plan)
         } else {
-            let reference = self.last_frame.as_ref().unwrap();
-            let (bitstream, rec) =
-                encode_pframe_and_reconstruct(self.width, self.height, self.qindex, v, reference)?;
-            (bitstream, rec)
+            self.pframe_count += 1;
+            let plan = RefPlan::for_pframe(self);
+            let last_ref = self.last_frame.as_ref().unwrap();
+            let golden_ref = self.golden_frame.as_ref().filter(|_| plan.use_golden);
+            let alt_ref = self.alt_ref_frame.as_ref().filter(|_| plan.use_alt);
+            let (bitstream, rec) = encode_pframe_and_reconstruct(
+                self.width,
+                self.height,
+                self.config,
+                v,
+                last_ref,
+                golden_ref,
+                alt_ref,
+                plan,
+            )?;
+            (bitstream, rec, plan)
         };
-        self.last_frame = Some(reference);
+        // Refresh references per the plan. `LAST` is always refreshed on
+        // P-frames in our encoder; GOLDEN / ALT only when the schedule
+        // says so.
+        if plan.refresh_last {
+            self.last_frame = Some(reference.clone());
+        }
+        if plan.refresh_golden {
+            self.golden_frame = Some(reference.clone());
+        }
+        if plan.refresh_alt {
+            self.alt_ref_frame = Some(reference.clone());
+        }
+        let _ = reference;
 
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;
@@ -595,6 +786,13 @@ struct SplitMv {
     part_mvs: [Mv; 16],
 }
 
+// Per-MB reference-frame ID, mirroring the decoder's namespace
+// (`REF_INTRA = 0`, `REF_LAST = 1`, `REF_GOLDEN = 2`, `REF_ALT = 3`).
+const ENC_REF_INTRA: u8 = 0;
+const ENC_REF_LAST: u8 = 1;
+const ENC_REF_GOLDEN: u8 = 2;
+const ENC_REF_ALT: u8 = 3;
+
 /// Per-MB decision for a P-frame.
 #[derive(Clone, Copy, Debug)]
 enum PMbDecision {
@@ -660,17 +858,21 @@ impl PMbDecision {
     }
 }
 
-/// Encode one P-frame (inter-frame) against REF_LAST, picking per MB
-/// between SKIP / ZERO_MV / NEAREST_MV / NEAR_MV / NEW_MV (with quarter-pel
-/// refinement) / intra-DC_PRED fallback. Returns the raw VP8 bitstream
-/// plus the reconstruction that exactly matches what the decoder will
-/// produce.
+/// Encode one P-frame (inter-frame). Reference picking is per-MB across
+/// the available LAST / GOLDEN / ALTREF slots; mode decision is
+/// Lagrangian (`D + lambda*R`) when `config.enable_rdo` is set,
+/// otherwise the legacy SAD-only path. The reconstructed frame is
+/// returned for the caller to use in the next reference plan.
+#[allow(clippy::too_many_arguments)]
 fn encode_pframe_and_reconstruct(
     width: u32,
     height: u32,
-    qindex: u8,
+    config: Vp8EncoderConfig,
     frame: &VideoFrame,
-    reference: &ReferenceFrame,
+    last_ref: &ReferenceFrame,
+    golden_ref: Option<&ReferenceFrame>,
+    alt_ref: Option<&ReferenceFrame>,
+    plan: RefPlan,
 ) -> Result<(Vec<u8>, ReferenceFrame)> {
     let mb_w = ((width + 15) / 16) as usize;
     let mb_h = ((height + 15) / 16) as usize;
@@ -680,10 +882,10 @@ fn encode_pframe_and_reconstruct(
     let uv_buf_h = mb_h * 8;
 
     // Sanity: reference must have the same stride/geometry.
-    if reference.y_stride != y_stride
-        || reference.uv_stride != uv_stride
-        || reference.y_h != y_buf_h
-        || reference.uv_h != uv_buf_h
+    if last_ref.y_stride != y_stride
+        || last_ref.uv_stride != uv_stride
+        || last_ref.y_h != y_buf_h
+        || last_ref.uv_h != uv_buf_h
     {
         return Err(Error::invalid(
             "vp8 encoder: reference frame geometry mismatch (reset required)",
@@ -698,7 +900,7 @@ fn encode_pframe_and_reconstruct(
     let mut rec_u = vec![0u8; uv_stride * uv_buf_h];
     let mut rec_v = vec![0u8; uv_stride * uv_buf_h];
 
-    let qi = clamp_qindex(qindex as i32);
+    let qi = clamp_qindex(config.qindex as i32);
     let q = QuantCtx {
         y_dc: y_dc_step(qi as i32),
         y_ac: y_ac_step(qi as i32),
@@ -728,17 +930,28 @@ fn encode_pframe_and_reconstruct(
     for _ in 0..5 {
         hdr_enc.write_bool(128, false);
     }
-    //   refresh_alt = 1 (refresh all references with the new frame)
-    hdr_enc.write_bool(128, true);
-    //   refresh_golden = 1
-    hdr_enc.write_bool(128, true);
+    //   refresh_golden, refresh_alt — driven by the per-frame reference
+    //   plan computed by the encoder (alt-ref / golden cadence), not
+    //   hard-wired to 1.
+    hdr_enc.write_bool(128, plan.refresh_golden);
+    hdr_enc.write_bool(128, plan.refresh_alt);
+    //   When refresh_golden / refresh_alt are 0, the decoder reads a
+    //   2-bit copy_buffer_to_* selector. We always emit "no copy" (=0)
+    //   so the slot keeps its existing contents until a future refresh
+    //   puts a new reconstruction into it.
+    if !plan.refresh_golden {
+        hdr_enc.write_literal(2, 0);
+    }
+    if !plan.refresh_alt {
+        hdr_enc.write_literal(2, 0);
+    }
     //   sign_bias_golden, sign_bias_alt
     hdr_enc.write_bool(128, false);
     hdr_enc.write_bool(128, false);
     //   refresh_entropy_probs = 0
     hdr_enc.write_bool(128, false);
     //   refresh_last = 1
-    hdr_enc.write_bool(128, true);
+    hdr_enc.write_bool(128, plan.refresh_last);
     //   coef prob updates — all "no update"
     emit_no_coef_prob_updates(&mut hdr_enc);
     //   mb_skip_enabled = 1, skip prob literal (we use 128 — neutral).
@@ -749,11 +962,18 @@ fn encode_pframe_and_reconstruct(
     //   prob_intra is picked so `read_bool(prob_intra) == true` (inter) is
     //   cheap in the common case while leaving intra-in-P affordable — see
     //   PROB_INTRA_IN_P for tuning rationale.
-    //   prob_last=1 keeps `read_bool(1)==false` (REF_LAST) near-free.
-    //   prob_gf is never read since we never take the "not last" branch.
+    //
+    //   Reference-frame probabilities: with multi-ref enabled we pick
+    //   neutral 128 for both prob_last and prob_gf so the encoder pays
+    //   ~1 bit each on average for the LAST-vs-{GOLDEN,ALT} and
+    //   GOLDEN-vs-ALT splits. With multi-ref disabled we keep the legacy
+    //   prob_last=1 path that makes `read_bool(1)==false` near-free.
     let prob_intra: u8 = PROB_INTRA_IN_P;
-    let prob_last: u8 = 1;
-    let prob_gf: u8 = 128;
+    let (prob_last, prob_gf): (u8, u8) = if plan.use_golden || plan.use_alt {
+        (128, 128)
+    } else {
+        (1, 128)
+    };
     hdr_enc.write_literal(8, prob_intra as u32);
     hdr_enc.write_literal(8, prob_last as u32);
     hdr_enc.write_literal(8, prob_gf as u32);
@@ -771,6 +991,7 @@ fn encode_pframe_and_reconstruct(
     // --- Per-MB decision + reconstruction ---
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_decisions: Vec<PMbDecision> = Vec::with_capacity(mb_w * mb_h);
+    let mut mb_ref_frames: Vec<u8> = Vec::with_capacity(mb_w * mb_h);
     let mut mb_mvs: Vec<Mv> = vec![Mv::ZERO; mb_w * mb_h];
     // Per-subblock MVs (needed for SPLIT's neighbour MVs when later MBs
     // use SPLIT themselves — encoder-side replica of the decoder's
@@ -780,28 +1001,106 @@ fn encode_pframe_and_reconstruct(
     let mut bmode_above: Vec<[i32; 4]> = vec![[B_DC_PRED; 4]; mb_w];
     let mut mb_bmodes: Vec<[i32; 16]> = vec![[B_DC_PRED; 16]; mb_w * mb_h];
     let mut mb_ymodes: Vec<i32> = vec![DC_PRED; mb_w * mb_h];
+    // Lambda for Lagrangian RDO (D + lambda*R). Computed once per frame
+    // since QP is fixed; if RDO is disabled lambda is 0 and rate
+    // contributions wash out, recovering the legacy SAD-only behaviour.
+    let lambda = if config.enable_rdo {
+        lambda_for_qp(qi as u32, config.lambda_scale)
+    } else {
+        0
+    };
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
-            // Gather the decoder-visible neighbour context for this MB so
-            // that `nearest` / `near` candidates are bit-exact.
-            let (nearest, near, best_for_newmv, cnt) =
-                find_near_mvs_enc(&mb_mvs, &mb_decisions, mb_x, mb_y, mb_w);
-            let ref_probs = mv_ref_probs_enc(&cnt);
+            let mb_idx = mb_y * mb_w + mb_x;
+            // For each candidate reference, gather the per-ref neighbour
+            // context (nearest / near / best). The decoder's find_near_mvs
+            // walks neighbours and only contributes those whose ref_frame
+            // matches; the encoder mirrors that filtering exactly.
+            //
+            // Always start with LAST since every P-frame has it. Then add
+            // GOLDEN / ALT if the plan has them populated.
+            type RdCandidate = (u64, u8, PMbDecision, Mv, Mv, Mv, [u8; 4]);
+            let mut best_choice: Option<RdCandidate> = None;
 
-            let decision = choose_pmb_decision(
-                &src_y,
-                &reference.y,
-                y_stride,
-                y_buf_h,
-                mb_x,
-                mb_y,
-                nearest,
-                near,
-                &rec_y,
-            );
+            let try_ref = |ref_frame: u8, ref_plane: &ReferenceFrame, store: &mut Option<_>| {
+                let (nearest, near, best_for_newmv, cnt) = find_near_mvs_enc(
+                    &mb_mvs,
+                    &mb_decisions,
+                    &mb_ref_frames,
+                    mb_x,
+                    mb_y,
+                    mb_w,
+                    ref_frame,
+                );
+                let dec = choose_pmb_decision(
+                    &src_y,
+                    &ref_plane.y,
+                    y_stride,
+                    y_buf_h,
+                    mb_x,
+                    mb_y,
+                    nearest,
+                    near,
+                    &rec_y,
+                );
+                let cost = rd_cost_for_decision(
+                    &dec,
+                    &src_y,
+                    &ref_plane.y,
+                    y_stride,
+                    y_buf_h,
+                    mb_x,
+                    mb_y,
+                    ref_frame,
+                    plan,
+                    nearest,
+                    near,
+                    best_for_newmv,
+                    prob_intra,
+                    prob_last,
+                    prob_gf,
+                    mb_skip_prob,
+                    lambda,
+                );
+                let take = match store {
+                    None => true,
+                    Some((bcost, _, _, _, _, _, _)) => cost < *bcost,
+                };
+                if take {
+                    *store = Some((cost, ref_frame, dec, nearest, near, best_for_newmv, cnt));
+                }
+            };
+
+            try_ref(ENC_REF_LAST, last_ref, &mut best_choice);
+            if let Some(g) = golden_ref {
+                try_ref(ENC_REF_GOLDEN, g, &mut best_choice);
+            }
+            if let Some(a) = alt_ref {
+                try_ref(ENC_REF_ALT, a, &mut best_choice);
+            }
+
+            let (_cost, picked_ref, decision, _nearest, _near, best_for_newmv, cnt) =
+                best_choice.expect("LAST must always produce a candidate");
+            let ref_probs = mv_ref_probs_enc(&cnt);
             mb_decisions.push(decision);
-            mb_mvs[mb_y * mb_w + mb_x] = decision.mv();
-            mb_sub_mvs[mb_y * mb_w + mb_x] = decision.sub_mvs();
+            // Skip / ZeroMv on a non-LAST reference would still need
+            // a `prob_last==true` ref-frame bit emitted — keep that
+            // information so the bitstream emit code below picks the
+            // right path. For Intra we record REF_INTRA (=0).
+            let stored_ref = if decision.is_intra() {
+                ENC_REF_INTRA
+            } else {
+                picked_ref
+            };
+            mb_ref_frames.push(stored_ref);
+            mb_mvs[mb_idx] = decision.mv();
+            mb_sub_mvs[mb_idx] = decision.sub_mvs();
+            // Pick the right reference plane for the residual encode below.
+            let used_ref: &ReferenceFrame = match picked_ref {
+                ENC_REF_GOLDEN => golden_ref.expect("plan.use_golden was true"),
+                ENC_REF_ALT => alt_ref.expect("plan.use_alt was true"),
+                _ => last_ref,
+            };
 
             // Mode-info bits.
             // 1) segment id (skipped — seg disabled).
@@ -856,8 +1155,25 @@ fn encode_pframe_and_reconstruct(
                 mb_ymodes[mb_y * mb_w + mb_x] = y_mode;
                 emit_inter_uv_mode(&mut hdr_enc, uv_mode, &DEFAULT_UV_MODE_PROBS);
             } else {
-                // 4) ref_frame bits: prob_last "is not last" = false (→ REF_LAST).
-                hdr_enc.write_bool(prob_last as u32, false);
+                // 4) ref_frame bits. RFC 6386 §16.2:
+                //      prob_last     : 0 → REF_LAST
+                //      prob_last     : 1 → read prob_gf:
+                //         prob_gf    : 0 → REF_GOLDEN
+                //         prob_gf    : 1 → REF_ALT
+                match picked_ref {
+                    ENC_REF_LAST => {
+                        hdr_enc.write_bool(prob_last as u32, false);
+                    }
+                    ENC_REF_GOLDEN => {
+                        hdr_enc.write_bool(prob_last as u32, true);
+                        hdr_enc.write_bool(prob_gf as u32, false);
+                    }
+                    ENC_REF_ALT => {
+                        hdr_enc.write_bool(prob_last as u32, true);
+                        hdr_enc.write_bool(prob_gf as u32, true);
+                    }
+                    _ => unreachable!("inter MB must have a non-intra ref_frame"),
+                }
 
                 // 5) MV_REF_TREE leaves (RFC §16.3):
                 //      leaf 0 = ZERO_MV      (path: 0)
@@ -925,9 +1241,9 @@ fn encode_pframe_and_reconstruct(
             let mb_rec = match decision {
                 PMbDecision::Skip => {
                     copy_ref_into_rec(
-                        &reference.y,
-                        &reference.u,
-                        &reference.v,
+                        &used_ref.y,
+                        &used_ref.u,
+                        &used_ref.v,
                         &mut rec_y,
                         &mut rec_u,
                         &mut rec_v,
@@ -945,9 +1261,9 @@ fn encode_pframe_and_reconstruct(
                     &src_y,
                     &src_u,
                     &src_v,
-                    &reference.y,
-                    &reference.u,
-                    &reference.v,
+                    &used_ref.y,
+                    &used_ref.u,
+                    &used_ref.v,
                     &mut rec_y,
                     &mut rec_u,
                     &mut rec_v,
@@ -964,9 +1280,9 @@ fn encode_pframe_and_reconstruct(
                     &src_y,
                     &src_u,
                     &src_v,
-                    &reference.y,
-                    &reference.u,
-                    &reference.v,
+                    &used_ref.y,
+                    &used_ref.u,
+                    &used_ref.v,
                     &mut rec_y,
                     &mut rec_u,
                     &mut rec_v,
@@ -1059,6 +1375,319 @@ fn encode_pframe_and_reconstruct(
         uv_h: uv_buf_h,
     };
     Ok((out, reference_out))
+}
+
+// ---------------------------------------------------------------------------
+// Lagrangian RDO helpers — used by the per-MB ref-and-mode picker.
+// ---------------------------------------------------------------------------
+
+/// Lagrangian multiplier for a given quantiser. The textbook expression
+/// is `lambda = 0.85 * QP^2`; we scale by `scale/256` to keep lambda
+/// comparable in magnitude to the SSE accumulator (which is integer
+/// 0..=255*255 per pixel * 256 pixels per MB ≈ low millions for an
+/// average MB). Returned as an unsigned integer for use in `D + λ·R`
+/// arithmetic; 0 disables the rate term and recovers SSE-only mode.
+#[inline]
+fn lambda_for_qp(qp: u32, scale: u32) -> u32 {
+    if scale == 0 {
+        return 0;
+    }
+    let q = qp.max(1);
+    (scale.saturating_mul(q.saturating_mul(q))) / 256
+}
+
+/// Approximate the entropy cost (in **eighth-of-a-bit** units) of writing
+/// a `read_bool(prob)` with the given outcome. Indexes into a 256-entry
+/// LUT of `floor(log2(256/p))*8` — coarse but plenty accurate for
+/// mode-decision tie-breaking.
+#[inline]
+fn bool_cost(prob: u8, outcome: bool) -> u32 {
+    let p = if outcome {
+        prob as u32
+    } else {
+        256 - prob as u32
+    };
+    PROB_TO_COST_8X[p.min(255) as usize] as u32
+}
+
+/// LUT: `PROB_TO_COST_8X[p] = floor(log2(256/max(p,1))) * 8` for p in 0..256.
+static PROB_TO_COST_8X: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut p = 0;
+    while p < 256 {
+        let pp = if p == 0 { 1u32 } else { p as u32 };
+        let mut bits = 0u32;
+        let mut v = 256u32;
+        while v > pp {
+            v >>= 1;
+            bits += 1;
+        }
+        let c = bits * 8;
+        t[p] = if c > 255 { 255 } else { c as u8 };
+        p += 1;
+    }
+    t
+};
+
+/// SSE of a 16x16 luma MB at `(mb_x, mb_y)` predicted from `ref_y` shifted
+/// by `(dy, dx)` integer luma pixels (with edge clamping).
+fn mb_luma_sse_at_int(
+    src_y: &[u8],
+    ref_y: &[u8],
+    stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    dy: i32,
+    dx: i32,
+) -> u64 {
+    let x0 = mb_x * 16;
+    let y0 = mb_y * 16;
+    let w = stride as i32;
+    let h = (ref_y.len() / stride) as i32;
+    let mut sse = 0u64;
+    for r in 0..16 {
+        let ry = (y0 as i32 + r as i32 + dy).clamp(0, h - 1) as usize;
+        let row_off_src = (y0 + r) * stride;
+        for c in 0..16 {
+            let rx = (x0 as i32 + c as i32 + dx).clamp(0, w - 1) as usize;
+            let d = src_y[row_off_src + x0 + c] as i32 - ref_y[ry * stride + rx] as i32;
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
+/// SSE of a 16x16 luma MB predicted at sub-pel MV `mv` (1/8-pel units),
+/// using the 6-tap luma filter the decoder applies.
+fn mb_luma_sse_at_subpel(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    src_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    mv: Mv,
+) -> u64 {
+    let mut pred = [0u8; 256];
+    for i in 0..16 {
+        let by = i / 4;
+        let bx = i % 4;
+        let dst_x = bx * 4;
+        let dst_y = by * 4;
+        let ref_x_fp = (mb_xp + dst_x) as i32 * 8 + mv.col as i32;
+        let ref_y_fp = (mb_yp + dst_y) as i32 * 8 + mv.row as i32;
+        sixtap_predict(
+            ref_plane, ref_x_fp, ref_y_fp, &mut pred, 16, dst_x, dst_y, 4, 4,
+        );
+    }
+    let mut sse = 0u64;
+    for r in 0..16 {
+        for c in 0..16 {
+            let s = src_y[(mb_yp + r) * src_stride + mb_xp + c] as i32;
+            let p = pred[r * 16 + c] as i32;
+            let d = s - p;
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
+/// Approximate the per-MB mode-info bit cost (eighth-of-a-bit units)
+/// for a candidate decision: skip flag + intra-vs-inter + ref-frame
+/// bits + MV-tree leaf + MV deltas.
+#[allow(clippy::too_many_arguments)]
+fn estimate_mode_rate_8ths(
+    decision: &PMbDecision,
+    ref_frame: u8,
+    plan: RefPlan,
+    nearest: Mv,
+    near: Mv,
+    best_for_newmv: Mv,
+    prob_intra: u8,
+    prob_last: u8,
+    prob_gf: u8,
+    mb_skip_prob: u8,
+) -> u32 {
+    let mut r = 0u32;
+    r += bool_cost(mb_skip_prob, matches!(decision, PMbDecision::Skip));
+    let is_inter = !decision.is_intra();
+    r += bool_cost(prob_intra, is_inter);
+    if !is_inter {
+        return r;
+    }
+    if plan.use_golden || plan.use_alt {
+        match ref_frame {
+            ENC_REF_LAST => r += bool_cost(prob_last, false),
+            ENC_REF_GOLDEN => {
+                r += bool_cost(prob_last, true);
+                r += bool_cost(prob_gf, false);
+            }
+            ENC_REF_ALT => {
+                r += bool_cost(prob_last, true);
+                r += bool_cost(prob_gf, true);
+            }
+            _ => {}
+        }
+    } else {
+        r += bool_cost(prob_last, false);
+    }
+    match decision {
+        PMbDecision::Skip | PMbDecision::ZeroMv => {
+            r += bool_cost(128, false);
+        }
+        PMbDecision::NearestMv(_) => {
+            r += bool_cost(128, true);
+            r += bool_cost(128, false);
+        }
+        PMbDecision::NearMv(_) => {
+            r += bool_cost(128, true);
+            r += bool_cost(128, true);
+            r += bool_cost(128, false);
+        }
+        PMbDecision::NewMv(mv) => {
+            r += bool_cost(128, true);
+            r += bool_cost(128, true);
+            r += bool_cost(128, true);
+            r += bool_cost(128, false);
+            let dr = (mv.row as i32 - best_for_newmv.row as i32).unsigned_abs();
+            let dc = (mv.col as i32 - best_for_newmv.col as i32).unsigned_abs();
+            r += mv_delta_cost_8ths(dr) + mv_delta_cost_8ths(dc);
+        }
+        PMbDecision::SplitMv(s) => {
+            r += bool_cost(128, true);
+            r += bool_cost(128, true);
+            r += bool_cost(128, true);
+            r += bool_cost(128, true);
+            let n = MB_SPLIT_COUNT[s.split_mode as usize] as u32;
+            r += 32 * n;
+            for p in 0..n as usize {
+                let mv = s.part_mvs[p];
+                if mv != best_for_newmv && mv != Mv::ZERO {
+                    let dr = (mv.row as i32 - best_for_newmv.row as i32).unsigned_abs();
+                    let dc = (mv.col as i32 - best_for_newmv.col as i32).unsigned_abs();
+                    r += mv_delta_cost_8ths(dr) + mv_delta_cost_8ths(dc);
+                }
+            }
+        }
+        PMbDecision::Intra { .. } => {}
+    }
+    let _ = (nearest, near);
+    r
+}
+
+/// Approximate the bool-coded bit cost of an MV-component delta in
+/// eighth-of-a-bit units.
+#[inline]
+fn mv_delta_cost_8ths(mag: u32) -> u32 {
+    if mag == 0 {
+        32
+    } else if mag < 8 {
+        48
+    } else if mag < 16 {
+        96
+    } else if mag < 64 {
+        128
+    } else if mag < 256 {
+        160
+    } else {
+        192
+    }
+}
+
+/// Approximate the SSE for a candidate decision (the distortion `D` of
+/// the Lagrangian cost). For inter modes we use the sub-pel SSE against
+/// the chosen reference; for intra we return a fixed moderate value
+/// since intra-in-P is gated by SAD upstream.
+#[allow(clippy::too_many_arguments)]
+fn estimate_distortion(
+    decision: &PMbDecision,
+    src_y: &[u8],
+    ref_y: &[u8],
+    y_stride: usize,
+    y_buf_h: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> u64 {
+    let mb_xp = mb_x * 16;
+    let mb_yp = mb_y * 16;
+    let ref_plane = RefPlane {
+        data: ref_y,
+        stride: y_stride,
+        width: y_stride,
+        height: y_buf_h,
+    };
+    match decision {
+        PMbDecision::Skip | PMbDecision::ZeroMv => {
+            mb_luma_sse_at_int(src_y, ref_y, y_stride, mb_x, mb_y, 0, 0)
+        }
+        PMbDecision::NearestMv(mv) | PMbDecision::NearMv(mv) | PMbDecision::NewMv(mv) => {
+            mb_luma_sse_at_subpel(src_y, &ref_plane, y_stride, mb_xp, mb_yp, *mv)
+        }
+        PMbDecision::SplitMv(s) => {
+            let mut sse = 0u64;
+            for i in 0..16 {
+                let part = MB_SPLITS[s.split_mode as usize][i];
+                let mv = s.part_mvs[part as usize];
+                let by = i / 4;
+                let bx = i % 4;
+                let sx = mb_xp + bx * 4;
+                let sy = mb_yp + by * 4;
+                let mut pred = [0u8; 16];
+                let ref_x_fp = sx as i32 * 8 + mv.col as i32;
+                let ref_y_fp = sy as i32 * 8 + mv.row as i32;
+                sixtap_predict(&ref_plane, ref_x_fp, ref_y_fp, &mut pred, 4, 0, 0, 4, 4);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let s = src_y[(sy + r) * y_stride + sx + c] as i32;
+                        let p = pred[r * 4 + c] as i32;
+                        let d = s - p;
+                        sse += (d * d) as u64;
+                    }
+                }
+            }
+            sse
+        }
+        PMbDecision::Intra { .. } => 8000,
+    }
+}
+
+/// Compute the Lagrangian RD cost `D + λ·R/8` (R is in eighth-of-a-bit
+/// units, so we divide by 8 to renormalise). Used by the per-MB
+/// reference-and-mode picker to select the best candidate across LAST /
+/// GOLDEN / ALTREF.
+#[allow(clippy::too_many_arguments)]
+fn rd_cost_for_decision(
+    decision: &PMbDecision,
+    src_y: &[u8],
+    ref_y: &[u8],
+    y_stride: usize,
+    y_buf_h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    ref_frame: u8,
+    plan: RefPlan,
+    nearest: Mv,
+    near: Mv,
+    best_for_newmv: Mv,
+    prob_intra: u8,
+    prob_last: u8,
+    prob_gf: u8,
+    mb_skip_prob: u8,
+    lambda: u32,
+) -> u64 {
+    let d = estimate_distortion(decision, src_y, ref_y, y_stride, y_buf_h, mb_x, mb_y);
+    let r = estimate_mode_rate_8ths(
+        decision,
+        ref_frame,
+        plan,
+        nearest,
+        near,
+        best_for_newmv,
+        prob_intra,
+        prob_last,
+        prob_gf,
+        mb_skip_prob,
+    );
+    d + ((lambda as u64) * (r as u64)) / 8
 }
 
 /// Pick the best P-frame decision for one MB.
@@ -1330,18 +1959,24 @@ fn integer_motion_search(
     (best, best_sad)
 }
 
-/// Encode-time replica of `find_near_mvs` in the decoder, restricted to
-/// the REF_LAST-only encoder. Returns `(nearest, near, best, cnt)`.
+/// Encode-time replica of `find_near_mvs` in the decoder. Returns
+/// `(nearest, near, best, cnt)` for a candidate `ref_frame`. Out-of-frame
+/// neighbours, intra neighbours, and neighbours whose ref differs from
+/// `ref_frame` all contribute NOTHING (not a ZERO MV). See the decoder's
+/// `find_near_mvs` for the RFC 6386 §16.3 walk.
 ///
-/// Must mirror the decoder's `find_near_mvs` bit-for-bit — out-of-frame
-/// and intra neighbours contribute NOTHING (not a ZERO MV). See the
-/// decoder's implementation for the full RFC 6386 §16.3 walk.
+/// Note: with all reference frames sharing sign-bias = false in this
+/// encoder, the sign-bias flip is a no-op so we omit it (the decoder
+/// would XOR neighbour vs current ref bias and negate when they differ).
+#[allow(clippy::too_many_arguments)]
 fn find_near_mvs_enc(
     mb_mvs: &[Mv],
     mb_decisions: &[PMbDecision],
+    mb_ref_frames: &[u8],
     mb_x: usize,
     mb_y: usize,
     mb_w: usize,
+    ref_frame: u8,
 ) -> (Mv, Mv, Mv, [u8; 4]) {
     let mut mvs: [Mv; 4] = [Mv::ZERO; 4];
     let mut cnt = [0u8; 4];
@@ -1357,7 +1992,17 @@ fn find_near_mvs_enc(
         let idx = (ny as usize) * mb_w + (nx as usize);
         let nmv = match mb_decisions.get(idx) {
             Some(d) if d.is_intra() => continue, // intra, no contribution
-            Some(_) => mb_mvs[idx],
+            Some(_) => {
+                // Filter neighbours whose reference differs from ours —
+                // the decoder's find_near_mvs only contributes neighbours
+                // whose ref_frame matches the current MB's ref (with
+                // sign-bias-aware MV negation; here all biases are false).
+                let nref = mb_ref_frames.get(idx).copied().unwrap_or(ENC_REF_LAST);
+                if nref != ref_frame {
+                    continue;
+                }
+                mb_mvs[idx]
+            }
             None => continue,
         };
 

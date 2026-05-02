@@ -98,10 +98,27 @@ in-tree decode stays bit-exact with what `ffmpeg` produces. Disable
 with `enable_segments = false` to recover the legacy single-segment
 encoding bit-for-bit.
 
+**Per-frame scene-cut adaptation** watches each incoming source
+frame's per-pixel luma mean-absolute-difference (MAD) versus the
+previous source frame, then compares it against the running
+`mean(MAD) + threshold · stddev(MAD)` over the last 16 frames (with
+an absolute floor of 12 luma units to suppress spurious cuts on
+quiet content). When the MAD crosses both thresholds the next frame
+is forced to a keyframe, the LAST / GOLDEN / ALTREF reference slots
+are dropped so the keyframe rebuilds the GOP from scratch, and the
+post-cut N frames receive a linearly-tapered qindex boost
+(`scene_cut_quant_boost`, default 8 over `scene_cut_boost_frames=4`
+frames) so the rebuild GOP starts at a higher quality floor than the
+plain frame qindex would give. Disable with
+`enable_scene_cut = false` to recover the legacy
+single-keyframe-at-frame-0 cadence bit-for-bit.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,
-`enable_segments`, and `segment_quant_deltas`.
+`enable_segments`, `segment_quant_deltas`, `enable_scene_cut`,
+`scene_cut_threshold`, `scene_cut_quant_boost`, and
+`scene_cut_boost_frames`.
 
 ### Container
 

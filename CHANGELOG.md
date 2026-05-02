@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-frame scene-cut adaptation in the encoder. New
+  `Vp8EncoderConfig` knobs `enable_scene_cut` (default on),
+  `scene_cut_threshold` (default 4.0), `scene_cut_quant_boost`
+  (default 8) and `scene_cut_boost_frames` (default 4). The encoder
+  watches each incoming source frame's per-pixel luma
+  mean-absolute-difference (MAD) versus the previous source frame and
+  flags a scene cut when the MAD exceeds
+  `mean(MAD) + threshold · stddev(MAD)` over the running 16-frame
+  window (also gated by an absolute floor of 12 luma units to avoid
+  spurious cuts on quiet content). On a flagged cut the next frame is
+  forced to a keyframe, the LAST / GOLDEN / ALTREF reference slots
+  are dropped, and the post-cut N frames receive a linearly-tapered
+  qindex boost so the rebuild GOP starts at higher quality. The
+  legacy `make_encoder_with_qindex` constructor keeps the detector
+  off so handcrafted small-frame test sequences stay bit-exact with
+  pre-#166 behaviour. Six new integration tests in
+  `tests/encoder_scene_cut.rs` cover the splice-point detection, the
+  no-false-positive guarantee on steady-pan content, the post-cut
+  PSNR regression, the legacy-cadence opt-out, and ffmpeg
+  cross-decode validation.
+
 - Per-MB segment maps (RFC 6386 §10). The encoder classifies each MB
   by source-luma 16×16 variance into one of four segments, then
   emits the segmentation block (`segmentation_enabled = 1`,

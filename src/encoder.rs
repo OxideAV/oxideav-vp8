@@ -169,6 +169,37 @@ pub const DEFAULT_SEGMENT_QUANT_DELTAS: [i32; 4] = [-8, -4, 0, 4];
 /// of ~80, ~640, ~3200 per pixel.
 pub const SEGMENT_VARIANCE_THRESHOLDS: [u64; 3] = [80 * 256, 640 * 256, 3200 * 256];
 
+/// Default scene-cut detection multiplier. A frame is flagged as a
+/// scene cut when its source-luma mean-absolute-difference (MAD) versus
+/// the previous source frame exceeds `mean(MAD) + N · stddev(MAD)`
+/// across the running window — i.e. the new frame's MAD is `N` standard
+/// deviations above the running average. `4.0` is the libvpx /
+/// libavcodec ballpark for "obvious cut, not just motion".
+pub const DEFAULT_SCENE_CUT_THRESHOLD: f32 = 4.0;
+/// Floor applied to the MAD comparison so the very first few P-frames
+/// (when the running stddev is still ~0) do not trigger spurious cuts
+/// on quiet content. Per-pixel luma MAD threshold below which we never
+/// flag a cut, regardless of how many sigmas above the mean it is.
+pub const SCENE_CUT_ABS_FLOOR: f32 = 12.0;
+/// Default quantiser boost (qindex delta, applied as a subtraction —
+/// lower qindex = finer quant) granted to the first
+/// `DEFAULT_SCENE_CUT_BOOST_FRAMES` after a forced scene-cut keyframe.
+/// Compensates for the fact that the new GOP's references have just
+/// been thrown away — extra quality on the rebuild buys back the
+/// long-tail PSNR drop that the cut would otherwise propagate.
+pub const DEFAULT_SCENE_CUT_QUANT_BOOST: u8 = 8;
+/// Default number of frames after a forced scene-cut keyframe over
+/// which `scene_cut_quant_boost` is applied (linearly tapered to zero
+/// by the end of the window). 4 frames is enough to repopulate
+/// GOLDEN / ALTREF on the default cadence and let the encoder settle
+/// without bloating the GOP's average bitrate.
+pub const DEFAULT_SCENE_CUT_BOOST_FRAMES: u32 = 4;
+/// Length of the running-statistics window used by the scene-cut
+/// detector. A small window keeps the detector responsive to gradual
+/// brightness changes (so steady-state pans don't poison the threshold);
+/// 16 frames is roughly half a second at 30 fps.
+const SCENE_CUT_WINDOW: usize = 16;
+
 /// Per-MB encoder configuration. Knob bag for the alt-ref / golden-ref
 /// planning + Lagrangian RDO mode decision wired up in this version.
 ///
@@ -206,6 +237,33 @@ pub struct Vp8EncoderConfig {
     /// `[-8, -4, 0, +4]` gives smooth regions higher quality and
     /// high-variance regions a coarser quant to save bits.
     pub segment_quant_deltas: [i32; 4],
+    /// Enable the per-frame scene-cut detector. When `true` each
+    /// incoming source frame's mean-absolute-difference (MAD) versus
+    /// the previous source frame is compared against the running mean
+    /// `+ scene_cut_threshold * stddev` over the last 16 frames; when
+    /// the MAD exceeds the bound (and the absolute floor) the next
+    /// frame is forced to a keyframe and the LAST / GOLDEN / ALTREF
+    /// slots are dropped, so the keyframe rebuilds the GOP from scratch
+    /// instead of dragging in pre-cut residual context.
+    pub enable_scene_cut: bool,
+    /// Multiplier on the running MAD stddev that the new frame's MAD
+    /// must exceed (over and above the running mean) for the encoder
+    /// to flag it as a scene cut. Lower = more aggressive (more cuts);
+    /// higher = stricter (only obvious cuts). Defaults to
+    /// [`DEFAULT_SCENE_CUT_THRESHOLD`].
+    pub scene_cut_threshold: f32,
+    /// Quantiser boost (subtracted from `qindex`, so finer quant)
+    /// applied to the first few frames following a forced scene-cut
+    /// keyframe. Compensates for the brand-new reference frame —
+    /// extra quality at the cut buys back the long-tail PSNR loss
+    /// that the dropped GOLDEN/ALTREF would otherwise propagate.
+    /// `0` disables the boost (still detects cuts, still emits the
+    /// keyframe, just doesn't change the QP).
+    pub scene_cut_quant_boost: u8,
+    /// Number of frames after a scene-cut keyframe over which the
+    /// quant boost is applied (tapered linearly to zero). After this
+    /// many frames the encoder reverts to `qindex` exactly.
+    pub scene_cut_boost_frames: u32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -219,6 +277,10 @@ impl Default for Vp8EncoderConfig {
             enable_multi_ref: true,
             enable_segments: true,
             segment_quant_deltas: DEFAULT_SEGMENT_QUANT_DELTAS,
+            enable_scene_cut: true,
+            scene_cut_threshold: DEFAULT_SCENE_CUT_THRESHOLD,
+            scene_cut_quant_boost: DEFAULT_SCENE_CUT_QUANT_BOOST,
+            scene_cut_boost_frames: DEFAULT_SCENE_CUT_BOOST_FRAMES,
         }
     }
 }
@@ -266,11 +328,18 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         golden_frame: None,
         alt_ref_frame: None,
         pframe_count: 0,
+        scene_cut: SceneCutState::new(),
     }))
 }
 
 /// Build an encoder with an explicit qindex. Useful for tests and for
 /// callers that want finer control than the default quality.
+///
+/// This legacy constructor keeps the per-frame scene-cut detector
+/// **disabled** so callers that hand-craft small frame sequences get
+/// the bit-exact pre-#166 behaviour (no surprise forced keyframes).
+/// Use [`make_encoder_with_config`] with `enable_scene_cut = true`
+/// to opt in.
 pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<Box<dyn Encoder>> {
     let width = params
         .width
@@ -296,6 +365,7 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
     let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
     let mut cfg = Vp8EncoderConfig::default();
     cfg.qindex = qindex.min(127);
+    cfg.enable_scene_cut = false;
     Ok(Box::new(Vp8Encoder {
         output_params,
         width,
@@ -308,6 +378,7 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
         golden_frame: None,
         alt_ref_frame: None,
         pframe_count: 0,
+        scene_cut: SceneCutState::new(),
     }))
 }
 
@@ -353,6 +424,7 @@ pub fn make_encoder_with_config(
         golden_frame: None,
         alt_ref_frame: None,
         pframe_count: 0,
+        scene_cut: SceneCutState::new(),
     }))
 }
 
@@ -384,6 +456,144 @@ struct Vp8Encoder {
     /// Count of P-frames emitted so far; used to drive the periodic
     /// golden / alt-ref refresh schedule.
     pframe_count: u32,
+    /// Scene-cut detector state: source-luma mean of the previous
+    /// incoming frame, the running window of source-MAD samples (one
+    /// per P-frame), and how many frames remain in the post-cut
+    /// quant-boost window.
+    scene_cut: SceneCutState,
+}
+
+/// Per-frame state for the scene-cut detector. Holds the previous source
+/// frame's luma so the next frame can compute its MAD without keeping the
+/// whole previous frame around in some other slot, plus the running
+/// window of MAD samples that drives the mean + stddev threshold.
+#[derive(Clone)]
+struct SceneCutState {
+    /// Source-luma plane of the previous source frame, packed at the
+    /// caller's stride. `None` until the first frame has been processed.
+    /// We retain only the luma plane (not chroma) because brightness
+    /// jumps dominate the MAD signal on real cuts and the chroma
+    /// contribution is dwarfed by the per-pixel cost. `prev_width` /
+    /// `prev_height` give the slot's geometry for the next-frame compare.
+    prev_y: Option<Vec<u8>>,
+    prev_width: usize,
+    prev_height: usize,
+    prev_stride: usize,
+    /// Ring buffer of recent inter-frame MAD samples (per-pixel,
+    /// integer luma units). Capped at `SCENE_CUT_WINDOW`. Drained on
+    /// scene-cut so the post-cut window starts fresh.
+    mad_window: VecDeque<f32>,
+    /// Number of P-frames remaining in the active quant-boost window
+    /// after the most recent forced scene-cut keyframe. Decremented
+    /// once per encoded frame.
+    boost_remaining: u32,
+}
+
+impl SceneCutState {
+    fn new() -> Self {
+        Self {
+            prev_y: None,
+            prev_width: 0,
+            prev_height: 0,
+            prev_stride: 0,
+            mad_window: VecDeque::with_capacity(SCENE_CUT_WINDOW),
+            boost_remaining: 0,
+        }
+    }
+
+    /// Compute the per-pixel mean-absolute-difference of the supplied
+    /// source-luma plane vs the cached `prev_y`. Returns `None` when
+    /// no previous frame is cached (first frame after init / reset)
+    /// or when the geometry has changed (which would make the per-pixel
+    /// compare meaningless — also reported as no-cut so the caller
+    /// just records the new geometry).
+    fn mad_against_prev(
+        &self,
+        y: &[u8],
+        width: usize,
+        height: usize,
+        stride: usize,
+    ) -> Option<f32> {
+        let prev = self.prev_y.as_ref()?;
+        if width != self.prev_width
+            || height != self.prev_height
+            || stride != self.prev_stride
+            || prev.len() < height * stride
+            || y.len() < height * stride
+        {
+            return None;
+        }
+        let mut acc: u64 = 0;
+        for r in 0..height {
+            let row_off = r * stride;
+            for c in 0..width {
+                let a = prev[row_off + c] as i32;
+                let b = y[row_off + c] as i32;
+                acc += (a - b).unsigned_abs() as u64;
+            }
+        }
+        let n = (width * height) as f32;
+        if n == 0.0 {
+            None
+        } else {
+            Some(acc as f32 / n)
+        }
+    }
+
+    /// Mean of the running MAD window. `0.0` on an empty window.
+    fn mad_mean(&self) -> f32 {
+        if self.mad_window.is_empty() {
+            return 0.0;
+        }
+        let n = self.mad_window.len() as f32;
+        self.mad_window.iter().copied().sum::<f32>() / n
+    }
+
+    /// Sample stddev of the running MAD window. `0.0` on a window with
+    /// fewer than 2 samples.
+    fn mad_stddev(&self) -> f32 {
+        if self.mad_window.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.mad_mean();
+        let n = self.mad_window.len() as f32;
+        let var = self
+            .mad_window
+            .iter()
+            .map(|x| (*x - mean) * (*x - mean))
+            .sum::<f32>()
+            / (n - 1.0);
+        var.sqrt()
+    }
+
+    /// Push a new MAD sample, evicting the oldest if the window is full.
+    fn push_mad(&mut self, mad: f32) {
+        if self.mad_window.len() >= SCENE_CUT_WINDOW {
+            self.mad_window.pop_front();
+        }
+        self.mad_window.push_back(mad);
+    }
+
+    /// Stash the supplied source-luma plane as the new "previous" frame
+    /// for the next MAD compare.
+    fn cache_prev(&mut self, y: &[u8], width: usize, height: usize, stride: usize) {
+        let needed = height * stride;
+        let buf = self.prev_y.get_or_insert_with(|| vec![0u8; needed]);
+        if buf.len() != needed {
+            buf.resize(needed, 0);
+        }
+        buf.copy_from_slice(&y[..needed]);
+        self.prev_width = width;
+        self.prev_height = height;
+        self.prev_stride = stride;
+    }
+
+    /// Drop all running statistics on a forced cut so the next P-frame's
+    /// MAD is not compared against pre-cut samples.
+    fn reset_after_cut(&mut self, boost_frames: u32) {
+        self.mad_window.clear();
+        self.boost_remaining = boost_frames;
+    }
 }
 
 /// Per-frame plan: which reference slots get refreshed by the new
@@ -403,24 +613,55 @@ struct RefPlan {
 
 impl RefPlan {
     /// Compute the refresh / availability plan for the next P-frame
-    /// given the current encoder state.
+    /// given the current encoder state, using the encoder's persistent
+    /// `config`. Equivalent to `for_pframe_with_config(enc, &enc.config)`.
+    #[allow(dead_code)]
     fn for_pframe(enc: &Vp8Encoder) -> Self {
+        Self::for_pframe_with_config(enc, &enc.config)
+    }
+
+    /// Compute the refresh / availability plan against an explicit
+    /// per-frame config. Used by the scene-cut path which feeds in a
+    /// boosted-qindex copy of the persistent config without otherwise
+    /// changing the multi-ref / segment knobs.
+    fn for_pframe_with_config(enc: &Vp8Encoder, cfg: &Vp8EncoderConfig) -> Self {
         // Counter is incremented before computing the plan, so the
         // *first* P-frame is `pframe_count == 1`.
         let n = enc.pframe_count;
-        let refresh_golden = enc.config.golden_interval > 0
-            && enc.config.enable_multi_ref
-            && n % enc.config.golden_interval == 0;
-        let refresh_alt = enc.config.alt_ref_interval > 0
-            && enc.config.enable_multi_ref
-            && n % enc.config.alt_ref_interval == 0;
+        let refresh_golden =
+            cfg.golden_interval > 0 && cfg.enable_multi_ref && n % cfg.golden_interval == 0;
+        let refresh_alt =
+            cfg.alt_ref_interval > 0 && cfg.enable_multi_ref && n % cfg.alt_ref_interval == 0;
         Self {
             refresh_last: true,
             refresh_golden,
             refresh_alt,
-            use_golden: enc.config.enable_multi_ref && enc.golden_frame.is_some(),
-            use_alt: enc.config.enable_multi_ref && enc.alt_ref_frame.is_some(),
+            use_golden: cfg.enable_multi_ref && enc.golden_frame.is_some(),
+            use_alt: cfg.enable_multi_ref && enc.alt_ref_frame.is_some(),
         }
+    }
+}
+
+impl Vp8Encoder {
+    /// Per-frame configuration. Returns `self.config` unchanged when
+    /// no scene-cut quant boost is in flight; otherwise subtracts a
+    /// linearly-tapered boost from `qindex` so the first post-cut
+    /// frame gets the full boost and the boost-window tail blends
+    /// back to the configured qindex.
+    fn effective_config_for_frame(&self) -> Vp8EncoderConfig {
+        let mut cfg = self.config;
+        let total = self.config.scene_cut_boost_frames;
+        let remaining = self.scene_cut.boost_remaining;
+        if total > 0 && remaining > 0 && self.config.scene_cut_quant_boost > 0 {
+            // remaining counts down from `total` (set on the keyframe)
+            // to 0; taper = remaining / total gives a linear ramp from
+            // 1.0 down to 0 over the window.
+            let taper = remaining as f32 / total as f32;
+            let boost = (self.config.scene_cut_quant_boost as f32 * taper).round() as i32;
+            let new_qi = (self.config.qindex as i32 - boost).clamp(0, 127) as u8;
+            cfg.qindex = new_qi;
+        }
+        cfg
     }
 }
 
@@ -445,12 +686,67 @@ impl Encoder for Vp8Encoder {
         // by the caller / pipeline against `output_params`. The encoder
         // trusts the planes match `self.width × self.height` Yuv420P.
 
-        let is_keyframe = self.last_frame.is_none();
+        // ----------------------------------------------------------------
+        // Scene-cut detection (RFC 6386 itself is silent on the encoder's
+        // GOP structure — cuts are an encoder-side rate-control choice,
+        // not a bitstream feature). We compute the per-pixel
+        // mean-absolute-difference (MAD) of this frame's source luma
+        // versus the previous source frame, then compare it against the
+        // running mean + N · stddev over the last few frames. A cut
+        // forces the next frame to be a keyframe and drops the LAST /
+        // GOLDEN / ALTREF slots so the keyframe is genuinely
+        // self-contained. The detector also seeds a short post-cut
+        // quant-boost window that buys back the long-tail PSNR drop
+        // caused by losing the long-term references.
+        // ----------------------------------------------------------------
+        let y_plane = &v.planes[0];
+        let frame_w = self.width as usize;
+        let frame_h = self.height as usize;
+
+        let mut force_keyframe_for_cut = false;
+        let mut cut_mad: Option<f32> = None;
+        if self.config.enable_scene_cut && self.last_frame.is_some() {
+            if let Some(mad) =
+                self.scene_cut
+                    .mad_against_prev(&y_plane.data, frame_w, frame_h, y_plane.stride)
+            {
+                let mean = self.scene_cut.mad_mean();
+                let std = self.scene_cut.mad_stddev();
+                let bound = mean + self.config.scene_cut_threshold * std;
+                if mad >= bound && mad >= SCENE_CUT_ABS_FLOOR {
+                    force_keyframe_for_cut = true;
+                    cut_mad = Some(mad);
+                } else {
+                    self.scene_cut.push_mad(mad);
+                }
+            }
+        }
+
+        let is_keyframe = self.last_frame.is_none() || force_keyframe_for_cut;
+        if force_keyframe_for_cut {
+            // Drop every reference slot so the new keyframe rebuilds
+            // the GOP from scratch. Without this the per-MB ref-frame
+            // picker on the *next* P-frame could still pull pre-cut
+            // pixels out of GOLDEN / ALTREF.
+            self.last_frame = None;
+            self.golden_frame = None;
+            self.alt_ref_frame = None;
+            self.pframe_count = 0;
+            self.scene_cut
+                .reset_after_cut(self.config.scene_cut_boost_frames);
+        }
+
+        // Per-frame qindex with an optional post-cut quality boost. The
+        // boost is tapered linearly so the first post-cut frame gets
+        // the full reduction and the boost-window tail falls back to
+        // the configured qindex in step.
+        let frame_config = self.effective_config_for_frame();
+
         let (data, reference, plan) = if is_keyframe {
             let (bitstream, rec) = encode_keyframe_and_reconstruct_with_config(
                 self.width,
                 self.height,
-                self.config,
+                frame_config,
                 v,
             )?;
             // Keyframe refreshes all three slots.
@@ -464,14 +760,14 @@ impl Encoder for Vp8Encoder {
             (bitstream, rec, plan)
         } else {
             self.pframe_count += 1;
-            let plan = RefPlan::for_pframe(self);
+            let plan = RefPlan::for_pframe_with_config(self, &frame_config);
             let last_ref = self.last_frame.as_ref().unwrap();
             let golden_ref = self.golden_frame.as_ref().filter(|_| plan.use_golden);
             let alt_ref = self.alt_ref_frame.as_ref().filter(|_| plan.use_alt);
             let (bitstream, rec) = encode_pframe_and_reconstruct(
                 self.width,
                 self.height,
-                self.config,
+                frame_config,
                 v,
                 last_ref,
                 golden_ref,
@@ -493,6 +789,20 @@ impl Encoder for Vp8Encoder {
             self.alt_ref_frame = Some(reference.clone());
         }
         let _ = reference;
+
+        // Update scene-cut state: cache this frame's source luma for the
+        // next MAD compare, decay the post-cut boost window, and seed
+        // the running MAD window with this cut's MAD so the *next*
+        // post-cut MAD is graded against a sensible baseline (not the
+        // huge cut sample we just rejected).
+        if let Some(mad) = cut_mad {
+            self.scene_cut.push_mad(mad);
+        }
+        self.scene_cut
+            .cache_prev(&y_plane.data, frame_w, frame_h, y_plane.stride);
+        if self.scene_cut.boost_remaining > 0 {
+            self.scene_cut.boost_remaining -= 1;
+        }
 
         let mut pkt = Packet::new(0, self.time_base, data);
         pkt.pts = v.pts;

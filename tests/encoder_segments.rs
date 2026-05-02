@@ -148,6 +148,13 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        // Disable scene-cut detection: this fixture is randomised
+        // pseudo-noise that would otherwise trip the cut detector and
+        // change the keyframe / size accounting these tests pin.
+        enable_scene_cut: false,
+        scene_cut_threshold: 0.0,
+        scene_cut_quant_boost: 0,
+        scene_cut_boost_frames: 0,
     }
 }
 
@@ -161,6 +168,10 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_multi_ref: true,
         enable_segments: true,
         segment_quant_deltas: DEFAULT_SEGMENT_QUANT_DELTAS,
+        enable_scene_cut: false,
+        scene_cut_threshold: 0.0,
+        scene_cut_quant_boost: 0,
+        scene_cut_boost_frames: 0,
     }
 }
 
@@ -182,6 +193,10 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         // step up to coarser quants (saves bits where texture masks the
         // loss).
         segment_quant_deltas: [0, 2, 6, 12],
+        enable_scene_cut: false,
+        scene_cut_threshold: 0.0,
+        scene_cut_quant_boost: 0,
+        scene_cut_boost_frames: 0,
     }
 }
 

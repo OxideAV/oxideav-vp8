@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.1...v0.1.2) - 2026-05-02
+
+### Other
+
+- per-frame scene-cut adaptation
+- per-MB segment maps with per-segment quantiser deltas
+- per-MB context-adaptive ref-frame probabilities
+- alt-ref / golden-ref planning + Lagrangian RDO mode decision
+- adopt slim VideoFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - Per-frame scene-cut adaptation in the encoder. New

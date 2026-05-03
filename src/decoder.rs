@@ -1757,16 +1757,17 @@ fn chroma_avg4(sum: i32) -> i32 {
 /// `vp8_loop_filter_frame_init`).
 ///
 /// Steps:
-///   1. base = `header.loop_filter.level`, then if segmentation is
-///      active: `base = abs ? seg_lf : clamp(base + seg_lf, 0..=63)`.
-///   2. if `mode_ref_delta_enabled`:
-///      a. `level += ref_deltas[ref_frame]`
-///      b. if intra and `y_mode == B_PRED` → `level += mode_deltas[0]`
-///     else if inter and `y_mode == ZERO_MV` → `level += mode_deltas[1]`
-///     else if inter and `y_mode in {NEAREST,NEAR,NEW}_MV` →
-///     `level += mode_deltas[2]`
-///     else if inter and `y_mode == SPLIT_MV` → `level += mode_deltas[3]`
-///   3. clamp 0..=63.
+/// 1. base = `header.loop_filter.level`, then if segmentation is
+///    active: `base = abs ? seg_lf : clamp(base + seg_lf, 0..=63)`.
+/// 2. if `mode_ref_delta_enabled`:
+///    - (a) `level += ref_deltas[ref_frame]`
+///    - (b) `level += mode_deltas[i]` where `i` is selected from the
+///      current `(intra/inter, y_mode)` pair as follows:
+///      - intra and `y_mode == B_PRED`         → `i = 0`
+///      - inter and `y_mode == ZERO_MV`        → `i = 1`
+///      - inter and `y_mode in NEAREST/NEAR/NEW_MV` → `i = 2`
+///      - inter and `y_mode == SPLIT_MV`       → `i = 3`
+/// 3. clamp 0..=63.
 fn per_mb_filter_level(header: &FrameHeader, info: &MbInfo) -> u8 {
     let mut lvl = header.loop_filter.level as i32;
     if header.segmentation.enabled {

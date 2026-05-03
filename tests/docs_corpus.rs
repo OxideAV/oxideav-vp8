@@ -397,10 +397,10 @@ fn corpus_q_low() {
     });
 }
 
-// TODO(vp8-corpus): q-high 65.83% after the LF formula + Y2 DC step
-// fixes. Residual diffs are at MB-edge / sub-block-edge boundaries
-// for high-qindex (127) mandelbrot content, suggesting an inner-loop
-// chroma rounding still off by ±1. Track in a follow-up round.
+// TODO(vp8-corpus): q-high — round 25 added per-MB LF deltas + the
+// libvpx-correct interior_limit shift. Effective filter level for
+// INTRA MBs is now 38+2=40 (was using 38), matching the trace's
+// `LOOPFILTER level=40`. Promote to BitExact once cross-validated.
 #[test]
 fn corpus_q_high() {
     evaluate(&CorpusCase {
@@ -412,11 +412,10 @@ fn corpus_q_high() {
     });
 }
 
-// TODO(vp8-corpus): i-only-loopfilter-high 72.71% after the LF formula
-// fix. Remaining diffs are mostly ±1 at sub-block edges — the
-// per-MB filter ordering matches libvpx now but per-pixel rounding
-// can still drift after multiple consecutive edges touch the same
-// pixel. Tracked for the next round.
+// TODO(vp8-corpus): i-only-loopfilter-high — round 25 added per-MB LF
+// deltas + interior_limit shift. Effective filter level for INTRA MBs
+// is now 33+2=35, matching the trace's `LOOPFILTER level=35`. Promote
+// to BitExact once cross-validated.
 #[test]
 fn corpus_i_only_loopfilter_high() {
     evaluate(&CorpusCase {

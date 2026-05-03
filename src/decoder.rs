@@ -1706,6 +1706,57 @@ fn chroma_avg4(sum: i32) -> i32 {
     }
 }
 
+/// Compute the per-MB loop-filter level after applying segmentation,
+/// reference-frame and mode deltas (RFC 6386 §15.2; libvpx
+/// `vp8_loop_filter_frame_init`).
+///
+/// Steps:
+///   1. base = `header.loop_filter.level`, then if segmentation is
+///      active: `base = abs ? seg_lf : clamp(base + seg_lf, 0..=63)`.
+///   2. if `mode_ref_delta_enabled`:
+///      a. `level += ref_deltas[ref_frame]`
+///      b. if intra and `y_mode == B_PRED` → `level += mode_deltas[0]`
+///         else if inter and `y_mode == ZERO_MV` → `level += mode_deltas[1]`
+///         else if inter and `y_mode in {NEAREST,NEAR,NEW}_MV` →
+///         `level += mode_deltas[2]`
+///         else if inter and `y_mode == SPLIT_MV` → `level += mode_deltas[3]`
+///   3. clamp 0..=63.
+fn per_mb_filter_level(header: &FrameHeader, info: &MbInfo) -> u8 {
+    let mut lvl = header.loop_filter.level as i32;
+    if header.segmentation.enabled {
+        let seg = info.segment_id as usize;
+        let delta = header.segmentation.lf[seg];
+        if header.segmentation.abs_delta {
+            lvl = delta;
+        } else {
+            lvl = (lvl + delta).clamp(0, 63);
+        }
+    }
+    if header.loop_filter.mode_ref_delta_enabled {
+        // Ref delta — REF_INTRA = 0, REF_LAST = 1, REF_GOLDEN = 2, REF_ALT = 3.
+        lvl += header.loop_filter.ref_deltas[info.ref_frame as usize];
+        // Mode delta — mode index map per libvpx:
+        //   0 = INTRA + B_PRED
+        //   1 = inter + ZERO_MV
+        //   2 = inter + NEAREST/NEAR/NEW_MV
+        //   3 = inter + SPLIT_MV
+        if info.ref_frame == REF_INTRA {
+            if info.y_mode == B_PRED {
+                lvl += header.loop_filter.mode_deltas[0];
+            }
+        } else {
+            let mode_idx = match info.y_mode {
+                ZERO_MV => 1,
+                NEAREST_MV | NEAR_MV | NEW_MV => 2,
+                SPLIT_MV => 3,
+                _ => 1, // shouldn't happen for inter, fall back to ZERO bucket
+            };
+            lvl += header.loop_filter.mode_deltas[mode_idx];
+        }
+    }
+    lvl.clamp(0, 63) as u8
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Apply the in-loop filter, iterating macroblocks in raster order and
 /// (per RFC 6386 §15.1) doing the four edge passes per-MB in this order:
@@ -1721,6 +1772,9 @@ fn chroma_avg4(sum: i32) -> i32 {
 /// filter type only filters luma and only the four pixels closest to
 /// the edge — RFC §15.2). Chroma has only one inner sub-block edge per
 /// MB (the centre at x = mb_x*8 + 4 / y = mb_y*8 + 4).
+///
+/// The per-MB filter strength derives from `per_mb_filter_level` —
+/// segmentation + mode-ref deltas applied per-MB, per RFC §15.2.
 fn apply_loop_filter(
     header: &FrameHeader,
     mb_info: &[MbInfo],
@@ -1739,14 +1793,20 @@ fn apply_loop_filter(
         return;
     }
     let lf = &header.loop_filter;
-    let params_mb = FilterParams::for_mb_typed(lf.level, lf.sharpness, true, key_frame);
-    let params_sb = FilterParams::for_mb_typed(lf.level, lf.sharpness, false, key_frame);
     let simple = lf.filter_type == 1;
     for mb_y in 0..mb_h {
         let y0 = mb_y * 16;
         let y0c = mb_y * 8;
         for mb_x in 0..mb_w {
             let info = &mb_info[mb_y * mb_w + mb_x];
+            // Per-MB level: segmentation + ref/mode deltas. When this
+            // resolves to 0 the MB's edges are skipped entirely.
+            let mb_level = per_mb_filter_level(header, info);
+            if mb_level == 0 {
+                continue;
+            }
+            let params_mb = FilterParams::for_mb_typed(mb_level, lf.sharpness, true, key_frame);
+            let params_sb = FilterParams::for_mb_typed(mb_level, lf.sharpness, false, key_frame);
             let filter_subblocks =
                 info.has_coeffs || info.y_mode == B_PRED || info.inter_split_mode.is_some();
             let x = mb_x * 16;

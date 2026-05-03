@@ -162,10 +162,10 @@ fn normal_filter(
 /// Filter `level` parameters helper — derives the three thresholds
 /// per RFC 6386 §15.4.
 ///
-///   interior_limit = loop_filter_level, then if sharpness > 0
-///       interior_limit >>= sharpness > 4 ? 2 : 1
+///   interior_limit = loop_filter_level >> ((sharpness >= 4) ? 2 : 1)
+///   if sharpness > 0:
 ///       interior_limit = min(interior_limit, 9 - sharpness)
-///       interior_limit = max(interior_limit, 1)
+///   interior_limit = max(interior_limit, 1)
 ///
 ///   mbedge_limit   = ((loop_filter_level + 2) * 2) + interior_limit
 ///   sub_bedge_limit = (loop_filter_level * 2) + interior_limit
@@ -180,6 +180,15 @@ fn normal_filter(
 ///       level >= 20 → 2
 ///       level >= 15 → 1
 ///       else → 0
+///
+/// **The `>> 1` (or `>> 2`) shift on `interior_limit` is unconditional**
+/// — libvpx's `vp8_loop_filter_init` always shifts; the prior code
+/// gated the shift on `sharpness > 0`, which produced
+/// `interior_limit = level` and hence `mbedge_limit = (level+2)*2 +
+/// level = 3*level + 4` instead of the libvpx-correct
+/// `2*(level+2) + (level >> 1)`. The discrepancy compounds as the
+/// frame-wide `filter_level` grows, manifesting as ±1..±3 pixel
+/// drift at every edge for any nonzero filter level.
 ///
 /// `mb_edge=true` returns the inter-macroblock variant; `false` returns
 /// the inter-subblock variant.
@@ -199,9 +208,11 @@ impl FilterParams {
 
     pub fn for_mb_typed(level: u8, sharpness: u8, mb_edge: bool, key_frame: bool) -> Self {
         let l = level as i32;
-        let mut interior = l;
+        // `interior_limit = level >> ((sharpness >= 4) ? 2 : 1)` —
+        // shift is unconditional per `vp8_loop_filter_init`. The
+        // sharpness>0 branch only adds the additional 9-sharpness cap.
+        let mut interior = l >> if sharpness >= 4 { 2 } else { 1 };
         if sharpness > 0 {
-            interior >>= if sharpness > 4 { 2 } else { 1 };
             let cap = 9 - sharpness as i32;
             if interior > cap {
                 interior = cap;

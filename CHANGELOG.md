@@ -18,6 +18,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complement the existing one-mode-per-test coverage in
   `tests/encoder_roundtrip.rs`.
 
+### Fixed
+
+- **Per-MB loop-filter level** (`src/decoder.rs` new `per_mb_filter_level`):
+  the decoder now applies the segmentation + ref-frame + mode deltas
+  per RFC 6386 §15.2 / libvpx `vp8_loop_filter_frame_init`. Previously
+  every MB was filtered at the frame-wide `loop_filter_level`, ignoring
+  the parsed `ref_deltas[4]` / `mode_deltas[4]` arrays entirely. Every
+  libvpx-encoded fixture in `docs/video/vp8/fixtures/` has
+  `mode_ref_delta_enabled=1` with `ref_deltas=[2, 0, -2, -2]`, so an
+  INTRA-coded MB on a keyframe gets `level + 2` and the wrong baseline
+  produced edge-aligned ±1..±3 drifts on every loop-filter-active
+  fixture (q-high, i-only-loopfilter-high,
+  vp8-with-loopfilter-mode-simple, small-roi-segmentation,
+  gradient-and-noise-128x128, golden-update-cycle, altref-arnr-on,
+  i-only-64x64).
+- **Loop-filter `interior_limit` shift** (`src/loopfilter.rs`
+  `FilterParams::for_mb_typed`): the `level >> 1` shift for
+  `interior_limit` (also `level >> 2` when sharpness ≥ 4) is now
+  unconditional, matching libvpx's `vp8_loop_filter_init`. The prior
+  code gated the shift on `sharpness > 0`, which left
+  `interior_limit = level` for sharpness=0 streams (the common case)
+  and inflated `mbedge_limit = (level+2)*2 + level` instead of the
+  correct `(level+2)*2 + (level >> 1)`. Compounded with the missing
+  per-MB delta fix above. Also corrected the shift threshold from
+  `sharpness > 4` to `sharpness >= 4` to match libvpx.
+
 ### Changed
 
 - `src/lib.rs` doc-comment rewritten to reflect the post-round-24

@@ -1290,7 +1290,10 @@ fn reconstruct_intra_mb(
         } else {
             None
         };
-        let mut pred = vec![0u8; 16 * 16];
+        // Stack-allocated 16×16 luma intra-prediction scratch. Hoisting
+        // this out of the heap saves one malloc + one free per intra MB
+        // (16 of them on a 64×64 keyframe, scaled per area).
+        let mut pred = [0u8; 16 * 16];
         predict_16x16(
             info.y_mode,
             if above_avail { Some(&above) } else { None },
@@ -1357,7 +1360,10 @@ fn reconstruct_intra_mb(
         } else {
             None
         };
-        let mut pred = vec![0u8; 8 * 8];
+        // Stack-allocated 8×8 chroma intra-prediction scratch — twice
+        // per intra MB (U and V planes). Same hoist rationale as the
+        // luma block above.
+        let mut pred = [0u8; 8 * 8];
         predict_8x8(
             info.uv_mode,
             if above_avail { Some(&above) } else { None },

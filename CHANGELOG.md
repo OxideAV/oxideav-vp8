@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.3...v0.1.4) - 2026-05-03
+
+### Other
+
+- portable_simd path for filter_simple_horizontal (feature-gated)
+- hoist padded_parts (token-partition copies) into DecoderState scratch
+- hoist y/u/v plane buffers into DecoderState scratch
+- rustfmt sweep on prior perf commits
+- hoist per-frame above-row + mb_info scratch into DecoderState
+- inline hot 4x4 transform + loopfilter helpers
+- leading-zeros renormalise in BoolDecoder::read_bool
+- stack-allocate motion-comp scratch in sixtap/bilinear_predict
+- stack-allocate intra-prediction scratch in reconstruct_intra_mb
+- criterion harness for decoder hot paths
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.2...v0.1.3) - 2026-05-03
 
 ### Other

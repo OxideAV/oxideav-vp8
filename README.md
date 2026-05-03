@@ -129,6 +129,27 @@ IVF read *and* write:
 - **Muxer** emits the same file shape, patching in the final frame
   count in `write_trailer`.
 
+### Conformance corpus
+
+`tests/docs_corpus.rs` runs every fixture in
+[`docs/video/vp8/fixtures/`](https://github.com/OxideAV/oxideav-docs/tree/master/video/vp8/fixtures)
+through the in-tree decoder and scores per-plane pixel-match against
+each fixture's `expected.yuv` ground truth. Three tiers:
+
+| Tier | Fixtures | Behaviour |
+| --- | --- | --- |
+| `BitExact` (CI gate) | `tiny-i-only-16x16`, `i-only-loopfilter-off`, `partition-padding-16x16-4parts` | Test fails on any divergence |
+| `ReportOnly` | 13 fixtures (loopfilter / multi-MB B_PRED / multi-partition / inter / segmentation / altref) | Logs match% + max diff; does not gate CI |
+| `Ignored` | `webm-mux-vs-ivf-webm` | Disabled until oxideav-mkv is wired in for WebM demux (paired IVF version is still scored) |
+
+Plus a two-part check for the `yuv422-not-supported` negative case:
+the decoder accepts libvpx's auto-converted yuv420 stream, and the
+encoder does not panic on a 4:2:2-shaped frame. The 13 ReportOnly
+fixtures track the documented B_PRED-neighbour-context and
+loopfilter-edge bugs (see CHANGELOG). Each is tagged
+`TODO(vp8-corpus)` in the test source so they can be picked off in
+follow-up rounds.
+
 ## Quick use
 
 Decode a raw VP8 frame out of an IVF file:

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Integration tests against the `docs/video/vp8/` fixture corpus (17
+  tests in `tests/docs_corpus.rs`, covering every fixture documented
+  in `docs/video/vp8/vp8-fixtures-and-traces.md`). Each test demuxes
+  the per-fixture `input.ivf`, decodes through `Vp8Decoder`, and
+  scores per-plane pixel-match against `expected.yuv`. Three tiers:
+  `BitExact` (gates CI), `ReportOnly` (logs divergence without
+  failing while the underlying bug is queued), and `Ignored` (WebM
+  container, deferred until oxideav-mkv is wired in). Negative case
+  `yuv422-not-supported` covered via two checks: the decoder accepts
+  the libvpx auto-converted yuv420 stream, and the encoder does not
+  panic on a 4:2:2-shaped input.
+- `[workspace]` self-contained marker in `Cargo.toml` mirroring the
+  pattern in `oxideav-tta`: lets `cargo test` from inside the crate
+  run hermetically without walking up into the parent monorepo
+  workspace (which may carry mid-development sibling crates that
+  fail to load).
+
+### Bit-exact corpus fixtures
+
+- `tiny-i-only-16x16` (1 MB, DC-only Y2, filter_level=1)
+- `i-only-loopfilter-off` (filter_level=0, all-zero coeffs)
+- `partition-padding-16x16-4parts` (1 MB, 4 token partitions)
+
+### Report-only corpus fixtures
+
+The remaining 13 fixtures decode but diverge from the reference YUV.
+Each is tagged with a `TODO(vp8-corpus)` in `tests/docs_corpus.rs`
+that names the fixture and the observed pixel-match percentage. Two
+recurring root causes:
+
+- B_PRED neighbour-context propagation between adjacent MBs (already
+  noted in `tests/decode_keyframe.rs` and `src/lib.rs` module docs):
+  `i-only-64x64` (92.94%), `q-low` (86.91%), `gradient-and-noise-128x128`
+  (89.44%), `segment-4-partitions` (92.14%), `webm-mux-vs-ivf-ivf`
+  (92.94%), `vp8-with-loopfilter-mode-simple` (61.02%).
+- Loop filter / dequant boundary at high qindex with active deblocker:
+  `q-high` (12.56% — qi=127 + filter_level=38),
+  `i-only-loopfilter-high` (40.72% — filter_level=33).
+- Inter / multi-frame fixtures inherit the keyframe bug since the
+  P-frames reference a divergent keyframe: `i-frame-then-p-frame-64x64`
+  (84.96%), `golden-update-cycle` (82.86%), `altref-arnr-on` (79.07%),
+  `small-roi-segmentation` (22.96%).
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.1...v0.1.2) - 2026-05-02
 
 ### Other

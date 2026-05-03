@@ -118,13 +118,25 @@ pub fn sixtap_predict(
 
     // Two-pass: horizontal then vertical. The intermediate buffer needs
     // bh + 5 rows (extra for the 6-tap vertical support).
+    //
+    // VP8 motion-comp block sizes are 4 / 8 / 16 (chroma 4 / 8) — bw
+    // never exceeds 16, and bh + 5 never exceeds 21 (16 + 5). So a
+    // stack-resident `[i32; 21 * 16]` covers every legal call and
+    // avoids the per-block heap allocation that the prior `vec![]` did.
+    // The indexing keeps `bw` as the row stride exactly as before, so
+    // the inner-loop arithmetic is unchanged.
+    const MAX_TMP_BW: usize = 16;
+    const MAX_TMP_H: usize = 16 + 5;
+    debug_assert!(bw <= MAX_TMP_BW, "sixtap_predict: bw {bw} > {MAX_TMP_BW}");
     let tmp_h = bh + 5;
-    let mut tmp = vec![0i32; tmp_h * bw];
+    debug_assert!(tmp_h <= MAX_TMP_H, "sixtap_predict: tmp_h {tmp_h} > {MAX_TMP_H}");
+    let mut tmp = [0i32; MAX_TMP_BW * MAX_TMP_H];
+    let row_stride = bw;
     for j in 0..tmp_h {
         let yy = int_y + j as i32 - 2;
         for i in 0..bw {
             let v = sixtap_h(plane, int_x + i as i32, yy, fx);
-            tmp[j * bw + i] = (v + 64) >> 7;
+            tmp[j * row_stride + i] = (v + 64) >> 7;
         }
     }
     let taps = &SIXTAP_FILTERS[fy];
@@ -132,12 +144,12 @@ pub fn sixtap_predict(
         for i in 0..bw {
             // tmp row for center = j + 2.
             let base = j + 2;
-            let v = tmp[(base - 2) * bw + i] * taps[0]
-                + tmp[(base - 1) * bw + i] * taps[1]
-                + tmp[base * bw + i] * taps[2]
-                + tmp[(base + 1) * bw + i] * taps[3]
-                + tmp[(base + 2) * bw + i] * taps[4]
-                + tmp[(base + 3) * bw + i] * taps[5];
+            let v = tmp[(base - 2) * row_stride + i] * taps[0]
+                + tmp[(base - 1) * row_stride + i] * taps[1]
+                + tmp[base * row_stride + i] * taps[2]
+                + tmp[(base + 1) * row_stride + i] * taps[3]
+                + tmp[(base + 2) * row_stride + i] * taps[4]
+                + tmp[(base + 3) * row_stride + i] * taps[5];
             dst[(dst_y + j) * dst_stride + dst_x + i] = clip_u8((v + 64) >> 7);
         }
     }
@@ -174,19 +186,29 @@ pub fn bilinear_predict(
     let hy = &BILINEAR_FILTERS[fy];
 
     // Horizontal first produces bh+1 rows.
+    //
+    // VP8 chroma bilinear blocks are at most 8 wide / 8 tall (so
+    // tmp_h <= 9). A stack-resident `[i32; 16 * 17]` (sized for the
+    // worst-case luma path that may also dispatch through this fn)
+    // removes the per-block heap allocation. Same indexing scheme.
+    const MAX_TMP_BW: usize = 16;
+    const MAX_TMP_H: usize = 16 + 1;
+    debug_assert!(bw <= MAX_TMP_BW, "bilinear_predict: bw {bw} > {MAX_TMP_BW}");
     let tmp_h = bh + 1;
-    let mut tmp = vec![0i32; tmp_h * bw];
+    debug_assert!(tmp_h <= MAX_TMP_H, "bilinear_predict: tmp_h {tmp_h} > {MAX_TMP_H}");
+    let mut tmp = [0i32; MAX_TMP_BW * MAX_TMP_H];
+    let row_stride = bw;
     for j in 0..tmp_h {
         let yy = int_y + j as i32;
         for i in 0..bw {
             let v = (plane.sample(int_x + i as i32, yy) as i32) * hx[0]
                 + (plane.sample(int_x + i as i32 + 1, yy) as i32) * hx[1];
-            tmp[j * bw + i] = (v + 64) >> 7;
+            tmp[j * row_stride + i] = (v + 64) >> 7;
         }
     }
     for j in 0..bh {
         for i in 0..bw {
-            let v = tmp[j * bw + i] * hy[0] + tmp[(j + 1) * bw + i] * hy[1];
+            let v = tmp[j * row_stride + i] * hy[0] + tmp[(j + 1) * row_stride + i] * hy[1];
             dst[(dst_y + j) * dst_stride + dst_x + i] = clip_u8((v + 64) >> 7);
         }
     }

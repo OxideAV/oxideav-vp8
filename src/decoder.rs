@@ -132,10 +132,15 @@ struct DecoderState {
 /// the inter MB loop holds `&mut y_plane` alongside `&state.last`
 /// without conflict.
 ///
-/// `padded_parts` is NOT hoisted — the partition `BoolDecoder`s hold
-/// borrows back into the padded byte slices for the duration of the
-/// token walk, and that lifetime model is independently queued for
-/// follow-up.
+/// `padded_parts` is hoisted as `Vec<Vec<u8>>` — token-partition
+/// padded copies. Each inner `Vec` is `clear()`-then-
+/// `extend_from_slice()`d each frame so the heap allocation persists
+/// across frames; the outer `Vec` is resized to `nb_parts` (1, 2, 4
+/// or 8 per the 2-bit `log2_nb_partitions` field). The `BoolDecoder`
+/// instances built from these slices hold borrows back into the padded
+/// data for the duration of the token walk, but the entire walk
+/// completes before `decode_frame_with_state` returns, so the borrows
+/// never escape.
 #[derive(Clone, Default)]
 struct Scratch {
     nz_y_above: Vec<[u8; 4]>,
@@ -147,6 +152,7 @@ struct Scratch {
     y_plane: Vec<u8>,
     u_plane: Vec<u8>,
     v_plane: Vec<u8>,
+    padded_parts: Vec<Vec<u8>>,
 }
 
 impl DecoderState {
@@ -369,6 +375,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         y_plane,
         u_plane,
         v_plane,
+        padded_parts,
     } = &mut state.scratch;
 
     // --- MB mode decode ---
@@ -405,16 +412,24 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
     // priming size. VP8 allows trailing zeros to be elided; past-EOF
     // reads in the boolean decoder are already defined to return zero
     // so padding is a no-op from a decoding standpoint.
-    let padded_parts: Vec<Vec<u8>> = parts
-        .iter()
-        .map(|p| {
-            let mut v = p.to_vec();
-            while v.len() < 2 {
-                v.push(0);
-            }
-            v
-        })
-        .collect();
+    //
+    // The outer `Vec` and inner `Vec<u8>` storage live in
+    // `state.scratch.padded_parts` across frames — `clear()` zeros
+    // length without freeing capacity, and `extend_from_slice` reuses
+    // the prior allocation when the new partition fits (it usually
+    // does once the bitstream has settled into a steady state). The
+    // resize+take-from-default trick handles the case where the new
+    // frame has more partitions than the previous (the new entries
+    // start as empty `Vec::new()` and the first frame at that size
+    // pays a single allocation).
+    padded_parts.resize_with(parts.len(), Vec::new);
+    for (dst, src) in padded_parts.iter_mut().zip(parts.iter()) {
+        dst.clear();
+        dst.extend_from_slice(src);
+        while dst.len() < 2 {
+            dst.push(0);
+        }
+    }
     let mut token_decs: Vec<BoolDecoder> = padded_parts
         .iter()
         .map(|p| BoolDecoder::new(p))

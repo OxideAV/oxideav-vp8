@@ -65,6 +65,7 @@ fn high_edge_variance(p1: u8, p0: u8, q0: u8, q1: u8, hev: i32) -> bool {
 }
 
 /// Simple-mode 4-tap filter on a single edge crossing (`p1 p0 | q0 q1`).
+#[inline]
 fn simple_filter(p1: u8, p0: u8, q0: u8, q1: u8) -> (u8, u8) {
     let p0i = u_to_i(p0);
     let q0i = u_to_i(q0);
@@ -82,6 +83,7 @@ fn simple_filter(p1: u8, p0: u8, q0: u8, q1: u8) -> (u8, u8) {
 
 /// Normal-mode filter (RFC §15.4) — adjusts up to 3 px on each side
 /// depending on HEV / interior masks.
+#[inline]
 fn normal_filter(
     p2: u8,
     p1: u8,

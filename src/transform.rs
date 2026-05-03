@@ -15,6 +15,7 @@ const SINPI8SQRT2: i32 = 35468;
 /// the cross-row cancellations that the column pass would have done
 /// first never happen, and `out[3]` (and other odd-column entries of
 /// the top/bottom rows) drift by ±1 in many real bitstreams.
+#[inline]
 pub fn idct4x4(coeffs: &[i16; 16]) -> [i16; 16] {
     let mut work = [0i32; 16];
     // Column pass — transform each of the 4 columns. Inputs are
@@ -54,12 +55,14 @@ pub fn idct4x4(coeffs: &[i16; 16]) -> [i16; 16] {
     out
 }
 
+#[inline]
 fn clip_short(v: i32) -> i16 {
     v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
 /// Inverse 4×4 Walsh-Hadamard (RFC 6386 §14.3) — reconstructs the
 /// 16 Y2 DC coefficients.
+#[inline]
 pub fn iwht4x4(coeffs: &[i16; 16]) -> [i16; 16] {
     let mut work = [0i32; 16];
     for i in 0..4 {

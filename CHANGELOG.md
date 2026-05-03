@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.2...v0.1.3) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- drop nested [workspace] block (umbrella sweep)
+- fix IDCT order, Y2 DC cap, and loopfilter formulas ([#237](https://github.com/OxideAV/oxideav-vp8/pull/237))
+- integrate docs/video/vp8 fixture corpus + trace harness
+- look-ahead alt-ref synthesis (RFC 6386 §6 hidden frames)
+- migrate to centralized OxideAV/.github reusable workflows
+
 ### Fixed
 
 - **IDCT pass order** (`src/transform.rs`): swapped the inverse 4×4

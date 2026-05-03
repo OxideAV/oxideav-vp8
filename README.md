@@ -13,8 +13,41 @@ framework but usable standalone.
 oxideav-core = "0.1"
 oxideav-codec = "0.1"
 oxideav-container = "0.1"
-oxideav-vp8 = "0.0"
+oxideav-vp8 = "0.1"
 ```
+
+## Standalone use (no `oxideav-core`)
+
+Image-library consumers that just want to turn a VP8 frame buffer
+into pixels — no framework, no codec registry, no trait objects —
+can depend on this crate with the default `registry` feature off:
+
+```toml
+[dependencies]
+oxideav-vp8 = { version = "0.1", default-features = false }
+```
+
+That drops the `oxideav-core` dependency entirely and exposes a
+free-standing decode/encode API:
+
+```rust
+use oxideav_vp8::{decode_vp8, encode_vp8_keyframe, Vp8Frame, Vp8Error};
+
+let frame: Vp8Frame = decode_vp8(&buf)?;
+let encoded: Vec<u8> = encode_vp8_keyframe(frame.width, frame.height, 50, &frame)?;
+# Ok::<_, Vp8Error>(())
+```
+
+`Vp8Frame` carries the cropped Yuv420P planes (`y`, `u`, `v` as
+`Vec<u8>`, `width` / `height` / `y_stride` / `uv_stride` as `u32`).
+`Vp8Error` covers `InvalidData` / `Unsupported` / `Eof` / `NeedMore`
+— no `Io` variant; standalone callers handle their own buffer
+shuffling. Turning the `registry` feature back on adds the
+`Decoder` / `Encoder` trait implementations + the IVF
+`Demuxer` / `Muxer` + the `register` helpers and a
+`From<Vp8Error> for oxideav_core::Error` conversion so the legacy
+`decode_frame` / `encode_keyframe` entry points still return the
+`oxideav_core` shapes (`VideoFrame`, `Result<T, oxideav_core::Error>`).
 
 ## Status
 

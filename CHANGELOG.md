@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New default-on `registry` feature. With `default-features = false`
+  the crate compiles without `oxideav-core` and exposes a free-standing
+  decode/encode API: `decode_vp8(buf) -> Result<Vp8Frame, Vp8Error>`,
+  `encode_vp8_keyframe(width, height, qindex, &Vp8Frame)`, plus local
+  `Vp8Frame` (cropped YUV 4:2:0 planes) and `Vp8Error` (`InvalidData`
+  / `Unsupported` / `Eof` / `NeedMore`) types. Image-library consumers
+  ("decode this WebP/VP8 buffer to pixels") can now depend on this
+  crate without the framework dependency tree. The default-feature
+  path keeps the existing `Decoder` / `Encoder` / IVF `Demuxer` /
+  `Muxer` trait implementations and the registry helpers
+  (`register` / `register_codecs` / `register_containers`) — every
+  current consumer (`oxideav` umbrella, `oxideav-pipeline`, mp4 + mkv
+  WebP extraction) keeps working unchanged. (#358)
+
 - `tests/encoder_mode_coverage.rs` — four integration tests that
   deliberately exercise the encoder's full mode surface in single
   frames: mixed intra-16×16 modes (DC / V / H / TM in one keyframe),

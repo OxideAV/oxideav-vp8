@@ -5,12 +5,16 @@
 //! sub-pel reconstruction, and the sign-bias / refresh / copy-buffer
 //! flags that manage the reference slots.
 
+#[cfg(feature = "registry")]
 use std::collections::VecDeque;
 
+#[cfg(feature = "registry")]
 use oxideav_core::Decoder;
-use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane,
-};
+#[cfg(feature = "registry")]
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase, VideoFrame, VideoPlane};
+
+use crate::error::{Result, Vp8Error as Error};
+use crate::frame::Vp8Frame;
 
 use crate::bool_decoder::BoolDecoder;
 use crate::frame_header::{
@@ -43,7 +47,8 @@ const REF_GOLDEN: u8 = 2;
 const REF_ALT: u8 = 3;
 
 /// Public factory used by the registry.
-pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+#[cfg(feature = "registry")]
+pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     Ok(Box::new(Vp8Decoder::new(params.codec_id.clone())))
 }
 
@@ -167,6 +172,7 @@ impl DecoderState {
     }
 }
 
+#[cfg(feature = "registry")]
 pub struct Vp8Decoder {
     codec_id: CodecId,
     queued: VecDeque<VideoFrame>,
@@ -175,6 +181,7 @@ pub struct Vp8Decoder {
     state: DecoderState,
 }
 
+#[cfg(feature = "registry")]
 impl Vp8Decoder {
     pub fn new(codec_id: CodecId) -> Self {
         Self {
@@ -187,12 +194,13 @@ impl Vp8Decoder {
     }
 }
 
+#[cfg(feature = "registry")]
 impl Decoder for Vp8Decoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+    fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
         // Hidden frames (`show_frame = 0`) are reference-only: they
@@ -207,25 +215,25 @@ impl Decoder for Vp8Decoder {
         let visible = parsed.tag.show_frame;
         let frame = decode_frame_with_state(&packet.data, &mut self.state)?;
         if visible {
-            let mut vf = frame;
+            let mut vf = vp8_frame_to_video_frame(frame);
             vf.pts = self.pending_pts;
             self.queued.push_back(vf);
         }
         Ok(())
     }
 
-    fn receive_frame(&mut self) -> Result<Frame> {
+    fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
         match self.queued.pop_front() {
             Some(v) => Ok(Frame::Video(v)),
-            None => Err(Error::NeedMore),
+            None => Err(oxideav_core::Error::NeedMore),
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> oxideav_core::Result<()> {
         Ok(())
     }
 
-    fn reset(&mut self) -> Result<()> {
+    fn reset(&mut self) -> oxideav_core::Result<()> {
         // VP8 carries per-stream entropy probability tables
         // (`PersistentProbs`) plus the three reference frames
         // (LAST / GOLDEN / ALTREF) between packets. All of these must be
@@ -240,15 +248,60 @@ impl Decoder for Vp8Decoder {
     }
 }
 
-/// Decode a single VP8 keyframe (or a P-frame if the caller has the correct
-/// reference state, in practice only used by tests that call it on keyframes).
-pub fn decode_frame(buf: &[u8]) -> Result<VideoFrame> {
+/// Standalone decode entry point — accepts a single VP8 frame buffer
+/// (typically a keyframe; an inter-frame works only when the caller
+/// has already populated the decoder state) and returns a [`Vp8Frame`]
+/// with the cropped YUV 4:2:0 planes.
+///
+/// This API is unconditional: it works whether or not the `registry`
+/// feature is enabled, and never references `oxideav-core` types.
+/// Image-library consumers that just want pixels should use this entry
+/// point.
+pub fn decode_vp8(buf: &[u8]) -> Result<Vp8Frame> {
     let mut state = DecoderState::new();
     decode_frame_with_state(buf, &mut state)
 }
 
+/// Legacy alias: identical to [`decode_vp8`] but returns the
+/// `oxideav-core::VideoFrame` shape instead of a [`Vp8Frame`]. Gated
+/// on the `registry` feature; standalone callers should use
+/// [`decode_vp8`].
+#[cfg(feature = "registry")]
+pub fn decode_frame(buf: &[u8]) -> oxideav_core::Result<VideoFrame> {
+    let mut state = DecoderState::new();
+    decode_frame_with_state(buf, &mut state)
+        .map(vp8_frame_to_video_frame)
+        .map_err(Into::into)
+}
+
+/// Convert a [`Vp8Frame`] (tight-stride YUV planes) to an
+/// `oxideav-core::VideoFrame`. The fields map 1:1 — `Vp8Frame` already
+/// holds cropped, tight-stride buffers, so no copying or repacking
+/// happens beyond constructing the outer `Vec<VideoPlane>`.
+#[cfg(feature = "registry")]
+pub(crate) fn vp8_frame_to_video_frame(f: Vp8Frame) -> VideoFrame {
+    let cw = f.uv_stride as usize;
+    VideoFrame {
+        pts: f.pts,
+        planes: vec![
+            VideoPlane {
+                stride: f.y_stride as usize,
+                data: f.y,
+            },
+            VideoPlane {
+                stride: cw,
+                data: f.u,
+            },
+            VideoPlane {
+                stride: cw,
+                data: f.v,
+            },
+        ],
+    }
+}
+
 /// Decode a single frame using the given (mutable) decoder state.
-fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<VideoFrame> {
+fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Frame> {
     let parsed = parse_header(buf)?;
     let is_keyframe = matches!(parsed.tag.frame_type, FrameType::Key);
 
@@ -730,22 +783,15 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         v_out[j * cw..j * cw + cw].copy_from_slice(src_v);
     }
 
-    Ok(VideoFrame {
+    Ok(Vp8Frame {
+        width: width as u32,
+        height: height as u32,
         pts: None,
-        planes: vec![
-            VideoPlane {
-                stride: width,
-                data: y_out,
-            },
-            VideoPlane {
-                stride: cw,
-                data: u_out,
-            },
-            VideoPlane {
-                stride: cw,
-                data: v_out,
-            },
-        ],
+        y: y_out,
+        u: u_out,
+        v: v_out,
+        y_stride: width as u32,
+        uv_stride: cw as u32,
     })
 }
 

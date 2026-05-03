@@ -27,13 +27,19 @@
 //! * Single token partition.
 //! * Accepted pixel format: `PixelFormat::Yuv420P`.
 
+#[cfg(feature = "registry")]
 use std::collections::VecDeque;
 
+#[cfg(feature = "registry")]
 use oxideav_core::Encoder;
+#[cfg(feature = "registry")]
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
-    TimeBase, VideoFrame, VideoPlane,
+    CodecId, CodecParameters, Frame, MediaType, Packet, PixelFormat, Rational, TimeBase,
+    VideoFrame, VideoPlane,
 };
+
+use crate::error::{Result, Vp8Error as Error};
+use crate::frame::Vp8Frame;
 
 use crate::bool_encoder::BoolEncoder;
 use crate::fdct::{fdct4x4, fwht4x4};
@@ -53,11 +59,56 @@ use crate::tables::quant::{
 use crate::tables::token_tree::{COEF_BANDS, ZIGZAG};
 use crate::tables::trees::{
     B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_PRED, B_RD_PRED, B_TM_PRED, B_VE_PRED,
-    B_VL_PRED, B_VR_PRED, DC_PRED, DEFAULT_UV_MODE_PROBS, DEFAULT_YMODE_PROBS, H_PRED,
-    KF_BMODE_PROB, KF_UV_MODE_PROBS, KF_YMODE_PROBS, MBSPLIT_PROBS, MB_SPLITS, MB_SPLIT_COUNT,
-    MV_COUNTS_TO_PROBS, SPLIT_MV, SUB_MV_REF_PROBS, TM_PRED, V_PRED, ZERO_MV,
+    B_VL_PRED, B_VR_PRED, DC_PRED, H_PRED, KF_BMODE_PROB, KF_UV_MODE_PROBS, KF_YMODE_PROBS,
+    MBSPLIT_PROBS, MB_SPLITS, MB_SPLIT_COUNT, MV_COUNTS_TO_PROBS, SPLIT_MV, SUB_MV_REF_PROBS,
+    TM_PRED, V_PRED, ZERO_MV,
 };
+#[cfg(feature = "registry")]
+use crate::tables::trees::{DEFAULT_UV_MODE_PROBS, DEFAULT_YMODE_PROBS};
 use crate::transform::{idct4x4, iwht4x4};
+
+/// Internal borrowed view over a Yuv420P source frame. The encoder
+/// reads only Y/U/V plane data + per-plane stride, so a thin
+/// 6-field struct is enough to abstract over the two public input
+/// shapes ([`Vp8Frame`] for the unconditional standalone API and
+/// `oxideav_core::VideoFrame` for the registry-feature trait path)
+/// without rewriting the per-MB plumbing.
+struct Yuv420Source<'a> {
+    y: &'a [u8],
+    u: &'a [u8],
+    v: &'a [u8],
+    y_stride: usize,
+    u_stride: usize,
+    v_stride: usize,
+}
+
+impl<'a> Yuv420Source<'a> {
+    fn from_vp8_frame(f: &'a Vp8Frame) -> Self {
+        Self {
+            y: &f.y,
+            u: &f.u,
+            v: &f.v,
+            y_stride: f.y_stride as usize,
+            u_stride: f.uv_stride as usize,
+            v_stride: f.uv_stride as usize,
+        }
+    }
+
+    #[cfg(feature = "registry")]
+    fn from_video_frame(v: &'a VideoFrame) -> Result<Self> {
+        if v.planes.len() < 3 {
+            return Err(Error::invalid("vp8 encoder: expected 3 planes"));
+        }
+        Ok(Self {
+            y: &v.planes[0].data,
+            u: &v.planes[1].data,
+            v: &v.planes[2].data,
+            y_stride: v.planes[0].stride,
+            u_stride: v.planes[1].stride,
+            v_stride: v.planes[2].stride,
+        })
+    }
+}
 
 /// Default qindex. 50 ≈ mid-quality; the codec accepts 0..=127.
 pub const DEFAULT_QINDEX: u8 = 50;
@@ -407,21 +458,22 @@ impl Default for Vp8EncoderConfig {
 }
 
 /// Encoder factory used by [`crate::register_codecs`].
-pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+#[cfg(feature = "registry")]
+pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
-        .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing width"))?;
     let height = params
         .height
-        .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing height"))?;
     if width == 0 || height == 0 || width > 16383 || height > 16383 {
-        return Err(Error::invalid(format!(
+        return Err(oxideav_core::Error::invalid(format!(
             "vp8 encoder: dimensions {width}x{height} out of range (1..=16383)"
         )));
     }
     let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
     if pix != PixelFormat::Yuv420P {
-        return Err(Error::unsupported(format!(
+        return Err(oxideav_core::Error::unsupported(format!(
             "vp8 encoder: only Yuv420P supported (got {:?})",
             pix
         )));
@@ -462,16 +514,20 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 /// the bit-exact pre-#166 behaviour (no surprise forced keyframes).
 /// Use [`make_encoder_with_config`] with `enable_scene_cut = true`
 /// to opt in.
-pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<Box<dyn Encoder>> {
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_qindex(
+    params: &CodecParameters,
+    qindex: u8,
+) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
-        .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing width"))?;
     let height = params
         .height
-        .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing height"))?;
     let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
     if pix != PixelFormat::Yuv420P {
-        return Err(Error::unsupported(format!(
+        return Err(oxideav_core::Error::unsupported(format!(
             "vp8 encoder: only Yuv420P supported (got {:?})",
             pix
         )));
@@ -515,19 +571,20 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
 
 /// Build an encoder with a fully-specified configuration. Lets callers
 /// turn alt-ref / golden planning + RDO on or off independently.
+#[cfg(feature = "registry")]
 pub fn make_encoder_with_config(
     params: &CodecParameters,
     config: Vp8EncoderConfig,
-) -> Result<Box<dyn Encoder>> {
+) -> oxideav_core::Result<Box<dyn Encoder>> {
     let width = params
         .width
-        .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing width"))?;
     let height = params
         .height
-        .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing height"))?;
     let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
     if pix != PixelFormat::Yuv420P {
-        return Err(Error::unsupported(format!(
+        return Err(oxideav_core::Error::unsupported(format!(
             "vp8 encoder: only Yuv420P supported (got {:?})",
             pix
         )));
@@ -574,6 +631,7 @@ struct ReferenceFrame {
     uv_h: usize,
 }
 
+#[cfg(feature = "registry")]
 struct Vp8Encoder {
     output_params: CodecParameters,
     width: u32,
@@ -604,6 +662,7 @@ struct Vp8Encoder {
 /// frame's luma so the next frame can compute its MAD without keeping the
 /// whole previous frame around in some other slot, plus the running
 /// window of MAD samples that drives the mean + stddev threshold.
+#[cfg(feature = "registry")]
 #[derive(Clone)]
 struct SceneCutState {
     /// Source-luma plane of the previous source frame, packed at the
@@ -626,6 +685,7 @@ struct SceneCutState {
     boost_remaining: u32,
 }
 
+#[cfg(feature = "registry")]
 impl SceneCutState {
     fn new() -> Self {
         Self {
@@ -736,6 +796,7 @@ impl SceneCutState {
 /// Per-frame plan: which reference slots get refreshed by the new
 /// reconstruction at the end of this frame, plus which references are
 /// available to the per-MB inter mode decision while encoding it.
+#[cfg(feature = "registry")]
 #[derive(Clone, Copy, Debug)]
 struct RefPlan {
     refresh_last: bool,
@@ -748,6 +809,7 @@ struct RefPlan {
     use_alt: bool,
 }
 
+#[cfg(feature = "registry")]
 impl RefPlan {
     /// Compute the refresh / availability plan for the next P-frame
     /// given the current encoder state, using the encoder's persistent
@@ -779,6 +841,7 @@ impl RefPlan {
     }
 }
 
+#[cfg(feature = "registry")]
 impl Vp8Encoder {
     /// Per-frame configuration. Returns `self.config` unchanged when
     /// no scene-cut quant boost is in flight; otherwise subtracts a
@@ -853,6 +916,7 @@ impl Vp8Encoder {
     }
 }
 
+#[cfg(feature = "registry")]
 impl Encoder for Vp8Encoder {
     fn codec_id(&self) -> &CodecId {
         &self.output_params.codec_id
@@ -862,13 +926,19 @@ impl Encoder for Vp8Encoder {
         &self.output_params
     }
 
-    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+    fn send_frame(&mut self, frame: &Frame) -> oxideav_core::Result<()> {
         let v = match frame {
             Frame::Video(v) => v,
-            _ => return Err(Error::invalid("vp8 encoder: video frames only")),
+            _ => {
+                return Err(oxideav_core::Error::invalid(
+                    "vp8 encoder: video frames only",
+                ))
+            }
         };
         if v.planes.len() < 3 {
-            return Err(Error::invalid("vp8 encoder: expected 3 planes"));
+            return Err(oxideav_core::Error::invalid(
+                "vp8 encoder: expected 3 planes",
+            ));
         }
         // Frame dims and pixel format are now stream-level — validated
         // by the caller / pipeline against `output_params`. The encoder
@@ -990,12 +1060,13 @@ impl Encoder for Vp8Encoder {
             }
         }
 
+        let src = Yuv420Source::from_video_frame(v)?;
         let (data, reference, plan) = if is_keyframe {
             let (bitstream, rec) = encode_keyframe_and_reconstruct_with_config(
                 self.width,
                 self.height,
                 frame_config,
-                v,
+                &src,
             )?;
             // Keyframe refreshes all three slots.
             let plan = RefPlan {
@@ -1023,7 +1094,7 @@ impl Encoder for Vp8Encoder {
                 self.width,
                 self.height,
                 frame_config,
-                v,
+                &src,
                 last_ref,
                 golden_ref,
                 alt_ref,
@@ -1078,18 +1149,18 @@ impl Encoder for Vp8Encoder {
         Ok(())
     }
 
-    fn receive_packet(&mut self) -> Result<Packet> {
+    fn receive_packet(&mut self) -> oxideav_core::Result<Packet> {
         if let Some(p) = self.pending.pop_front() {
             return Ok(p);
         }
         if self.eof {
-            Err(Error::Eof)
+            Err(oxideav_core::Error::Eof)
         } else {
-            Err(Error::NeedMore)
+            Err(oxideav_core::Error::NeedMore)
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> oxideav_core::Result<()> {
         self.eof = true;
         Ok(())
     }
@@ -1100,18 +1171,38 @@ impl Encoder for Vp8Encoder {
 // ---------------------------------------------------------------------------
 
 /// Encode one keyframe. Returns the raw VP8 bitstream for the frame.
-/// Backwards-compatible with the earlier single-return signature.
-pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) -> Result<Vec<u8>> {
-    // Honour the standalone-API contract: qindex only, segmentation off,
-    // matches the previous behaviour bit-for-bit.
+///
+/// Standalone (no `oxideav-core`) entry point: takes a [`Vp8Frame`]
+/// and returns the encoded bytes plus a [`Vp8Error`] on failure. The
+/// bit-identical behaviour of the legacy [`encode_keyframe`] is
+/// preserved (same `Vp8EncoderConfig` defaults, segmentation off,
+/// normal-mode loop filter).
+pub fn encode_vp8_keyframe(
+    width: u32,
+    height: u32,
+    qindex: u8,
+    frame: &Vp8Frame,
+) -> Result<Vec<u8>> {
+    let src = Yuv420Source::from_vp8_frame(frame);
     let mut cfg = Vp8EncoderConfig::default();
     cfg.qindex = qindex.min(127);
     cfg.enable_segments = false;
-    // Match the pre-#336 normal-mode loop-filter emit so the
-    // standalone API stays bit-identical. Callers that want simple-mode
-    // LF construct a `Vp8EncoderConfig` and use the streaming API.
     cfg.loop_filter_mode = LoopFilterMode::Normal;
-    let (bitstream, _rec) = encode_keyframe_and_reconstruct_with_config(width, height, cfg, frame)?;
+    let (bitstream, _rec) = encode_keyframe_and_reconstruct_with_config(width, height, cfg, &src)?;
+    Ok(bitstream)
+}
+
+/// Legacy keyframe encode entry. Identical to [`encode_vp8_keyframe`]
+/// but takes the `oxideav-core::VideoFrame` shape — gated on the
+/// `registry` feature.
+#[cfg(feature = "registry")]
+pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) -> Result<Vec<u8>> {
+    let src = Yuv420Source::from_video_frame(frame)?;
+    let mut cfg = Vp8EncoderConfig::default();
+    cfg.qindex = qindex.min(127);
+    cfg.enable_segments = false;
+    cfg.loop_filter_mode = LoopFilterMode::Normal;
+    let (bitstream, _rec) = encode_keyframe_and_reconstruct_with_config(width, height, cfg, &src)?;
     Ok(bitstream)
 }
 
@@ -1119,7 +1210,7 @@ fn encode_keyframe_and_reconstruct_with_config(
     width: u32,
     height: u32,
     config: Vp8EncoderConfig,
-    frame: &VideoFrame,
+    frame: &Yuv420Source<'_>,
 ) -> Result<(Vec<u8>, ReferenceFrame)> {
     let qindex = config.qindex;
     let mb_w = ((width + 15) / 16) as usize;
@@ -1534,11 +1625,12 @@ impl PMbDecision {
 /// otherwise the legacy SAD-only path. The reconstructed frame is
 /// returned for the caller to use in the next reference plan.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "registry")]
 fn encode_pframe_and_reconstruct(
     width: u32,
     height: u32,
     config: Vp8EncoderConfig,
-    frame: &VideoFrame,
+    frame: &Yuv420Source<'_>,
     last_ref: &ReferenceFrame,
     golden_ref: Option<&ReferenceFrame>,
     alt_ref: Option<&ReferenceFrame>,
@@ -2174,6 +2266,7 @@ fn encode_pframe_and_reconstruct(
 /// Synthesised alt-ref source image. Stored as Yuv420P planes packed at
 /// the natural width/stride (no MB padding) so it can be wrapped in a
 /// `VideoFrame` and fed straight to the standard P-frame encoder.
+#[cfg(feature = "registry")]
 struct SynthesizedAltRef {
     y: Vec<u8>,
     u: Vec<u8>,
@@ -2189,6 +2282,7 @@ struct SynthesizedAltRef {
     pts: Option<i64>,
 }
 
+#[cfg(feature = "registry")]
 impl SynthesizedAltRef {
     /// Wrap as a `VideoFrame` so the standard P-frame encoder accepts
     /// the synthesized planes as a "source".
@@ -2232,6 +2326,7 @@ impl SynthesizedAltRef {
 /// Returns `None` when geometry is invalid (zero dims, plane shape
 /// mismatch). Single-frame buffers return the centre frame unchanged
 /// (no smoothing possible — same as the legacy alt-ref source).
+#[cfg(feature = "registry")]
 fn synthesize_altref_image(
     width: usize,
     height: usize,
@@ -2419,6 +2514,7 @@ fn synthesize_altref_image(
 /// frame border (the centre and source planes need not be MB-padded —
 /// we clamp explicitly). Both planes carry their own `stride`, allowing
 /// arbitrary row padding without forcing a copy.
+#[cfg(feature = "registry")]
 #[allow(clippy::too_many_arguments)]
 fn altref_search_mb(
     centre: &[u8],
@@ -2480,6 +2576,7 @@ fn altref_search_mb(
 /// `RefPlan` and patching the `show_frame` bit in the resulting tag
 /// byte. The reconstruction returned is what BOTH encoder and decoder
 /// will install in their alt-ref slot.
+#[cfg(feature = "registry")]
 fn encode_hidden_altref_pframe(
     width: u32,
     height: u32,
@@ -2488,6 +2585,7 @@ fn encode_hidden_altref_pframe(
     last_ref: &ReferenceFrame,
 ) -> Result<(Vec<u8>, ReferenceFrame)> {
     let synth_frame = synth.as_video_frame();
+    let synth_src = Yuv420Source::from_video_frame(&synth_frame)?;
     let plan = RefPlan {
         refresh_last: false,
         refresh_golden: false,
@@ -2520,16 +2618,8 @@ fn encode_hidden_altref_pframe(
     // hidden-frame growth stays well below the per-frame savings on a
     // motion-rich noisy fixture.
     hcfg.qindex = (cfg.qindex as i32 - HIDDEN_ALTREF_QINDEX_DELTA).clamp(0, 127) as u8;
-    let (mut bitstream, rec) = encode_pframe_and_reconstruct(
-        width,
-        height,
-        hcfg,
-        &synth_frame,
-        last_ref,
-        None,
-        None,
-        plan,
-    )?;
+    let (mut bitstream, rec) =
+        encode_pframe_and_reconstruct(width, height, hcfg, &synth_src, last_ref, None, None, plan)?;
     // Patch the frame tag to set `show_frame = 0`. The tag is the first
     // 3 bytes; bit 4 of byte 0 is the show_frame flag.
     if !bitstream.is_empty() {
@@ -2655,6 +2745,7 @@ fn mb_luma_sse_at_subpel(
 /// Approximate the per-MB mode-info bit cost (eighth-of-a-bit units)
 /// for a candidate decision: skip flag + intra-vs-inter + ref-frame
 /// bits + MV-tree leaf + MV deltas.
+#[cfg(feature = "registry")]
 #[allow(clippy::too_many_arguments)]
 fn estimate_mode_rate_8ths(
     decision: &PMbDecision,
@@ -2815,6 +2906,7 @@ fn estimate_distortion(
 /// units, so we divide by 8 to renormalise). Used by the per-MB
 /// reference-and-mode picker to select the best candidate across LAST /
 /// GOLDEN / ALTREF.
+#[cfg(feature = "registry")]
 #[allow(clippy::too_many_arguments)]
 fn rd_cost_for_decision(
     decision: &PMbDecision,
@@ -5684,7 +5776,7 @@ fn apply_loop_filter_enc(
 /// Copy the 3 planes of a video frame into MB-aligned (16/8 pixel) buffers.
 /// Edge-replicate when frame dimensions are not multiples of 16.
 fn extract_mb_padded(
-    v: &VideoFrame,
+    src: &Yuv420Source<'_>,
     width: usize,
     height: usize,
     mb_w: usize,
@@ -5695,17 +5787,13 @@ fn extract_mb_padded(
     let y_h = mb_h * 16;
     let uv_h = mb_h * 8;
 
-    let y_plane = &v.planes[0];
-    let u_plane = &v.planes[1];
-    let v_plane = &v.planes[2];
-
     let mut y_out = vec![0u8; y_stride * y_h];
     for j in 0..y_h {
         let src_row = j.min(height - 1);
-        let src_start = src_row * y_plane.stride;
+        let src_start = src_row * src.y_stride;
         for i in 0..y_stride {
             let src_col = i.min(width - 1);
-            y_out[j * y_stride + i] = y_plane.data[src_start + src_col];
+            y_out[j * y_stride + i] = src.y[src_start + src_col];
         }
     }
     let uv_w = (width + 1) / 2;
@@ -5714,12 +5802,12 @@ fn extract_mb_padded(
     let mut v_out = vec![0u8; uv_stride * uv_h];
     for j in 0..uv_h {
         let src_row = j.min(uv_src_h - 1);
-        let u_start = src_row * u_plane.stride;
-        let v_start = src_row * v_plane.stride;
+        let u_start = src_row * src.u_stride;
+        let v_start = src_row * src.v_stride;
         for i in 0..uv_stride {
             let src_col = i.min(uv_w - 1);
-            u_out[j * uv_stride + i] = u_plane.data[u_start + src_col];
-            v_out[j * uv_stride + i] = v_plane.data[v_start + src_col];
+            u_out[j * uv_stride + i] = src.u[u_start + src_col];
+            v_out[j * uv_stride + i] = src.v[v_start + src_col];
         }
     }
     Ok((y_out, u_out, v_out))
@@ -6064,6 +6152,7 @@ mod tests {
     /// `prob_last` should land near 255 (REF_LAST near-free, the libvpx
     /// single-ref convention) and `prob_intra` should land near 255
     /// (intra-in-P essentially never picked).
+    #[cfg(feature = "registry")]
     #[test]
     fn header_probs_track_per_mb_ref_distribution() {
         use crate::bool_decoder::BoolDecoder;

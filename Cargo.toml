@@ -14,12 +14,26 @@ keywords = ["multimedia", "video", "vp8", "codec", "pure-rust"]
 categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
-oxideav-core = "0.1"
+# `oxideav-core` is gated behind the default-on `registry` feature so
+# image-library consumers can depend on `oxideav-vp8` with
+# `default-features = false` and avoid the framework dependency tree
+# entirely. Without `registry` the crate exposes a free-standing
+# `decode_vp8` / `encode_vp8_keyframe` API plus local `Vp8Frame` /
+# `Vp8Error` types and never references `oxideav-core`.
+oxideav-core = { version = "0.1", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
 
 [features]
+default = ["registry"]
+
+# Wires up the codec / encoder / decoder / IVF demuxer + muxer trait
+# implementations against `oxideav-core` so the crate can plug into the
+# `oxideav` framework registry. Default-on; turn off for image-library
+# use-cases that just want the standalone `decode_vp8` API.
+registry = ["dep:oxideav-core"]
+
 # Enables `portable_simd`-based loop-filter horizontal edges. Requires
 # nightly Rust (the feature gate is only stable on nightly as of
 # 1.80). Default-stable builds compile the scalar path, so consumers

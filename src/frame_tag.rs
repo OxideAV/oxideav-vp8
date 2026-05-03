@@ -11,7 +11,7 @@
 //!   2-byte width       (lower 14 bits little-endian: 13 bits width + 2 bits scale)
 //!   2-byte height      (lower 14 bits little-endian: 13 bits height + 2 bits scale)
 
-use oxideav_core::{Error, Result};
+use crate::error::{Result, Vp8Error as Error};
 
 pub const KEYFRAME_SYNC_CODE: [u8; 3] = [0x9d, 0x01, 0x2a];
 

@@ -1,7 +1,7 @@
 //! VP8 frame header — bool-coded section starting after the uncompressed
 //! chunk. Covers RFC 6386 §9.2 through §9.10.
 
-use oxideav_core::Result;
+use crate::error::Result;
 
 use crate::bool_decoder::BoolDecoder;
 use crate::frame_tag::FrameType;

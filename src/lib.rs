@@ -33,6 +33,12 @@
 //!   per-MB picker, context-adaptive `prob_intra/last/gf` triple.
 
 #![cfg_attr(feature = "simd", feature(portable_simd))]
+// When built without the `registry` feature, large swathes of the
+// encoder (P-frame helpers, alt-ref synthesis, scene-cut state, etc.)
+// have no callers — they're only reachable via the `Encoder` trait
+// implementation that's gated behind `registry`. Suppress the
+// resulting dead-code warnings rather than gating every helper.
+#![cfg_attr(not(feature = "registry"), allow(dead_code))]
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::too_many_arguments)]
@@ -52,68 +58,37 @@ pub mod bool_decoder;
 pub mod bool_encoder;
 pub mod decoder;
 pub mod encoder;
+pub mod error;
 pub mod fdct;
+pub mod frame;
 pub mod frame_header;
 pub mod frame_tag;
 pub mod inter;
 pub mod intra;
+#[cfg(feature = "registry")]
 pub mod ivf;
 pub mod loopfilter;
 pub mod mv;
+#[cfg(feature = "registry")]
+pub mod registry;
 pub mod tables;
 pub mod tokens;
 pub mod transform;
 
-use oxideav_core::ContainerRegistry;
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag, Result};
-use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
-
 pub const CODEC_ID_STR: &str = "vp8";
 
-pub fn register_codecs(reg: &mut CodecRegistry) {
-    let cid = CodecId::new(CODEC_ID_STR);
-    let caps = CodecCapabilities::video("vp8_sw")
-        .with_lossy(true)
-        .with_intra_only(false)
-        .with_max_size(16384, 16384);
-    // AVI FourCC claims — `VP80` is canonical, `VP8 ` (trailing space)
-    // is the Google-blessed variant found in some .avi files.
-    reg.register(
-        CodecInfo::new(cid.clone())
-            .capabilities(caps)
-            .decoder(make_decoder)
-            .tags([CodecTag::fourcc(b"VP80"), CodecTag::fourcc(b"VP8 ")]),
-    );
-
-    let enc_caps = CodecCapabilities::video("vp8_sw_enc")
-        .with_lossy(true)
-        .with_intra_only(false)
-        .with_max_size(16383, 16383);
-    reg.register(
-        CodecInfo::new(cid)
-            .capabilities(enc_caps)
-            .encoder(make_encoder),
-    );
-}
-
-pub fn register_containers(reg: &mut ContainerRegistry) {
-    ivf::register(reg);
-}
-
-fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    decoder::make_decoder(params)
-}
-
-fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
-    encoder::make_encoder(params)
-}
-
-/// Combined registration for callers that just want everything.
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
-}
-
-pub use decoder::{decode_frame, Vp8Decoder};
+// Public unconditional API — works whether or not `registry` is enabled.
+pub use decoder::decode_vp8;
+pub use error::{Result, Vp8Error};
+pub use frame::Vp8Frame;
 pub use frame_header::{parse_keyframe_header, FrameHeader};
 pub use frame_tag::{parse_header, FrameTag, FrameType, KeyframeHeader, ParsedHeader};
+
+// Public registry-gated API — keeps the framework integration surface
+// (Decoder/Encoder traits, IVF Demuxer/Muxer, register helpers) behind
+// the default-on `registry` feature so image-library callers can build
+// the crate without dragging in `oxideav-core`.
+#[cfg(feature = "registry")]
+pub use decoder::{decode_frame, Vp8Decoder};
+#[cfg(feature = "registry")]
+pub use registry::{register, register_codecs, register_containers};

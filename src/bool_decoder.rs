@@ -9,7 +9,7 @@
 //! is the authoritative behaviour. The implementation below tracks that
 //! reference closely.
 
-use oxideav_core::{Error, Result};
+use crate::error::{Result, Vp8Error as Error};
 
 /// Boolean (arithmetic) decoder. Mutable cursor over a borrowed `&[u8]`.
 #[derive(Debug)]

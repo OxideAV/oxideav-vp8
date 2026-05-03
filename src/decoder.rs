@@ -101,6 +101,41 @@ struct DecoderState {
     last: RefFrame,
     golden: RefFrame,
     altref: RefFrame,
+    /// Per-frame scratch buffers reused across decode_frame_with_state
+    /// calls. Sized lazily at the top of each frame; capacity is
+    /// retained between frames so a steady-state stream allocates only
+    /// once at the keyframe (when dimensions become known) and never
+    /// again. Heap-allocating these per frame is visible in profiles —
+    /// an 1080p frame walks ~8160 mb_info entries plus ~120 above-row
+    /// scratch entries plus three multi-MB-byte plane buffers.
+    scratch: Scratch,
+}
+
+/// Scratch buffers reused across `decode_frame_with_state` invocations.
+/// All entries are resized to the current frame's MB dimensions on
+/// entry. `nz_*_above` / `bmode_above` are explicitly reset at the top
+/// of the per-MB walk, so leftover data from the prior frame doesn't
+/// leak across. `mb_info` is fully overwritten by the mode-decode loop
+/// in raster order before any neighbour-lookup reads it (find_near_mvs,
+/// keyframe B_PRED neighbour walk).
+///
+/// Plane buffers (`y_plane` / `u_plane` / `v_plane`) and the padded
+/// token-partition copies are NOT hoisted — the plane buffers are
+/// borrowed mutably by the MB reconstruction path while the immutable
+/// `state.last/golden/altref` references are also live (the borrow
+/// checker would reject the simultaneous `&mut state.scratch.y_plane` /
+/// `&state.last`), and the partition decoders hold borrows back into
+/// `padded_parts` for the duration of the token walk. Those hoists are
+/// queued for a follow-up round that splits `state` so the planes can
+/// live in a sibling struct.
+#[derive(Clone, Default)]
+struct Scratch {
+    nz_y_above: Vec<[u8; 4]>,
+    nz_uv_above: Vec<[u8; 2]>,
+    nz_v_above: Vec<[u8; 2]>,
+    nz_y2_above: Vec<u8>,
+    bmode_above: Vec<[i32; 4]>,
+    mb_info: Vec<MbInfo>,
 }
 
 impl DecoderState {
@@ -110,6 +145,7 @@ impl DecoderState {
             last: RefFrame::default(),
             golden: RefFrame::default(),
             altref: RefFrame::default(),
+            scratch: Scratch::default(),
         }
     }
 }
@@ -273,37 +309,65 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
     let mut u_plane = vec![0u8; uv_stride * uv_buf_h];
     let mut v_plane = vec![0u8; uv_stride * uv_buf_h];
 
-    let mut nz_y_above = vec![[0u8; 4]; mb_w];
-    let mut nz_uv_above = vec![[0u8; 2]; mb_w];
-    let mut nz_v_above = vec![[0u8; 2]; mb_w];
-    let mut nz_y2_above = vec![0u8; mb_w];
-    let mut bmode_above = vec![[0i32; 4]; mb_w];
+    // Hoisted per-frame scratch lives in `state.scratch`. Resizing
+    // is a no-op once dimensions stabilise (after the keyframe), so a
+    // steady-state stream allocates these buffers exactly once for the
+    // lifetime of the decoder. `bmode_above` MUST be zero-initialised
+    // on the very first row of the frame (the `row == 0` branch in
+    // `decode_mb_mode_info_keyframe` reads `bmode_above[mb_x][col]`),
+    // which `resize` accomplishes when growing from 0; for already-
+    // sized buffers the explicit reset further down handles it.
+    state.scratch.nz_y_above.resize(mb_w, [0u8; 4]);
+    state.scratch.nz_uv_above.resize(mb_w, [0u8; 2]);
+    state.scratch.nz_v_above.resize(mb_w, [0u8; 2]);
+    state.scratch.nz_y2_above.resize(mb_w, 0u8);
+    state.scratch.bmode_above.resize(mb_w, [0i32; 4]);
+    // Reset the bmode_above row for this frame — neighbour reads from
+    // mb_y == 0 must see fresh zeros, and rows further down get
+    // overwritten by the per-MB writes anyway.
+    for c in &mut state.scratch.bmode_above {
+        *c = [0; 4];
+    }
+    state.scratch.mb_info.resize(mb_w * mb_h, MbInfo::default());
+
+    // Split the scratch borrow so each sub-field is independently
+    // mutable. Without this we'd have to choose between holding a
+    // single `&mut state.scratch` (blocking simultaneous `&state.last`
+    // reads in the inter MB loop) and re-borrowing per call (verbose
+    // and easier to get wrong).
+    let Scratch {
+        nz_y_above,
+        nz_uv_above,
+        nz_v_above,
+        nz_y2_above,
+        bmode_above,
+        mb_info,
+    } = &mut state.scratch;
 
     // --- MB mode decode ---
     let mut mb_dec = hdr_dec;
-    let mut mb_info = vec![MbInfo::default(); mb_w * mb_h];
 
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             let info = if is_keyframe {
                 decode_mb_mode_info_keyframe(
                     &mut mb_dec,
-                    &mb_info,
+                    mb_info.as_slice(),
                     mb_x,
                     mb_y,
                     mb_w,
                     &header,
-                    &mut bmode_above,
+                    bmode_above.as_mut_slice(),
                 )?
             } else {
                 decode_mb_mode_info_inter(
                     &mut mb_dec,
-                    &mb_info,
+                    mb_info.as_slice(),
                     mb_x,
                     mb_y,
                     mb_w,
                     &header,
-                    &mut bmode_above,
+                    bmode_above.as_mut_slice(),
                 )?
             };
             mb_info[mb_y * mb_w + mb_x] = info;
@@ -329,16 +393,16 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         .map(|p| BoolDecoder::new(p))
         .collect::<Result<_>>()?;
 
-    for c in &mut nz_y_above {
+    for c in nz_y_above.iter_mut() {
         *c = [0; 4];
     }
-    for c in &mut nz_uv_above {
+    for c in nz_uv_above.iter_mut() {
         *c = [0; 2];
     }
-    for c in &mut nz_v_above {
+    for c in nz_v_above.iter_mut() {
         *c = [0; 2];
     }
-    for c in &mut nz_y2_above {
+    for c in nz_y2_above.iter_mut() {
         *c = 0;
     }
 
@@ -513,7 +577,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
             } else {
                 reconstruct_inter_mb(
                     &header,
-                    state,
+                    &state.last,
+                    &state.golden,
+                    &state.altref,
                     &info,
                     has_y2,
                     &y2_coeffs,
@@ -535,7 +601,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
     // Loop filter.
     apply_loop_filter(
         &header,
-        &mb_info,
+        mb_info.as_slice(),
         mb_w,
         mb_h,
         &mut y_plane,
@@ -1397,7 +1463,9 @@ fn reconstruct_intra_mb(
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_inter_mb(
     header: &FrameHeader,
-    state: &DecoderState,
+    last: &RefFrame,
+    golden: &RefFrame,
+    altref: &RefFrame,
     info: &MbInfo,
     has_y2: bool,
     y2_coeffs: &[i16; 16],
@@ -1433,10 +1501,10 @@ fn reconstruct_inter_mb(
     };
 
     let ref_frame = match info.ref_frame {
-        REF_LAST => &state.last,
-        REF_GOLDEN => &state.golden,
-        REF_ALT => &state.altref,
-        _ => &state.last,
+        REF_LAST => last,
+        REF_GOLDEN => golden,
+        REF_ALT => altref,
+        _ => last,
     };
 
     let mb_x_px = mb_x * 16;

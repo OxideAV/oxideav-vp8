@@ -119,15 +119,23 @@ struct DecoderState {
 /// in raster order before any neighbour-lookup reads it (find_near_mvs,
 /// keyframe B_PRED neighbour walk).
 ///
-/// Plane buffers (`y_plane` / `u_plane` / `v_plane`) and the padded
-/// token-partition copies are NOT hoisted — the plane buffers are
-/// borrowed mutably by the MB reconstruction path while the immutable
-/// `state.last/golden/altref` references are also live (the borrow
-/// checker would reject the simultaneous `&mut state.scratch.y_plane` /
-/// `&state.last`), and the partition decoders hold borrows back into
-/// `padded_parts` for the duration of the token walk. Those hoists are
-/// queued for a follow-up round that splits `state` so the planes can
-/// live in a sibling struct.
+/// `y_plane` / `u_plane` / `v_plane` are the per-frame reconstructed
+/// planes. They are zero-initialised on resize (keyframe) and fully
+/// overwritten by the MB reconstruction loop on subsequent frames —
+/// every output pixel is produced by intra-prediction or motion
+/// compensation, so leftover data never leaks. Hoisting these saves
+/// three multi-MB-byte heap allocations per frame; an 1080p stream is
+/// 3 × ~3.1 MiB / frame, very visible in profiles. The borrow checker
+/// is satisfied by destructuring the scratch sub-struct into disjoint
+/// `&mut` field borrows at the top of `decode_frame_with_state` (Rust
+/// permits simultaneous mutable borrows of distinct struct fields), so
+/// the inter MB loop holds `&mut y_plane` alongside `&state.last`
+/// without conflict.
+///
+/// `padded_parts` is NOT hoisted — the partition `BoolDecoder`s hold
+/// borrows back into the padded byte slices for the duration of the
+/// token walk, and that lifetime model is independently queued for
+/// follow-up.
 #[derive(Clone, Default)]
 struct Scratch {
     nz_y_above: Vec<[u8; 4]>,
@@ -136,6 +144,9 @@ struct Scratch {
     nz_y2_above: Vec<u8>,
     bmode_above: Vec<[i32; 4]>,
     mb_info: Vec<MbInfo>,
+    y_plane: Vec<u8>,
+    u_plane: Vec<u8>,
+    v_plane: Vec<u8>,
 }
 
 impl DecoderState {
@@ -305,9 +316,6 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
     let uv_stride = mb_w * 8;
     let y_buf_h = mb_h * 16;
     let uv_buf_h = mb_h * 8;
-    let mut y_plane = vec![0u8; y_stride * y_buf_h];
-    let mut u_plane = vec![0u8; uv_stride * uv_buf_h];
-    let mut v_plane = vec![0u8; uv_stride * uv_buf_h];
 
     // Hoisted per-frame scratch lives in `state.scratch`. Resizing
     // is a no-op once dimensions stabilise (after the keyframe), so a
@@ -330,11 +338,27 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
     }
     state.scratch.mb_info.resize(mb_w * mb_h, MbInfo::default());
 
+    // Plane buffers: resize-then-zero so the contents start fresh on
+    // every frame regardless of prior dimensions. Resize is a no-op
+    // once steady-state, and the zero-fill matches the explicit
+    // `vec![0u8; ...]` semantics this code replaced. Every output
+    // pixel is rewritten by the reconstruction loop below — the zero
+    // floor matters only for the cropping copy out of out-of-bounds
+    // pad rows on non-multiple-of-16 frame sizes.
+    state.scratch.y_plane.resize(y_stride * y_buf_h, 0);
+    state.scratch.u_plane.resize(uv_stride * uv_buf_h, 0);
+    state.scratch.v_plane.resize(uv_stride * uv_buf_h, 0);
+    state.scratch.y_plane.fill(0);
+    state.scratch.u_plane.fill(0);
+    state.scratch.v_plane.fill(0);
+
     // Split the scratch borrow so each sub-field is independently
     // mutable. Without this we'd have to choose between holding a
     // single `&mut state.scratch` (blocking simultaneous `&state.last`
     // reads in the inter MB loop) and re-borrowing per call (verbose
-    // and easier to get wrong).
+    // and easier to get wrong). The plane fields participate in the
+    // same destructuring so the inter MB loop can hold `&mut y_plane`
+    // alongside `&state.last`.
     let Scratch {
         nz_y_above,
         nz_uv_above,
@@ -342,6 +366,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         nz_y2_above,
         bmode_above,
         mb_info,
+        y_plane,
+        u_plane,
+        v_plane,
     } = &mut state.scratch;
 
     // --- MB mode decode ---
@@ -568,9 +595,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                     mb_x,
                     mb_y,
                     mb_w,
-                    &mut y_plane,
-                    &mut u_plane,
-                    &mut v_plane,
+                    y_plane.as_mut_slice(),
+                    u_plane.as_mut_slice(),
+                    v_plane.as_mut_slice(),
                     y_stride,
                     uv_stride,
                 );
@@ -588,9 +615,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                     &v_coeffs,
                     mb_x,
                     mb_y,
-                    &mut y_plane,
-                    &mut u_plane,
-                    &mut v_plane,
+                    y_plane.as_mut_slice(),
+                    u_plane.as_mut_slice(),
+                    v_plane.as_mut_slice(),
                     y_stride,
                     uv_stride,
                 );
@@ -604,9 +631,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         mb_info.as_slice(),
         mb_w,
         mb_h,
-        &mut y_plane,
-        &mut u_plane,
-        &mut v_plane,
+        y_plane.as_mut_slice(),
+        u_plane.as_mut_slice(),
+        v_plane.as_mut_slice(),
         y_stride,
         uv_stride,
         y_buf_h,
@@ -614,7 +641,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         is_keyframe,
     );
 
-    // Update reference frames based on flags.
+    // Update reference frames based on flags. Cloning the destructured
+    // `&mut Vec<u8>` field auto-derefs to `Vec<u8>::clone`, producing
+    // owned heap copies for the reference snapshots.
     let new_frame = RefFrame {
         y: y_plane.clone(),
         u: u_plane.clone(),

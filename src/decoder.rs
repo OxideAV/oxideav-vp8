@@ -351,7 +351,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         let dec = &mut token_decs[part_idx];
 
         for mb_x in 0..mb_w {
-            let info = mb_info[mb_y * mb_w + mb_x].clone();
+            let mut info = mb_info[mb_y * mb_w + mb_x].clone();
             let skip = info.skip;
 
             let is_intra = info.ref_frame == REF_INTRA;
@@ -372,6 +372,10 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
             let mut u_coeffs = [[0i16; 16]; 4];
             let mut v_coeffs = [[0i16; 16]; 4];
 
+            // Track whether the MB has any non-zero coefficient
+            // anywhere — needed by the loop-filter sub-block-edge skip
+            // rule (RFC 6386 §15.1, libvpx `eob_mask`).
+            let mut any_coeffs = false;
             if !skip {
                 if has_y2 {
                     let nctx = nz_y2_above[mb_x] + nz_y2_left;
@@ -386,6 +390,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                     let nz_flag = if nz > 0 { 1 } else { 0 };
                     nz_y2_above[mb_x] = nz_flag;
                     nz_y2_left = nz_flag;
+                    if nz > 0 {
+                        any_coeffs = true;
+                    }
                 }
 
                 let block_type = if has_y2 {
@@ -411,6 +418,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                         let nz_flag = if nz > 0 { 1 } else { 0 };
                         nz_y_above[mb_x][bx] = nz_flag;
                         nz_y_left[by] = nz_flag;
+                        if nz > 0 {
+                            any_coeffs = true;
+                        }
                     }
                 }
 
@@ -436,6 +446,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                         let nz_flag = if nz > 0 { 1 } else { 0 };
                         nz_uv_above[mb_x][bx] = nz_flag;
                         nz_u_left[by] = nz_flag;
+                        if nz > 0 {
+                            any_coeffs = true;
+                        }
                     }
                 }
                 for by in 0..2 {
@@ -455,6 +468,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                         let nz_flag = if nz > 0 { 1 } else { 0 };
                         nz_v_above[mb_x][bx] = nz_flag;
                         nz_v_left[by] = nz_flag;
+                        if nz > 0 {
+                            any_coeffs = true;
+                        }
                     }
                 }
             } else {
@@ -473,6 +489,8 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
                     nz_v_left[bx] = 0;
                 }
             }
+            info.has_coeffs = any_coeffs;
+            mb_info[mb_y * mb_w + mb_x].has_coeffs = any_coeffs;
 
             if is_intra {
                 reconstruct_intra_mb(
@@ -527,6 +545,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Video
         uv_stride,
         y_buf_h,
         uv_buf_h,
+        is_keyframe,
     );
 
     // Update reference frames based on flags.
@@ -638,6 +657,11 @@ struct MbInfo {
     sub_mvs: [Mv; 16],
     /// Split mode (when y_mode == SPLIT_MV).
     inter_split_mode: Option<u8>,
+    /// True if any non-zero DCT/WHT coefficient was decoded for this
+    /// MB (libvpx's "eob_mask"). Loopfilter step 2 + 4 (sub-block edge
+    /// filtering) is skipped when this is false AND y_mode is neither
+    /// B_PRED nor SPLITMV — see RFC 6386 §15.1.
+    has_coeffs: bool,
 }
 
 fn decode_mb_mode_info_keyframe(
@@ -1565,9 +1589,23 @@ fn chroma_avg4(sum: i32) -> i32 {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Apply the in-loop filter, iterating macroblocks in raster order and
+/// (per RFC 6386 §15.1) doing the four edge passes per-MB in this order:
+///
+///   1. Left MB-edge vertical filter (when col > 0)
+///   2. Inner sub-block vertical filters at x = mb_x*16 + 4/8/12
+///      (skipped when MB has no coefficients AND y_mode is neither
+///      B_PRED nor SPLITMV)
+///   3. Top MB-edge horizontal filter (when row > 0)
+///   4. Inner sub-block horizontal filters (same skip rule)
+///
+/// At each step, luma is filtered first followed by U and V (the simple
+/// filter type only filters luma and only the four pixels closest to
+/// the edge — RFC §15.2). Chroma has only one inner sub-block edge per
+/// MB (the centre at x = mb_x*8 + 4 / y = mb_y*8 + 4).
 fn apply_loop_filter(
     header: &FrameHeader,
-    _mb_info: &[MbInfo],
+    mb_info: &[MbInfo],
     mb_w: usize,
     mb_h: usize,
     y_plane: &mut [u8],
@@ -1577,78 +1615,169 @@ fn apply_loop_filter(
     uv_stride: usize,
     y_buf_h: usize,
     uv_buf_h: usize,
+    key_frame: bool,
 ) {
     if header.loop_filter.level == 0 {
         return;
     }
     let lf = &header.loop_filter;
-    let params_mb = FilterParams::for_mb(lf.level, lf.sharpness, true);
-    let params_sb = FilterParams::for_mb(lf.level, lf.sharpness, false);
+    let params_mb = FilterParams::for_mb_typed(lf.level, lf.sharpness, true, key_frame);
+    let params_sb = FilterParams::for_mb_typed(lf.level, lf.sharpness, false, key_frame);
     let simple = lf.filter_type == 1;
     for mb_y in 0..mb_h {
-        for mb_x in 1..mb_w {
+        let y0 = mb_y * 16;
+        let y0c = mb_y * 8;
+        for mb_x in 0..mb_w {
+            let info = &mb_info[mb_y * mb_w + mb_x];
+            let filter_subblocks =
+                info.has_coeffs || info.y_mode == B_PRED || info.inter_split_mode.is_some();
             let x = mb_x * 16;
-            let y0 = mb_y * 16;
-            if simple {
-                filter_simple_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb);
-            } else {
-                filter_normal_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb, true);
-            }
-        }
-    }
-    for mb_y in 1..mb_h {
-        let y = mb_y * 16;
-        if simple {
-            filter_simple_horizontal(y_plane, y_stride, y, y_stride, y_buf_h, params_mb);
-        } else {
-            filter_normal_horizontal(y_plane, y_stride, y, y_stride, y_buf_h, params_mb, true);
-        }
-    }
-    if !simple {
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
-                let bx0 = mb_x * 16;
-                let by0 = mb_y * 16;
-                for k in 1..4 {
-                    let xv = bx0 + k * 4;
+            let xc = mb_x * 8;
+
+            // 1. Left MB v-edges — luma then U then V (RFC §15.1; the
+            //    simple filter type is luma-only per §15.2).
+            if mb_x > 0 {
+                if simple {
+                    filter_simple_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb);
+                } else {
                     filter_normal_vertical(
                         y_plane,
                         y_stride,
-                        xv,
+                        x,
                         y_stride,
-                        by0 + 16,
-                        params_sb,
-                        false,
+                        y0 + 16,
+                        params_mb,
+                        true,
                     );
-                    let yh = by0 + k * 4;
-                    filter_normal_horizontal(
-                        y_plane, y_stride, yh, y_stride, y_buf_h, params_sb, false,
+                    filter_normal_vertical(
+                        u_plane,
+                        uv_stride,
+                        xc,
+                        uv_stride,
+                        y0c + 8,
+                        params_mb,
+                        true,
+                    );
+                    filter_normal_vertical(
+                        v_plane,
+                        uv_stride,
+                        xc,
+                        uv_stride,
+                        y0c + 8,
+                        params_mb,
+                        true,
                     );
                 }
             }
-        }
-    }
-    for mb_y in 0..mb_h {
-        for mb_x in 1..mb_w {
-            let x = mb_x * 8;
-            let y0 = mb_y * 8;
-            if simple {
-                filter_simple_vertical(u_plane, uv_stride, x, uv_stride, y0 + 8, params_mb);
-                filter_simple_vertical(v_plane, uv_stride, x, uv_stride, y0 + 8, params_mb);
-            } else {
-                filter_normal_vertical(u_plane, uv_stride, x, uv_stride, y0 + 8, params_mb, true);
-                filter_normal_vertical(v_plane, uv_stride, x, uv_stride, y0 + 8, params_mb, true);
+
+            // 2. Inner sub-block v-edges — three for luma, one for U/V.
+            if filter_subblocks {
+                if simple {
+                    for k in 1..4 {
+                        filter_simple_vertical(
+                            y_plane,
+                            y_stride,
+                            x + k * 4,
+                            y_stride,
+                            y0 + 16,
+                            params_sb,
+                        );
+                    }
+                } else {
+                    for k in 1..4 {
+                        filter_normal_vertical(
+                            y_plane,
+                            y_stride,
+                            x + k * 4,
+                            y_stride,
+                            y0 + 16,
+                            params_sb,
+                            false,
+                        );
+                    }
+                    filter_normal_vertical(
+                        u_plane,
+                        uv_stride,
+                        xc + 4,
+                        uv_stride,
+                        y0c + 8,
+                        params_sb,
+                        false,
+                    );
+                    filter_normal_vertical(
+                        v_plane,
+                        uv_stride,
+                        xc + 4,
+                        uv_stride,
+                        y0c + 8,
+                        params_sb,
+                        false,
+                    );
+                }
             }
-        }
-    }
-    for mb_y in 1..mb_h {
-        let y = mb_y * 8;
-        if simple {
-            filter_simple_horizontal(u_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb);
-            filter_simple_horizontal(v_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb);
-        } else {
-            filter_normal_horizontal(u_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb, true);
-            filter_normal_horizontal(v_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb, true);
+
+            // 3. Top MB h-edges.
+            if mb_y > 0 {
+                if simple {
+                    filter_simple_horizontal(y_plane, y_stride, y0, y_stride, y_buf_h, params_mb);
+                } else {
+                    filter_normal_horizontal(
+                        y_plane, y_stride, y0, y_stride, y_buf_h, params_mb, true,
+                    );
+                    filter_normal_horizontal(
+                        u_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                    );
+                    filter_normal_horizontal(
+                        v_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                    );
+                }
+            }
+
+            // 4. Inner sub-block h-edges.
+            if filter_subblocks {
+                if simple {
+                    for k in 1..4 {
+                        filter_simple_horizontal(
+                            y_plane,
+                            y_stride,
+                            y0 + k * 4,
+                            y_stride,
+                            y_buf_h,
+                            params_sb,
+                        );
+                    }
+                } else {
+                    for k in 1..4 {
+                        filter_normal_horizontal(
+                            y_plane,
+                            y_stride,
+                            y0 + k * 4,
+                            y_stride,
+                            y_buf_h,
+                            params_sb,
+                            false,
+                        );
+                    }
+                    filter_normal_horizontal(
+                        u_plane,
+                        uv_stride,
+                        y0c + 4,
+                        uv_stride,
+                        uv_buf_h,
+                        params_sb,
+                        false,
+                    );
+                    filter_normal_horizontal(
+                        v_plane,
+                        uv_stride,
+                        y0c + 4,
+                        uv_stride,
+                        uv_buf_h,
+                        params_sb,
+                        false,
+                    );
+                }
+            }
         }
     }
 }

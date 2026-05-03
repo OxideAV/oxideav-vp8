@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **IDCT pass order** (`src/transform.rs`): swapped the inverse 4×4
+  DCT to run the column pass first then the row pass, matching the
+  RFC 6386 §14.1 C reference. The prior row-then-column ordering
+  silently produced ±1 pixel drifts on residuals whose row-0 odd-
+  column coefficients were non-zero (cross-pass cancellations that
+  the column pass would have done first never happened, leaving a
+  stale value in `out[3]`/`out[7]`/etc). Single highest-impact bug
+  in the corpus: `q-low` jumps 86.91% → 100% bit-exact and
+  `i-only-64x64` jumps 92.94% → 98.49%.
+- **Y2 DC dequantiser cap** (`src/tables/quant.rs`): removed the
+  spurious `min(.., 264)` clamp on `y2_dc_step`. Per libvpx
+  `dequant_init`, only the chroma DC step is capped at 132 — Y2 DC
+  is `dc_qlookup[q] * 2` uncapped. With the cap in place, qi=127
+  encodings (q-high) were dequantising the 16 Y2 DC coefficients
+  with a step of 264 instead of 314, giving a ~16% DC error on
+  every macroblock at the high end. Removes an entire class of
+  high-q reconstruction error.
+- **Loop-filter parameter formulas** (`src/loopfilter.rs`,
+  `FilterParams`): rewrote `for_mb` per RFC 6386 §15.4 — the prior
+  implementation used `interior_limit = level >> 2` and then capped
+  the `edge_limit` at `9 - sharpness`, which collapsed both
+  thresholds to single-digit values for any normal level (e.g.
+  level=38 → edge_limit=9 instead of 118), effectively disabling
+  the filter on real content. The corrected formula is
+  `interior_limit = level` (with sharpness adjust), `mbedge_limit =
+  ((level + 2) * 2) + interior_limit`, `sub_bedge_limit = (level *
+  2) + interior_limit`. Also added the inter-frame `hev_threshold`
+  branch (`level >= 20 → 2`) that the keyframe-only formula
+  omitted, exposed via the new `for_mb_typed(.., key_frame)`
+  constructor.
+- **Loop-filter per-MB iteration order + skip rule** (`src/decoder.rs`
+  `apply_loop_filter`, `src/encoder.rs` `apply_loop_filter_enc`):
+  rewrote the filter driver to walk macroblocks in raster scan and
+  apply the four edge passes per-MB (left MB-v, inner sub-block-v,
+  top MB-h, inner sub-block-h) with the libvpx luma-then-U-then-V
+  interleave at each step. Sub-block edges are now skipped for MBs
+  with no decoded coefficients AND y_mode neither `B_PRED` nor
+  `SPLITMV` (the libvpx `eob_mask` shortcut from RFC 6386 §15.1).
+  Tracking `has_coeffs` required new fields on `MbInfo`/`MbEncoded`
+  populated during decode/encode.
+- **Encoder TL-pixel defaults** (`src/encoder.rs` `gather_4x4_neighbours`,
+  `gather_16x16_neighbours`, `gather_8x8_neighbours`): the encoder
+  was using `tl=127` whenever above was available but left was not
+  (and vice versa), while the decoder was using the libvpx-correct
+  swap (above-only → left-default `129`, left-only → above-default
+  `127`). Cumulative drift on the inter-frame chain when the
+  encoder's reference picture diverged from the decoder's at the
+  frame-edge MBs — surfaced after the loop-filter rewrite as a
+  catastrophic PSNR drop on the multi-ref RDO regression.
+
+### Corpus tier promotions (`tests/docs_corpus.rs`)
+
+Promoted to `Tier::BitExact` (CI now gates on these):
+
+- `q-low` (was 86.91% → 100%)
+- `segment-4-partitions` (was ReportOnly → 100%)
+
+Other notable improvements (still `ReportOnly`):
+
+- `q-high` 12.56% → 65.83% (Y2 DC + LF formula)
+- `i-only-loopfilter-high` 40.72% → 72.71% (LF formula)
+- `i-only-64x64` 92.94% → 98.49% (IDCT)
+- `webm-mux-vs-ivf-ivf` 92.94% → 98.49% (IDCT)
+- `gradient-and-noise-128x128` 89.44% → 93.25%
+- `vp8-with-loopfilter-mode-simple` 61.02% → 96.73% (LF formula)
+- `golden-update-cycle` 82.86% → 92.03%
+- `altref-arnr-on` 79.07% → 83.12%
+
 ### Added
 
 - Integration tests against the `docs/video/vp8/` fixture corpus (17
@@ -25,32 +95,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run hermetically without walking up into the parent monorepo
   workspace (which may carry mid-development sibling crates that
   fail to load).
-
-### Bit-exact corpus fixtures
-
-- `tiny-i-only-16x16` (1 MB, DC-only Y2, filter_level=1)
-- `i-only-loopfilter-off` (filter_level=0, all-zero coeffs)
-- `partition-padding-16x16-4parts` (1 MB, 4 token partitions)
-
-### Report-only corpus fixtures
-
-The remaining 13 fixtures decode but diverge from the reference YUV.
-Each is tagged with a `TODO(vp8-corpus)` in `tests/docs_corpus.rs`
-that names the fixture and the observed pixel-match percentage. Two
-recurring root causes:
-
-- B_PRED neighbour-context propagation between adjacent MBs (already
-  noted in `tests/decode_keyframe.rs` and `src/lib.rs` module docs):
-  `i-only-64x64` (92.94%), `q-low` (86.91%), `gradient-and-noise-128x128`
-  (89.44%), `segment-4-partitions` (92.14%), `webm-mux-vs-ivf-ivf`
-  (92.94%), `vp8-with-loopfilter-mode-simple` (61.02%).
-- Loop filter / dequant boundary at high qindex with active deblocker:
-  `q-high` (12.56% — qi=127 + filter_level=38),
-  `i-only-loopfilter-high` (40.72% — filter_level=33).
-- Inter / multi-frame fixtures inherit the keyframe bug since the
-  P-frames reference a divergent keyframe: `i-frame-then-p-frame-64x64`
-  (84.96%), `golden-update-cycle` (82.86%), `altref-arnr-on` (79.07%),
-  `small-roi-segmentation` (22.96%).
 
 ## [0.1.2](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.1...v0.1.2) - 2026-05-02
 

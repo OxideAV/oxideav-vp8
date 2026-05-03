@@ -26,10 +26,11 @@ pub fn clamp_qindex(q: i32) -> usize {
     q.clamp(0, 127) as usize
 }
 
-/// Y2 DC step has a maximum of 132 (RFC 6386 §14.1).
+/// Y2 DC step is `dc_qlookup * 2` (RFC 6386 §14.1; libvpx
+/// `dequant_init`). The 132 cap applies to UV DC only — Y2 DC is
+/// **not** capped.
 pub fn y2_dc_step(qindex: i32) -> i32 {
-    let v = DC_Q_LOOKUP[clamp_qindex(qindex)] as i32 * 2;
-    v.min(132 * 2)
+    DC_Q_LOOKUP[clamp_qindex(qindex)] as i32 * 2
 }
 
 /// Y2 AC step is `ac_qlookup * 155 / 100`, clamped to a minimum of 8.

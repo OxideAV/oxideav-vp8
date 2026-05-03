@@ -8,40 +8,48 @@ const COSPI8SQRT2MINUS1: i32 = 20091;
 const SINPI8SQRT2: i32 = 35468;
 
 /// Inverse 4×4 DCT (RFC 6386 §14.1 reference). Input/output buffers
-/// are 16 entries in row-major order. The `ctx` is destroyed.
+/// are 16 entries in row-major order. The pass order is **column pass
+/// first, then row pass**, exactly as in the RFC C reference. Doing
+/// the row pass first instead silently produces wrong results for
+/// residuals whose row-0 coefficients are non-zero in odd columns:
+/// the cross-row cancellations that the column pass would have done
+/// first never happen, and `out[3]` (and other odd-column entries of
+/// the top/bottom rows) drift by ±1 in many real bitstreams.
 pub fn idct4x4(coeffs: &[i16; 16]) -> [i16; 16] {
     let mut work = [0i32; 16];
-    // Row pass.
+    // Column pass — transform each of the 4 columns. Inputs are
+    // coeffs[i + 0/4/8/12] for column i; outputs go to the same
+    // positions in `work`.
     for i in 0..4 {
-        let off = i * 4;
-        let a1 = coeffs[off] as i32 + coeffs[off + 2] as i32;
-        let b1 = coeffs[off] as i32 - coeffs[off + 2] as i32;
-        let temp1 = (coeffs[off + 1] as i32 * SINPI8SQRT2) >> 16;
-        let temp2 = coeffs[off + 3] as i32 + ((coeffs[off + 3] as i32 * COSPI8SQRT2MINUS1) >> 16);
+        let a1 = coeffs[i] as i32 + coeffs[i + 8] as i32;
+        let b1 = coeffs[i] as i32 - coeffs[i + 8] as i32;
+        let temp1 = (coeffs[i + 4] as i32 * SINPI8SQRT2) >> 16;
+        let temp2 = coeffs[i + 12] as i32 + ((coeffs[i + 12] as i32 * COSPI8SQRT2MINUS1) >> 16);
         let c1 = temp1 - temp2;
-        let temp1 = coeffs[off + 1] as i32 + ((coeffs[off + 1] as i32 * COSPI8SQRT2MINUS1) >> 16);
-        let temp2 = (coeffs[off + 3] as i32 * SINPI8SQRT2) >> 16;
+        let temp1 = coeffs[i + 4] as i32 + ((coeffs[i + 4] as i32 * COSPI8SQRT2MINUS1) >> 16);
+        let temp2 = (coeffs[i + 12] as i32 * SINPI8SQRT2) >> 16;
         let d1 = temp1 + temp2;
-        work[off] = a1 + d1;
-        work[off + 3] = a1 - d1;
-        work[off + 1] = b1 + c1;
-        work[off + 2] = b1 - c1;
+        work[i] = a1 + d1;
+        work[i + 12] = a1 - d1;
+        work[i + 4] = b1 + c1;
+        work[i + 8] = b1 - c1;
     }
-    // Column pass.
+    // Row pass — transform each of the 4 rows of the partial result.
     let mut out = [0i16; 16];
     for i in 0..4 {
-        let a1 = work[i] + work[i + 8];
-        let b1 = work[i] - work[i + 8];
-        let temp1 = (work[i + 4] * SINPI8SQRT2) >> 16;
-        let temp2 = work[i + 12] + ((work[i + 12] * COSPI8SQRT2MINUS1) >> 16);
+        let off = i * 4;
+        let a1 = work[off] + work[off + 2];
+        let b1 = work[off] - work[off + 2];
+        let temp1 = (work[off + 1] * SINPI8SQRT2) >> 16;
+        let temp2 = work[off + 3] + ((work[off + 3] * COSPI8SQRT2MINUS1) >> 16);
         let c1 = temp1 - temp2;
-        let temp1 = work[i + 4] + ((work[i + 4] * COSPI8SQRT2MINUS1) >> 16);
-        let temp2 = (work[i + 12] * SINPI8SQRT2) >> 16;
+        let temp1 = work[off + 1] + ((work[off + 1] * COSPI8SQRT2MINUS1) >> 16);
+        let temp2 = (work[off + 3] * SINPI8SQRT2) >> 16;
         let d1 = temp1 + temp2;
-        out[i] = clip_short((a1 + d1 + 4) >> 3);
-        out[i + 12] = clip_short((a1 - d1 + 4) >> 3);
-        out[i + 4] = clip_short((b1 + c1 + 4) >> 3);
-        out[i + 8] = clip_short((b1 - c1 + 4) >> 3);
+        out[off] = clip_short((a1 + d1 + 4) >> 3);
+        out[off + 3] = clip_short((a1 - d1 + 4) >> 3);
+        out[off + 1] = clip_short((b1 + c1 + 4) >> 3);
+        out[off + 2] = clip_short((b1 - c1 + 4) >> 3);
     }
     out
 }

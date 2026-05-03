@@ -55,7 +55,7 @@ use crate::tables::trees::{
     B_DC_PRED, B_HD_PRED, B_HE_PRED, B_HU_PRED, B_LD_PRED, B_PRED, B_RD_PRED, B_TM_PRED, B_VE_PRED,
     B_VL_PRED, B_VR_PRED, DC_PRED, DEFAULT_UV_MODE_PROBS, DEFAULT_YMODE_PROBS, H_PRED,
     KF_BMODE_PROB, KF_UV_MODE_PROBS, KF_YMODE_PROBS, MBSPLIT_PROBS, MB_SPLITS, MB_SPLIT_COUNT,
-    MV_COUNTS_TO_PROBS, SUB_MV_REF_PROBS, TM_PRED, V_PRED,
+    MV_COUNTS_TO_PROBS, SPLIT_MV, SUB_MV_REF_PROBS, TM_PRED, V_PRED, ZERO_MV,
 };
 use crate::transform::{idct4x4, iwht4x4};
 
@@ -1278,6 +1278,8 @@ fn encode_keyframe_and_reconstruct_with_config(
         mb_h,
         lf_level,
         lf_sharpness,
+        &mb_encoded,
+        true, // keyframe
     );
 
     let first_partition = hdr_enc.finish();
@@ -1852,6 +1854,8 @@ fn encode_pframe_and_reconstruct(
         mb_h,
         lf_level,
         lf_sharpness,
+        &mb_encoded,
+        false, // P-frame
     );
 
     // --- Pass 2: build the inter-frame header + emit per-MB mode info ---
@@ -3411,11 +3415,20 @@ fn encode_inter_mb_at_mv(
         }
     }
 
+    let any_coeffs = y2_q.iter().any(|&v| v != 0)
+        || y_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || u_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || v_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0);
     MbEncoded {
         y2_coeffs: y2_q,
         y_coeffs: y_q,
         u_coeffs: u_q,
         v_coeffs: v_q,
+        // Non-SPLIT inter MB. For loop-filter sub-block skip purposes
+        // ZERO_MV behaves the same as any non-B_PRED non-SPLIT mode —
+        // filter_subblocks reduces to has_coeffs.
+        y_mode: ZERO_MV,
+        has_coeffs: any_coeffs,
     }
 }
 
@@ -3617,6 +3630,14 @@ struct MbEncoded {
     y_coeffs: [[i16; 16]; 16],
     u_coeffs: [[i16; 16]; 4],
     v_coeffs: [[i16; 16]; 4],
+    /// Y mode chosen for this MB — needed by the loop-filter sub-block
+    /// skip rule (RFC 6386 §15.1: B_PRED / SPLITMV always filter inner
+    /// edges).
+    y_mode: i32,
+    /// Whether any non-zero coefficient was emitted for this MB. Loop
+    /// filter sub-block edges skip when this is false AND y_mode is
+    /// not B_PRED / SPLITMV.
+    has_coeffs: bool,
 }
 
 impl MbEncoded {
@@ -3626,6 +3647,8 @@ impl MbEncoded {
             y_coeffs: [[0; 16]; 16],
             u_coeffs: [[0; 16]; 4],
             v_coeffs: [[0; 16]; 4],
+            y_mode: 0,
+            has_coeffs: false,
         }
     }
 }
@@ -3658,12 +3681,16 @@ fn gather_16x16_neighbours(
     } else {
         None
     };
+    // Mirror the decoder's TL defaults (reconstruct_intra_mb non-B_PRED):
+    //   * both available → real corner pixel
+    //   * only above available → use the LEFT default (129)
+    //   * only left available → use the ABOVE default (127)
     let tl = if above_avail && left_avail {
         Some(rec_y[(mb_yp - 1) * y_stride + mb_xp - 1])
     } else if above_avail {
-        Some(127)
-    } else if left_avail {
         Some(129)
+    } else if left_avail {
+        Some(127)
     } else {
         None
     };
@@ -3697,12 +3724,14 @@ fn gather_8x8_neighbours(
     } else {
         None
     };
+    // Mirror the decoder's TL defaults — same swap logic as the
+    // luma 16×16 path.
     let tl = if above_avail && left_avail {
         Some(rec[(mb_yc - 1) * uv_stride + mb_xc - 1])
     } else if above_avail {
-        Some(127)
-    } else if left_avail {
         Some(129)
+    } else if left_avail {
+        Some(127)
     } else {
         None
     };
@@ -3925,11 +3954,17 @@ fn encode_intra_mb(
         }
     }
 
+    let any_coeffs = y2_q.iter().any(|&v| v != 0)
+        || y_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || u_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || v_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0);
     MbEncoded {
         y2_coeffs: y2_q,
         y_coeffs: y_q,
         u_coeffs: u_q,
         v_coeffs: v_q,
+        y_mode,
+        has_coeffs: any_coeffs,
     }
 }
 
@@ -3981,9 +4016,18 @@ fn gather_4x4_neighbours(
             neigh.left[k] = rec_y[(dst_y + k) * y_stride + dst_x - 1];
         }
     }
-    if dst_x > 0 && dst_y > 0 {
-        neigh.tl = rec_y[(dst_y - 1) * y_stride + dst_x - 1];
-    }
+    // TL pixel defaults — must match the decoder's logic in
+    // reconstruct_intra_mb (B_PRED path): when only one neighbour is
+    // available, TL takes the *other* neighbour's default sample.
+    neigh.tl = if dst_x > 0 && dst_y > 0 {
+        rec_y[(dst_y - 1) * y_stride + dst_x - 1]
+    } else if dst_y > 0 {
+        // left column unavailable → use the left default (129)
+        129
+    } else {
+        // above unavailable → use the above default (127)
+        127
+    };
     neigh
 }
 
@@ -5357,11 +5401,18 @@ fn encode_inter_mb_split(
         }
     }
 
+    let any_coeffs = y_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || u_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || v_q.iter().flat_map(|b| b.iter()).any(|&v| v != 0);
     MbEncoded {
         y2_coeffs: [0; 16],
         y_coeffs: y_q,
         u_coeffs: u_q,
         v_coeffs: v_q,
+        // SPLIT_MV — per RFC §15.1, sub-block edges are always filtered
+        // for SPLIT_MV regardless of has_coeffs.
+        y_mode: SPLIT_MV,
+        has_coeffs: any_coeffs,
     }
 }
 
@@ -5370,6 +5421,9 @@ fn encode_inter_mb_split(
 // sees post-filter samples).
 // ---------------------------------------------------------------------------
 
+/// Encoder-side loop filter — must produce bit-identical reconstruction
+/// to what the decoder will emit. The per-MB iteration order and skip
+/// rules mirror `apply_loop_filter` in `decoder.rs` (RFC 6386 §15.1).
 #[allow(clippy::too_many_arguments)]
 fn apply_loop_filter_enc(
     y_plane: &mut [u8],
@@ -5383,50 +5437,100 @@ fn apply_loop_filter_enc(
     mb_h: usize,
     level: u8,
     sharpness: u8,
+    mb_encoded: &[MbEncoded],
+    key_frame: bool,
 ) {
     if level == 0 {
         return;
     }
-    let params_mb = FilterParams::for_mb(level, sharpness, true);
-    let params_sb = FilterParams::for_mb(level, sharpness, false);
-    // filter_type = 0 (normal) — matches what the encoder signals.
+    let params_mb = FilterParams::for_mb_typed(level, sharpness, true, key_frame);
+    let params_sb = FilterParams::for_mb_typed(level, sharpness, false, key_frame);
     for mb_y in 0..mb_h {
-        for mb_x in 1..mb_w {
-            let x = mb_x * 16;
-            let y0 = mb_y * 16;
-            filter_normal_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb, true);
-        }
-    }
-    for mb_y in 1..mb_h {
-        let y = mb_y * 16;
-        filter_normal_horizontal(y_plane, y_stride, y, y_stride, y_buf_h, params_mb, true);
-    }
-    for mb_y in 0..mb_h {
+        let y0 = mb_y * 16;
+        let y0c = mb_y * 8;
         for mb_x in 0..mb_w {
-            let bx0 = mb_x * 16;
-            let by0 = mb_y * 16;
-            for k in 1..4 {
-                let xv = bx0 + k * 4;
-                filter_normal_vertical(y_plane, y_stride, xv, y_stride, by0 + 16, params_sb, false);
-                let yh = by0 + k * 4;
+            let mb = &mb_encoded[mb_y * mb_w + mb_x];
+            let filter_subblocks = mb.has_coeffs || mb.y_mode == B_PRED || mb.y_mode == SPLIT_MV;
+            let x = mb_x * 16;
+            let xc = mb_x * 8;
+
+            if mb_x > 0 {
+                filter_normal_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb, true);
+                filter_normal_vertical(u_plane, uv_stride, xc, uv_stride, y0c + 8, params_mb, true);
+                filter_normal_vertical(v_plane, uv_stride, xc, uv_stride, y0c + 8, params_mb, true);
+            }
+            if filter_subblocks {
+                for k in 1..4 {
+                    filter_normal_vertical(
+                        y_plane,
+                        y_stride,
+                        x + k * 4,
+                        y_stride,
+                        y0 + 16,
+                        params_sb,
+                        false,
+                    );
+                }
+                filter_normal_vertical(
+                    u_plane,
+                    uv_stride,
+                    xc + 4,
+                    uv_stride,
+                    y0c + 8,
+                    params_sb,
+                    false,
+                );
+                filter_normal_vertical(
+                    v_plane,
+                    uv_stride,
+                    xc + 4,
+                    uv_stride,
+                    y0c + 8,
+                    params_sb,
+                    false,
+                );
+            }
+            if mb_y > 0 {
+                filter_normal_horizontal(y_plane, y_stride, y0, y_stride, y_buf_h, params_mb, true);
                 filter_normal_horizontal(
-                    y_plane, y_stride, yh, y_stride, y_buf_h, params_sb, false,
+                    u_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                );
+                filter_normal_horizontal(
+                    v_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                );
+            }
+            if filter_subblocks {
+                for k in 1..4 {
+                    filter_normal_horizontal(
+                        y_plane,
+                        y_stride,
+                        y0 + k * 4,
+                        y_stride,
+                        y_buf_h,
+                        params_sb,
+                        false,
+                    );
+                }
+                filter_normal_horizontal(
+                    u_plane,
+                    uv_stride,
+                    y0c + 4,
+                    uv_stride,
+                    uv_buf_h,
+                    params_sb,
+                    false,
+                );
+                filter_normal_horizontal(
+                    v_plane,
+                    uv_stride,
+                    y0c + 4,
+                    uv_stride,
+                    uv_buf_h,
+                    params_sb,
+                    false,
                 );
             }
         }
-    }
-    for mb_y in 0..mb_h {
-        for mb_x in 1..mb_w {
-            let x = mb_x * 8;
-            let y0 = mb_y * 8;
-            filter_normal_vertical(u_plane, uv_stride, x, uv_stride, y0 + 8, params_mb, true);
-            filter_normal_vertical(v_plane, uv_stride, x, uv_stride, y0 + 8, params_mb, true);
-        }
-    }
-    for mb_y in 1..mb_h {
-        let y = mb_y * 8;
-        filter_normal_horizontal(u_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb, true);
-        filter_normal_horizontal(v_plane, uv_stride, y, uv_stride, uv_buf_h, params_mb, true);
     }
     // Suppress unused imports when both paths route through normal mode.
     let _ = filter_simple_vertical;

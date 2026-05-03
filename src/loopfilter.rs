@@ -108,17 +108,24 @@ fn normal_filter(
     let mut a = clamp(3 * (q0i - p0i) + a);
 
     if is_mb_edge && !hev {
-        // Subblock-edge full-mb-edge smoothing per §15.4 (b)+ (c)
-        let w = clamp(p1i - q1i + 3 * (q0i - p0i));
-        let a3 = clamp(27 * w + 63) >> 7;
-        let a2 = clamp(18 * w + 63) >> 7;
-        let a1 = clamp(9 * w + 63) >> 7;
-        let new_p0 = i_to_u(p0i + a1);
-        let new_q0 = i_to_u(q0i - a1);
+        // MB-edge wide smoothing per RFC 6386 §15.3 (MBfilter, !hev branch).
+        //   w  = c(c(p1 - q1) + 3*(q0 - p0))
+        //   a3 = c((27*w + 63) >> 7); P0/Q0 += ±a3
+        //   a2 = c((18*w + 63) >> 7); P1/Q1 += ±a2
+        //   a1 = c(( 9*w + 63) >> 7); P2/Q2 += ±a1
+        // The clamp goes around the SHIFTED expression — clamping the
+        // pre-shift value first yields ~0 in the common case and breaks
+        // every wide-filter pass.
+        let w = clamp(clamp(p1i - q1i) + 3 * (q0i - p0i));
+        let a3 = clamp((27 * w + 63) >> 7);
+        let a2 = clamp((18 * w + 63) >> 7);
+        let a1 = clamp((9 * w + 63) >> 7);
+        let new_p0 = i_to_u(p0i + a3);
+        let new_q0 = i_to_u(q0i - a3);
         let new_p1 = i_to_u(p1i + a2);
         let new_q1 = i_to_u(q1i - a2);
-        let new_p2 = i_to_u(p2i + a3);
-        let new_q2 = i_to_u(q2i - a3);
+        let new_p2 = i_to_u(p2i + a1);
+        let new_q2 = i_to_u(q2i - a1);
         return (new_p2, new_p1, new_p0, new_q0, new_q1, new_q2);
     }
 
@@ -138,7 +145,29 @@ fn normal_filter(
 }
 
 /// Filter `level` parameters helper — derives the three thresholds
-/// needed by §15.2.
+/// per RFC 6386 §15.4.
+///
+///   interior_limit = loop_filter_level, then if sharpness > 0
+///       interior_limit >>= sharpness > 4 ? 2 : 1
+///       interior_limit = min(interior_limit, 9 - sharpness)
+///       interior_limit = max(interior_limit, 1)
+///
+///   mbedge_limit   = ((loop_filter_level + 2) * 2) + interior_limit
+///   sub_bedge_limit = (loop_filter_level * 2) + interior_limit
+///
+///   hev_threshold (key frames):
+///       level >= 40 → 2
+///       level >= 15 → 1
+///       else → 0
+///   hev_threshold (interframes — note the extra "level >= 20 → 2"
+///   tier and the "level >= 40 → 3" cap):
+///       level >= 40 → 3
+///       level >= 20 → 2
+///       level >= 15 → 1
+///       else → 0
+///
+/// `mb_edge=true` returns the inter-macroblock variant; `false` returns
+/// the inter-subblock variant.
 #[derive(Clone, Copy, Debug)]
 pub struct FilterParams {
     pub edge_limit: i32,
@@ -147,29 +176,46 @@ pub struct FilterParams {
 }
 
 impl FilterParams {
+    /// Convenience for key-frame callers (the in-tree decoder/encoder
+    /// historically only filtered keyframes through this path).
     pub fn for_mb(level: u8, sharpness: u8, mb_edge: bool) -> Self {
+        Self::for_mb_typed(level, sharpness, mb_edge, true)
+    }
+
+    pub fn for_mb_typed(level: u8, sharpness: u8, mb_edge: bool, key_frame: bool) -> Self {
         let l = level as i32;
-        let mut interior = (l >> 2).max(1);
+        let mut interior = l;
         if sharpness > 0 {
-            interior >>= 1;
-            if sharpness > 4 {
-                interior >>= 1;
+            interior >>= if sharpness > 4 { 2 } else { 1 };
+            let cap = 9 - sharpness as i32;
+            if interior > cap {
+                interior = cap;
             }
         }
         if interior < 1 {
             interior = 1;
         }
-        let mut edge = if mb_edge { 2 * l + interior } else { l };
-        let max_edge = 9 - sharpness as i32;
-        if edge > max_edge {
-            edge = max_edge;
-        }
-        let hev = if l < 15 {
-            0
-        } else if l < 36 {
+        let edge = if mb_edge {
+            ((l + 2) * 2) + interior
+        } else {
+            (l * 2) + interior
+        };
+        let hev = if key_frame {
+            if l >= 40 {
+                2
+            } else if l >= 15 {
+                1
+            } else {
+                0
+            }
+        } else if l >= 40 {
+            3
+        } else if l >= 20 {
+            2
+        } else if l >= 15 {
             1
         } else {
-            2
+            0
         };
         Self {
             edge_limit: edge,

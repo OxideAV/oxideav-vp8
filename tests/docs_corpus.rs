@@ -370,10 +370,8 @@ fn corpus_partition_padding_16x16_4parts() {
 //     bug surfaces in a follow-up round. Each is paired with a
 //     TODO(vp8-corpus) tag so the bug is grep-able. ---
 
-// TODO(vp8-corpus): i-only-64x64 currently 92.94% match (Y max diff 4,
-// UV max diff 2). Multi-MB B_PRED-heavy content hits the same
-// neighbour-context propagation bug already documented in
-// `tests/decode_keyframe.rs`. Fix once the B_PRED context fix lands.
+// i-only-64x64: 98.49% match after the IDCT pass-order fix (round 24).
+// Residual differences are in the loopfilter pass, not B_PRED context.
 #[test]
 fn corpus_i_only_64x64() {
     evaluate(&CorpusCase {
@@ -385,25 +383,24 @@ fn corpus_i_only_64x64() {
     });
 }
 
-// TODO(vp8-corpus): q-low currently 86.91% match (Y max diff 2, UV
-// max diff 1). All 4 MBs use B_PRED; same B_PRED-neighbour bug as
-// i-only-64x64. Should pass bit-exactly once that lands.
 #[test]
 fn corpus_q_low() {
+    // Bit-exact after the IDCT pass-order fix (round 24): the per-MB
+    // B_PRED chain that produced 86.91% under the old row-then-column
+    // pass now matches libvpx pixel-for-pixel.
     evaluate(&CorpusCase {
         name: "q-low",
         width: 32,
         height: 32,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
-// TODO(vp8-corpus): q-high currently 12.56% match (Y max diff 42, UV
-// max diff 40). 64-MB mandelbrot at qi=127 with active loopfilter
-// (level=38). Likely a combination of the loopfilter divergence (see
-// i-only-loopfilter-high below) and a high-qindex dequant rounding
-// boundary. Fix in a focused round.
+// TODO(vp8-corpus): q-high 65.83% after the LF formula + Y2 DC step
+// fixes. Residual diffs are at MB-edge / sub-block-edge boundaries
+// for high-qindex (127) mandelbrot content, suggesting an inner-loop
+// chroma rounding still off by ±1. Track in a follow-up round.
 #[test]
 fn corpus_q_high() {
     evaluate(&CorpusCase {
@@ -415,11 +412,11 @@ fn corpus_q_high() {
     });
 }
 
-// TODO(vp8-corpus): i-only-loopfilter-high currently 40.72% match.
-// Mandelbrot at filter_level=33 — the deblocker edges differ from
-// the reference. Likely an inner-limit / mb_edge_limit threshold
-// formula divergence or a missing per-ref / per-mode lf_delta
-// adjustment. Cross-check with the LOOPFILTER trace events.
+// TODO(vp8-corpus): i-only-loopfilter-high 72.71% after the LF formula
+// fix. Remaining diffs are mostly ±1 at sub-block edges — the
+// per-MB filter ordering matches libvpx now but per-pixel rounding
+// can still drift after multiple consecutive edges touch the same
+// pixel. Tracked for the next round.
 #[test]
 fn corpus_i_only_loopfilter_high() {
     evaluate(&CorpusCase {
@@ -433,12 +430,14 @@ fn corpus_i_only_loopfilter_high() {
 
 #[test]
 fn corpus_segment_4_partitions() {
+    // Bit-exact after the round-24 IDCT + LF fixes — segmentation
+    // signalling is correctly threaded through the per-MB qindex.
     evaluate(&CorpusCase {
         name: "segment-4-partitions",
         width: 128,
         height: 128,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 

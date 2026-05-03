@@ -138,17 +138,35 @@ each fixture's `expected.yuv` ground truth. Three tiers:
 
 | Tier | Fixtures | Behaviour |
 | --- | --- | --- |
-| `BitExact` (CI gate) | `tiny-i-only-16x16`, `i-only-loopfilter-off`, `partition-padding-16x16-4parts` | Test fails on any divergence |
-| `ReportOnly` | 13 fixtures (loopfilter / multi-MB B_PRED / multi-partition / inter / segmentation / altref) | Logs match% + max diff; does not gate CI |
+| `BitExact` (CI gate) | `tiny-i-only-16x16`, `i-only-loopfilter-off`, `partition-padding-16x16-4parts`, `q-low`, `segment-4-partitions` | Test fails on any divergence |
+| `ReportOnly` | 11 fixtures (loopfilter / inter / multi-frame chains) | Logs match% + max diff; does not gate CI |
 | `Ignored` | `webm-mux-vs-ivf-webm` | Disabled until oxideav-mkv is wired in for WebM demux (paired IVF version is still scored) |
 
 Plus a two-part check for the `yuv422-not-supported` negative case:
 the decoder accepts libvpx's auto-converted yuv420 stream, and the
-encoder does not panic on a 4:2:2-shaped frame. The 13 ReportOnly
-fixtures track the documented B_PRED-neighbour-context and
-loopfilter-edge bugs (see CHANGELOG). Each is tagged
-`TODO(vp8-corpus)` in the test source so they can be picked off in
-follow-up rounds.
+encoder does not panic on a 4:2:2-shaped frame. The remaining
+ReportOnly fixtures track residual loopfilter rounding ±1 / inter-
+frame chain accumulation; each is tagged `TODO(vp8-corpus)` in the
+test source.
+
+Round-24 deltas (this round, see CHANGELOG): IDCT pass-order, Y2
+DC-step uncap, loopfilter formula + per-MB iteration, encoder TL-
+pixel defaults swap. Net pixel-match improvement:
+
+| Fixture | Was | Now |
+| --- | --- | --- |
+| `q-low` | 86.91% | **100.00%** (BitExact) |
+| `segment-4-partitions` | (ReportOnly) | **100.00%** (BitExact) |
+| `i-only-64x64` | 92.94% | 98.49% |
+| `webm-mux-vs-ivf-ivf` | 92.94% | 98.49% |
+| `vp8-with-loopfilter-mode-simple` | 61.02% | 96.73% |
+| `gradient-and-noise-128x128` | 89.44% | 93.25% |
+| `golden-update-cycle` | 82.86% | 92.03% |
+| `i-frame-then-p-frame-64x64` | 84.96% | 89.58% |
+| `altref-arnr-on` | 79.07% | 83.12% |
+| `i-only-loopfilter-high` | 40.72% | 72.71% |
+| `q-high` | 12.56% | 65.83% |
+| `small-roi-segmentation` | 22.96% | 32.66% |
 
 ## Quick use
 

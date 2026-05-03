@@ -27,7 +27,8 @@ use oxideav_core::{
 };
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
-    make_encoder_with_config, Vp8EncoderConfig, DEFAULT_GOLDEN_INTERVAL, DEFAULT_LOOKAHEAD_WINDOW,
+    make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_GOLDEN_INTERVAL,
+    DEFAULT_LOOKAHEAD_WINDOW, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::{parse_header, FrameType};
 
@@ -170,6 +171,8 @@ fn baseline_cfg(alt_ref_interval: u32) -> Vp8EncoderConfig {
         scene_cut_boost_frames: 0,
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     }
 }
 

@@ -119,6 +119,29 @@ fn loop_filter_level_for_qindex(qi: u8) -> u8 {
     l.clamp(1, 63) as u8
 }
 
+/// Pick the bitstream `filter_type` (0 = normal, 1 = simple) for a
+/// given config + frame-level filter level. The simple-mode filter
+/// (RFC 6386 §15.2) is luma-only and only touches the four pixels
+/// closest to each edge — a smaller per-MB cost (no chroma MB-edge
+/// + no chroma sub-block-edge filter calls) and a slightly smaller
+/// header (one bit). Picked by default at low filter levels where
+/// the wider 6-pixel normal-mode filter would risk smoothing
+/// content the encoder is otherwise preserving.
+#[inline]
+fn pick_filter_type(level: u8, config: &Vp8EncoderConfig) -> u8 {
+    match config.loop_filter_mode {
+        LoopFilterMode::Normal => 0,
+        LoopFilterMode::Simple => 1,
+        LoopFilterMode::Auto => {
+            if level <= config.simple_lf_max_level {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
 /// SAD threshold (per pixel) below which SPLIT_MV is not considered.
 /// When a single MV already matches the MB well, the per-partition MV
 /// bits for SPLIT are wasted — skipping the search entirely is a big
@@ -241,6 +264,33 @@ const ALTREF_MC_RANGE: i32 = 8;
 /// on visible frames can compensate.
 const HIDDEN_ALTREF_QINDEX_DELTA: i32 = 12;
 
+/// Loop-filter type selector. `Auto` is the default (and the libvpx
+/// convention): pick simple mode at low filter levels (where the
+/// wider normal-mode filter would over-smooth low-detail content)
+/// and normal mode otherwise. `Normal` and `Simple` force the
+/// corresponding `filter_type` regardless of level — handy for
+/// regression tests pinning a specific bitstream shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoopFilterMode {
+    /// Pick `simple` when `lf_level <= simple_lf_max_level`, otherwise
+    /// `normal`.
+    Auto,
+    /// Always emit `filter_type = 0` (normal). Equivalent to the
+    /// pre-#336 hard-wired behaviour.
+    Normal,
+    /// Always emit `filter_type = 1` (simple). Useful for low-bitrate
+    /// streaming where the bit/speed savings dominate the visual loss.
+    Simple,
+}
+
+/// Default upper-bound `lf_level` (inclusive) for `LoopFilterMode::Auto`
+/// to pick simple mode. With `loop_filter_level_for_qindex(qi) = 15 +
+/// qi/8`, level ≤ 15 corresponds to qi ≤ 7 (very low-distortion
+/// targets where the wider 6-pixel normal filter would smooth content
+/// the encoder is otherwise preserving). Level 16..=63 stay on
+/// normal mode by default.
+pub const DEFAULT_SIMPLE_LF_MAX_LEVEL: u8 = 15;
+
 /// Per-MB encoder configuration. Knob bag for the alt-ref / golden-ref
 /// planning + Lagrangian RDO mode decision wired up in this version.
 ///
@@ -321,6 +371,16 @@ pub struct Vp8EncoderConfig {
     /// symmetric around the centre frame. Capped internally at
     /// `alt_ref_interval` so we never delay a refresh point indefinitely.
     pub lookahead_window: usize,
+    /// Loop-filter mode selection (RFC 6386 §15.2 `filter_type`).
+    /// Default `Auto` picks simple mode at low filter levels and
+    /// normal mode otherwise; see [`LoopFilterMode`] for forced
+    /// alternatives.
+    pub loop_filter_mode: LoopFilterMode,
+    /// Upper-bound `lf_level` (inclusive) below which
+    /// `LoopFilterMode::Auto` picks simple mode. Ignored when
+    /// `loop_filter_mode` is `Normal` or `Simple`. Defaults to
+    /// [`DEFAULT_SIMPLE_LF_MAX_LEVEL`].
+    pub simple_lf_max_level: u8,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -340,6 +400,8 @@ impl Default for Vp8EncoderConfig {
             scene_cut_boost_frames: DEFAULT_SCENE_CUT_BOOST_FRAMES,
             enable_lookahead_altref: true,
             lookahead_window: DEFAULT_LOOKAHEAD_WINDOW,
+            loop_filter_mode: LoopFilterMode::Auto,
+            simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
         }
     }
 }
@@ -430,6 +492,10 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
     // ask for a "qindex only" encoder — the lookahead path emits hidden
     // alt-ref packets which would surprise legacy callers.
     cfg.enable_lookahead_altref = false;
+    // Match the pre-#336 normal-mode loop-filter emit so legacy
+    // qindex-only callers still get bit-identical bitstreams. Callers
+    // that want simple-mode LF use `make_encoder_with_config`.
+    cfg.loop_filter_mode = LoopFilterMode::Normal;
     Ok(Box::new(Vp8Encoder {
         output_params,
         width,
@@ -1041,6 +1107,10 @@ pub fn encode_keyframe(width: u32, height: u32, qindex: u8, frame: &VideoFrame) 
     let mut cfg = Vp8EncoderConfig::default();
     cfg.qindex = qindex.min(127);
     cfg.enable_segments = false;
+    // Match the pre-#336 normal-mode loop-filter emit so the
+    // standalone API stays bit-identical. Callers that want simple-mode
+    // LF construct a `Vp8EncoderConfig` and use the streaming API.
+    cfg.loop_filter_mode = LoopFilterMode::Normal;
     let (bitstream, _rec) = encode_keyframe_and_reconstruct_with_config(width, height, cfg, frame)?;
     Ok(bitstream)
 }
@@ -1079,6 +1149,7 @@ fn encode_keyframe_and_reconstruct_with_config(
     // reconstruction (so the next P-frame uses the post-filter pixels).
     let lf_level = loop_filter_level_for_qindex(qi as u8);
     let lf_sharpness = LOOP_FILTER_SHARPNESS;
+    let lf_filter_type = pick_filter_type(lf_level, &config);
 
     // --- Per-MB segment classification (pre-computed so the frame
     //     header's segment tree_probs match the actual distribution). ---
@@ -1106,9 +1177,9 @@ fn encode_keyframe_and_reconstruct_with_config(
     hdr_enc.write_literal(1, 0);
     // Segmentation block (writes the single "enabled=0" bit when off).
     emit_segmentation_header(&mut hdr_enc, &segments, &segment_tree_probs);
-    // loop filter: filter_type=0 (normal), level, sharpness,
-    //              mode_ref_delta_enabled=0.
-    hdr_enc.write_literal(1, 0);
+    // loop filter: filter_type (0 = normal, 1 = simple), level,
+    //              sharpness, mode_ref_delta_enabled = 0.
+    hdr_enc.write_literal(1, lf_filter_type as u32);
     hdr_enc.write_literal(6, lf_level as u32);
     hdr_enc.write_literal(3, lf_sharpness as u32);
     hdr_enc.write_bool(128, false);
@@ -1278,6 +1349,7 @@ fn encode_keyframe_and_reconstruct_with_config(
         mb_h,
         lf_level,
         lf_sharpness,
+        lf_filter_type,
         &mb_encoded,
         true, // keyframe
     );
@@ -1505,6 +1577,7 @@ fn encode_pframe_and_reconstruct(
 
     let lf_level = loop_filter_level_for_qindex(qi as u8);
     let lf_sharpness = LOOP_FILTER_SHARPNESS;
+    let lf_filter_type = pick_filter_type(lf_level, &config);
 
     // --- Per-MB segment classification (pre-computed so the frame
     //     header's segment tree_probs match the actual distribution). ---
@@ -1854,6 +1927,7 @@ fn encode_pframe_and_reconstruct(
         mb_h,
         lf_level,
         lf_sharpness,
+        lf_filter_type,
         &mb_encoded,
         false, // P-frame
     );
@@ -1866,7 +1940,7 @@ fn encode_pframe_and_reconstruct(
     //   + 3 tree_probs).
     emit_segmentation_header(&mut hdr_enc, &segments, &segment_tree_probs);
     //   loop filter
-    hdr_enc.write_literal(1, 0); // filter_type (normal)
+    hdr_enc.write_literal(1, lf_filter_type as u32); // filter_type (0 normal, 1 simple)
     hdr_enc.write_literal(6, lf_level as u32);
     hdr_enc.write_literal(3, lf_sharpness as u32);
     hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
@@ -5424,6 +5498,9 @@ fn encode_inter_mb_split(
 /// Encoder-side loop filter — must produce bit-identical reconstruction
 /// to what the decoder will emit. The per-MB iteration order and skip
 /// rules mirror `apply_loop_filter` in `decoder.rs` (RFC 6386 §15.1).
+///
+/// `filter_type`: 0 = normal (6-pixel filter on luma + chroma at every
+/// edge); 1 = simple (4-pixel luma-only filter, chroma untouched).
 #[allow(clippy::too_many_arguments)]
 fn apply_loop_filter_enc(
     y_plane: &mut [u8],
@@ -5437,6 +5514,7 @@ fn apply_loop_filter_enc(
     mb_h: usize,
     level: u8,
     sharpness: u8,
+    filter_type: u8,
     mb_encoded: &[MbEncoded],
     key_frame: bool,
 ) {
@@ -5445,6 +5523,7 @@ fn apply_loop_filter_enc(
     }
     let params_mb = FilterParams::for_mb_typed(level, sharpness, true, key_frame);
     let params_sb = FilterParams::for_mb_typed(level, sharpness, false, key_frame);
+    let simple = filter_type == 1;
     for mb_y in 0..mb_h {
         let y0 = mb_y * 16;
         let y0c = mb_y * 8;
@@ -5454,87 +5533,152 @@ fn apply_loop_filter_enc(
             let x = mb_x * 16;
             let xc = mb_x * 8;
 
+            // 1. Left MB v-edges. Simple mode: luma only, four pixels.
             if mb_x > 0 {
-                filter_normal_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb, true);
-                filter_normal_vertical(u_plane, uv_stride, xc, uv_stride, y0c + 8, params_mb, true);
-                filter_normal_vertical(v_plane, uv_stride, xc, uv_stride, y0c + 8, params_mb, true);
-            }
-            if filter_subblocks {
-                for k in 1..4 {
+                if simple {
+                    filter_simple_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb);
+                } else {
                     filter_normal_vertical(
                         y_plane,
                         y_stride,
-                        x + k * 4,
+                        x,
                         y_stride,
                         y0 + 16,
-                        params_sb,
-                        false,
+                        params_mb,
+                        true,
+                    );
+                    filter_normal_vertical(
+                        u_plane,
+                        uv_stride,
+                        xc,
+                        uv_stride,
+                        y0c + 8,
+                        params_mb,
+                        true,
+                    );
+                    filter_normal_vertical(
+                        v_plane,
+                        uv_stride,
+                        xc,
+                        uv_stride,
+                        y0c + 8,
+                        params_mb,
+                        true,
                     );
                 }
-                filter_normal_vertical(
-                    u_plane,
-                    uv_stride,
-                    xc + 4,
-                    uv_stride,
-                    y0c + 8,
-                    params_sb,
-                    false,
-                );
-                filter_normal_vertical(
-                    v_plane,
-                    uv_stride,
-                    xc + 4,
-                    uv_stride,
-                    y0c + 8,
-                    params_sb,
-                    false,
-                );
             }
-            if mb_y > 0 {
-                filter_normal_horizontal(y_plane, y_stride, y0, y_stride, y_buf_h, params_mb, true);
-                filter_normal_horizontal(
-                    u_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
-                );
-                filter_normal_horizontal(
-                    v_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
-                );
-            }
+
+            // 2. Inner sub-block v-edges (3 luma, 1 chroma). Simple
+            //    mode skips chroma.
             if filter_subblocks {
-                for k in 1..4 {
-                    filter_normal_horizontal(
-                        y_plane,
-                        y_stride,
-                        y0 + k * 4,
-                        y_stride,
-                        y_buf_h,
+                if simple {
+                    for k in 1..4 {
+                        filter_simple_vertical(
+                            y_plane,
+                            y_stride,
+                            x + k * 4,
+                            y_stride,
+                            y0 + 16,
+                            params_sb,
+                        );
+                    }
+                } else {
+                    for k in 1..4 {
+                        filter_normal_vertical(
+                            y_plane,
+                            y_stride,
+                            x + k * 4,
+                            y_stride,
+                            y0 + 16,
+                            params_sb,
+                            false,
+                        );
+                    }
+                    filter_normal_vertical(
+                        u_plane,
+                        uv_stride,
+                        xc + 4,
+                        uv_stride,
+                        y0c + 8,
+                        params_sb,
+                        false,
+                    );
+                    filter_normal_vertical(
+                        v_plane,
+                        uv_stride,
+                        xc + 4,
+                        uv_stride,
+                        y0c + 8,
                         params_sb,
                         false,
                     );
                 }
-                filter_normal_horizontal(
-                    u_plane,
-                    uv_stride,
-                    y0c + 4,
-                    uv_stride,
-                    uv_buf_h,
-                    params_sb,
-                    false,
-                );
-                filter_normal_horizontal(
-                    v_plane,
-                    uv_stride,
-                    y0c + 4,
-                    uv_stride,
-                    uv_buf_h,
-                    params_sb,
-                    false,
-                );
+            }
+
+            // 3. Top MB h-edges.
+            if mb_y > 0 {
+                if simple {
+                    filter_simple_horizontal(y_plane, y_stride, y0, y_stride, y_buf_h, params_mb);
+                } else {
+                    filter_normal_horizontal(
+                        y_plane, y_stride, y0, y_stride, y_buf_h, params_mb, true,
+                    );
+                    filter_normal_horizontal(
+                        u_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                    );
+                    filter_normal_horizontal(
+                        v_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                    );
+                }
+            }
+
+            // 4. Inner sub-block h-edges.
+            if filter_subblocks {
+                if simple {
+                    for k in 1..4 {
+                        filter_simple_horizontal(
+                            y_plane,
+                            y_stride,
+                            y0 + k * 4,
+                            y_stride,
+                            y_buf_h,
+                            params_sb,
+                        );
+                    }
+                } else {
+                    for k in 1..4 {
+                        filter_normal_horizontal(
+                            y_plane,
+                            y_stride,
+                            y0 + k * 4,
+                            y_stride,
+                            y_buf_h,
+                            params_sb,
+                            false,
+                        );
+                    }
+                    filter_normal_horizontal(
+                        u_plane,
+                        uv_stride,
+                        y0c + 4,
+                        uv_stride,
+                        uv_buf_h,
+                        params_sb,
+                        false,
+                    );
+                    filter_normal_horizontal(
+                        v_plane,
+                        uv_stride,
+                        y0c + 4,
+                        uv_stride,
+                        uv_buf_h,
+                        params_sb,
+                        false,
+                    );
+                }
             }
         }
     }
-    // Suppress unused imports when both paths route through normal mode.
-    let _ = filter_simple_vertical;
-    let _ = filter_simple_horizontal;
 }
 
 /// Copy the 3 planes of a video frame into MB-aligned (16/8 pixel) buffers.
@@ -6002,5 +6146,44 @@ mod tests {
             h.prob_gf, 128,
             "prob_gf should fall back to 128 with no GOLDEN/ALT observations"
         );
+    }
+
+    #[test]
+    fn pick_filter_type_auto_picks_simple_at_low_levels() {
+        let mut cfg = Vp8EncoderConfig::default();
+        cfg.loop_filter_mode = LoopFilterMode::Auto;
+        cfg.simple_lf_max_level = 15;
+        // ≤ threshold → simple (1).
+        assert_eq!(pick_filter_type(0, &cfg), 1);
+        assert_eq!(pick_filter_type(15, &cfg), 1);
+        // > threshold → normal (0).
+        assert_eq!(pick_filter_type(16, &cfg), 0);
+        assert_eq!(pick_filter_type(63, &cfg), 0);
+    }
+
+    #[test]
+    fn pick_filter_type_forced_modes_ignore_level() {
+        let mut cfg = Vp8EncoderConfig::default();
+        cfg.simple_lf_max_level = 15;
+
+        cfg.loop_filter_mode = LoopFilterMode::Normal;
+        assert_eq!(pick_filter_type(0, &cfg), 0);
+        assert_eq!(pick_filter_type(15, &cfg), 0);
+        assert_eq!(pick_filter_type(63, &cfg), 0);
+
+        cfg.loop_filter_mode = LoopFilterMode::Simple;
+        assert_eq!(pick_filter_type(0, &cfg), 1);
+        assert_eq!(pick_filter_type(63, &cfg), 1);
+    }
+
+    #[test]
+    fn loop_filter_level_for_qindex_default_picks_normal_under_auto() {
+        // Default qindex 50 → level 21, above the simple threshold 15
+        // → Auto should pick normal-mode LF, preserving the pre-#336
+        // bitstream shape for the standard `make_encoder` path.
+        let lvl = loop_filter_level_for_qindex(DEFAULT_QINDEX);
+        assert_eq!(lvl, 21);
+        let cfg = Vp8EncoderConfig::default();
+        assert_eq!(pick_filter_type(lvl, &cfg), 0);
     }
 }

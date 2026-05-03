@@ -24,7 +24,8 @@ use oxideav_core::{
 use oxideav_vp8::bool_decoder::BoolDecoder;
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
-    make_encoder_with_config, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL, DEFAULT_GOLDEN_INTERVAL,
+    make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::frame_header::{parse_inter_header, PersistentProbs};
 use oxideav_vp8::{parse_header, FrameType};
@@ -104,6 +105,8 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         // so packet count and ref-frame counts match the legacy baseline.
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);

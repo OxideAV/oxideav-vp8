@@ -18,6 +18,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complement the existing one-mode-per-test coverage in
   `tests/encoder_roundtrip.rs`.
 
+### Added (encoder)
+
+- `LoopFilterMode` enum + `simple_lf_max_level` field on
+  [`Vp8EncoderConfig`]. Selects between simple mode (RFC 6386 §15.2
+  `filter_type=1`, 4-pixel luma-only edge filter, no chroma touch) and
+  normal mode (`filter_type=0`, 6-pixel filter on luma + chroma).
+  `LoopFilterMode::Auto` (the default for the new config-driven API)
+  picks simple at `lf_level <= simple_lf_max_level` (default 15) and
+  normal otherwise — a bit-saving + speed win at low filter levels
+  where the wider 6-pixel normal filter would risk smoothing content
+  the encoder is otherwise preserving.
+  [`make_encoder_with_qindex`] and [`encode_keyframe`] still pin
+  `LoopFilterMode::Normal` so legacy callers stay bit-identical.
+- `apply_loop_filter_enc` now dispatches simple-mode filter calls
+  (`filter_simple_vertical` / `filter_simple_horizontal`) when
+  `filter_type=1`, mirroring the decoder's per-MB iteration order +
+  skip rules. Previously the simple-mode filter functions were dead
+  code in the encoder path.
+
 ### Fixed
 
 - **Per-MB loop-filter level** (`src/decoder.rs` new `per_mb_filter_level`):

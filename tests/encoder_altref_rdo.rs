@@ -24,7 +24,8 @@ use oxideav_core::{
 };
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
-    make_encoder_with_config, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL, DEFAULT_GOLDEN_INTERVAL,
+    make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::{parse_header, FrameType};
 
@@ -156,6 +157,8 @@ fn refresh_flags_follow_plan() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -216,6 +219,8 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -264,6 +269,8 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -320,6 +327,8 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -346,6 +355,8 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -445,6 +456,8 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -504,6 +517,8 @@ fn legacy_single_ref_path_still_works() {
         // emits an extra hidden frame at every alt-ref refresh point).
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

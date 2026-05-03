@@ -23,8 +23,9 @@ use oxideav_core::{
 };
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
-    make_encoder_with_config, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD,
+    make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST,
+    DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 
 const W: u32 = 64;
@@ -182,6 +183,8 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         // packet-vs-frame count assertions stay 1:1.
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     }
 }
 
@@ -201,6 +204,8 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         scene_cut_boost_frames: DEFAULT_SCENE_CUT_BOOST_FRAMES,
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     }
 }
 

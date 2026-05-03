@@ -24,8 +24,8 @@ use oxideav_core::{
 };
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
-    make_encoder_with_config, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_SEGMENT_QUANT_DELTAS,
+    make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::frame_header::{parse_inter_header, parse_keyframe_header, PersistentProbs};
 use oxideav_vp8::{parse_header, FrameType};
@@ -160,6 +160,8 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         // baseline these tests pin.
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     }
 }
 
@@ -179,6 +181,8 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         scene_cut_boost_frames: 0,
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     }
 }
 
@@ -206,6 +210,8 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         scene_cut_boost_frames: 0,
         enable_lookahead_altref: false,
         lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
     }
 }
 

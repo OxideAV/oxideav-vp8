@@ -1762,10 +1762,10 @@ fn chroma_avg4(sum: i32) -> i32 {
 ///   2. if `mode_ref_delta_enabled`:
 ///      a. `level += ref_deltas[ref_frame]`
 ///      b. if intra and `y_mode == B_PRED` → `level += mode_deltas[0]`
-///         else if inter and `y_mode == ZERO_MV` → `level += mode_deltas[1]`
-///         else if inter and `y_mode in {NEAREST,NEAR,NEW}_MV` →
-///         `level += mode_deltas[2]`
-///         else if inter and `y_mode == SPLIT_MV` → `level += mode_deltas[3]`
+///     else if inter and `y_mode == ZERO_MV` → `level += mode_deltas[1]`
+///     else if inter and `y_mode in {NEAREST,NEAR,NEW}_MV` →
+///     `level += mode_deltas[2]`
+///     else if inter and `y_mode == SPLIT_MV` → `level += mode_deltas[3]`
 ///   3. clamp 0..=63.
 fn per_mb_filter_level(header: &FrameHeader, info: &MbInfo) -> u8 {
     let mut lvl = header.loop_filter.level as i32;

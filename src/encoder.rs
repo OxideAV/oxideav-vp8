@@ -174,7 +174,7 @@ fn loop_filter_level_for_qindex(qi: u8) -> u8 {
 /// given config + frame-level filter level. The simple-mode filter
 /// (RFC 6386 §15.2) is luma-only and only touches the four pixels
 /// closest to each edge — a smaller per-MB cost (no chroma MB-edge
-/// + no chroma sub-block-edge filter calls) and a slightly smaller
+/// and no chroma sub-block-edge filter calls) and a slightly smaller
 /// header (one bit). Picked by default at low filter levels where
 /// the wider 6-pixel normal-mode filter would risk smoothing
 /// content the encoder is otherwise preserving.

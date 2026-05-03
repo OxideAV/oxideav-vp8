@@ -166,9 +166,12 @@ fn bench_decode_i_then_p(c: &mut Criterion) {
     // intra path. P-frame motion comp is one of the bigger inter costs.
     let mut g = c.benchmark_group("decode_i_then_p");
     g.throughput(Throughput::Elements(frames.len() as u64));
-    g.bench_function(BenchmarkId::from_parameter("i-frame-then-p-frame-64x64"), |b| {
-        b.iter(|| decode_all(&frames));
-    });
+    g.bench_function(
+        BenchmarkId::from_parameter("i-frame-then-p-frame-64x64"),
+        |b| {
+            b.iter(|| decode_all(&frames));
+        },
+    );
     g.finish();
 }
 

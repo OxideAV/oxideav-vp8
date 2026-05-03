@@ -129,7 +129,10 @@ pub fn sixtap_predict(
     const MAX_TMP_H: usize = 16 + 5;
     debug_assert!(bw <= MAX_TMP_BW, "sixtap_predict: bw {bw} > {MAX_TMP_BW}");
     let tmp_h = bh + 5;
-    debug_assert!(tmp_h <= MAX_TMP_H, "sixtap_predict: tmp_h {tmp_h} > {MAX_TMP_H}");
+    debug_assert!(
+        tmp_h <= MAX_TMP_H,
+        "sixtap_predict: tmp_h {tmp_h} > {MAX_TMP_H}"
+    );
     let mut tmp = [0i32; MAX_TMP_BW * MAX_TMP_H];
     let row_stride = bw;
     for j in 0..tmp_h {
@@ -195,7 +198,10 @@ pub fn bilinear_predict(
     const MAX_TMP_H: usize = 16 + 1;
     debug_assert!(bw <= MAX_TMP_BW, "bilinear_predict: bw {bw} > {MAX_TMP_BW}");
     let tmp_h = bh + 1;
-    debug_assert!(tmp_h <= MAX_TMP_H, "bilinear_predict: tmp_h {tmp_h} > {MAX_TMP_H}");
+    debug_assert!(
+        tmp_h <= MAX_TMP_H,
+        "bilinear_predict: tmp_h {tmp_h} > {MAX_TMP_H}"
+    );
     let mut tmp = [0i32; MAX_TMP_BW * MAX_TMP_H];
     let row_stride = bw;
     for j in 0..tmp_h {

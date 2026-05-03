@@ -19,6 +19,13 @@ oxideav-core = "0.1"
 [dev-dependencies]
 criterion = "0.5"
 
+[features]
+# Enables `portable_simd`-based loop-filter horizontal edges. Requires
+# nightly Rust (the feature gate is only stable on nightly as of
+# 1.80). Default-stable builds compile the scalar path, so consumers
+# pinned to stable see no behaviour change. Off by default.
+simd = []
+
 [[bench]]
 name = "decode"
 harness = false

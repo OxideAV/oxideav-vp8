@@ -8,6 +8,19 @@
 //! For an I-frame all macroblocks share `loop_filter_level` because
 //! ref-frame deltas only matter for predictions involving inter / golden
 //! / altref references; on keyframes they default to zero.
+//!
+//! ## SIMD
+//!
+//! With the `simd` cargo feature on nightly Rust, the
+//! `filter_simple_horizontal` path uses `std::simd` to process 16
+//! horizontal pixels per chunk via `Simd<u8, 16>` (Y MB row width is
+//! exactly 16). The vectorised path is bit-exact with the scalar
+//! reference — every per-pixel arithmetic op (clamp, signed shift,
+//! mask-then-replace) has a direct lane-wise simd equivalent — and
+//! falls back to scalar for the trailing `width % 16` pixels. The
+//! more elaborate `normal_filter` (with its MB-edge wide branch and
+//! per-pixel HEV gate) is left for a follow-up round; vertical edges
+//! need a transposed-load layout that is also queued.
 
 #[inline]
 fn clamp(v: i32) -> i32 {
@@ -267,7 +280,16 @@ pub fn filter_simple_horizontal(
     if y < 2 || y + 2 > height {
         return;
     }
-    for i in 0..width {
+    // SIMD body: process `width` in blocks of 16 then fall through to
+    // the scalar tail. The simd variant is bit-exact with the scalar
+    // `simple_threshold` + `simple_filter` pair. The cfg branch is
+    // written as separate `let` bindings so the default-stable build
+    // doesn't see an unused `mut`.
+    #[cfg(feature = "simd")]
+    let start = simd::filter_simple_horizontal_simd(plane, stride, y, width, params);
+    #[cfg(not(feature = "simd"))]
+    let start = 0usize;
+    for i in start..width {
         let p1 = plane[(y - 2) * stride + i];
         let p0 = plane[(y - 1) * stride + i];
         let q0 = plane[y * stride + i];
@@ -325,6 +347,126 @@ pub fn filter_normal_vertical(
         plane[row + x] = nq0;
         plane[row + x + 1] = nq1;
         plane[row + x + 2] = nq2;
+    }
+}
+
+#[cfg(feature = "simd")]
+mod simd {
+    //! Vectorised loop-filter helpers. Each function processes a slab
+    //! of 16 contiguous horizontal pixels per call and returns the
+    //! number of pixels handled (the caller fills the trailing
+    //! `width % 16` with the scalar implementation).
+    //!
+    //! The arithmetic is bit-exact with the scalar reference. Each
+    //! per-pixel step in `simple_threshold` / `simple_filter` lifts
+    //! to a lane-wise simd op:
+    //!   * `(v as i32 - 128)`     → `v.cast::<i16>() - splat(128)`
+    //!   * `clamp(-128, 127)`    → `simd_clamp(splat(-128), splat(127))`
+    //!   * arithmetic shift `>>3` → `>>` on `Simd<i16, 16>` (i16 is
+    //!     signed so `>>` lowers to SAR on x86 / sshr on ARM)
+    //!   * `(v + 128).clamp(0, 255) as u8` → `(v + splat(128))
+    //!     .simd_clamp(splat(0), splat(255)).cast::<u8>()`
+    //!   * `mask.select(filtered, original)` writes the filtered
+    //!     value only where `simple_threshold` passes
+    //!
+    //! Loads use `Simd::from_slice` (panics on short slice — caller
+    //! ensures the chunk is in-bounds via the `start + 16 <= width`
+    //! check below). Stores use `copy_to_slice`.
+
+    use core::simd::cmp::{SimdOrd, SimdPartialOrd};
+    use core::simd::num::SimdInt;
+    use core::simd::{Mask, Simd};
+
+    use super::FilterParams;
+
+    const N: usize = 16;
+
+    /// Returns the count of pixels handled by SIMD (caller fills the
+    /// rest with the scalar path). When width < 16 returns 0.
+    pub(super) fn filter_simple_horizontal_simd(
+        plane: &mut [u8],
+        stride: usize,
+        y: usize,
+        width: usize,
+        params: FilterParams,
+    ) -> usize {
+        if width < N {
+            return 0;
+        }
+        let edge_limit: Simd<i16, N> = Simd::splat(params.edge_limit as i16);
+        let c128: Simd<i16, N> = Simd::splat(128);
+        let c0: Simd<i16, N> = Simd::splat(0);
+        let c255: Simd<i16, N> = Simd::splat(255);
+        let cmin: Simd<i16, N> = Simd::splat(-128);
+        let cmax: Simd<i16, N> = Simd::splat(127);
+
+        let mut handled = 0usize;
+        let row_pm2 = (y - 2) * stride;
+        let row_pm1 = (y - 1) * stride;
+        let row_q0 = y * stride;
+        let row_q1 = (y + 1) * stride;
+
+        let mut i = 0;
+        while i + N <= width {
+            // --- loads (immutable) ---
+            let p1u: Simd<u8, N> = Simd::from_slice(&plane[row_pm2 + i..row_pm2 + i + N]);
+            let p0u: Simd<u8, N> = Simd::from_slice(&plane[row_pm1 + i..row_pm1 + i + N]);
+            let q0u: Simd<u8, N> = Simd::from_slice(&plane[row_q0 + i..row_q0 + i + N]);
+            let q1u: Simd<u8, N> = Simd::from_slice(&plane[row_q1 + i..row_q1 + i + N]);
+
+            // u8 → i16 (zero-extend then arithmetic).
+            let p1: Simd<i16, N> = p1u.cast();
+            let p0: Simd<i16, N> = p0u.cast();
+            let q0: Simd<i16, N> = q0u.cast();
+            let q1: Simd<i16, N> = q1u.cast();
+
+            // simple_threshold:
+            //   abs_diff(p0,q0) * 2 + abs_diff(p1,q1) / 2 <= edge_limit
+            // abs_diff via i16: |p0 - q0|.
+            let ad_p0q0 = (p0 - q0).abs();
+            let ad_p1q1 = (p1 - q1).abs();
+            let s1: Simd<i16, N> = Simd::splat(1);
+            let thr_lhs = ad_p0q0 + ad_p0q0 + (ad_p1q1 >> s1);
+            // SimdPartialOrd::simd_le returns Mask<i16, N>.
+            let mask: Mask<i16, N> = thr_lhs.simd_le(edge_limit);
+
+            // simple_filter (bit-exact with scalar):
+            //   p0i = p0 - 128; q0i = q0 - 128; ... (signed i16 lanes)
+            let p0i = p0 - c128;
+            let q0i = q0 - c128;
+            let p1i = p1 - c128;
+            let q1i = q1 - c128;
+
+            //   a = clamp(3*(q0-p0) + clamp(p1-q1))
+            let inner = (p1i - q1i).simd_clamp(cmin, cmax);
+            let a0 = (q0i - p0i) * Simd::splat(3) + inner;
+            let a0 = a0.simd_clamp(cmin, cmax);
+            //   b = clamp(a + 3) >> 3;  a = clamp(a + 4) >> 3;
+            // Note: portable_simd's `Shr` impl is `Simd<T,N> >> Simd<T,N>`,
+            // so the shift count must be a splat — a bare integer
+            // literal does not coerce.
+            let s3: Simd<i16, N> = Simd::splat(3);
+            let b = (a0 + s3).simd_clamp(cmin, cmax) >> s3;
+            let a = (a0 + Simd::splat(4)).simd_clamp(cmin, cmax) >> s3;
+            //   new_q0 = i_to_u(q0i - a); new_p0 = i_to_u(p0i + b);
+            let new_q0i = (q0i - a + c128).simd_clamp(c0, c255);
+            let new_p0i = (p0i + b + c128).simd_clamp(c0, c255);
+
+            // Mask-select: keep originals where threshold rejects.
+            let out_p0_i = mask.select(new_p0i, p0);
+            let out_q0_i = mask.select(new_q0i, q0);
+            // i16 → u8 (lanes are clamped 0..=255 already).
+            let out_p0: Simd<u8, N> = out_p0_i.cast();
+            let out_q0: Simd<u8, N> = out_q0_i.cast();
+
+            // --- stores ---
+            out_p0.copy_to_slice(&mut plane[row_pm1 + i..row_pm1 + i + N]);
+            out_q0.copy_to_slice(&mut plane[row_q0 + i..row_q0 + i + N]);
+
+            i += N;
+            handled += N;
+        }
+        handled
     }
 }
 

@@ -34,6 +34,7 @@
 //!   corner cases (SPLIT_MV context) are simplified.
 //! * IVF container — read-side demuxer with FourCC `VP80` probe.
 
+#![cfg_attr(feature = "simd", feature(portable_simd))]
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::too_many_arguments)]

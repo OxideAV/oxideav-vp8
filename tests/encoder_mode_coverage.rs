@@ -339,7 +339,6 @@ fn pframe_near_mv_neighbour_chain_roundtrip() {
     let p_y = psnr(&frame_p.planes[0].data, &y1_expected);
     eprintln!(
         "near-mv chain Y PSNR={p_y:.2} dB, P-frame {} bytes (I={} bytes)",
-        p_y,
         pkt_p.data.len(),
         pkt_i.data.len()
     );

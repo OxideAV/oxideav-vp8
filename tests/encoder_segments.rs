@@ -155,6 +155,11 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so packet counts
+        // and refresh-flag cadence remain bit-exact with the pre-#209
+        // baseline these tests pin.
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     }
 }
 
@@ -172,6 +177,8 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     }
 }
 
@@ -197,6 +204,8 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     }
 }
 

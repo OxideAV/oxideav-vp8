@@ -100,6 +100,10 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Same reasoning for #209 — disable look-ahead alt-ref synthesis
+        // so packet count and ref-frame counts match the legacy baseline.
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);

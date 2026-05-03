@@ -32,7 +32,7 @@ use std::collections::VecDeque;
 use oxideav_core::Encoder;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Rational, Result,
-    TimeBase, VideoFrame,
+    TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::bool_encoder::BoolEncoder;
@@ -200,6 +200,47 @@ pub const DEFAULT_SCENE_CUT_BOOST_FRAMES: u32 = 4;
 /// 16 frames is roughly half a second at 30 fps.
 const SCENE_CUT_WINDOW: usize = 16;
 
+/// Default look-ahead window size for alt-ref synthesis. The encoder
+/// buffers this many input frames before emitting the alt-ref so it can
+/// build a temporally-filtered (noise-reduced) reference image from a
+/// neighbourhood of the centre frame. Odd values are preferred so the
+/// window is symmetric around its centre. 7 is the libvpx ballpark and
+/// keeps the per-frame latency cost bounded (~200 ms at 30 fps).
+pub const DEFAULT_LOOKAHEAD_WINDOW: usize = 7;
+
+/// Sigma (in luma intensity units) controlling how aggressively the
+/// temporal filter rejects pixels that disagree with the centre frame.
+/// `weight = exp(-diff^2 / sigma^2)` falls off so that pixels within
+/// ±sigma of the centre contribute strongly while pixels several sigma
+/// away contribute essentially zero — this preserves motion edges and
+/// occlusion boundaries while smoothing residual noise/grain. 24 is
+/// chosen so a typical 8-bit noise floor (~3-5 LSB) lands in the
+/// "strongly weighted" tail and a real motion edge (>>48 LSB) is
+/// effectively gated off — slightly broader than the canonical libvpx
+/// ARNR sigma to favour noise smoothing on the synthetic fixtures the
+/// test suite stresses.
+const TEMPORAL_FILTER_SIGMA: f32 = 24.0;
+
+/// Half-range (luma integer pixels) of the inter-window motion search
+/// used to align non-centre frames to the centre frame for the temporal
+/// filter. A small range keeps the synthesis cheap; for the noise-
+/// reduction goal we only need to align local content, not track
+/// large displacements.
+const ALTREF_MC_RANGE: i32 = 8;
+
+/// Quantiser delta applied to the hidden alt-ref P-frame relative to
+/// the visible-frame `qindex`. The alt-ref slot's accuracy bounds the
+/// per-MB residual size on every visible P-frame that references it,
+/// so spending a few extra bits on the hidden frame compounds across
+/// the rest of the GOP. 12 is empirically the sweet spot: hidden
+/// frames stay small (the visible-q-minus-12 quant is still coarse
+/// enough that smooth content quantises to nearly all-zero coeffs)
+/// while the alt-ref reconstruction is noticeably cleaner than what
+/// the visible-frame quantiser would manage on its own. Going much
+/// finer blows the hidden-frame size up faster than the per-MB savings
+/// on visible frames can compensate.
+const HIDDEN_ALTREF_QINDEX_DELTA: i32 = 12;
+
 /// Per-MB encoder configuration. Knob bag for the alt-ref / golden-ref
 /// planning + Lagrangian RDO mode decision wired up in this version.
 ///
@@ -264,6 +305,22 @@ pub struct Vp8EncoderConfig {
     /// quant boost is applied (tapered linearly to zero). After this
     /// many frames the encoder reverts to `qindex` exactly.
     pub scene_cut_boost_frames: u32,
+    /// Enable look-ahead alt-ref synthesis. When `true` the encoder
+    /// buffers up to `lookahead_window` source frames and, at every
+    /// alt-ref refresh point, synthesises the alt-ref slot from a
+    /// motion-compensated, pixel-wise temporal filter over the window
+    /// (smoother reference → smaller forward-prediction residuals on
+    /// motion-rich content). The synthesised image is communicated to
+    /// the decoder as a hidden P-frame (`show_frame = 0`) emitted
+    /// just before the visible frame at that position. When `false`
+    /// the encoder reverts to the legacy "alt-ref slot is whatever
+    /// reconstruction the cadence frame produced" behaviour.
+    pub enable_lookahead_altref: bool,
+    /// Look-ahead window size (number of source frames buffered for
+    /// alt-ref synthesis). Must be ≥ 1. Odd values keep the window
+    /// symmetric around the centre frame. Capped internally at
+    /// `alt_ref_interval` so we never delay a refresh point indefinitely.
+    pub lookahead_window: usize,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -281,6 +338,8 @@ impl Default for Vp8EncoderConfig {
             scene_cut_threshold: DEFAULT_SCENE_CUT_THRESHOLD,
             scene_cut_quant_boost: DEFAULT_SCENE_CUT_QUANT_BOOST,
             scene_cut_boost_frames: DEFAULT_SCENE_CUT_BOOST_FRAMES,
+            enable_lookahead_altref: true,
+            lookahead_window: DEFAULT_LOOKAHEAD_WINDOW,
         }
     }
 }
@@ -329,6 +388,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         alt_ref_frame: None,
         pframe_count: 0,
         scene_cut: SceneCutState::new(),
+        lookahead: VecDeque::new(),
     }))
 }
 
@@ -366,6 +426,10 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
     let mut cfg = Vp8EncoderConfig::default();
     cfg.qindex = qindex.min(127);
     cfg.enable_scene_cut = false;
+    // Match the pre-#209 single-frame emit contract for callers that
+    // ask for a "qindex only" encoder — the lookahead path emits hidden
+    // alt-ref packets which would surprise legacy callers.
+    cfg.enable_lookahead_altref = false;
     Ok(Box::new(Vp8Encoder {
         output_params,
         width,
@@ -379,6 +443,7 @@ pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<
         alt_ref_frame: None,
         pframe_count: 0,
         scene_cut: SceneCutState::new(),
+        lookahead: VecDeque::new(),
     }))
 }
 
@@ -425,6 +490,7 @@ pub fn make_encoder_with_config(
         alt_ref_frame: None,
         pframe_count: 0,
         scene_cut: SceneCutState::new(),
+        lookahead: VecDeque::new(),
     }))
 }
 
@@ -461,6 +527,11 @@ struct Vp8Encoder {
     /// per P-frame), and how many frames remain in the post-cut
     /// quant-boost window.
     scene_cut: SceneCutState,
+    /// Look-ahead buffer of pending input frames (for alt-ref synthesis).
+    /// Only populated when `config.enable_lookahead_altref` is `true`;
+    /// otherwise frames bypass this buffer entirely and the legacy
+    /// 1-in / 1-out send/receive cadence is preserved exactly.
+    lookahead: VecDeque<VideoFrame>,
 }
 
 /// Per-frame state for the scene-cut detector. Holds the previous source
@@ -663,6 +734,57 @@ impl Vp8Encoder {
         }
         cfg
     }
+
+    /// Push a copy of the supplied source frame into the look-ahead
+    /// ring buffer used by the alt-ref synthesis path. Evicts the oldest
+    /// entry when the buffer is at capacity (`config.lookahead_window`).
+    /// `lookahead_window` of 0 or 1 just keeps the most-recent frame.
+    fn push_lookahead_source(&mut self, v: &VideoFrame) {
+        let cap = self.config.lookahead_window.max(1);
+        // Snapshot only the data we need (the 3 plane buffers + their
+        // strides). Cloning the whole VideoFrame is fine on the small
+        // resolutions this encoder targets.
+        let snap = VideoFrame {
+            pts: v.pts,
+            planes: v.planes.iter().take(3).cloned().collect(),
+        };
+        if self.lookahead.len() >= cap {
+            self.lookahead.pop_front();
+        }
+        self.lookahead.push_back(snap);
+    }
+
+    /// Synthesise a temporally-filtered alt-ref image from the current
+    /// look-ahead buffer and emit it as a hidden P-frame
+    /// (`show_frame = 0`, `refresh_alt = 1`). Returns the hidden frame's
+    /// bitstream + its reconstructed reference (matching what the
+    /// decoder will install in its alt-ref slot).
+    ///
+    /// The reference for the hidden frame's residual is `last_ref` —
+    /// whatever currently sits in the encoder's LAST slot. By keeping
+    /// the hidden frame's `refresh_last = 0`, the LAST slot is left
+    /// untouched after the hidden frame, so the visible frame that
+    /// follows still references the same LAST it would have without
+    /// the hidden frame in the way.
+    ///
+    /// Returns `None` when synthesis is not feasible (window has zero
+    /// frames, geometry mismatch, etc.). Callers should fall back to
+    /// the legacy alt-ref-from-reconstruction path on `None`.
+    fn try_emit_lookahead_altref(
+        &self,
+        cfg: &Vp8EncoderConfig,
+        last_ref: &ReferenceFrame,
+    ) -> Option<(Vec<u8>, ReferenceFrame)> {
+        if self.lookahead.is_empty() {
+            return None;
+        }
+        // Synthesize a Yuv420P VideoFrame from the lookahead buffer.
+        let synth =
+            synthesize_altref_image(self.width as usize, self.height as usize, &self.lookahead)?;
+        // Encode the synthesized image as a hidden P-frame against LAST,
+        // refreshing only ALT.
+        encode_hidden_altref_pframe(self.width, self.height, *cfg, &synth, last_ref).ok()
+    }
 }
 
 impl Encoder for Vp8Encoder {
@@ -742,6 +864,66 @@ impl Encoder for Vp8Encoder {
         // the configured qindex in step.
         let frame_config = self.effective_config_for_frame();
 
+        // ----------------------------------------------------------------
+        // Look-ahead alt-ref synthesis. When enabled, the encoder caches
+        // up to `lookahead_window` recent source frames (including the
+        // current one) and, at every alt-ref refresh point, builds a
+        // motion-compensated, pixel-wise temporal-filtered image from
+        // them. That synthesized image becomes the new alt-ref reference
+        // for both encoder and decoder via a hidden P-frame
+        // (`show_frame = 0`, `refresh_alt = 1`) emitted *just before* the
+        // visible frame at the cadence point. The hidden frame's
+        // residual is coded against LAST so the synthesized image is
+        // reconstructed identically on both sides.
+        //
+        // After the hidden frame fires, the visible frame at the cadence
+        // point gets its `refresh_alt` flag suppressed (the hidden frame
+        // already did the refresh) — its bitstream still references the
+        // new alt-ref via LAST/GOLDEN/ALT per-MB picking.
+        // ----------------------------------------------------------------
+        let mut suppress_visible_alt_refresh = false;
+        if !is_keyframe
+            && self.config.enable_lookahead_altref
+            && self.config.alt_ref_interval > 0
+            && self.config.enable_multi_ref
+            && self.last_frame.is_some()
+        {
+            // Push the *current* source frame into the lookahead ring
+            // first so it participates as the centre of the temporal
+            // window (cleanest alignment behaviour). The legacy path
+            // doesn't use this buffer so the push is otherwise a no-op.
+            self.push_lookahead_source(v);
+            // Cadence: the hidden alt-ref refreshes at the *same* P-frame
+            // index where the visible plan would have refreshed alt
+            // before #209. `pframe_count` is incremented later (in the
+            // visible-encode block); compute what the *next* count would
+            // be — that's the index we test against the cadence.
+            let next_pframe_count = self.pframe_count + 1;
+            if next_pframe_count % self.config.alt_ref_interval == 0 {
+                // Synthesize + emit the hidden alt-ref. On any internal
+                // failure we silently fall back to the legacy path
+                // (visible frame's `refresh_alt` flag stays as planned)
+                // — never break the encode just because synthesis went
+                // wrong on a particular window.
+                let last_ref = self.last_frame.as_ref().unwrap().clone();
+                if let Some((hidden_bitstream, hidden_rec)) =
+                    self.try_emit_lookahead_altref(&frame_config, &last_ref)
+                {
+                    let mut hpkt = Packet::new(0, self.time_base, hidden_bitstream);
+                    // Hidden frame carries the same PTS as the visible
+                    // frame it precedes — there is no "natural" timestamp
+                    // for an invisible reference frame, and the IVF
+                    // wrapper just needs both to be parseable.
+                    hpkt.pts = v.pts;
+                    hpkt.dts = v.pts;
+                    hpkt.flags.keyframe = false;
+                    self.pending.push_back(hpkt);
+                    self.alt_ref_frame = Some(hidden_rec);
+                    suppress_visible_alt_refresh = true;
+                }
+            }
+        }
+
         let (data, reference, plan) = if is_keyframe {
             let (bitstream, rec) = encode_keyframe_and_reconstruct_with_config(
                 self.width,
@@ -760,7 +942,14 @@ impl Encoder for Vp8Encoder {
             (bitstream, rec, plan)
         } else {
             self.pframe_count += 1;
-            let plan = RefPlan::for_pframe_with_config(self, &frame_config);
+            let mut plan = RefPlan::for_pframe_with_config(self, &frame_config);
+            // The hidden alt-ref already refreshed the slot — the visible
+            // frame must NOT also flip `refresh_alt`, otherwise the
+            // decoder would overwrite the synthesized alt-ref with the
+            // visible frame's reconstruction immediately afterwards.
+            if suppress_visible_alt_refresh {
+                plan.refresh_alt = false;
+            }
             let last_ref = self.last_frame.as_ref().unwrap();
             let golden_ref = self.golden_frame.as_ref().filter(|_| plan.use_golden);
             let alt_ref = self.alt_ref_frame.as_ref().filter(|_| plan.use_alt);
@@ -789,6 +978,17 @@ impl Encoder for Vp8Encoder {
             self.alt_ref_frame = Some(reference.clone());
         }
         let _ = reference;
+
+        // Push to the lookahead buffer for the *non*-altref branch (the
+        // altref branch above already pushed). This keeps the buffer
+        // populated for the next refresh point.
+        if !suppress_visible_alt_refresh
+            && self.config.enable_lookahead_altref
+            && self.config.alt_ref_interval > 0
+            && self.config.enable_multi_ref
+        {
+            self.push_lookahead_source(v);
+        }
 
         // Update scene-cut state: cache this frame's source luma for the
         // next MAD compare, decay the post-cut boost window, and seed
@@ -1882,6 +2082,382 @@ fn encode_pframe_and_reconstruct(
         uv_h: uv_buf_h,
     };
     Ok((out, reference_out))
+}
+
+// ---------------------------------------------------------------------------
+// Look-ahead alt-ref synthesis (RFC 6386 §6 mentions hidden frames; the
+// synthesis algorithm here is derived from first principles + classical
+// motion-compensated temporal-noise-reduction theory: align each
+// neighbour to the centre frame by per-block motion search, then take a
+// pixel-wise weighted mean with a similarity-driven exponential weight
+// that gates off occluded / new content).
+// ---------------------------------------------------------------------------
+
+/// Synthesised alt-ref source image. Stored as Yuv420P planes packed at
+/// the natural width/stride (no MB padding) so it can be wrapped in a
+/// `VideoFrame` and fed straight to the standard P-frame encoder.
+struct SynthesizedAltRef {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+    width: usize,
+    /// Source-image height; only consumed via the chroma-plane size
+    /// computation in `as_video_frame`, where it falls out of `data.len`.
+    /// Kept for call-site clarity.
+    #[allow(dead_code)]
+    height: usize,
+    /// Optional PTS to forward to the hidden frame's packet. Inherited
+    /// from the centre frame in the look-ahead window.
+    pts: Option<i64>,
+}
+
+impl SynthesizedAltRef {
+    /// Wrap as a `VideoFrame` so the standard P-frame encoder accepts
+    /// the synthesized planes as a "source".
+    fn as_video_frame(&self) -> VideoFrame {
+        let cw = (self.width + 1) / 2;
+        VideoFrame {
+            pts: self.pts,
+            planes: vec![
+                VideoPlane {
+                    stride: self.width,
+                    data: self.y.clone(),
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: self.u.clone(),
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: self.v.clone(),
+                },
+            ],
+        }
+    }
+}
+
+/// Build a temporally-filtered alt-ref source from the supplied
+/// look-ahead buffer of recent input frames.
+///
+/// Algorithm (per RFC 6386-compatible derivation):
+/// 1. Pick the centre frame of the buffer (index `len / 2`).
+/// 2. For every other frame in the buffer, run a coarse 16×16 integer
+///    motion search aligning that frame to the centre. The best MV
+///    minimises luma SAD over the MB.
+/// 3. Sample each non-centre frame at its motion-compensated position
+///    to get an MC-aligned pixel value per location.
+/// 4. For every output pixel, compute `weight = exp(-diff^2 / sigma^2)`
+///    against the centre pixel; pixels too dissimilar (occlusion, new
+///    content) get near-zero weight and don't contaminate the average.
+/// 5. The output is the weighted mean (centre always counted, weight 1).
+///
+/// Returns `None` when geometry is invalid (zero dims, plane shape
+/// mismatch). Single-frame buffers return the centre frame unchanged
+/// (no smoothing possible — same as the legacy alt-ref source).
+fn synthesize_altref_image(
+    width: usize,
+    height: usize,
+    buf: &VecDeque<VideoFrame>,
+) -> Option<SynthesizedAltRef> {
+    if buf.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+    let cw = (width + 1) / 2;
+    let ch = (height + 1) / 2;
+    let n = buf.len();
+    let centre_idx = n / 2;
+
+    // Sanity-check every frame has matching geometry. Synthesis only
+    // makes sense when the planes are the same shape across the window.
+    for f in buf.iter() {
+        if f.planes.len() < 3 {
+            return None;
+        }
+        if f.planes[0].data.len() < height * f.planes[0].stride {
+            return None;
+        }
+        if f.planes[1].data.len() < ch * f.planes[1].stride {
+            return None;
+        }
+        if f.planes[2].data.len() < ch * f.planes[2].stride {
+            return None;
+        }
+    }
+
+    let centre = &buf[centre_idx];
+    let centre_y = &centre.planes[0];
+    let centre_u = &centre.planes[1];
+    let centre_v = &centre.planes[2];
+
+    // Trivial path: only one frame in the buffer → output equals centre.
+    // No motion search, no filtering. Matches the legacy alt-ref's
+    // "use the source frame as-is" behaviour.
+    if n == 1 {
+        let mut y_out = vec![0u8; width * height];
+        let mut u_out = vec![0u8; cw * ch];
+        let mut v_out = vec![0u8; cw * ch];
+        for r in 0..height {
+            let s = r * centre_y.stride;
+            y_out[r * width..r * width + width].copy_from_slice(&centre_y.data[s..s + width]);
+        }
+        for r in 0..ch {
+            let su = r * centre_u.stride;
+            let sv = r * centre_v.stride;
+            u_out[r * cw..r * cw + cw].copy_from_slice(&centre_u.data[su..su + cw]);
+            v_out[r * cw..r * cw + cw].copy_from_slice(&centre_v.data[sv..sv + cw]);
+        }
+        return Some(SynthesizedAltRef {
+            y: y_out,
+            u: u_out,
+            v: v_out,
+            width,
+            height,
+            pts: centre.pts,
+        });
+    }
+
+    // For each non-centre frame, compute one MV per 16×16 luma MB
+    // aligning that frame to the centre. We reuse the same SAD-based
+    // integer search the inter mode decision uses, on the natural-stride
+    // luma planes.
+    let mb_w = (width + 15) / 16;
+    let mb_h = (height + 15) / 16;
+    let mut frame_mvs: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+    for (i, f) in buf.iter().enumerate() {
+        if i == centre_idx {
+            // Centre's MV is always 0 — placeholder.
+            frame_mvs.push(vec![(0i32, 0i32); mb_w * mb_h]);
+            continue;
+        }
+        let mut mvs = Vec::with_capacity(mb_w * mb_h);
+        let src = &f.planes[0];
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let mv = altref_search_mb(
+                    &centre_y.data,
+                    centre_y.stride,
+                    &src.data,
+                    src.stride,
+                    width,
+                    height,
+                    mb_x,
+                    mb_y,
+                );
+                mvs.push(mv);
+            }
+        }
+        frame_mvs.push(mvs);
+    }
+
+    // Pixel-wise temporal filter. For each pixel of the centre, look up
+    // the corresponding MC-aligned pixel from every other frame, compute
+    // exp(-diff^2 / sigma^2), and accumulate a weighted mean.
+    let sigma2 = TEMPORAL_FILTER_SIGMA * TEMPORAL_FILTER_SIGMA;
+    let mut y_out = vec![0u8; width * height];
+    for row in 0..height {
+        let mb_y = row / 16;
+        for col in 0..width {
+            let mb_x = col / 16;
+            let centre_px = centre_y.data[row * centre_y.stride + col] as f32;
+            let mut wsum = 1.0f32; // centre counted with weight 1
+            let mut acc = centre_px;
+            for (i, f) in buf.iter().enumerate() {
+                if i == centre_idx {
+                    continue;
+                }
+                let (dy, dx) = frame_mvs[i][mb_y * mb_w + mb_x];
+                let sr = (row as i32 + dy).clamp(0, height as i32 - 1) as usize;
+                let sc = (col as i32 + dx).clamp(0, width as i32 - 1) as usize;
+                let s = &f.planes[0];
+                let px = s.data[sr * s.stride + sc] as f32;
+                let d = px - centre_px;
+                let w = (-(d * d) / sigma2).exp();
+                acc += w * px;
+                wsum += w;
+            }
+            y_out[row * width + col] = (acc / wsum).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    // Chroma uses the same MV table at half-resolution (chroma MB = 8×8).
+    // Map a chroma sample (cr, cc) to its luma MB by `(2*cr / 16, 2*cc / 16)`
+    // = `(cr / 8, cc / 8)`, then halve the luma MV for the chroma MC offset.
+    let mut u_out = vec![0u8; cw * ch];
+    let mut v_out = vec![0u8; cw * ch];
+    for plane_sel in 0..2 {
+        let (centre_pl, out) = if plane_sel == 0 {
+            (centre_u, &mut u_out)
+        } else {
+            (centre_v, &mut v_out)
+        };
+        for cr in 0..ch {
+            let mb_y = (cr * 2) / 16;
+            for cc in 0..cw {
+                let mb_x = (cc * 2) / 16;
+                let centre_px = centre_pl.data[cr * centre_pl.stride + cc] as f32;
+                let mut wsum = 1.0f32;
+                let mut acc = centre_px;
+                for (i, f) in buf.iter().enumerate() {
+                    if i == centre_idx {
+                        continue;
+                    }
+                    let (dy, dx) = frame_mvs[i][mb_y * mb_w + mb_x];
+                    // Chroma displacement is half of luma.
+                    let cdy = dy / 2;
+                    let cdx = dx / 2;
+                    let sr = (cr as i32 + cdy).clamp(0, ch as i32 - 1) as usize;
+                    let sc = (cc as i32 + cdx).clamp(0, cw as i32 - 1) as usize;
+                    let s = if plane_sel == 0 {
+                        &f.planes[1]
+                    } else {
+                        &f.planes[2]
+                    };
+                    let px = s.data[sr * s.stride + sc] as f32;
+                    let d = px - centre_px;
+                    let w = (-(d * d) / sigma2).exp();
+                    acc += w * px;
+                    wsum += w;
+                }
+                out[cr * cw + cc] = (acc / wsum).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    Some(SynthesizedAltRef {
+        y: y_out,
+        u: u_out,
+        v: v_out,
+        width,
+        height,
+        pts: centre.pts,
+    })
+}
+
+/// Per-MB integer-pel motion search aligning `src` (one of the buffered
+/// frames) to `centre`. Searches a small ±`ALTREF_MC_RANGE` window
+/// around (0, 0) and returns the `(dy, dx)` displacement (in pixels)
+/// that minimises 16×16 luma SAD between the centre MB and the
+/// MV-pointed source MB. Boundary MBs near the frame edge clamp at the
+/// frame border (the centre and source planes need not be MB-padded —
+/// we clamp explicitly). Both planes carry their own `stride`, allowing
+/// arbitrary row padding without forcing a copy.
+#[allow(clippy::too_many_arguments)]
+fn altref_search_mb(
+    centre: &[u8],
+    centre_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    mb_x: usize,
+    mb_y: usize,
+) -> (i32, i32) {
+    let x0 = mb_x * 16;
+    let y0 = mb_y * 16;
+    let bw = (width as i32 - x0 as i32).clamp(0, 16) as usize;
+    let bh = (height as i32 - y0 as i32).clamp(0, 16) as usize;
+    if bw == 0 || bh == 0 {
+        return (0, 0);
+    }
+    let sad_at = |dy: i32, dx: i32| -> u32 {
+        let mut sad: u32 = 0;
+        for r in 0..bh {
+            let cy = y0 + r;
+            let sy = (cy as i32 + dy).clamp(0, height as i32 - 1) as usize;
+            for c in 0..bw {
+                let cx = x0 + c;
+                let sx = (cx as i32 + dx).clamp(0, width as i32 - 1) as usize;
+                let a = centre[cy * centre_stride + cx] as i32;
+                let b = src[sy * src_stride + sx] as i32;
+                sad += (a - b).unsigned_abs();
+            }
+        }
+        sad
+    };
+    let mut best = (0i32, 0i32);
+    let mut best_sad = sad_at(0, 0);
+    for dy in -ALTREF_MC_RANGE..=ALTREF_MC_RANGE {
+        for dx in -ALTREF_MC_RANGE..=ALTREF_MC_RANGE {
+            if dy == 0 && dx == 0 {
+                continue;
+            }
+            let s = sad_at(dy, dx);
+            if s < best_sad {
+                best_sad = s;
+                best = (dy, dx);
+            }
+        }
+    }
+    best
+}
+
+/// Encode the synthesized image as a hidden P-frame against `last_ref`.
+///
+/// Bitstream specifics:
+/// * `show_frame = 0` (consumer doesn't see this frame).
+/// * `refresh_alt = 1`, everything else off (only the alt-ref slot is
+///   updated; LAST and GOLDEN keep their previous reconstructions).
+///
+/// Implemented by calling the standard P-frame encoder with a custom
+/// `RefPlan` and patching the `show_frame` bit in the resulting tag
+/// byte. The reconstruction returned is what BOTH encoder and decoder
+/// will install in their alt-ref slot.
+fn encode_hidden_altref_pframe(
+    width: u32,
+    height: u32,
+    cfg: Vp8EncoderConfig,
+    synth: &SynthesizedAltRef,
+    last_ref: &ReferenceFrame,
+) -> Result<(Vec<u8>, ReferenceFrame)> {
+    let synth_frame = synth.as_video_frame();
+    let plan = RefPlan {
+        refresh_last: false,
+        refresh_golden: false,
+        refresh_alt: true,
+        // No GOLDEN/ALT predicted-from references — the hidden frame
+        // codes against LAST only. Both ALT and GOLDEN are still
+        // populated in the encoder state but we explicitly forbid
+        // their use as a prediction reference inside the synthesized
+        // frame to keep the per-MB mode decision simple.
+        use_golden: false,
+        use_alt: false,
+    };
+    // Disable RDO knobs that depend on multi-ref bookkeeping for the
+    // hidden frame — the standard encoder still works fine in this
+    // mode but the cleanest residual-only encode is achieved with the
+    // single-reference behaviour.
+    let mut hcfg = cfg;
+    hcfg.enable_multi_ref = false;
+    // Disable segments so the hidden frame's bitstream is minimal —
+    // segmentation adds per-MB bits that aren't useful for a hidden
+    // alt-ref where every MB should be coded against LAST as the
+    // only reference.
+    hcfg.enable_segments = false;
+    // Push the hidden frame's quant a few notches finer than the
+    // visible frame's. The alt-ref slot's accuracy directly determines
+    // how big the per-MB residuals are on every subsequent P-frame
+    // that references it — spending a small amount of extra bits on
+    // the hidden frame buys back a much larger savings on the (often
+    // many) visible frames that follow. The exact delta is tuned so
+    // hidden-frame growth stays well below the per-frame savings on a
+    // motion-rich noisy fixture.
+    hcfg.qindex = (cfg.qindex as i32 - HIDDEN_ALTREF_QINDEX_DELTA).clamp(0, 127) as u8;
+    let (mut bitstream, rec) = encode_pframe_and_reconstruct(
+        width,
+        height,
+        hcfg,
+        &synth_frame,
+        last_ref,
+        None,
+        None,
+        plan,
+    )?;
+    // Patch the frame tag to set `show_frame = 0`. The tag is the first
+    // 3 bytes; bit 4 of byte 0 is the show_frame flag.
+    if !bitstream.is_empty() {
+        bitstream[0] &= !0x10;
+    }
+    Ok((bitstream, rec))
 }
 
 // ---------------------------------------------------------------------------

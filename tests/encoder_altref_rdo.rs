@@ -150,6 +150,12 @@ fn refresh_flags_follow_plan() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -204,6 +210,12 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -246,6 +258,12 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -296,6 +314,12 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -316,6 +340,12 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -409,6 +439,12 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -462,6 +498,12 @@ fn legacy_single_ref_path_still_works() {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // refresh-flag / packet-count assertions in these tests stay
+        // bit-exact with the pre-#209 baseline (the synthesis path
+        // emits an extra hidden frame at every alt-ref refresh point).
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

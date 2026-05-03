@@ -178,6 +178,10 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
         scene_cut_boost_frames: 0,
+        // Disable look-ahead alt-ref synthesis (#209) so the
+        // packet-vs-frame count assertions stay 1:1.
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     }
 }
 
@@ -195,6 +199,8 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         scene_cut_threshold: DEFAULT_SCENE_CUT_THRESHOLD,
         scene_cut_quant_boost: DEFAULT_SCENE_CUT_QUANT_BOOST,
         scene_cut_boost_frames: DEFAULT_SCENE_CUT_BOOST_FRAMES,
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
     }
 }
 

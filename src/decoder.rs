@@ -142,10 +142,22 @@ impl Decoder for Vp8Decoder {
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.pending_pts = packet.pts;
         self.pending_tb = packet.time_base;
+        // Hidden frames (`show_frame = 0`) are reference-only: they
+        // update the LAST/GOLDEN/ALTREF slots but the consumer must
+        // never receive them as a video frame. The encoder uses these
+        // for look-ahead alt-ref synthesis (the synthesized image is
+        // installed in the alt-ref slot via a hidden P-frame). We
+        // detect them on the frame tag and suppress the queue push
+        // while still letting `decode_frame_with_state` walk through
+        // the bitstream and update reference state.
+        let parsed = parse_header(&packet.data)?;
+        let visible = parsed.tag.show_frame;
         let frame = decode_frame_with_state(&packet.data, &mut self.state)?;
-        let mut vf = frame;
-        vf.pts = self.pending_pts;
-        self.queued.push_back(vf);
+        if visible {
+            let mut vf = frame;
+            vf.pts = self.pending_pts;
+            self.queued.push_back(vf);
+        }
         Ok(())
     }
 

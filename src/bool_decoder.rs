@@ -49,6 +49,7 @@ impl<'a> BoolDecoder<'a> {
 
     /// Decode a single boolean using the given probability (0..=255). A
     /// probability of `prob` corresponds to a P(0) = prob / 256.
+    #[inline]
     pub fn read_bool(&mut self, prob: u32) -> bool {
         debug_assert!(prob <= 255);
         let split = 1 + (((self.range - 1) * prob) >> 8);
@@ -62,18 +63,32 @@ impl<'a> BoolDecoder<'a> {
             self.range = split;
             bit = false;
         }
-        // Renormalise.
-        while self.range < 128 {
-            self.range <<= 1;
-            self.value <<= 1;
-            self.bit_count += 1;
-            if self.bit_count == 8 {
-                self.bit_count = 0;
-                if self.pos < self.buf.len() {
-                    self.value |= self.buf[self.pos] as u32;
-                    self.pos += 1;
-                }
+        // Renormalise. The naive RFC 6386 §20.2 reference walks one bit
+        // at a time (`while range < 128 { range<<=1; … }`) but on a real
+        // CPU the shift count is `(range as u8).leading_zeros()`: range
+        // sits in (0,255] after the subtraction so the u8 view captures
+        // exactly the right magnitude. We batch the shift, then perform
+        // at most one byte refill.
+        //
+        // Refill logic (matches the per-bit reference iterated `shift`
+        // times): after `shift` shifts, the original `bit_count` bits
+        // and the `shift` newly-shifted bits combine. If their sum hits
+        // 8, the queued byte (low 8 bits of `value`) has been fully
+        // consumed and the next source byte is loaded at the current
+        // residual `bit_count` (i.e. `bit_count - 8` after the
+        // subtraction). `shift <= 7` because `range` was in (0,255], and
+        // pre-shift `bit_count <= 7`, so the sum is at most 14 — we
+        // never need two refills in one call.
+        let shift = (self.range as u8).leading_zeros() as i32;
+        self.range <<= shift;
+        self.value <<= shift;
+        self.bit_count += shift;
+        if self.bit_count >= 8 {
+            self.bit_count -= 8;
+            if self.pos < self.buf.len() {
                 // Past EOF reads as zero (RFC 6386 §7.3).
+                self.value |= (self.buf[self.pos] as u32) << self.bit_count;
+                self.pos += 1;
             }
         }
         bit

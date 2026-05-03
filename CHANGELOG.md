@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tests/encoder_mode_coverage.rs` — four integration tests that
+  deliberately exercise the encoder's full mode surface in single
+  frames: mixed intra-16×16 modes (DC / V / H / TM in one keyframe),
+  the 10 B_PRED 4×4 sub-modes via directional-patch content, all four
+  SPLIT_MV partitionings on a two-motion P-frame, and the NEAR_MV /
+  neighbour-context chain via a pan with coherent global motion. These
+  complement the existing one-mode-per-test coverage in
+  `tests/encoder_roundtrip.rs`.
+
+### Changed
+
+- `src/lib.rs` doc-comment rewritten to reflect the post-round-24
+  reality (full encoder + decoder, all 14 intra modes wired, all four
+  inter modes + four split-MV partitionings, simple + normal loop
+  filter on the decoder side, IVF muxer in addition to the demuxer).
+  The earlier "I-frame decode + IVF demuxer" framing was inherited
+  from the v0.0.x days and no longer reflects the crate's surface.
+- `Cargo.toml` description updated to "encoder + decoder, IVF
+  container" — same reason.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.3...v0.1.4) - 2026-05-03
 
 ### Other

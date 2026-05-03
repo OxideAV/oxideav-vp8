@@ -1,38 +1,36 @@
-//! Pure-Rust VP8 video decoder + IVF container.
+//! Pure-Rust VP8 video codec + IVF container — encoder + decoder.
 //!
-//! Status:
-//! * Boolean (arithmetic) decoder — RFC 6386 §7. Done; round-trip tested
-//!   against a libvpx-style reference encoder.
-//! * Frame tag + uncompressed key-frame chunk — RFC 6386 §9.1. Done.
+//! Status (RFC 6386 surface coverage):
+//! * Boolean (arithmetic) decoder + encoder — §7. Round-trip tested.
+//! * Frame tag + uncompressed key-frame chunk — §9.1. Both directions.
 //! * Frame header (segmentation / loop filter / quant / probs) — §9.2-§9.10.
-//!   Done.
-//! * Macroblock prediction modes — intra-16×16 + intra-4×4 + intra-8×8 chroma.
-//!   All 14 modes implemented.
-//! * Token / coefficient decoding — §13. Implemented as a flat unrolled
-//!   variant matching libvpx's `GetCoeffs`.
-//! * Inverse 4×4 DCT + 4×4 WHT — §14. Done; passes a forward-DCT round-trip
-//!   test on a constant block.
-//! * Loop filter — §15. Simple + normal modes wired up.
-//! * I-frame decode (4:2:0 YUV) — produces correctly-shaped output. The
-//!   no-neighbour case (top-left MB) is bit-exact against libvpx; uniform
-//!   content streams decode at 100% pixel match. Multi-MB B_PRED-heavy
-//!   content like `testsrc` is partially correct — there's an
-//!   under-investigation issue in either context propagation between
-//!   neighbouring B_PRED macroblocks or the post-IDCT pixel pipeline that
-//!   degrades the per-frame pixel-match rate. Tracked in the integration
-//!   test `tests/decode_keyframe.rs`.
-//! * P-frame decode — structural pipeline in place: parses the inter
-//!   header, decodes per-MB mode info (NEAREST/NEAR/ZERO/NEW/SPLIT),
-//!   decodes MVs via the 19-entry per-component probability tree,
-//!   manages LAST/GOLDEN/ALTREF reference slots with copy-to and
-//!   refresh flags, and runs motion compensation via the 6-tap luma
-//!   filter + bilinear chroma filter. Gray / static content round-trips
-//!   bit-exactly through the keyframe; motion-heavy content currently
-//!   suffers from the same B_PRED keyframe neighbour bug noted above
-//!   (since P-frames reference the keyframe). A `find_near_mvs`
-//!   approximation and sign-bias handling cover common cases; some
-//!   corner cases (SPLIT_MV context) are simplified.
-//! * IVF container — read-side demuxer with FourCC `VP80` probe.
+//!   Both directions, including ref-frame sign bias, refresh + copy-buffer
+//!   flags, mb_skip_enabled + per-frame entropy-prob updates.
+//! * Macroblock prediction modes — intra-16×16 (DC / V / H / TM / B_PRED),
+//!   intra-4×4 (all 10 sub-modes: B_DC, B_TM, B_VE, B_HE, B_LD, B_RD, B_VR,
+//!   B_VL, B_HD, B_HU), intra-8×8 chroma (same 4 modes as 16×16). Encoder
+//!   picks via SSE-on-source for every candidate; decoder reconstructs.
+//! * Inter modes — NEAREST_MV / NEAR_MV / ZERO_MV / NEW_MV plus all four
+//!   SPLIT_MV partitionings (16×8 / 8×16 / 8×8 / 4×4). Per-partition
+//!   integer-pel + quarter-pel motion search on the encoder side.
+//! * Token / coefficient decoding — §13. Flat unrolled `GetCoeffs`.
+//!   Encoder mirrors with its emit-side companion.
+//! * Inverse 4×4 DCT + 4×4 WHT (§14) + forward counterparts. Bit-exact
+//!   round-trip; column-then-row IDCT pass order matches the RFC C ref.
+//! * Loop filter — §15. Decoder handles simple + normal modes, both edge
+//!   directions, MB + sub-block. Encoder emits normal mode only (with
+//!   level derived from qindex via libvpx's `clamp(15 + qindex/8, 1, 63)`).
+//! * Reference management — LAST / GOLDEN / ALTREF, with refresh +
+//!   copy-buffer per RFC 6386 §9.7. Sign-bias handled in find_near_mvs.
+//! * Segmentation map (§10) — per-MB segment id + per-segment quantiser
+//!   delta, both directions; encoder classifies by source-luma variance
+//!   and emits the entropy-matched tree_probs triple.
+//! * IVF container — demuxer + muxer (FourCC `VP80` probe).
+//!
+//! Encoder-only smarts (not in spec, layered on top):
+//! * Lagrangian rate-distortion mode decision (`D + λ·R`), per-frame
+//!   scene-cut detection, look-ahead alt-ref synthesis, multi-reference
+//!   per-MB picker, context-adaptive `prob_intra/last/gf` triple.
 
 #![cfg_attr(feature = "simd", feature(portable_simd))]
 #![allow(clippy::needless_range_loop)]

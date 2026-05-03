@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT AND BSD-3-Clause"
 repository = "https://github.com/OxideAV/oxideav-vp8"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust VP8 video decoder for oxideav (RFC 6386, I-frame decode + IVF container)"
+description = "Pure-Rust VP8 video codec for oxideav (RFC 6386, encoder + decoder, IVF container)"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-vp8"

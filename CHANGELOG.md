@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.5...v0.1.6) - 2026-05-04
+
+### Added
+
+- *(encoder)* real per-mode SSE for Intra in estimate_distortion ([#392](https://github.com/OxideAV/oxideav-vp8/pull/392))
+- *(encoder)* B_PRED candidate in intra-in-P on heavy-texture MBs ([#339](https://github.com/OxideAV/oxideav-vp8/pull/339))
+- *(encoder)* real bool-coded bit accumulator for RDO rate input ([#340](https://github.com/OxideAV/oxideav-vp8/pull/340))
+- *(encoder)* MV picker neighbour bias + un-ignore neighbour-chain test ([#373](https://github.com/OxideAV/oxideav-vp8/pull/373))
+- *(encoder)* per-segment loop-filter level deltas ([#337](https://github.com/OxideAV/oxideav-vp8/pull/337))
+
+### Fixed
+
+- *(encoder)* drop bogus ref-frame filter from find_near_mvs_enc
+
+### Other
+
+- rustfmt sweep on #392 follow-up
+- rustfmt sweep on #340 follow-up
+- *(encoder)* simplify NEAREST/NEAR bias check
+
 ### Added
 
 - *(encoder)* B_PRED is now a candidate in the intra-in-P fallback when

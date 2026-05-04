@@ -1880,37 +1880,18 @@ fn apply_loop_filter(
             let xc = mb_x * 8;
 
             // 1. Left MB v-edges — luma then U then V (RFC §15.1; the
-            //    simple filter type is luma-only per §15.2).
+            //    simple filter type is luma-only per §15.2). Filters
+            //    EXACTLY this MB's 16 luma rows (8 chroma rows).
             if mb_x > 0 {
                 if simple {
-                    filter_simple_vertical(y_plane, y_stride, x, y_stride, y0 + 16, params_mb);
+                    filter_simple_vertical(y_plane, y_stride, x, y_stride, y0, 16, params_mb);
                 } else {
+                    filter_normal_vertical(y_plane, y_stride, x, y_stride, y0, 16, params_mb, true);
                     filter_normal_vertical(
-                        y_plane,
-                        y_stride,
-                        x,
-                        y_stride,
-                        y0 + 16,
-                        params_mb,
-                        true,
+                        u_plane, uv_stride, xc, uv_stride, y0c, 8, params_mb, true,
                     );
                     filter_normal_vertical(
-                        u_plane,
-                        uv_stride,
-                        xc,
-                        uv_stride,
-                        y0c + 8,
-                        params_mb,
-                        true,
-                    );
-                    filter_normal_vertical(
-                        v_plane,
-                        uv_stride,
-                        xc,
-                        uv_stride,
-                        y0c + 8,
-                        params_mb,
-                        true,
+                        v_plane, uv_stride, xc, uv_stride, y0c, 8, params_mb, true,
                     );
                 }
             }
@@ -1924,7 +1905,8 @@ fn apply_loop_filter(
                             y_stride,
                             x + k * 4,
                             y_stride,
-                            y0 + 16,
+                            y0,
+                            16,
                             params_sb,
                         );
                     }
@@ -1935,7 +1917,8 @@ fn apply_loop_filter(
                             y_stride,
                             x + k * 4,
                             y_stride,
-                            y0 + 16,
+                            y0,
+                            16,
                             params_sb,
                             false,
                         );
@@ -1945,7 +1928,8 @@ fn apply_loop_filter(
                         uv_stride,
                         xc + 4,
                         uv_stride,
-                        y0c + 8,
+                        y0c,
+                        8,
                         params_sb,
                         false,
                     );
@@ -1954,26 +1938,28 @@ fn apply_loop_filter(
                         uv_stride,
                         xc + 4,
                         uv_stride,
-                        y0c + 8,
+                        y0c,
+                        8,
                         params_sb,
                         false,
                     );
                 }
             }
 
-            // 3. Top MB h-edges.
+            // 3. Top MB h-edges. Filters EXACTLY this MB's 16 luma cols
+            //    (8 chroma cols).
             if mb_y > 0 {
                 if simple {
-                    filter_simple_horizontal(y_plane, y_stride, y0, y_stride, y_buf_h, params_mb);
+                    filter_simple_horizontal(y_plane, y_stride, y0, y_buf_h, x, 16, params_mb);
                 } else {
                     filter_normal_horizontal(
-                        y_plane, y_stride, y0, y_stride, y_buf_h, params_mb, true,
+                        y_plane, y_stride, y0, y_buf_h, x, 16, params_mb, true,
                     );
                     filter_normal_horizontal(
-                        u_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                        u_plane, uv_stride, y0c, uv_buf_h, xc, 8, params_mb, true,
                     );
                     filter_normal_horizontal(
-                        v_plane, uv_stride, y0c, uv_stride, uv_buf_h, params_mb, true,
+                        v_plane, uv_stride, y0c, uv_buf_h, xc, 8, params_mb, true,
                     );
                 }
             }
@@ -1986,8 +1972,9 @@ fn apply_loop_filter(
                             y_plane,
                             y_stride,
                             y0 + k * 4,
-                            y_stride,
                             y_buf_h,
+                            x,
+                            16,
                             params_sb,
                         );
                     }
@@ -1997,8 +1984,9 @@ fn apply_loop_filter(
                             y_plane,
                             y_stride,
                             y0 + k * 4,
-                            y_stride,
                             y_buf_h,
+                            x,
+                            16,
                             params_sb,
                             false,
                         );
@@ -2007,8 +1995,9 @@ fn apply_loop_filter(
                         u_plane,
                         uv_stride,
                         y0c + 4,
-                        uv_stride,
                         uv_buf_h,
+                        xc,
+                        8,
                         params_sb,
                         false,
                     );
@@ -2016,8 +2005,9 @@ fn apply_loop_filter(
                         v_plane,
                         uv_stride,
                         y0c + 4,
-                        uv_stride,
                         uv_buf_h,
+                        xc,
+                        8,
                         params_sb,
                         false,
                     );

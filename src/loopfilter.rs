@@ -260,21 +260,28 @@ impl FilterParams {
     }
 }
 
-/// Apply the simple-mode loop filter to a MB-edge column at `(x, y)`
-/// with `width × height` boundary. `simple` mode only filters the four
-/// pixels closest to the edge.
+/// Apply the simple-mode loop filter to a MB-edge vertical column at
+/// `(x, y_start)` for `len_rows` rows. The frame `width` is used only
+/// to bounds-check the column. Simple mode only filters the four pixels
+/// closest to the edge.
+///
+/// Note: the function processes EXACTLY `len_rows` rows starting at
+/// `y_start`. Per RFC 6386 §15.1 each MB filters its own 16 rows of
+/// each shared vertical edge — passing `len_rows = 16` with
+/// `y_start = mb_y * 16` is the standard call.
 pub fn filter_simple_vertical(
     plane: &mut [u8],
     stride: usize,
     x: usize,
     width: usize,
-    height: usize,
+    y_start: usize,
+    len_rows: usize,
     params: FilterParams,
 ) {
     if x < 2 || x + 2 > width {
         return;
     }
-    for j in 0..height {
+    for j in y_start..(y_start + len_rows) {
         let row = j * stride;
         let p1 = plane[row + x - 2];
         let p0 = plane[row + x - 1];
@@ -288,28 +295,34 @@ pub fn filter_simple_vertical(
     }
 }
 
-/// Apply the simple-mode loop filter to a MB-edge row at `(x, y)`.
+/// Apply the simple-mode loop filter to a MB-edge horizontal row at
+/// `(x_start, y)` for `len_cols` columns. The frame `height` is used
+/// only to bounds-check the row.
+///
+/// Note: each MB filters its own 16 columns of each shared horizontal
+/// edge — passing `len_cols = 16` with `x_start = mb_x * 16` is the
+/// standard call.
 pub fn filter_simple_horizontal(
     plane: &mut [u8],
     stride: usize,
     y: usize,
-    width: usize,
     height: usize,
+    x_start: usize,
+    len_cols: usize,
     params: FilterParams,
 ) {
     if y < 2 || y + 2 > height {
         return;
     }
-    // SIMD body: process `width` in blocks of 16 then fall through to
-    // the scalar tail. The simd variant is bit-exact with the scalar
-    // `simple_threshold` + `simple_filter` pair. The cfg branch is
-    // written as separate `let` bindings so the default-stable build
-    // doesn't see an unused `mut`.
+    // SIMD body: process the `len_cols` slab in blocks of 16 then fall
+    // through to the scalar tail. The simd variant is bit-exact with
+    // the scalar `simple_threshold` + `simple_filter` pair.
     #[cfg(feature = "simd")]
-    let start = simd::filter_simple_horizontal_simd(plane, stride, y, width, params);
+    let start =
+        x_start + simd::filter_simple_horizontal_simd(plane, stride, y, x_start, len_cols, params);
     #[cfg(not(feature = "simd"))]
-    let start = 0usize;
-    for i in start..width {
+    let start = x_start;
+    for i in start..(x_start + len_cols) {
         let p1 = plane[(y - 2) * stride + i];
         let p0 = plane[(y - 1) * stride + i];
         let q0 = plane[y * stride + i];
@@ -322,20 +335,26 @@ pub fn filter_simple_horizontal(
     }
 }
 
-/// Apply the normal-mode loop filter to a vertical edge.
+/// Apply the normal-mode loop filter to a vertical edge column at `x`
+/// for `len_rows` rows starting at row `y_start`. The frame `width` is
+/// used only to bounds-check the column (need at least 4 pixels on
+/// each side). Per RFC 6386 §15.1 each MB filters its OWN 16 rows of
+/// each shared vertical edge — passing `len_rows = 16` (luma) or 8
+/// (chroma) with `y_start = mb_y * 16` (or 8) is the standard call.
 pub fn filter_normal_vertical(
     plane: &mut [u8],
     stride: usize,
     x: usize,
     width: usize,
-    height: usize,
+    y_start: usize,
+    len_rows: usize,
     params: FilterParams,
     is_mb_edge: bool,
 ) {
     if x < 4 || x + 4 > width {
         return;
     }
-    for j in 0..height {
+    for j in y_start..(y_start + len_rows) {
         let row = j * stride;
         let p3 = plane[row + x - 4];
         let p2 = plane[row + x - 3];
@@ -401,16 +420,18 @@ mod simd {
 
     const N: usize = 16;
 
-    /// Returns the count of pixels handled by SIMD (caller fills the
-    /// rest with the scalar path). When width < 16 returns 0.
+    /// Returns the count of pixels (within `len_cols`) handled by SIMD
+    /// — the caller fills the trailing `len_cols % 16` with the scalar
+    /// path. When `len_cols < 16` returns 0.
     pub(super) fn filter_simple_horizontal_simd(
         plane: &mut [u8],
         stride: usize,
         y: usize,
-        width: usize,
+        x_start: usize,
+        len_cols: usize,
         params: FilterParams,
     ) -> usize {
-        if width < N {
+        if len_cols < N {
             return 0;
         }
         let edge_limit: Simd<i16, N> = Simd::splat(params.edge_limit as i16);
@@ -426,8 +447,9 @@ mod simd {
         let row_q0 = y * stride;
         let row_q1 = (y + 1) * stride;
 
-        let mut i = 0;
-        while i + N <= width {
+        let mut i = x_start;
+        let end = x_start + len_cols;
+        while i + N <= end {
             // --- loads (immutable) ---
             let p1u: Simd<u8, N> = Simd::from_slice(&plane[row_pm2 + i..row_pm2 + i + N]);
             let p0u: Simd<u8, N> = Simd::from_slice(&plane[row_pm1 + i..row_pm1 + i + N]);
@@ -491,19 +513,23 @@ mod simd {
 }
 
 /// Apply the normal-mode loop filter to a horizontal edge.
+/// Apply the normal-mode loop filter to a horizontal edge row at `y`
+/// for `len_cols` columns starting at column `x_start`. The frame
+/// `height` is used only to bounds-check the row.
 pub fn filter_normal_horizontal(
     plane: &mut [u8],
     stride: usize,
     y: usize,
-    width: usize,
     height: usize,
+    x_start: usize,
+    len_cols: usize,
     params: FilterParams,
     is_mb_edge: bool,
 ) {
     if y < 4 || y + 4 > height {
         return;
     }
-    for i in 0..width {
+    for i in x_start..(x_start + len_cols) {
         let p3 = plane[(y - 4) * stride + i];
         let p2 = plane[(y - 3) * stride + i];
         let p1 = plane[(y - 2) * stride + i];

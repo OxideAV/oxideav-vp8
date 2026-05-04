@@ -399,10 +399,13 @@ fn corpus_q_low() {
     });
 }
 
-// TODO(vp8-corpus): q-high — round 25 added per-MB LF deltas + the
-// libvpx-correct interior_limit shift. Effective filter level for
-// INTRA MBs is now 38+2=40 (was using 38), matching the trace's
-// `LOOPFILTER level=40`. Promote to BitExact once cross-validated.
+// Bit-exact after the per-MB loopfilter range fix: the
+// filter_normal_*/filter_simple_* helpers now process EXACTLY the
+// current MB's 16 luma rows (8 chroma) instead of looping
+// `0..(y0+16)`, which previously double/triple/quadruple-filtered
+// every row through every shared edge as raster order swept down.
+// At high filter level the over-filter compounded fast — q-high
+// (level=38, INTRA MBs effective 44) was decoding at 63.83% before.
 #[test]
 fn corpus_q_high() {
     evaluate(&CorpusCase {
@@ -410,14 +413,13 @@ fn corpus_q_high() {
         width: 128,
         height: 128,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
-// TODO(vp8-corpus): i-only-loopfilter-high — round 25 added per-MB LF
-// deltas + interior_limit shift. Effective filter level for INTRA MBs
-// is now 33+2=35, matching the trace's `LOOPFILTER level=35`. Promote
-// to BitExact once cross-validated.
+// Bit-exact after the per-MB loopfilter range fix (see q-high comment).
+// At level=33 the over-filter pulled match down to 73.70%; with the
+// range fix the trace `LOOPFILTER level=35` reconstruction is exact.
 #[test]
 fn corpus_i_only_loopfilter_high() {
     evaluate(&CorpusCase {
@@ -425,7 +427,7 @@ fn corpus_i_only_loopfilter_high() {
         width: 64,
         height: 64,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -442,6 +444,7 @@ fn corpus_segment_4_partitions() {
     });
 }
 
+// Bit-exact after the per-MB loopfilter range fix (see q-high comment).
 #[test]
 fn corpus_gradient_and_noise_128x128() {
     evaluate(&CorpusCase {
@@ -449,10 +452,13 @@ fn corpus_gradient_and_noise_128x128() {
         width: 128,
         height: 128,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
+// Bit-exact after the per-MB loopfilter range fix — the simple-mode
+// filter (RFC 6386 §15.2) used the same 0..height iteration bug as
+// the normal-mode filter and is fixed by the same change.
 #[test]
 fn corpus_vp8_with_loopfilter_mode_simple() {
     evaluate(&CorpusCase {
@@ -460,7 +466,7 @@ fn corpus_vp8_with_loopfilter_mode_simple() {
         width: 64,
         height: 64,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 

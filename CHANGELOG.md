@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.6...v0.1.7) - 2026-05-04
+
+### Added
+
+- *(encoder)* per-frequency quant_indices deltas ([#417](https://github.com/OxideAV/oxideav-vp8/pull/417))
+
+### Fixed
+
+- *(decoder)* RFC-correct SPLITMV sub-block context + MV clamp at frame edges
+- *(decoder)* persist loop-filter ref/mode deltas across frames ([#416](https://github.com/OxideAV/oxideav-vp8/pull/416))
+- *(loopfilter)* each MB filters only its own 16-pixel slab per edge
+- *(inter)* chroma uses 6-tap, not bilinear, in profile 0
+- *(decoder)* persist coef probs only when refresh_entropy_probs=1
+- *(loopfilter)* interior_limit shift gated on sharpness, per libvpx
+
+### Other
+
+- chroma 6-tap (profile 0) + corpus tier roster after fixes
+
 ### Added
 
 - *(encoder)* per-frequency `quant_indices` deltas (RFC 6386 §9.6) — five

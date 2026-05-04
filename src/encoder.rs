@@ -3099,23 +3099,20 @@ fn choose_pmb_decision(
     //    the MV-delta bit cost; `NEIGHBOUR_MV_MARGIN` gives NEAREST /
     //    NEAR an extra edge on top of that base margin.
     let mut best_free: (u32, PMbDecision) = (zero_sad, PMbDecision::ZeroMv);
+    // `nearest_sad` / `near_sad` are computed iff the corresponding MV
+    // is non-zero (see step 4 above), so reaching `Some(_)` here
+    // implies the candidate is a real neighbour MV worth biasing
+    // toward the ZERO baseline. The bias is *vs ZERO* (not vs the
+    // running best) so a noisy NEAR candidate that is already much
+    // worse than NEAREST cannot leapfrog NEAREST just because it
+    // also beats ZERO + bias.
     if let Some(s) = nearest_sad {
-        let beats = if nearest != Mv::ZERO {
-            s < best_free.0 + NEIGHBOUR_OVER_ZERO_BIAS
-        } else {
-            s < best_free.0
-        };
-        if beats {
+        if s < zero_sad + NEIGHBOUR_OVER_ZERO_BIAS && s < best_free.0 + NEIGHBOUR_OVER_ZERO_BIAS {
             best_free = (s, PMbDecision::NearestMv(nearest));
         }
     }
     if let Some(s) = near_sad {
-        let beats = if near != Mv::ZERO {
-            s < best_free.0 + NEIGHBOUR_OVER_ZERO_BIAS
-        } else {
-            s < best_free.0
-        };
-        if beats {
+        if s < zero_sad + NEIGHBOUR_OVER_ZERO_BIAS && s < best_free.0 {
             best_free = (s, PMbDecision::NearMv(near));
         }
     }

@@ -152,7 +152,10 @@ impl Default for BoolCounter {
 impl BoolCounter {
     /// Fresh counter — same initial state as `BoolEncoder::new()`.
     pub const fn new() -> Self {
-        Self { range: 255, bits: 0 }
+        Self {
+            range: 255,
+            bits: 0,
+        }
     }
 
     /// Mirror of [`BoolEncoder::write_bool`] that updates `range` and
@@ -281,7 +284,11 @@ const fn neg_log2_x256(x: u32) -> u16 {
     let log2_x_x256: u32 = (int_part << 8) | frac_q8;
     // lg = 8 - log2(x), in 1/256-bit units
     let lg_x256 = (8u32 << 8).saturating_sub(log2_x_x256);
-    if lg_x256 > 2048 { 2048 } else { lg_x256 as u16 }
+    if lg_x256 > 2048 {
+        2048
+    } else {
+        lg_x256 as u16
+    }
 }
 
 /// Look up the cost of writing a single `(prob, outcome)` bool, in
@@ -353,12 +360,18 @@ mod tests {
         // ~16 fractional bits of precision but the LSB rounding can
         // drift the empirical answer one or two ticks.
         for &(prob, outcome) in &[
-            (8u8, false), (8u8, true),
-            (32u8, false), (32u8, true),
-            (64u8, false), (64u8, true),
-            (128u8, false), (128u8, true),
-            (200u8, false), (200u8, true),
-            (240u8, false), (240u8, true),
+            (8u8, false),
+            (8u8, true),
+            (32u8, false),
+            (32u8, true),
+            (64u8, false),
+            (64u8, true),
+            (128u8, false),
+            (128u8, true),
+            (200u8, false),
+            (200u8, true),
+            (240u8, false),
+            (240u8, true),
         ] {
             let mut ctr = BoolCounter::new();
             const N: u32 = 5000;
@@ -387,12 +400,16 @@ mod tests {
             assert!(
                 PROB_COST_BITS_X256[0][p] >= PROB_COST_BITS_X256[0][p + 1],
                 "cost(p={p}, false)={} should be >= cost(p={}, false)={}",
-                PROB_COST_BITS_X256[0][p], p+1, PROB_COST_BITS_X256[0][p + 1]
+                PROB_COST_BITS_X256[0][p],
+                p + 1,
+                PROB_COST_BITS_X256[0][p + 1]
             );
             assert!(
                 PROB_COST_BITS_X256[1][p] <= PROB_COST_BITS_X256[1][p + 1],
                 "cost(p={p}, true)={} should be <= cost(p={}, true)={}",
-                PROB_COST_BITS_X256[1][p], p+1, PROB_COST_BITS_X256[1][p + 1]
+                PROB_COST_BITS_X256[1][p],
+                p + 1,
+                PROB_COST_BITS_X256[1][p + 1]
             );
         }
         // p=128 is roughly 1 bit either way -> ~256 in our 1/256-bit units.

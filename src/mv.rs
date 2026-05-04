@@ -239,7 +239,9 @@ mod tests {
         // real BoolEncoder. We emit each value into its own fresh
         // encoder (so the buffered-state slack is bounded by ~25 bits)
         // and compare totals in 1/256-bit units.
-        for &v in &[0, 1, -1, 4, 7, -7, 8, -8, 15, -15, 16, 33, -33, 127, -127, 256, 1023] {
+        for &v in &[
+            0, 1, -1, 4, 7, -7, 8, -8, 15, -15, 16, 33, -33, 127, -127, 256, 1023,
+        ] {
             let mut enc = BoolEncoder::new();
             encode_mv_component(&mut enc, &DEFAULT_MV_CONTEXT[0], v);
             let real_bytes = enc.finish().len();

@@ -133,6 +133,41 @@ const NEWMV_SAD_MARGIN: u32 = 64;
 /// strictly better — reflects the bit savings from skipping the MV delta.
 const NEIGHBOUR_MV_MARGIN: u32 = 32;
 
+/// Per-MB SAD bias granted to a non-zero NEAREST / NEAR neighbour
+/// candidate over the ZERO-MV baseline. When the upstream-chain has
+/// already committed to a coherent global motion (e.g. a pan), the
+/// neighbour MV is the right one to follow even when its sub-pel SAD
+/// is marginally worse than ZERO — the encoder pays no MV delta for
+/// NEAREST / NEAR, so the bit savings amortise easily over a
+/// 1/2-LSB-per-pixel SAD overshoot. Without this bias the picker
+/// dithers between ZERO_MV and NEAREST_MV across the frame and the
+/// neighbour-chain breaks (#373).
+const NEIGHBOUR_OVER_ZERO_BIAS: u32 = 96;
+
+/// 1/8-pel L∞ tolerance under which a refined NEW_MV is considered
+/// equivalent to a non-zero neighbour candidate — the picker emits
+/// NEAREST / NEAR instead of paying the MV-delta bits for a NEW_MV
+/// that lands at almost the same sub-pel location. `4` covers the
+/// quarter-pel refinement step (`SUBPEL_REFINE_STEP = 2`) plus a one-
+/// step jitter on either axis, which is the common case when integer
+/// motion search lands one quarter-pel off the true motion.
+const NEIGHBOUR_MV_SNAP_TOLERANCE: i32 = 4;
+
+/// Reduced NEW_MV-over-free margin applied when the refined MV has a
+/// large enough displacement from zero that it represents real motion
+/// (rather than a noise-driven sub-pel jitter around zero). Catches
+/// the global-pan case where ZERO and NEW_MV(-4,-4) both have similar
+/// SAD against a quantised-and-deblocked reference but only NEW_MV
+/// reconstructs anything close to lossless. Threshold on the L∞ MV
+/// magnitude in 1/8-pel units (`16 = 2 luma pixels`).
+const NEWMV_LARGE_DISPLACEMENT_THRESHOLD: i32 = 16;
+/// Replacement margin used when the displacement exceeds the threshold
+/// above. A real-motion NEW_MV only needs to match (or barely improve)
+/// the SAD of the free-MV alternative; the bit cost of coding the
+/// delta is still amortised by the residual savings on the larger
+/// displacement.
+const NEWMV_LARGE_DISPLACEMENT_MARGIN: u32 = 4;
+
 /// Sub-pel refinement step in 1/8-pel units. Quarter-pel (=2) is the
 /// sweet spot for a first-pass implementation: it recovers most of the
 /// quarter-pel PSNR gain without the bit-cost ramp of eighth-pel MV
@@ -3052,20 +3087,35 @@ fn choose_pmb_decision(
     };
 
     // 5) compare free-MV modes (ZERO / NEAREST / NEAR) — all three code
-    //    no MV delta, so the smallest SAD wins directly. NEW_MV then has
-    //    to beat the best free mode by at least NEWMV_SAD_MARGIN, since
-    //    NEW_MV pays the MV-delta bit cost. NEIGHBOUR_MV_MARGIN gives
-    //    NEAREST / NEAR an extra edge over NEW_MV on top of the base
-    //    margin — in practice this just combines into a larger total
-    //    margin for NEW_MV over a neighbour candidate.
+    //    no MV delta, so the SAD comparison is direct. To propagate a
+    //    coherent global motion across MBs we *bias* a non-zero NEAREST /
+    //    NEAR over the ZERO-MV baseline by `NEIGHBOUR_OVER_ZERO_BIAS`:
+    //    if a neighbour MV is at most this many SAD units worse than
+    //    ZERO, follow it (the encoder pays no MV-delta bits for
+    //    NEAREST / NEAR, so the bit savings recoup the small SAD
+    //    overshoot — and crucially it keeps the neighbour-chain alive
+    //    for the next row of MBs). NEW_MV then has to beat the best
+    //    free mode by at least `NEWMV_SAD_MARGIN`, since NEW_MV pays
+    //    the MV-delta bit cost; `NEIGHBOUR_MV_MARGIN` gives NEAREST /
+    //    NEAR an extra edge on top of that base margin.
     let mut best_free: (u32, PMbDecision) = (zero_sad, PMbDecision::ZeroMv);
     if let Some(s) = nearest_sad {
-        if s < best_free.0 {
+        let beats = if nearest != Mv::ZERO {
+            s < best_free.0 + NEIGHBOUR_OVER_ZERO_BIAS
+        } else {
+            s < best_free.0
+        };
+        if beats {
             best_free = (s, PMbDecision::NearestMv(nearest));
         }
     }
     if let Some(s) = near_sad {
-        if s < best_free.0 {
+        let beats = if near != Mv::ZERO {
+            s < best_free.0 + NEIGHBOUR_OVER_ZERO_BIAS
+        } else {
+            s < best_free.0
+        };
+        if beats {
             best_free = (s, PMbDecision::NearMv(near));
         }
     }
@@ -3074,13 +3124,49 @@ fn choose_pmb_decision(
         PMbDecision::NearestMv(_) | PMbDecision::NearMv(_) => NEIGHBOUR_MV_MARGIN,
         _ => 0,
     };
-    let total_margin = NEWMV_SAD_MARGIN + extra_margin;
+    // Real-motion shortcut: when the refined NEW_MV is far from zero
+    // (genuine displacement, not a noisy sub-pel jitter) the residual
+    // savings on the larger MV easily amortise the delta-bit cost. Use
+    // a much smaller margin in that case so the picker doesn't fall
+    // back to ZERO_MV (and a useless residual) just because both
+    // candidates land at similar SAD against a heavily-quantised
+    // reference (#373).
+    let large_displacement = refined_mv.row.unsigned_abs() as i32
+        >= NEWMV_LARGE_DISPLACEMENT_THRESHOLD
+        || refined_mv.col.unsigned_abs() as i32 >= NEWMV_LARGE_DISPLACEMENT_THRESHOLD;
+    let new_vs_free_margin = if large_displacement {
+        NEWMV_LARGE_DISPLACEMENT_MARGIN + extra_margin
+    } else {
+        NEWMV_SAD_MARGIN + extra_margin
+    };
     let (mut best_decision, mut best_sad) =
-        if refined_sad + total_margin < best_free.0 && refined_mv != Mv::ZERO {
+        if refined_sad + new_vs_free_margin < best_free.0 && refined_mv != Mv::ZERO {
             (PMbDecision::NewMv(refined_mv), refined_sad)
         } else {
             (best_free.1, best_free.0)
         };
+
+    // 5.4) NEW_MV-to-neighbour snap: when the picker just chose NEW_MV
+    //      but the refined MV is within a quarter-pel jitter of an
+    //      available non-zero NEAREST or NEAR candidate, re-emit as
+    //      NEAREST / NEAR — same reconstruction (the predictor reads
+    //      the same sub-pel taps, modulo a tiny SAD difference) but
+    //      without paying the MV-delta bits. Keeps the neighbour-chain
+    //      coherent across rows of MBs that all share the same motion
+    //      and naturally find it via the per-MB integer search (#373).
+    if let PMbDecision::NewMv(mv) = best_decision {
+        if nearest != Mv::ZERO && mv_within_tolerance(mv, nearest, NEIGHBOUR_MV_SNAP_TOLERANCE) {
+            best_decision = PMbDecision::NearestMv(nearest);
+            if let Some(s) = nearest_sad {
+                best_sad = s;
+            }
+        } else if near != Mv::ZERO && mv_within_tolerance(mv, near, NEIGHBOUR_MV_SNAP_TOLERANCE) {
+            best_decision = PMbDecision::NearMv(near);
+            if let Some(s) = near_sad {
+                best_sad = s;
+            }
+        }
+    }
 
     // 5.5) SPLIT_MV: per-partition motion search, considered when the
     //      single-MV NEW_MV residual is still noticeable. Each of the 4
@@ -3116,6 +3202,16 @@ fn choose_pmb_decision(
     }
 
     best_decision
+}
+
+/// L∞ tolerance check on two MVs (1/8-pel units). Returns `true` when
+/// each component is within `tol` of the other. Used to detect when a
+/// refined NEW_MV essentially matches an available NEAREST / NEAR
+/// neighbour candidate so the picker can emit the cheaper neighbour
+/// mode instead of paying the MV-delta bit cost.
+#[inline]
+fn mv_within_tolerance(a: Mv, b: Mv, tol: i32) -> bool {
+    (a.row as i32 - b.row as i32).abs() <= tol && (a.col as i32 - b.col as i32).abs() <= tol
 }
 
 /// Sub-pel luma SAD: run `sixtap_predict` per 4×4 (matching the decoder's

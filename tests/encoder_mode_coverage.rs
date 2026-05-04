@@ -283,18 +283,13 @@ fn pframe_split_mv_all_partitionings_roundtrip() {
 /// NEAR_MV path on the second MB row when the right neighbour has a
 /// distinct MV from the top-left neighbour.
 ///
-/// Currently `#[ignore]`d: with this test's diagonal-stripe content
-/// `(row+col)*4 % 256` (period 64px) at QP=50, the SAD delta between
-/// NEW_MV(-4,-4) and ZERO_MV is below the encoder's RDO rate-cost
-/// threshold, so the encoder emits a ~66-byte SKIP-everywhere P-frame
-/// rather than the (-4,-4) global pan the docstring assumed. The
-/// resulting reconstruction is frame-0 verbatim, off by a constant
-/// luma offset of 32, giving PSNR ≈ 17.6 dB. Re-enable once the
-/// encoder's MV-search picks the obvious global pan even when the
-/// per-MB SAD margin is small (a bias toward neighbour-matching MVs
-/// would do it), or relax the threshold and pattern.
+/// Re-enabled in #373: the encoder's `choose_pmb_decision` now
+/// (a) picks NEW_MV with a tiny SAD margin once the refined MV is a
+/// real displacement (`large_displacement` shortcut) so the top row
+/// emits the (-4,-4) MV for every MB, and (b) biases NEAREST / NEAR
+/// over ZERO_MV by `NEIGHBOUR_OVER_ZERO_BIAS` when the neighbour MV
+/// is non-zero, propagating the chain to all subsequent rows.
 #[test]
-#[ignore = "encoder RDO picks SKIP over NEW_MV(-4,-4) on this high-freq content; see doc-comment"]
 fn pframe_near_mv_neighbour_chain_roundtrip() {
     const W: u32 = 64;
     const H: u32 = 64;

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* B_PRED is now a candidate in the intra-in-P fallback when
+  the source MB's Y-plane variance crosses
+  `INTRA_IN_P_BPRED_VARIANCE_THRESHOLD` (= the segment-3 boundary,
+  3200 × 256). Heavy-texture MBs that no single 16×16 mode predicts
+  well now fall back to the per-4×4 sub-mode search the keyframe path
+  already used (issue #339). The picker still requires B_PRED to clear
+  `B_PRED_SSE_MARGIN_INTRA_IN_P` (1024 SSE units across the MB) over
+  the best 16×16 candidate to be selected, so smooth content keeps
+  paying the cheaper 16×16 + DC chroma + Y2 short-cut.
+
 ### Changed
 
 - *(encoder)* RDO rate input now sourced from a real bool-coded bit

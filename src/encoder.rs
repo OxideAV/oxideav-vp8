@@ -1844,6 +1844,8 @@ fn encode_pframe_and_reconstruct(
                     y_buf_h,
                     mb_x,
                     mb_y,
+                    mb_w,
+                    mb_h,
                     nearest,
                     near,
                     &rec_y,
@@ -3007,6 +3009,8 @@ fn choose_pmb_decision(
     y_buf_h: usize,
     mb_x: usize,
     mb_y: usize,
+    mb_w: usize,
+    mb_h: usize,
     nearest: Mv,
     near: Mv,
     rec_y: &[u8],
@@ -3166,12 +3170,35 @@ fn choose_pmb_decision(
     // 6) intra fallback when even the best inter prediction is very poor —
     //    e.g. uncovered regions, mid-frame scene cuts, heavy texture.
     if best_sad > INTRA_IN_P_SAD_PER_PIXEL * (16 * 16) {
-        // Pick the best intra mode for this MB's Y plane against the
-        // reconstruction we have so far. B_PRED is skipped in the
-        // intra-in-P path — its bit cost outweighs the quality bump
-        // when the residual already dominates. Chroma uses DC_PRED
-        // for the same reason.
-        let y_mode = choose_intra_16x16_y_mode(src_y, rec_y, y_stride, mb_xp, mb_yp);
+        // Pick the best 16×16 intra Y mode (DC / V / H / TM) against the
+        // reconstruction we have so far. Chroma uses DC_PRED — the
+        // residual already dominates so the chroma bit cost isn't
+        // worth a four-way search.
+        let y16_mode = choose_intra_16x16_y_mode(src_y, rec_y, y_stride, mb_xp, mb_yp);
+
+        // #339: when the MB's Y-plane variance is high (heavy texture
+        // that the 16×16 modes can't capture in a single prediction),
+        // also evaluate B_PRED. The per-4×4 sub-mode search picks
+        // direction-aware sub-block predictions that often score
+        // significantly lower SSE on textured content. B_PRED costs
+        // extra bits (16 sub-mode bool emits + a separate per-block
+        // residual chain, no Y2 DC short-cut), so we only let it win
+        // when the SSE improvement clears `B_PRED_SSE_MARGIN_INTRA_IN_P`.
+        let y_mode = if mb_luma_variance(src_y, y_stride, mb_xp, mb_yp)
+            >= INTRA_IN_P_BPRED_VARIANCE_THRESHOLD
+        {
+            let (y16_sse, _) = sse_intra_16x16(y16_mode, src_y, rec_y, y_stride, mb_xp, mb_yp);
+            let (bp_sse, _bp_modes) =
+                sse_intra_b_pred(src_y, rec_y, y_stride, mb_xp, mb_yp, mb_w, mb_h);
+            if bp_sse + B_PRED_SSE_MARGIN_INTRA_IN_P < y16_sse {
+                B_PRED
+            } else {
+                y16_mode
+            }
+        } else {
+            y16_mode
+        };
+
         return PMbDecision::Intra {
             y_mode,
             uv_mode: DC_PRED,
@@ -3180,6 +3207,42 @@ fn choose_pmb_decision(
 
     best_decision
 }
+
+/// Variance of a 16×16 luma block, in summed-square units (E[x^2] - E[x]^2,
+/// not divided by `n`). Same scale as
+/// [`SEGMENT_VARIANCE_THRESHOLDS`], so callers can compare directly
+/// against the same threshold ladder.
+#[inline]
+fn mb_luma_variance(src_y: &[u8], y_stride: usize, mb_xp: usize, mb_yp: usize) -> u64 {
+    let mut sum: u64 = 0;
+    let mut sum2: u64 = 0;
+    for r in 0..16 {
+        let row_off = (mb_yp + r) * y_stride + mb_xp;
+        for c in 0..16 {
+            let v = src_y[row_off + c] as u64;
+            sum += v;
+            sum2 += v * v;
+        }
+    }
+    let n = 256u64;
+    sum2.saturating_sub((sum * sum) / n)
+}
+
+/// Variance threshold (in `mb_luma_variance` units) above which the
+/// intra-in-P picker also evaluates B_PRED in addition to the four
+/// 16×16 modes (#339). Picked at the same boundary as the segment-3
+/// variance gate (`SEGMENT_VARIANCE_THRESHOLDS[2]` =
+/// `3200 * 256 = 819_200`) so that any MB the segment classifier
+/// already flagged as "high variance" is also a B_PRED candidate.
+pub const INTRA_IN_P_BPRED_VARIANCE_THRESHOLD: u64 = 3200 * 256;
+
+/// Minimum SSE improvement (across the full 256-pixel MB) that
+/// B_PRED must show over the best 16×16 intra candidate to be picked
+/// in the *intra-in-P* path (#339). Tighter than the keyframe-path
+/// margin (`B_PRED_SSE_MARGIN`) since intra-in-P MBs already pay an
+/// extra `prob_intra` bit for crossing into the intra branch and the
+/// rate-vs-distortion balance is more sensitive than on keyframes.
+const B_PRED_SSE_MARGIN_INTRA_IN_P: u64 = 1024;
 
 /// L∞ tolerance check on two MVs (1/8-pel units). Returns `true` when
 /// each component is within `tol` of the other. Used to detect when a
@@ -6157,7 +6220,21 @@ mod tests {
 
         // First MB — no neighbour MVs yet, NEAREST cannot apply.
         let rec_y = vec![128u8; stride * h];
-        let d0 = choose_pmb_decision(&src, &refp, stride, h, 0, 0, Mv::ZERO, Mv::ZERO, &rec_y);
+        let mb_w = stride / 16;
+        let mb_h = h / 16;
+        let d0 = choose_pmb_decision(
+            &src,
+            &refp,
+            stride,
+            h,
+            0,
+            0,
+            mb_w,
+            mb_h,
+            Mv::ZERO,
+            Mv::ZERO,
+            &rec_y,
+        );
         assert!(
             matches!(d0, PMbDecision::NewMv(_)),
             "first MB should pick NEW_MV, got {:?}",
@@ -6168,7 +6245,19 @@ mod tests {
 
         // Second MB on the same row — neighbour chain now exposes
         // `first_mv` as `nearest`; NEAREST is free so it must win.
-        let d1 = choose_pmb_decision(&src, &refp, stride, h, 1, 0, first_mv, Mv::ZERO, &rec_y);
+        let d1 = choose_pmb_decision(
+            &src,
+            &refp,
+            stride,
+            h,
+            1,
+            0,
+            mb_w,
+            mb_h,
+            first_mv,
+            Mv::ZERO,
+            &rec_y,
+        );
         assert!(
             matches!(d1, PMbDecision::NearestMv(_)),
             "second MB should pick NEAREST_MV, got {:?}",
@@ -6182,7 +6271,21 @@ mod tests {
         let h = 32;
         let buf = vec![100u8; stride * h];
         // Identical source = reference → zero SAD → SKIP.
-        let d = choose_pmb_decision(&buf, &buf, stride, h, 0, 0, Mv::ZERO, Mv::ZERO, &buf);
+        let mb_w = stride / 16;
+        let mb_h = h / 16;
+        let d = choose_pmb_decision(
+            &buf,
+            &buf,
+            stride,
+            h,
+            0,
+            0,
+            mb_w,
+            mb_h,
+            Mv::ZERO,
+            Mv::ZERO,
+            &buf,
+        );
         assert!(matches!(d, PMbDecision::Skip), "got {:?}", d);
     }
 
@@ -6202,12 +6305,134 @@ mod tests {
             }
         }
         let rec_y = vec![128u8; stride * h];
-        let d = choose_pmb_decision(&src, &refp, stride, h, 0, 0, Mv::ZERO, Mv::ZERO, &rec_y);
+        let mb_w = stride / 16;
+        let mb_h = h / 16;
+        let d = choose_pmb_decision(
+            &src,
+            &refp,
+            stride,
+            h,
+            0,
+            0,
+            mb_w,
+            mb_h,
+            Mv::ZERO,
+            Mv::ZERO,
+            &rec_y,
+        );
         assert!(
             matches!(d, PMbDecision::Intra { .. }),
             "expected Intra fallback, got {:?}",
             d
         );
+    }
+
+    #[test]
+    fn choose_pmb_decision_picks_b_pred_on_high_variance_intra_in_p() {
+        // High-variance source MB (#339): the per-4x4 B_PRED sub-mode
+        // search should beat the four 16×16 modes by enough to clear
+        // `B_PRED_SSE_MARGIN_INTRA_IN_P`. Set up a 32×32 frame whose
+        // top-left MB is a high-frequency cross-hatched pattern that
+        // no single 16×16 mode predicts well, but whose 4×4 sub-blocks
+        // each have a clear local direction.
+        let stride = 32;
+        let h = 32;
+        // Reference: smooth mid-gray (forces intra fallback by making
+        // every inter SAD huge against the structured source).
+        let refp = vec![128u8; stride * h];
+        // Source: cross-hatched stripes — alternating rows of (32, 224)
+        // and columns of similar opposing pattern. Variance >> the
+        // segment-3 boundary; 16×16 V_PRED / H_PRED / DC_PRED can each
+        // fit *part* of the MB but not all of it.
+        let mut src = vec![0u8; stride * h];
+        for r in 0..h {
+            for c in 0..stride {
+                let bit_r = (r / 4) & 1;
+                let bit_c = (c / 4) & 1;
+                src[r * stride + c] = match (bit_r, bit_c) {
+                    (0, 0) => 32,
+                    (0, 1) => 224,
+                    (1, 0) => 224,
+                    _ => 32,
+                };
+            }
+        }
+        // Reconstruction context: smooth — forces B_PRED to predict
+        // from neighbour-aware sub-block context (the common case for
+        // an early-row MB).
+        let rec_y = vec![128u8; stride * h];
+        let mb_w = stride / 16;
+        let mb_h = h / 16;
+        let d = choose_pmb_decision(
+            &src,
+            &refp,
+            stride,
+            h,
+            0,
+            0,
+            mb_w,
+            mb_h,
+            Mv::ZERO,
+            Mv::ZERO,
+            &rec_y,
+        );
+        // The patterned MB has variance well above
+        // `INTRA_IN_P_BPRED_VARIANCE_THRESHOLD`, so the picker
+        // evaluates B_PRED. On this cross-hatched source the per-4x4
+        // search is the only way to reach a low SSE — so B_PRED must
+        // win.
+        assert!(
+            matches!(d, PMbDecision::Intra { y_mode, .. } if y_mode == B_PRED),
+            "expected B_PRED intra-in-P on heavy-texture MB, got {:?}",
+            d
+        );
+    }
+
+    #[test]
+    fn choose_pmb_decision_keeps_16x16_intra_on_smooth_mb() {
+        // Low-variance source MB — under
+        // `INTRA_IN_P_BPRED_VARIANCE_THRESHOLD`, the picker must skip
+        // the B_PRED branch entirely (cost is in `predict_4x4` × 16 +
+        // `bool_cost_x256` × 16). Use a moderately-detailed but
+        // sub-threshold source so we still hit the intra-in-P path
+        // (i.e. inter SAD is high enough to fall back to intra) but
+        // B_PRED is NOT considered.
+        let stride = 32;
+        let h = 32;
+        let refp = vec![128u8; stride * h];
+        // Mid-grey with a slight gradient — variance high enough to
+        // make inter SAD huge against the flat reference, but well
+        // below `INTRA_IN_P_BPRED_VARIANCE_THRESHOLD`.
+        let mut src = vec![0u8; stride * h];
+        for r in 0..h {
+            for c in 0..stride {
+                src[r * stride + c] = (50 + r as u32 + c as u32 / 4).min(150) as u8;
+            }
+        }
+        let rec_y = vec![128u8; stride * h];
+        let mb_w = stride / 16;
+        let mb_h = h / 16;
+        let d = choose_pmb_decision(
+            &src,
+            &refp,
+            stride,
+            h,
+            0,
+            0,
+            mb_w,
+            mb_h,
+            Mv::ZERO,
+            Mv::ZERO,
+            &rec_y,
+        );
+        if let PMbDecision::Intra { y_mode, .. } = d {
+            assert!(
+                y_mode != B_PRED,
+                "low-variance MB must not pick B_PRED intra-in-P, got y_mode={y_mode}"
+            );
+        } else {
+            panic!("expected Intra fallback, got {:?}", d);
+        }
     }
 
     #[test]

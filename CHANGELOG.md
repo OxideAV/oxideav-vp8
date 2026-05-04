@@ -39,6 +39,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(decoder, encoder)* `MB_SPLIT_TREE` (RFC 6386 §16.3 `split_mv_tree`)
+  had three of its four leaf positions transcribed wrong: the bit-`10`
+  path returned `MB_SPLIT_16X8` instead of `MB_SPLIT_QUARTERS`, bit-`110`
+  returned `MB_SPLIT_8X16` instead of `MB_SPLIT_16X8`, and bit-`111`
+  returned `MB_SPLIT_QUARTERS` instead of `MB_SPLIT_8X16` (only bit-`0`
+  → `MB_SPLIT_4X4` was correct, since `4x4` is the false-branch leaf at
+  the root). The matching `emit_split_mb_tree` in the encoder used the
+  same swapped table so encoder→decoder roundtrips on our own bitstream
+  worked, masking the bug. Spec-encoded P-frames whose mode tree picked
+  SPLITMV (every multi-frame ReportOnly fixture) had the entire mb_y
+  row containing the first SPLITMV MB decoded against a different
+  partition than the encoder used, which then mis-aligned the bool
+  decoder for every following MB on that row because
+  `MB_SPLIT_COUNT[wrong_mode] != MB_SPLIT_COUNT[real_mode]` — a
+  different number of sub-MV ref trees got read. Brings
+  `i-frame-then-p-frame-64x64` from 88.57% → 96.98%,
+  `golden-update-cycle` from 93.23% → 96.59%, `altref-arnr-on` from
+  82.31% → 90.36%; max Y diff drops from 196 / 171 / 208 to 6 / 11 /
+  99 respectively. `small-roi-segmentation` is unchanged at 41.92%
+  (independent root cause downstream of segmentation's per-segment
+  qindex application).
 - *(decoder)* loop-filter `ref_deltas` and `mode_deltas` now persist
   across frames (RFC 6386 §9.4). When `mode_ref_lf_delta_update` is 0
   or only some per-element present flags are set, the decoder keeps the

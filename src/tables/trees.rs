@@ -135,13 +135,35 @@ pub const MV_REF_TREE: [i8; 8] = [
 ];
 
 /// MV split mode tree (§16.3 `mb_split_tree`).
+///
+/// RFC 6386 §16.3 / §20.13 `split_mv_tree`:
+///
+/// ```c
+/// static const int split_mv_tree[6] = {
+///     -3, 2,      /* "0"   = leaf 3 = 4x4 */
+///     -2, 4,      /* "10"  = leaf 2 = 8x8 quarters */
+///     -0, -1      /* "110" = leaf 0 = 16x8;  "111" = leaf 1 = 8x16 */
+/// };
+/// ```
+///
+/// Earlier versions of this table had the inner three leaves shifted:
+/// `[-3, 2, -0, 4, -1, -2]` — a transcription that swapped the bit-`10`
+/// branch from QUARTERS to 16X8, the bit-`110` branch from 16X8 to 8X16,
+/// and the bit-`111` branch from 8X16 to QUARTERS. That mis-coding only
+/// surfaces in P-frames whose mode tree actually exercises SPLITMV: the
+/// decoder picked a 16X8/8X16/QUARTERS partition when the bitstream
+/// encoded a different one, then read the wrong number of sub-MV-ref
+/// trees because [`MB_SPLIT_COUNT`] disagreed with the partition the
+/// encoder had used. The mis-aligned bool decoder corrupted every
+/// downstream MB on the same row (mb_y=3 in the 64×64 ReportOnly
+/// fixtures), which is exactly the symptom round-28 was tracking.
 pub const MB_SPLIT_TREE: [i8; 6] = [
-    -MB_SPLIT_4X4 as i8,
+    -MB_SPLIT_4X4 as i8, // bit 0   → leaf 3 (4x4)
     2,
-    -MB_SPLIT_16X8 as i8,
+    -MB_SPLIT_QUARTERS as i8, // bit 10  → leaf 2 (8x8)
     4,
-    -MB_SPLIT_8X16 as i8,
-    -MB_SPLIT_QUARTERS as i8,
+    -MB_SPLIT_16X8 as i8, // bit 110 → leaf 0 (16x8)
+    -MB_SPLIT_8X16 as i8, // bit 111 → leaf 1 (8x16)
 ];
 
 /// Sub-MV reference tree — RFC 6386 §16.3 `sub_mv_ref_tree`.

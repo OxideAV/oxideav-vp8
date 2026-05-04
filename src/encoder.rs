@@ -5094,6 +5094,27 @@ fn emit_tree_path(enc: &mut BoolEncoder, path: &[(u8, bool)], probs: &[u8]) {
 }
 
 /// Emit the mb-split-tree leaf.
+///
+/// RFC 6386 §16.3 / §20.13 `split_mv_tree`:
+///
+/// ```c
+/// static const int split_mv_tree[6] = {
+///     -3, 2,    /* "0"   = leaf 3 = 4x4 */
+///     -2, 4,    /* "10"  = leaf 2 = 8x8 (quarters) */
+///     -0, -1    /* "110" = leaf 0 = 16x8;  "111" = leaf 1 = 8x16 */
+/// };
+/// ```
+///
+/// So the 4 split modes map to bit codes:
+/// * `MB_SPLIT_4X4`      (= 3) → "0"   (1 bit)
+/// * `MB_SPLIT_QUARTERS` (= 2) → "10"  (2 bits)
+/// * `MB_SPLIT_16X8`     (= 0) → "110" (3 bits)
+/// * `MB_SPLIT_8X16`     (= 1) → "111" (3 bits)
+///
+/// The earlier mapping (16X8 → "10", 8X16 → "110", QUARTERS → "111")
+/// agreed with the decoder's MB_SPLIT_TREE bug (both swapped the same
+/// way) so encoder→decoder roundtrips on our own bitstream worked, but
+/// produced bitstreams a spec-correct decoder would mis-parse.
 fn emit_split_mb_tree(enc: &mut BoolEncoder, split_mode: u8) {
     let p = &MBSPLIT_PROBS;
     match split_mode {
@@ -5101,19 +5122,19 @@ fn emit_split_mb_tree(enc: &mut BoolEncoder, split_mode: u8) {
         3 => {
             enc.write_bool(p[0] as u32, false);
         }
-        // MB_SPLIT_16X8 = 0 → path: true, false.
-        0 => {
+        // MB_SPLIT_QUARTERS = 2 → path: true, false.
+        2 => {
             enc.write_bool(p[0] as u32, true);
             enc.write_bool(p[1] as u32, false);
         }
-        // MB_SPLIT_8X16 = 1 → path: true, true, false.
-        1 => {
+        // MB_SPLIT_16X8 = 0 → path: true, true, false.
+        0 => {
             enc.write_bool(p[0] as u32, true);
             enc.write_bool(p[1] as u32, true);
             enc.write_bool(p[2] as u32, false);
         }
-        // MB_SPLIT_QUARTERS = 2 → path: true, true, true.
-        2 => {
+        // MB_SPLIT_8X16 = 1 → path: true, true, true.
+        1 => {
             enc.write_bool(p[0] as u32, true);
             enc.write_bool(p[1] as u32, true);
             enc.write_bool(p[2] as u32, true);

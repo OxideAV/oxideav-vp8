@@ -183,24 +183,36 @@ ReportOnly fixtures track residual loopfilter rounding ±1 / inter-
 frame chain accumulation; each is tagged `TODO(vp8-corpus)` in the
 test source.
 
-Round-24 deltas (this round, see CHANGELOG): IDCT pass-order, Y2
-DC-step uncap, loopfilter formula + per-MB iteration, encoder TL-
-pixel defaults swap. Net pixel-match improvement:
+Round-28 delta (this round, see CHANGELOG): RFC 6386 §16.3
+`split_mv_tree` had three of its four leaves transcribed in the wrong
+slots — the bit-`10` branch decoded as 16x8 instead of 8x8 quarters,
+bit-`110` as 8x16 instead of 16x8, bit-`111` as quarters instead of
+8x16. The encoder used the same swapped emit table, so our own
+encode/decode roundtrips passed; spec-encoded P-frames that exercised
+SPLITMV (every multi-frame ReportOnly fixture) corrupted the entire
+mb_y row containing the first SPLITMV MB — the decoder picked a
+different partition than the encoder used and read the wrong number
+of sub-MV ref trees, mis-aligning the bool decoder for every
+following MB on the row. Net pixel-match improvement:
 
 | Fixture | Was | Now |
 | --- | --- | --- |
-| `q-low` | 86.91% | **100.00%** (BitExact) |
-| `segment-4-partitions` | (ReportOnly) | **100.00%** (BitExact) |
-| `i-only-64x64` | 92.94% | 98.49% |
-| `webm-mux-vs-ivf-ivf` | 92.94% | 98.49% |
-| `vp8-with-loopfilter-mode-simple` | 61.02% | 96.73% |
-| `gradient-and-noise-128x128` | 89.44% | 93.25% |
-| `golden-update-cycle` | 82.86% | 92.03% |
-| `i-frame-then-p-frame-64x64` | 84.96% | 89.58% |
-| `altref-arnr-on` | 79.07% | 83.12% |
-| `i-only-loopfilter-high` | 40.72% | 72.71% |
-| `q-high` | 12.56% | 65.83% |
-| `small-roi-segmentation` | 22.96% | 32.66% |
+| `i-frame-then-p-frame-64x64` | 88.57% | **96.98%** (Y max diff 196 → 6) |
+| `golden-update-cycle` | 93.23% | **96.59%** (Y max diff 171 → 11) |
+| `altref-arnr-on` | 82.31% | **90.36%** (Y max diff 208 → 99) |
+| `small-roi-segmentation` | 41.91% | 41.92% (independent root cause) |
+
+11 BitExact fixtures (every keyframe-only fixture) remain at 100% and
+unchanged; SPLITMV is only reached in the 4 ReportOnly P-frame
+fixtures. The remaining 3-9% gap on the 3 fixed fixtures is small
+loopfilter / sub-pel MC residue downstream of mode decode, not the
+mode tree itself; max Y diff is now in the single digits except for
+altref-arnr-on (max 99 from one cluster of frames 7-9 that exercise
+ARNR temporal filtering on the alt-ref hidden frame).
+
+Round-24 deltas (previous round, see CHANGELOG): IDCT pass-order, Y2
+DC-step uncap, loopfilter formula + per-MB iteration, encoder TL-
+pixel defaults swap.
 
 ## Quick use
 

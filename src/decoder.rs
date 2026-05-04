@@ -779,6 +779,12 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
         state.probs.mb_skip_prob = header.mb_skip_prob;
         state.probs.mb_skip_enabled = header.mb_skip_enabled;
     }
+    // Loop-filter ref/mode deltas persist across frames REGARDLESS of
+    // `refresh_entropy_probs` — they're a separate carry-over state per
+    // RFC 6386 §9.4 (`mode_ref_lf_delta_update`). Stash whatever the
+    // current frame ended up with so the next frame's parse can inherit.
+    state.probs.ref_deltas = header.loop_filter.ref_deltas;
+    state.probs.mode_deltas = header.loop_filter.mode_deltas;
 
     // Crop.
     let mut y_out = vec![0u8; width * height];

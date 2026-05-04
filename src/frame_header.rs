@@ -122,7 +122,9 @@ pub fn parse_keyframe_header(d: &mut BoolDecoder<'_>) -> Result<FrameHeader> {
     let clamping_type = d.read_literal(1) as u8;
 
     let segmentation = parse_segmentation(d, FrameType::Key)?;
-    let loop_filter = parse_loop_filter(d)?;
+    // Keyframes reset all persistent loop-filter deltas to zero per
+    // RFC 6386 §9.4 ("the loop filter deltas are reset for keyframes").
+    let loop_filter = parse_loop_filter(d, [0; 4], [0; 4])?;
     let log2_nb_partitions = d.read_literal(2) as u8;
     let quant = parse_quant(d)?;
     // Keyframe — refresh_entropy_probs only: no refresh_last/refresh_golden flags.
@@ -168,6 +170,15 @@ pub fn parse_keyframe_header(d: &mut BoolDecoder<'_>) -> Result<FrameHeader> {
 /// Probabilistic decoder state that carries over between frames.
 /// Keyframes reset the state to defaults; non-keyframes optionally
 /// update it in-place when `refresh_entropy_probs` is set.
+///
+/// Loop-filter `ref_deltas` and `mode_deltas` (RFC 6386 §9.4) also
+/// live here even though they're not part of the entropy-coder state.
+/// The bitstream signals `mode_ref_lf_delta_update = 0` to mean
+/// "keep the previous frame's deltas verbatim" — our parser needs to
+/// pull from this carry-over state on those frames, otherwise every
+/// P-frame (and every keyframe whose `mode_ref_delta_update` happens
+/// to be 0) would zero them out and the per-MB filter level would
+/// diverge by the per-mode/per-ref delta.
 #[derive(Clone, Debug)]
 pub struct PersistentProbs {
     pub coef_probs: CoeffProbs,
@@ -176,6 +187,12 @@ pub struct PersistentProbs {
     pub mv_context: [MvContext; 2],
     pub mb_skip_prob: u8,
     pub mb_skip_enabled: bool,
+    /// Persistent `loop_filter.ref_deltas` / `mode_deltas`. Updated
+    /// when the new frame signals `mode_ref_lf_delta_update = 1` (and
+    /// the per-element "present" flag is set); otherwise carried over
+    /// verbatim from the previous frame.
+    pub ref_deltas: [i32; 4],
+    pub mode_deltas: [i32; 4],
 }
 
 impl PersistentProbs {
@@ -187,6 +204,8 @@ impl PersistentProbs {
             mv_context: DEFAULT_MV_CONTEXT,
             mb_skip_prob: 255,
             mb_skip_enabled: false,
+            ref_deltas: [0; 4],
+            mode_deltas: [0; 4],
         }
     }
 }
@@ -196,7 +215,9 @@ impl PersistentProbs {
 /// `probs` supplies the persistent entropy state from the previous frame.
 pub fn parse_inter_header(d: &mut BoolDecoder<'_>, probs: &PersistentProbs) -> Result<FrameHeader> {
     let segmentation = parse_segmentation(d, FrameType::Inter)?;
-    let loop_filter = parse_loop_filter(d)?;
+    // Pull the carried-over loop-filter deltas out of persistent state
+    // (RFC 6386 §9.4 — they survive across frames between updates).
+    let loop_filter = parse_loop_filter(d, probs.ref_deltas, probs.mode_deltas)?;
     let log2_nb_partitions = d.read_literal(2) as u8;
     let quant = parse_quant(d)?;
 
@@ -326,12 +347,36 @@ fn parse_segmentation(d: &mut BoolDecoder<'_>, _ft: FrameType) -> Result<Segment
     Ok(s)
 }
 
-fn parse_loop_filter(d: &mut BoolDecoder<'_>) -> Result<LoopFilterHeader> {
+/// Parse the loop-filter block of a frame header.
+///
+/// `prev_ref_deltas` / `prev_mode_deltas` carry the post-update
+/// values from the previous frame — RFC 6386 §9.4 specifies that:
+///
+/// 1. When `mode_ref_lf_delta_update = 0`, the deltas keep the
+///    previous frame's values exactly (fresh-default zeros if no
+///    earlier frame ever set them).
+/// 2. When `mode_ref_lf_delta_update = 1`, each delta has a 1-bit
+///    "present" flag. A flag of 0 means "keep the previous value"
+///    (NOT "reset to zero"). Only entries with the present flag set
+///    consume a 6-bit signed magnitude.
+///
+/// Both behaviours are needed to match libvpx / RFC: a P-frame that
+/// inherits the keyframe's deltas without re-signalling them must see
+/// the same per-MB level after the per-mode / per-ref delta is added.
+fn parse_loop_filter(
+    d: &mut BoolDecoder<'_>,
+    prev_ref_deltas: [i32; 4],
+    prev_mode_deltas: [i32; 4],
+) -> Result<LoopFilterHeader> {
     let mut lf = LoopFilterHeader::default();
     lf.filter_type = d.read_literal(1) as u8;
     lf.level = d.read_literal(6) as u8;
     lf.sharpness = d.read_literal(3) as u8;
     lf.mode_ref_delta_enabled = d.read_bool(128);
+    // Seed with the carried-over deltas; the update path below only
+    // overwrites entries whose per-element present flag is 1.
+    lf.ref_deltas = prev_ref_deltas;
+    lf.mode_deltas = prev_mode_deltas;
     if lf.mode_ref_delta_enabled {
         lf.mode_ref_delta_update = d.read_bool(128);
         if lf.mode_ref_delta_update {

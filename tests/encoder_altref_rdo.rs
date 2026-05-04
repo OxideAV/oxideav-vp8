@@ -145,6 +145,7 @@ fn refresh_flags_follow_plan() {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,
@@ -207,6 +208,7 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         enable_multi_ref: false,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,
@@ -257,6 +259,7 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,
@@ -315,6 +318,7 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         enable_multi_ref: false,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,
@@ -343,6 +347,7 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,
@@ -444,6 +449,7 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,
@@ -505,6 +511,7 @@ fn legacy_single_ref_path_still_works() {
         enable_multi_ref: false,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection to keep these existing tests'
         // refresh / keyframe cadence bit-exact with the pre-#166 baseline.
         enable_scene_cut: false,

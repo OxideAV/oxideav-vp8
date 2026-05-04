@@ -25,7 +25,8 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS,
+    DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::frame_header::{parse_inter_header, parse_keyframe_header, PersistentProbs};
 use oxideav_vp8::{parse_header, FrameType};
@@ -148,6 +149,7 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Disable scene-cut detection: this fixture is randomised
         // pseudo-noise that would otherwise trip the cut detector and
         // change the keyframe / size accounting these tests pin.
@@ -175,6 +177,7 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_multi_ref: true,
         enable_segments: true,
         segment_quant_deltas: DEFAULT_SEGMENT_QUANT_DELTAS,
+        segment_lf_deltas: DEFAULT_SEGMENT_LF_DELTAS,
         enable_scene_cut: false,
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
@@ -204,6 +207,10 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         // step up to coarser quants (saves bits where texture masks the
         // loss).
         segment_quant_deltas: [0, 2, 6, 12],
+        // Pin LF deltas off so the existing 5%-savings regression
+        // pins purely the quant-delta savings path. The DEFAULT
+        // (`[-2, -1, 0, +2]`) is exercised by `cfg_with_segments`.
+        segment_lf_deltas: [0; 4],
         enable_scene_cut: false,
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,
@@ -253,6 +260,63 @@ fn frame_headers_signal_segments_on() {
         assert_eq!(
             h.segmentation.quant, DEFAULT_SEGMENT_QUANT_DELTAS,
             "frame {i} per-segment quant deltas mismatch"
+        );
+        // Per-segment loop-filter deltas (#337) must match the
+        // encoder's configured per-segment LF schedule. With the
+        // defaults (`[-2, -1, 0, +2]`) smooth segments take a softer
+        // filter and high-variance segments take a stronger one.
+        assert_eq!(
+            h.segmentation.lf, DEFAULT_SEGMENT_LF_DELTAS,
+            "frame {i} per-segment loop-filter deltas mismatch"
+        );
+    }
+}
+
+/// Per-segment loop-filter deltas (#337): an explicit non-zero
+/// `segment_lf_deltas` must round-trip through the segmentation block
+/// of the frame header into the decoder's `LoopFilterHeader.lf` array.
+/// This pins both the encoder bool-coded emit (`emit_segmentation_header`)
+/// and the decoder parser (`parse_segmentation`) on the same per-segment
+/// LF wire format.
+#[test]
+fn frame_headers_carry_segment_lf_deltas() {
+    let clip = make_mixed_clip(3);
+    let custom_lf: [i32; 4] = [-3, 0, 1, 5];
+    let cfg = Vp8EncoderConfig {
+        qindex: QINDEX,
+        golden_interval: DEFAULT_GOLDEN_INTERVAL,
+        alt_ref_interval: DEFAULT_ALT_REF_INTERVAL,
+        enable_rdo: true,
+        lambda_scale: 218,
+        enable_multi_ref: true,
+        enable_segments: true,
+        segment_quant_deltas: DEFAULT_SEGMENT_QUANT_DELTAS,
+        segment_lf_deltas: custom_lf,
+        enable_scene_cut: false,
+        scene_cut_threshold: 0.0,
+        scene_cut_quant_boost: 0,
+        scene_cut_boost_frames: 0,
+        enable_lookahead_altref: false,
+        lookahead_window: 0,
+        loop_filter_mode: LoopFilterMode::Auto,
+        simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    };
+    let packets = encode_clip(cfg, &clip);
+    let probs = PersistentProbs::defaults();
+    use oxideav_vp8::bool_decoder::BoolDecoder;
+    for (i, pkt) in packets.iter().enumerate() {
+        let parsed = parse_header(pkt).expect("hdr");
+        let body = &pkt[parsed.compressed_offset..];
+        let mut bd = BoolDecoder::new(body).expect("bd");
+        let h = match parsed.tag.frame_type {
+            FrameType::Key => parse_keyframe_header(&mut bd).expect("kf"),
+            FrameType::Inter => parse_inter_header(&mut bd, &probs).expect("inter"),
+        };
+        assert!(h.segmentation.enabled, "frame {i} not segmented");
+        assert_eq!(
+            h.segmentation.lf, custom_lf,
+            "frame {i} per-segment LF deltas mismatch (wanted {custom_lf:?}, got {:?})",
+            h.segmentation.lf
         );
     }
 }

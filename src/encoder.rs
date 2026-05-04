@@ -235,6 +235,22 @@ pub const LAMBDA_SCALE_DEFAULT: u32 = 218; // ≈ 0.85 * 256
 /// on top of `header.quant.y_ac_qi`.
 pub const DEFAULT_SEGMENT_QUANT_DELTAS: [i32; 4] = [-8, -4, 0, 4];
 
+/// Default per-segment loop-filter level deltas applied to the frame-level
+/// `loop_filter.level` when segmentation is enabled (RFC 6386 §10 + §15.2).
+/// Indexed by segment id 0..=3 the same way `DEFAULT_SEGMENT_QUANT_DELTAS`
+/// is — the variance classifier lands smooth content in segment 0 and
+/// high-variance content in segment 3.
+///
+/// Smooth segments take a *negative* LF delta (a softer filter — smooth
+/// regions don't blocky-artefact and over-filtering would just smear
+/// fine detail). High-variance segments take a *positive* LF delta (a
+/// stronger filter — coarse-quantised textured MBs benefit from a wider
+/// deblocking pass to mask the per-MB DCT block boundaries that the
+/// extra QP step exposes). The decoder applies the delta as
+/// `clamp(frame_level + delta, 0..=63)` per-MB via
+/// `per_mb_filter_level`. Bitstream `abs_delta = 0`.
+pub const DEFAULT_SEGMENT_LF_DELTAS: [i32; 4] = [-2, -1, 0, 2];
+
 /// Variance bucket boundaries (luma, summed-square units per MB) that map
 /// each MB to a segment id. A 16×16 MB has 256 pixels so a per-pixel
 /// variance of `v_pp` corresponds to `v_pp * 256` in this metric. Picked
@@ -379,6 +395,17 @@ pub struct Vp8EncoderConfig {
     /// `[-8, -4, 0, +4]` gives smooth regions higher quality and
     /// high-variance regions a coarser quant to save bits.
     pub segment_quant_deltas: [i32; 4],
+    /// Per-segment loop-filter level deltas (segment id 0..=3) used when
+    /// `enable_segments` is `true`. Applied to the frame-level
+    /// `loop_filter.level` per-MB via `clamp(level + delta, 0..=63)`,
+    /// so e.g. `[-2, -1, 0, +2]` softens the deblocking pass on smooth
+    /// content (avoiding over-smoothing) and strengthens it on
+    /// high-variance content (masking DCT block boundaries exposed by
+    /// the coarser per-segment quantiser). The deltas are emitted in
+    /// the segmentation block of the frame header with `abs_delta = 0`
+    /// and decoded by `per_mb_filter_level`. Set every entry to `0` to
+    /// fall back to a single frame-wide filter level.
+    pub segment_lf_deltas: [i32; 4],
     /// Enable the per-frame scene-cut detector. When `true` each
     /// incoming source frame's mean-absolute-difference (MAD) versus
     /// the previous source frame is compared against the running mean
@@ -445,6 +472,7 @@ impl Default for Vp8EncoderConfig {
             enable_multi_ref: true,
             enable_segments: true,
             segment_quant_deltas: DEFAULT_SEGMENT_QUANT_DELTAS,
+            segment_lf_deltas: DEFAULT_SEGMENT_LF_DELTAS,
             enable_scene_cut: true,
             scene_cut_threshold: DEFAULT_SCENE_CUT_THRESHOLD,
             scene_cut_quant_boost: DEFAULT_SCENE_CUT_QUANT_BOOST,
@@ -1442,6 +1470,8 @@ fn encode_keyframe_and_reconstruct_with_config(
         lf_sharpness,
         lf_filter_type,
         &mb_encoded,
+        &mb_segment_ids,
+        &segments,
         true, // keyframe
     );
 
@@ -2021,6 +2051,8 @@ fn encode_pframe_and_reconstruct(
         lf_sharpness,
         lf_filter_type,
         &mb_encoded,
+        &mb_segment_ids,
+        &segments,
         false, // P-frame
     );
 
@@ -3647,6 +3679,12 @@ struct SegmentCtx {
     /// Per-segment qindex delta added to the frame-level `qindex`. Sent
     /// in the segmentation header with `abs_delta = false`.
     quant_deltas: [i32; 4],
+    /// Per-segment loop-filter level delta added to the frame-level
+    /// `loop_filter.level`. Sent alongside `quant_deltas` in the
+    /// segmentation block (also with `abs_delta = false`) and applied
+    /// per-MB by both the encoder's `apply_loop_filter_enc` and the
+    /// decoder's `per_mb_filter_level`.
+    lf_deltas: [i32; 4],
 }
 
 impl SegmentCtx {
@@ -3666,6 +3704,7 @@ impl SegmentCtx {
                 enabled: true,
                 quant_ctx: q,
                 quant_deltas: config.segment_quant_deltas,
+                lf_deltas: config.segment_lf_deltas,
             }
         } else {
             let q = QuantCtx::for_qindex(base_qi);
@@ -3673,12 +3712,26 @@ impl SegmentCtx {
                 enabled: false,
                 quant_ctx: [q, q, q, q],
                 quant_deltas: [0; 4],
+                lf_deltas: [0; 4],
             }
         }
     }
 
     fn quant_for(&self, segment_id: u8) -> &QuantCtx {
         &self.quant_ctx[(segment_id as usize) & 3]
+    }
+
+    /// Per-MB loop-filter level after applying the per-segment LF delta
+    /// (RFC 6386 §15.2; matches the decoder's `per_mb_filter_level`
+    /// when `mode_ref_delta_enabled = 0`, which is what the encoder
+    /// always emits). When segmentation is disabled this returns
+    /// `frame_level` unchanged regardless of `segment_id`.
+    fn filter_level_for(&self, segment_id: u8, frame_level: u8) -> u8 {
+        if !self.enabled {
+            return frame_level;
+        }
+        let delta = self.lf_deltas[(segment_id as usize) & 3];
+        ((frame_level as i32) + delta).clamp(0, 63) as u8
     }
 }
 
@@ -3775,9 +3828,21 @@ fn emit_segmentation_header(enc: &mut BoolEncoder, seg: &SegmentCtx, tree_probs:
             enc.write_bool(128, false);
         }
     }
-    // 4 per-segment loop-filter deltas, all zero in this encoder.
-    for _ in 0..4 {
-        enc.write_bool(128, false);
+    // 4 per-segment loop-filter deltas (each preceded by a 1-bit
+    // "present" flag, matching the decoder's `parse_segmentation`
+    // walk in `frame_header.rs`). Smooth segments take a negative
+    // delta to soften the filter; high-variance segments take a
+    // positive delta to mask the per-MB DCT block boundaries that the
+    // coarser per-segment quant exposes. Encoded as a 6-bit signed
+    // literal per RFC 6386 §10.
+    for i in 0..4 {
+        let v = seg.lf_deltas[i];
+        if v != 0 {
+            enc.write_bool(128, true);
+            enc.write_signed_literal(6, v);
+        } else {
+            enc.write_bool(128, false);
+        }
     }
     // tree_probs (3 entries). 255 (= "default") is the encoder's
     // sentinel for "no override"; we always send explicit probs since
@@ -5593,6 +5658,15 @@ fn encode_inter_mb_split(
 ///
 /// `filter_type`: 0 = normal (6-pixel filter on luma + chroma at every
 /// edge); 1 = simple (4-pixel luma-only filter, chroma untouched).
+///
+/// `frame_level` is the frame-wide loop-filter level (the value that
+/// will be emitted in the loop-filter header). When segmentation is
+/// enabled the per-MB level is derived as
+/// `clamp(frame_level + segment_lf_deltas[seg], 0..=63)` to match the
+/// decoder's `per_mb_filter_level` walk; when disabled the per-MB
+/// level is always `frame_level`. A per-MB level of 0 skips that MB
+/// entirely (matches the decoder's `if mb_level == 0 { continue; }`
+/// fast-path).
 #[allow(clippy::too_many_arguments)]
 fn apply_loop_filter_enc(
     y_plane: &mut [u8],
@@ -5604,23 +5678,33 @@ fn apply_loop_filter_enc(
     uv_buf_h: usize,
     mb_w: usize,
     mb_h: usize,
-    level: u8,
+    frame_level: u8,
     sharpness: u8,
     filter_type: u8,
     mb_encoded: &[MbEncoded],
+    mb_segment_ids: &[u8],
+    segments: &SegmentCtx,
     key_frame: bool,
 ) {
-    if level == 0 {
+    if frame_level == 0 {
         return;
     }
-    let params_mb = FilterParams::for_mb_typed(level, sharpness, true, key_frame);
-    let params_sb = FilterParams::for_mb_typed(level, sharpness, false, key_frame);
     let simple = filter_type == 1;
     for mb_y in 0..mb_h {
         let y0 = mb_y * 16;
         let y0c = mb_y * 8;
         for mb_x in 0..mb_w {
-            let mb = &mb_encoded[mb_y * mb_w + mb_x];
+            let mb_idx = mb_y * mb_w + mb_x;
+            let mb = &mb_encoded[mb_idx];
+            // Per-MB filter level (segmentation-aware). 0 → skip this MB
+            // entirely so the encoder reconstruction matches what the
+            // decoder will produce when `per_mb_filter_level` clamps to 0.
+            let mb_level = segments.filter_level_for(mb_segment_ids[mb_idx], frame_level);
+            if mb_level == 0 {
+                continue;
+            }
+            let params_mb = FilterParams::for_mb_typed(mb_level, sharpness, true, key_frame);
+            let params_sb = FilterParams::for_mb_typed(mb_level, sharpness, false, key_frame);
             let filter_subblocks = mb.has_coeffs || mb.y_mode == B_PRED || mb.y_mode == SPLIT_MV;
             let x = mb_x * 16;
             let xc = mb_x * 8;

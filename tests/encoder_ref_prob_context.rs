@@ -95,6 +95,7 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         // Pin pre-#166 cadence (no scene-cut detection) so this test's
         // ref-frame distribution accounting stays bit-exact.
         enable_scene_cut: false,

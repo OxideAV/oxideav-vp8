@@ -165,6 +165,7 @@ fn baseline_cfg(alt_ref_interval: u32) -> Vp8EncoderConfig {
         enable_multi_ref: true,
         enable_segments: false,
         segment_quant_deltas: [0; 4],
+        segment_lf_deltas: [0; 4],
         enable_scene_cut: false,
         scene_cut_threshold: 0.0,
         scene_cut_quant_boost: 0,

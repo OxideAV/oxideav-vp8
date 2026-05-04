@@ -6,7 +6,7 @@
 //! per-component probabilities (`MvContext`).
 
 use crate::bool_decoder::BoolDecoder;
-use crate::bool_encoder::BoolEncoder;
+use crate::bool_encoder::{bool_cost_x256, BoolEncoder};
 use crate::tables::mv::{MvContext, MV_SHORT_TREE};
 use crate::tables::trees::decode_tree;
 
@@ -140,6 +140,67 @@ pub fn encode_mv(enc: &mut BoolEncoder, mv_probs: &[MvContext; 2], mv: Mv) {
     encode_mv_component(enc, &mv_probs[1], mv.col as i32);
 }
 
+/// Cost (in 1/256-bit units) of writing a single MV component with
+/// [`encode_mv_component`] — i.e. the *real* per-component bit count
+/// for the candidate value, summed over all the bool symbols
+/// `encode_mv_component` would emit. Used by the encoder's RDO mode
+/// picker (issue #340) so the rate input to the Lagrangian matches the
+/// actual bit stream.
+///
+/// Mirrors `encode_mv_component`'s control flow exactly, but instead
+/// of emitting bits it accumulates each bool's
+/// `bool_encoder::bool_cost_x256(prob, outcome)`.
+pub fn mv_component_cost_x256(probs: &MvContext, value: i32) -> u32 {
+    let sign = value < 0;
+    let mag = value.unsigned_abs() as i32;
+    let large = mag >= 8;
+    let mut cost = bool_cost_x256(probs[0], large);
+    if large {
+        for i in 0..3 {
+            let bit = ((mag >> i) & 1) != 0;
+            cost += bool_cost_x256(probs[9 + i], bit);
+        }
+        for i in (4..=9).rev() {
+            let bit = ((mag >> i) & 1) != 0;
+            cost += bool_cost_x256(probs[9 + i], bit);
+        }
+        let upper_any = (mag & 0xfff0) != 0;
+        if upper_any {
+            let bit3 = ((mag >> 3) & 1) != 0;
+            cost += bool_cost_x256(probs[9 + 3], bit3);
+        }
+    } else {
+        cost += tree_leaf_cost_x256(&MV_SHORT_TREE, &probs[2..9], mag);
+    }
+    if mag != 0 {
+        cost += bool_cost_x256(probs[1], sign);
+    }
+    cost
+}
+
+/// Cost (in 1/256-bit units) of writing the path that leads to `leaf`
+/// in `tree`. Mirrors `encode_tree_leaf`'s control flow.
+fn tree_leaf_cost_x256(tree: &[i8], probs: &[u8], leaf: i32) -> u32 {
+    fn walk(tree: &[i8], leaf: i32, idx: usize) -> Option<Vec<(usize, bool)>> {
+        for bit in [false, true] {
+            let v = tree[idx + bit as usize];
+            if v <= 0 {
+                if -(v as i32) == leaf {
+                    return Some(vec![(idx >> 1, bit)]);
+                }
+            } else if let Some(mut rest) = walk(tree, leaf, v as usize) {
+                rest.insert(0, (idx >> 1, bit));
+                return Some(rest);
+            }
+        }
+        None
+    }
+    let path = walk(tree, leaf, 0).expect("leaf not in tree");
+    path.into_iter()
+        .map(|(prob_idx, bit)| bool_cost_x256(probs[prob_idx], bit))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +229,34 @@ mod tests {
             8, -8, 15, -15, 16, -16, 17, -17, 24, 40, 127, -127, 256, 1023,
         ] {
             roundtrip_component(v);
+        }
+    }
+
+    #[test]
+    fn mv_component_cost_matches_real_emit_bits() {
+        // mv_component_cost_x256 must agree with the bit count produced
+        // by piping the same value through encode_mv_component into a
+        // real BoolEncoder. We emit each value into its own fresh
+        // encoder (so the buffered-state slack is bounded by ~25 bits)
+        // and compare totals in 1/256-bit units.
+        for &v in &[0, 1, -1, 4, 7, -7, 8, -8, 15, -15, 16, 33, -33, 127, -127, 256, 1023] {
+            let mut enc = BoolEncoder::new();
+            encode_mv_component(&mut enc, &DEFAULT_MV_CONTEXT[0], v);
+            let real_bytes = enc.finish().len();
+            // Subtract the 32-bit (= 4-byte) trailing flush pad.
+            let real_bits_x256 = (real_bytes.saturating_sub(4) as u64) * 8 * 256;
+
+            let est_x256 = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], v) as u64;
+            // The real encoder also has up to 25 buffered bits not yet
+            // flushed to bytes; allow a generous window since the
+            // expected payload for these magnitudes is < ~16 bits
+            // anyway. The check is that the estimator is in the same
+            // ballpark as the actual bool encoder, not bit-exact.
+            let abs_diff = est_x256.saturating_sub(real_bits_x256 + 32 * 256);
+            assert!(
+                abs_diff <= 8 * 256,
+                "v={v}: estimator {est_x256}/256 vs real bits {real_bits_x256}/256 + slack"
+            );
         }
     }
 

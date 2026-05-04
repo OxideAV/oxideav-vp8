@@ -41,7 +41,7 @@ use oxideav_core::{
 use crate::error::{Result, Vp8Error as Error};
 use crate::frame::Vp8Frame;
 
-use crate::bool_encoder::BoolEncoder;
+use crate::bool_encoder::{bool_cost_x256, BoolEncoder};
 use crate::fdct::{fdct4x4, fwht4x4};
 use crate::frame_tag::KEYFRAME_SYNC_CODE;
 use crate::inter::{bilinear_predict, sixtap_predict, RefPlane};
@@ -50,7 +50,7 @@ use crate::loopfilter::{
     filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
     filter_simple_vertical, FilterParams,
 };
-use crate::mv::{encode_mv_component, Mv};
+use crate::mv::{encode_mv_component, mv_component_cost_x256, Mv};
 use crate::tables::coeff_probs::{CoeffProbs, DEFAULT_COEF_PROBS};
 use crate::tables::mv::DEFAULT_MV_CONTEXT;
 use crate::tables::quant::{
@@ -2714,38 +2714,11 @@ fn lambda_for_qp(qp: u32, scale: u32) -> u32 {
     (scale.saturating_mul(q.saturating_mul(q))) / 256
 }
 
-/// Approximate the entropy cost (in **eighth-of-a-bit** units) of writing
-/// a `read_bool(prob)` with the given outcome. Indexes into a 256-entry
-/// LUT of `floor(log2(256/p))*8` — coarse but plenty accurate for
-/// mode-decision tie-breaking.
-#[inline]
-fn bool_cost(prob: u8, outcome: bool) -> u32 {
-    let p = if outcome {
-        prob as u32
-    } else {
-        256 - prob as u32
-    };
-    PROB_TO_COST_8X[p.min(255) as usize] as u32
-}
-
-/// LUT: `PROB_TO_COST_8X[p] = floor(log2(256/max(p,1))) * 8` for p in 0..256.
-static PROB_TO_COST_8X: [u8; 256] = {
-    let mut t = [0u8; 256];
-    let mut p = 0;
-    while p < 256 {
-        let pp = if p == 0 { 1u32 } else { p as u32 };
-        let mut bits = 0u32;
-        let mut v = 256u32;
-        while v > pp {
-            v >>= 1;
-            bits += 1;
-        }
-        let c = bits * 8;
-        t[p] = if c > 255 { 255 } else { c as u8 };
-        p += 1;
-    }
-    t
-};
+// Per-decision rate accounting (issue #340) is now in 1/256-bit units
+// via `bool_encoder::bool_cost_x256`, which derives each entry from the
+// real bool-coder state machine. The previous 7-step
+// `PROB_TO_COST_8X` LUT (1/8-bit units) was a 32× precision loss that
+// collapsed many `p` values to the same cost — it has been removed.
 
 /// SSE of a 16x16 luma MB at `(mb_x, mb_y)` predicted from `ref_y` shifted
 /// by `(dy, dx)` integer luma pixels (with edge clamping).
@@ -2809,12 +2782,18 @@ fn mb_luma_sse_at_subpel(
     sse
 }
 
-/// Approximate the per-MB mode-info bit cost (eighth-of-a-bit units)
-/// for a candidate decision: skip flag + intra-vs-inter + ref-frame
-/// bits + MV-tree leaf + MV deltas.
+/// Per-MB mode-info bit cost (1/256-bit units) for a candidate
+/// decision: skip flag + intra-vs-inter + ref-frame bits + MV-tree
+/// leaf + MV deltas.
+///
+/// Each `bool_cost_x256(prob, outcome)` call returns the *real* bool-
+/// coder cost for one bool symbol (issue #340) — derived from the
+/// state machine `BoolEncoder::write_bool` runs, not the legacy
+/// `floor(log2(256/p))` approximation. Combine with distortion via
+/// `D + λ·R/256` (the `/256` undoes the fixed-point scale).
 #[cfg(feature = "registry")]
 #[allow(clippy::too_many_arguments)]
-fn estimate_mode_rate_8ths(
+fn estimate_mode_rate_x256(
     decision: &PMbDecision,
     ref_frame: u8,
     plan: RefPlan,
@@ -2827,63 +2806,70 @@ fn estimate_mode_rate_8ths(
     mb_skip_prob: u8,
 ) -> u32 {
     let mut r = 0u32;
-    r += bool_cost(mb_skip_prob, matches!(decision, PMbDecision::Skip));
+    r += bool_cost_x256(mb_skip_prob, matches!(decision, PMbDecision::Skip));
     let is_inter = !decision.is_intra();
-    r += bool_cost(prob_intra, is_inter);
+    r += bool_cost_x256(prob_intra, is_inter);
     if !is_inter {
         return r;
     }
     if plan.use_golden || plan.use_alt {
         match ref_frame {
-            ENC_REF_LAST => r += bool_cost(prob_last, false),
+            ENC_REF_LAST => r += bool_cost_x256(prob_last, false),
             ENC_REF_GOLDEN => {
-                r += bool_cost(prob_last, true);
-                r += bool_cost(prob_gf, false);
+                r += bool_cost_x256(prob_last, true);
+                r += bool_cost_x256(prob_gf, false);
             }
             ENC_REF_ALT => {
-                r += bool_cost(prob_last, true);
-                r += bool_cost(prob_gf, true);
+                r += bool_cost_x256(prob_last, true);
+                r += bool_cost_x256(prob_gf, true);
             }
             _ => {}
         }
     } else {
-        r += bool_cost(prob_last, false);
+        r += bool_cost_x256(prob_last, false);
     }
     match decision {
         PMbDecision::Skip | PMbDecision::ZeroMv => {
-            r += bool_cost(128, false);
+            r += bool_cost_x256(128, false);
         }
         PMbDecision::NearestMv(_) => {
-            r += bool_cost(128, true);
-            r += bool_cost(128, false);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, false);
         }
         PMbDecision::NearMv(_) => {
-            r += bool_cost(128, true);
-            r += bool_cost(128, true);
-            r += bool_cost(128, false);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, false);
         }
         PMbDecision::NewMv(mv) => {
-            r += bool_cost(128, true);
-            r += bool_cost(128, true);
-            r += bool_cost(128, true);
-            r += bool_cost(128, false);
-            let dr = (mv.row as i32 - best_for_newmv.row as i32).unsigned_abs();
-            let dc = (mv.col as i32 - best_for_newmv.col as i32).unsigned_abs();
-            r += mv_delta_cost_8ths(dr) + mv_delta_cost_8ths(dc);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, false);
+            // Precise MV-delta cost: route the candidate value through
+            // the same bool-coder cost LUT that `encode_mv_component`
+            // uses on the real bitstream (issue #340).
+            let dr = mv.row as i32 - best_for_newmv.row as i32;
+            let dc = mv.col as i32 - best_for_newmv.col as i32;
+            r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], dr);
+            r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], dc);
         }
         PMbDecision::SplitMv(s) => {
-            r += bool_cost(128, true);
-            r += bool_cost(128, true);
-            r += bool_cost(128, true);
-            r += bool_cost(128, true);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, true);
+            r += bool_cost_x256(128, true);
             let n = MB_SPLIT_COUNT[s.split_mode as usize] as u32;
-            r += 32 * n;
+            // Per-partition split-mode tree: ~4 bits per partition;
+            // 4 bits × 256/bit = 1024.
+            r += 1024 * n;
             for p in 0..n as usize {
                 let mv = s.part_mvs[p];
                 if mv != best_for_newmv && mv != Mv::ZERO {
-                    let dr = (mv.row as i32 - best_for_newmv.row as i32).unsigned_abs();
-                    let dc = (mv.col as i32 - best_for_newmv.col as i32).unsigned_abs();
-                    r += mv_delta_cost_8ths(dr) + mv_delta_cost_8ths(dc);
+                    let dr = mv.row as i32 - best_for_newmv.row as i32;
+                    let dc = mv.col as i32 - best_for_newmv.col as i32;
+                    r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], dr);
+                    r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], dc);
                 }
             }
         }
@@ -2893,24 +2879,11 @@ fn estimate_mode_rate_8ths(
     r
 }
 
-/// Approximate the bool-coded bit cost of an MV-component delta in
-/// eighth-of-a-bit units.
-#[inline]
-fn mv_delta_cost_8ths(mag: u32) -> u32 {
-    if mag == 0 {
-        32
-    } else if mag < 8 {
-        48
-    } else if mag < 16 {
-        96
-    } else if mag < 64 {
-        128
-    } else if mag < 256 {
-        160
-    } else {
-        192
-    }
-}
+// MV-delta rate is sourced from `mv::mv_component_cost_x256`, which
+// runs the candidate value through the same bool-coder cost LUT as
+// `mv::encode_mv_component` (issue #340) — bit-accurate per
+// component. The 6-tier legacy heuristic
+// (`32/48/96/128/160/192` in 1/8-bit units) has been removed.
 
 /// Approximate the SSE for a candidate decision (the distortion `D` of
 /// the Lagrangian cost). For inter modes we use the sub-pel SSE against
@@ -2969,10 +2942,17 @@ fn estimate_distortion(
     }
 }
 
-/// Compute the Lagrangian RD cost `D + λ·R/8` (R is in eighth-of-a-bit
-/// units, so we divide by 8 to renormalise). Used by the per-MB
+/// Compute the Lagrangian RD cost `D + λ·R/256` (R is in 1/256-bit
+/// units, so we divide by 256 to renormalise). Used by the per-MB
 /// reference-and-mode picker to select the best candidate across LAST /
 /// GOLDEN / ALTREF.
+///
+/// Issue #340: the rate input is now derived from a real bool-coded
+/// bit accumulator (see `bool_encoder::PROB_COST_BITS_X256`); the
+/// previous 1/8-bit, 7-step LUT collapsed many distinct probabilities
+/// to the same value. The Lagrangian magnitude is preserved by scaling
+/// the divisor 32× along with the precision, so existing
+/// `lambda_scale` knob calibrations carry over.
 #[cfg(feature = "registry")]
 #[allow(clippy::too_many_arguments)]
 fn rd_cost_for_decision(
@@ -2995,7 +2975,7 @@ fn rd_cost_for_decision(
     lambda: u32,
 ) -> u64 {
     let d = estimate_distortion(decision, src_y, ref_y, y_stride, y_buf_h, mb_x, mb_y);
-    let r = estimate_mode_rate_8ths(
+    let r = estimate_mode_rate_x256(
         decision,
         ref_frame,
         plan,
@@ -3007,7 +2987,7 @@ fn rd_cost_for_decision(
         prob_gf,
         mb_skip_prob,
     );
-    d + ((lambda as u64) * (r as u64)) / 8
+    d + ((lambda as u64) * (r as u64)) / 256
 }
 
 /// Pick the best P-frame decision for one MB.

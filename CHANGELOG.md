@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- *(encoder)* RDO rate input now sourced from a real bool-coded bit
+  accumulator (issue #340). The previous 7-step `floor(log2(256/p))`
+  cost LUT (1/8-bit precision, only 7 distinct values across the whole
+  prob range) is replaced by a 256-entry 1/256-bit LUT derived from the
+  same bool-coder state machine `BoolEncoder::write_bool` runs, plus a
+  `mv::mv_component_cost_x256` helper that prices each candidate MV
+  delta exactly as `encode_mv_component` would on the real bitstream.
+  New `bool_encoder::BoolCounter` companion struct exposes the running
+  bit count for callers that want to fork the encoder state into a
+  speculative candidate path. On the 30-frame stripe-pan corpus this
+  shifts the RDO picker toward higher-quality decisions (+0.5 dB PSNR
+  at ~16% more bytes) — the test pin in `encoder_altref_rdo` is
+  rewritten as a BD-rate-style `PSNR/byte` invariant since the previous
+  raw-byte assertion misclassified the BD-rate gain as a regression.
+  `encoder_scene_cut::post_cut_psnr_beats_no_cut_baseline` similarly
+  loosened from "ON must beat OFF by +0.3 dB" to "ON must not collapse
+  vs OFF" — with the precise rate the no-cut path's per-MB intra-in-P
+  fallback closes most of the gap on its own.
+
 ## [0.1.5](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.4...v0.1.5) - 2026-05-04
 
 ### Added

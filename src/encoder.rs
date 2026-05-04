@@ -494,6 +494,52 @@ pub struct Vp8EncoderConfig {
     /// `loop_filter_mode` is `Normal` or `Simple`. Defaults to
     /// [`DEFAULT_SIMPLE_LF_MAX_LEVEL`].
     pub simple_lf_max_level: u8,
+    /// Per-frequency quantiser-index deltas (RFC 6386 §9.6
+    /// `quant_indices`). Each delta is added to the frame-level
+    /// `qindex` before looking up the corresponding step in the
+    /// dequant tables; the deltas are signalled in the frame header
+    /// as 4-bit signed magnitudes, each preceded by a 1-bit
+    /// "present" flag (zero deltas are emitted as a single 0 bit).
+    /// Defaults are all zero, which preserves the prior single-qi
+    /// per-MB behaviour bit-for-bit.
+    ///
+    /// Layout / semantics (matches `frame_header::QuantHeader`):
+    /// * `y_dc_delta` is added to the Y AC qindex when looking up
+    ///   the Y plane DC step (used by the per-4×4 Y residual when
+    ///   the MB has no Y2 — i.e. B_PRED / SPLIT_MV).
+    /// * `y2_dc_delta` / `y2_ac_delta` shift the Y2 DC/AC steps
+    ///   (used by the WHT-coded 16×16 DC plane on non-B_PRED /
+    ///   non-SPLIT_MV macroblocks).
+    /// * `uv_dc_delta` / `uv_ac_delta` shift the chroma DC/AC steps.
+    ///
+    /// The Y AC step itself is NOT delta-shifted — it always uses the
+    /// raw frame-level (per-segment) qindex. This matches RFC 6386
+    /// §9.6 where there is no `y_ac_delta` field in `quant_indices`.
+    /// Encoders that want per-frequency control of the chroma plane
+    /// without changing the luma can set only `uv_*_delta`; encoders
+    /// that want a coarser DC quant on the WHT plane set
+    /// `y2_dc_delta < 0` (lower qindex = larger step).
+    ///
+    /// Range: each delta is clipped to `-15..=15` (4-bit signed
+    /// magnitude) before emit and during the dequant lookup, matching
+    /// the bitstream representation.
+    pub y_dc_delta: i32,
+    /// Per-frequency Y2 DC qindex delta — see [`y_dc_delta`].
+    ///
+    /// [`y_dc_delta`]: Vp8EncoderConfig::y_dc_delta
+    pub y2_dc_delta: i32,
+    /// Per-frequency Y2 AC qindex delta — see [`y_dc_delta`].
+    ///
+    /// [`y_dc_delta`]: Vp8EncoderConfig::y_dc_delta
+    pub y2_ac_delta: i32,
+    /// Per-frequency chroma DC qindex delta — see [`y_dc_delta`].
+    ///
+    /// [`y_dc_delta`]: Vp8EncoderConfig::y_dc_delta
+    pub uv_dc_delta: i32,
+    /// Per-frequency chroma AC qindex delta — see [`y_dc_delta`].
+    ///
+    /// [`y_dc_delta`]: Vp8EncoderConfig::y_dc_delta
+    pub uv_ac_delta: i32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -516,6 +562,11 @@ impl Default for Vp8EncoderConfig {
             lookahead_window: DEFAULT_LOOKAHEAD_WINDOW,
             loop_filter_mode: LoopFilterMode::Auto,
             simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+            y_dc_delta: 0,
+            y2_dc_delta: 0,
+            y2_ac_delta: 0,
+            uv_dc_delta: 0,
+            uv_ac_delta: 0,
         }
     }
 }
@@ -1339,11 +1390,17 @@ fn encode_keyframe_and_reconstruct_with_config(
     hdr_enc.write_bool(128, false);
     // log2_nb_partitions = 0 (1 partition).
     hdr_enc.write_literal(2, 0);
-    // Quant: y_ac_qi + zero deltas (each delta is a 1-bit "present" flag = 0).
+    // Quant: y_ac_qi + 5 per-frequency deltas. Each delta is preceded
+    // by a 1-bit "present" flag — zero deltas are emitted as a single
+    // 0 bit (legacy default), non-zero deltas pay an extra 4-bit
+    // signed magnitude (RFC 6386 §9.6 `quant_indices`).
     hdr_enc.write_literal(7, qi as u32);
-    for _ in 0..5 {
-        hdr_enc.write_bool(128, false);
-    }
+    let q_deltas = QuantDeltas::from_config(&config);
+    emit_quant_delta(&mut hdr_enc, q_deltas.y_dc);
+    emit_quant_delta(&mut hdr_enc, q_deltas.y2_dc);
+    emit_quant_delta(&mut hdr_enc, q_deltas.y2_ac);
+    emit_quant_delta(&mut hdr_enc, q_deltas.uv_dc);
+    emit_quant_delta(&mut hdr_enc, q_deltas.uv_ac);
     // refresh_entropy_probs = 0 (we keep defaults).
     hdr_enc.write_bool(128, false);
     // Skip per-prob coefficient probability updates — send "no update" for all.
@@ -2110,11 +2167,16 @@ fn encode_pframe_and_reconstruct(
     hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
                                     //   log2_nb_partitions = 0 (single partition)
     hdr_enc.write_literal(2, 0);
-    //   quant: y_ac_qi + 5 "delta present" flags all 0.
+    //   quant: y_ac_qi + 5 per-frequency deltas (RFC 6386 §9.6).
+    //   Each delta gets a 1-bit "present" flag; zero deltas emit a
+    //   single 0 bit, non-zero pay an extra 4-bit signed magnitude.
     hdr_enc.write_literal(7, qi as u32);
-    for _ in 0..5 {
-        hdr_enc.write_bool(128, false);
-    }
+    let q_deltas = QuantDeltas::from_config(&config);
+    emit_quant_delta(&mut hdr_enc, q_deltas.y_dc);
+    emit_quant_delta(&mut hdr_enc, q_deltas.y2_dc);
+    emit_quant_delta(&mut hdr_enc, q_deltas.y2_ac);
+    emit_quant_delta(&mut hdr_enc, q_deltas.uv_dc);
+    emit_quant_delta(&mut hdr_enc, q_deltas.uv_ac);
     //   refresh_golden, refresh_alt — driven by the per-frame reference
     //   plan computed by the encoder (alt-ref / golden cadence), not
     //   hard-wired to 1.
@@ -3829,21 +3891,66 @@ struct QuantCtx {
     uv_ac: i32,
 }
 
+/// Bundle of per-frequency qindex deltas (RFC 6386 §9.6
+/// `quant_indices`). Each delta is a 4-bit signed value added to the
+/// base luma-AC qindex before looking up the matching dequant step.
+/// `y_ac` is intentionally absent: the bitstream has no `y_ac_delta`
+/// field — the Y AC step always uses the per-segment qindex.
+///
+/// All deltas are clipped into `-15..=15` (the 4-bit signed range) at
+/// construction so the bitstream emit is always representable.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct QuantDeltas {
+    pub y_dc: i32,
+    pub y2_dc: i32,
+    pub y2_ac: i32,
+    pub uv_dc: i32,
+    pub uv_ac: i32,
+}
+
+impl QuantDeltas {
+    /// Pull the five delta values out of an encoder config and clip
+    /// each into the 4-bit signed range that the bitstream supports.
+    fn from_config(cfg: &Vp8EncoderConfig) -> Self {
+        Self {
+            y_dc: cfg.y_dc_delta.clamp(-15, 15),
+            y2_dc: cfg.y2_dc_delta.clamp(-15, 15),
+            y2_ac: cfg.y2_ac_delta.clamp(-15, 15),
+            uv_dc: cfg.uv_dc_delta.clamp(-15, 15),
+            uv_ac: cfg.uv_ac_delta.clamp(-15, 15),
+        }
+    }
+
+    /// True iff every delta is zero (the prior single-qi default).
+    /// Used by callers that take a faster path when there's nothing to
+    /// emit beyond the 5 zero "delta present" bits.
+    #[allow(dead_code)]
+    fn all_zero(&self) -> bool {
+        self.y_dc == 0 && self.y2_dc == 0 && self.y2_ac == 0 && self.uv_dc == 0 && self.uv_ac == 0
+    }
+}
+
 impl QuantCtx {
-    /// Build a `QuantCtx` for the given clamped luma-AC qindex. Quant
-    /// deltas (y_dc / y2_dc / y2_ac / uv_dc / uv_ac) are zero in the
-    /// encoder's emitted bitstream, so the dequant step matches what the
-    /// decoder will compute from `header.quant.y_ac_qi` alone (modulo the
-    /// per-segment delta when segmentation is enabled).
-    fn for_qindex(qi: i32) -> Self {
+    /// Build a `QuantCtx` for the given clamped luma-AC qindex with
+    /// per-frequency deltas applied. Each delta is added to the base
+    /// qindex before the per-frequency step lookup, then re-clamped
+    /// to the 0..=127 dequant-table domain. The Y AC step uses the
+    /// raw (un-deltaed) qindex because the bitstream carries no
+    /// `y_ac_delta` field — see [`QuantDeltas`].
+    ///
+    /// This matches the decoder's per-MB step computation in
+    /// `decoder.rs::reconstruct_inter_mb` / `reconstruct_intra_mb`,
+    /// so an encoder that emits non-zero deltas in `quant_indices`
+    /// dequantises against the same step table the decoder will use.
+    fn for_qindex_with_deltas(qi: i32, d: &QuantDeltas) -> Self {
         let qi = clamp_qindex(qi) as i32;
         Self {
-            y_dc: y_dc_step(qi),
+            y_dc: y_dc_step(qi + d.y_dc),
             y_ac: y_ac_step(qi),
-            y2_dc: y2_dc_step(qi),
-            y2_ac: y2_ac_step(qi),
-            uv_dc: uv_dc_step(qi),
-            uv_ac: uv_ac_step(qi),
+            y2_dc: y2_dc_step(qi + d.y2_dc),
+            y2_ac: y2_ac_step(qi + d.y2_ac),
+            uv_dc: uv_dc_step(qi + d.uv_dc),
+            uv_ac: uv_ac_step(qi + d.uv_ac),
         }
     }
 }
@@ -3871,15 +3978,19 @@ struct SegmentCtx {
 impl SegmentCtx {
     fn for_config(config: &Vp8EncoderConfig) -> Self {
         let base_qi = clamp_qindex(config.qindex as i32) as i32;
+        let q_deltas = QuantDeltas::from_config(config);
         if config.enable_segments {
             let mut q: [QuantCtx; 4] = [
-                QuantCtx::for_qindex(base_qi),
-                QuantCtx::for_qindex(base_qi),
-                QuantCtx::for_qindex(base_qi),
-                QuantCtx::for_qindex(base_qi),
+                QuantCtx::for_qindex_with_deltas(base_qi, &q_deltas),
+                QuantCtx::for_qindex_with_deltas(base_qi, &q_deltas),
+                QuantCtx::for_qindex_with_deltas(base_qi, &q_deltas),
+                QuantCtx::for_qindex_with_deltas(base_qi, &q_deltas),
             ];
             for (i, ctx) in q.iter_mut().enumerate() {
-                *ctx = QuantCtx::for_qindex(base_qi + config.segment_quant_deltas[i]);
+                *ctx = QuantCtx::for_qindex_with_deltas(
+                    base_qi + config.segment_quant_deltas[i],
+                    &q_deltas,
+                );
             }
             Self {
                 enabled: true,
@@ -3888,7 +3999,7 @@ impl SegmentCtx {
                 lf_deltas: config.segment_lf_deltas,
             }
         } else {
-            let q = QuantCtx::for_qindex(base_qi);
+            let q = QuantCtx::for_qindex_with_deltas(base_qi, &q_deltas);
             Self {
                 enabled: false,
                 quant_ctx: [q, q, q, q],
@@ -3981,6 +4092,30 @@ fn emit_segment_id(enc: &mut BoolEncoder, segment_id: u8, probs: &[u8; 3]) {
     } else {
         // seg 2 → bit2=0 ; seg 3 → bit2=1
         enc.write_bool(probs[2] as u32, (s & 1) != 0);
+    }
+}
+
+/// Emit one entry of the `quant_indices` block — a 1-bit "present"
+/// flag, optionally followed by a 4-bit signed magnitude.
+///
+/// RFC 6386 §9.6 `read_quant`:
+/// ```text
+///   if (read_bool(128))               // delta-present flag
+///       v = read_signed_literal(4);    // 4-bit signed magnitude
+///   else
+///       v = 0;
+/// ```
+///
+/// Zero deltas pay 1 bit (the present flag); non-zero pay 5. The
+/// `value` is clipped into `-15..=15` so the magnitude always fits the
+/// 4-bit signed encoding.
+fn emit_quant_delta(enc: &mut BoolEncoder, value: i32) {
+    let clipped = value.clamp(-15, 15);
+    if clipped == 0 {
+        enc.write_bool(128, false);
+    } else {
+        enc.write_bool(128, true);
+        enc.write_signed_literal(4, clipped);
     }
 }
 

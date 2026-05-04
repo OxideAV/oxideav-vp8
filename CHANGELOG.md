@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* per-frequency `quant_indices` deltas (RFC 6386 §9.6) — five
+  new `Vp8EncoderConfig` fields (`y_dc_delta`, `y2_dc_delta`,
+  `y2_ac_delta`, `uv_dc_delta`, `uv_ac_delta`) round-trip through the
+  emitted `quant_indices` block. Each delta is clipped to the 4-bit
+  signed range `-15..=15` and the dequant context applies it to the
+  matching frequency band before the per-segment qindex is added. Y AC
+  is intentionally absent because the bitstream has no `y_ac_delta`
+  field. Defaults are zero (legacy single-qi behaviour).
+
+### Fixed
+
+- *(decoder)* loop-filter `ref_deltas` and `mode_deltas` now persist
+  across frames (RFC 6386 §9.4). When `mode_ref_lf_delta_update` is 0
+  or only some per-element present flags are set, the decoder keeps the
+  previous frame's values verbatim instead of resetting to zero. Fixes
+  drift on multi-frame sequences where keyframe deltas are not re-emitted
+  by every P-frame; nets +55 / +57 exact-pixel matches on the
+  `golden-update-cycle` and `altref-arnr-on` corpus fixtures.
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.5...v0.1.6) - 2026-05-04
 
 ### Added

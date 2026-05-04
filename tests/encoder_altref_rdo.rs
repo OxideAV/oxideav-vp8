@@ -160,6 +160,11 @@ fn refresh_flags_follow_plan() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -223,6 +228,11 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -274,6 +284,11 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -333,6 +348,11 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -362,6 +382,11 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -476,6 +501,11 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -538,6 +568,11 @@ fn legacy_single_ref_path_still_works() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

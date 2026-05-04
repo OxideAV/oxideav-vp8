@@ -900,3 +900,107 @@ fn pframe_loop_filter_level_nonzero_in_header() {
     assert!(level > 0, "loop filter should be enabled on encode side");
     assert!(level < 64, "level must fit in 6 bits");
 }
+
+/// #417: per-frequency quant_indices deltas (RFC 6386 §9.6) emitted
+/// by the encoder must round-trip through `parse_keyframe_header`. The
+/// encoder used to hardwire all five delta-present flags to 0; this
+/// test sets every per-frequency delta and verifies they show up in
+/// the decoder's `QuantHeader`.
+///
+/// Also drives the encoder end-to-end at a non-trivial luma-AC qindex
+/// with the new deltas in place — the decode must succeed without
+/// errors. PSNR isn't asserted (the deltas push some bands much
+/// coarser, so a flat 25 dB bar would be a poor signal); the assertion
+/// is structural — the bitstream's `quant_indices` block carries the
+/// configured 4-bit signed magnitudes.
+#[test]
+fn encoder_emits_per_frequency_quant_deltas() {
+    use oxideav_vp8::bool_decoder::BoolDecoder;
+    use oxideav_vp8::encoder::{make_encoder_with_config, Vp8EncoderConfig};
+    use oxideav_vp8::parse_keyframe_header;
+
+    let cw = (W / 2) as usize;
+    let ch = (H / 2) as usize;
+    let mut y = vec![0u8; (W * H) as usize];
+    for r in 0..H as usize {
+        for c in 0..W as usize {
+            y[r * W as usize + c] = ((r ^ c) as u8).wrapping_mul(3);
+        }
+    }
+    let u = vec![100u8; cw * ch];
+    let v = vec![160u8; cw * ch];
+    let frame = make_frame(&y, &u, &v);
+
+    let mut params = CodecParameters::video(CodecId::new("vp8"));
+    params.width = Some(W);
+    params.height = Some(H);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    params.frame_rate = Some(Rational::new(30, 1));
+
+    // Mix of positive, negative, zero, and out-of-range (clipped) deltas.
+    let mut cfg = Vp8EncoderConfig {
+        qindex: QINDEX,
+        ..Default::default()
+    };
+    cfg.y_dc_delta = 3;
+    cfg.y2_dc_delta = -7;
+    cfg.y2_ac_delta = 0;
+    cfg.uv_dc_delta = 12;
+    cfg.uv_ac_delta = -15;
+    // Disable segmentation so the keyframe header parses with a single
+    // qindex per MB (segments_enabled=true would inject extra per-segment
+    // deltas on top, which is a separate code path covered by
+    // `encoder_segments`).
+    cfg.enable_segments = false;
+    let mut enc = make_encoder_with_config(&params, cfg).expect("encoder");
+
+    enc.send_frame(&Frame::Video(frame)).expect("send");
+    let pkt = enc.receive_packet().expect("rx");
+
+    // The keyframe layout is: 3-byte frame tag + 7-byte uncompressed
+    // chunk (start code + width/height) before the bool-coded
+    // compressed header. parse_keyframe_header consumes from the
+    // compressed payload start.
+    let mut bd = BoolDecoder::new(&pkt.data[10..]).expect("bool dec");
+    let header = parse_keyframe_header(&mut bd).expect("parse_keyframe_header");
+
+    assert_eq!(
+        header.quant.y_ac_qi, QINDEX as i32,
+        "y_ac_qi (base) should match the encoder's qindex"
+    );
+    assert_eq!(header.quant.y_dc_delta, 3, "y_dc_delta should round-trip");
+    assert_eq!(
+        header.quant.y2_dc_delta, -7,
+        "y2_dc_delta should round-trip"
+    );
+    assert_eq!(
+        header.quant.y2_ac_delta, 0,
+        "y2_ac_delta should round-trip (zero stays zero)"
+    );
+    assert_eq!(
+        header.quant.uv_dc_delta, 12,
+        "uv_dc_delta should round-trip"
+    );
+    assert_eq!(
+        header.quant.uv_ac_delta, -15,
+        "uv_ac_delta should round-trip (clipped at -15 — the 4-bit signed bound)"
+    );
+
+    // Also verify out-of-range values clip to ±15 rather than panic or
+    // overflow the 4-bit signed encoding.
+    let mut cfg2 = Vp8EncoderConfig {
+        qindex: QINDEX,
+        ..Default::default()
+    };
+    cfg2.y_dc_delta = 99; // clipped to +15
+    cfg2.uv_ac_delta = -200; // clipped to -15
+    cfg2.enable_segments = false;
+    let mut enc2 = make_encoder_with_config(&params, cfg2).expect("encoder");
+    enc2.send_frame(&Frame::Video(make_frame(&y, &u, &v)))
+        .expect("send");
+    let pkt2 = enc2.receive_packet().expect("rx");
+    let mut bd2 = BoolDecoder::new(&pkt2.data[10..]).expect("bool dec");
+    let header2 = parse_keyframe_header(&mut bd2).expect("parse_keyframe_header");
+    assert_eq!(header2.quant.y_dc_delta, 15);
+    assert_eq!(header2.quant.uv_ac_delta, -15);
+}

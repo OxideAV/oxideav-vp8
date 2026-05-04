@@ -164,6 +164,11 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     }
 }
 
@@ -186,6 +191,11 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     }
 }
 
@@ -219,6 +229,11 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     }
 }
 
@@ -300,6 +315,11 @@ fn frame_headers_carry_segment_lf_deltas() {
         lookahead_window: 0,
         loop_filter_mode: LoopFilterMode::Auto,
         simple_lf_max_level: DEFAULT_SIMPLE_LF_MAX_LEVEL,
+        y_dc_delta: 0,
+        y2_dc_delta: 0,
+        y2_ac_delta: 0,
+        uv_dc_delta: 0,
+        uv_ac_delta: 0,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

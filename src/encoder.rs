@@ -5223,19 +5223,24 @@ fn emit_split_submvs(
 
 /// Encoder replica of the decoder's `sub_mv_context`: picks a row of
 /// `SUB_MV_REF_PROBS` based on the (left, above) neighbour pair.
+///
+/// Mirrors RFC 6386 §16.3 `vp8_mvCont`: see the decoder-side
+/// `sub_mv_context` for the canonical mapping of context indices to
+/// `SUB_MV_REF_PROBS` rows.
 fn sub_mv_context_enc(left: &Mv, above: &Mv) -> usize {
     let l_zero = left.row == 0 && left.col == 0;
     let a_zero = above.row == 0 && above.col == 0;
-    if l_zero && a_zero {
-        0
-    } else if !l_zero && a_zero {
-        1
-    } else if l_zero && !a_zero {
-        2
-    } else if left == above {
+    let same = left == above;
+    if same && l_zero {
         4
-    } else {
+    } else if same {
         3
+    } else if a_zero {
+        2
+    } else if l_zero {
+        1
+    } else {
+        0
     }
 }
 

@@ -170,11 +170,15 @@ pub const MV_COUNTS_TO_PROBS: [[u8; 4]; 6] = [
 pub const MBSPLIT_PROBS: [u8; 3] = [110, 111, 150];
 
 /// Sub-MV reference probabilities given neighbour MVs.
-///   Row 0: left == above == 0      → probs for [LEFT_4X4, ABOVE_4X4, ZERO_4X4]
-///   Row 1: left != 0, above == 0
-///   Row 2: left == 0, above != 0
-///   Row 3: left != above (both non-zero)
-///   Row 4: left == above (both non-zero)
+///
+/// Indexed by the context returned by `vp8_mvCont` (RFC 6386 §16.3
+/// `sub_mv_ref_prob`). Rows are in RFC numeric order:
+///
+///   Row 0 NORMAL          : left != above, neither zero
+///   Row 1 LEFT_ZED        : left == 0, above != 0
+///   Row 2 ABOVE_ZED       : above == 0, left != 0
+///   Row 3 LEFT_ABOVE_SAME : left == above, both non-zero
+///   Row 4 LEFT_ABOVE_ZED  : left == above == 0
 pub const SUB_MV_REF_PROBS: [[u8; 3]; 5] = [
     [147, 136, 18],
     [106, 145, 1],

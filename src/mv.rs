@@ -31,6 +31,50 @@ impl Mv {
     }
 }
 
+/// MV-clamp border (RFC 6386 §16.3 `vp8_clamp_mv`, §18.1).
+///
+/// The MV-clamp margins applied around the per-MB `mb_to_*_edge`
+/// distances. RFC 6386 §16.3 cites them as `LEFT_TOP_MARGIN` and
+/// `RIGHT_BOTTOM_MARGIN` without naming the value; §18.1 fixes the
+/// reference-frame extended border at "1 macroblock" of replicated
+/// pixels around each side, which equates to 16 pixels × 8 sub-pel
+/// units = 128 in MV units. The same value is used for the top/left and
+/// bottom/right margins (single-MB symmetric border).
+pub const MV_BORDER: i32 = 128;
+
+/// Clamp an MV (in 1/8-pel units) to the per-MB legal range as defined
+/// in RFC 6386 §16.3 `vp8_clamp_mv`.
+///
+/// The four `mb_to_*_edge` distances are computed in 1/8-pel units from
+/// the current MB's pixel position to each frame edge:
+///
+/// ```text
+/// mb_to_left_edge   = -(mb_x * 16) << 3 = -mb_x * 128
+/// mb_to_right_edge  = ((mb_w - 1 - mb_x) * 16) << 3 = (mb_w-1-mb_x)*128
+/// mb_to_top_edge    = -(mb_y * 16) << 3 = -mb_y * 128
+/// mb_to_bottom_edge = ((mb_h - 1 - mb_y) * 16) << 3 = (mb_h-1-mb_y)*128
+/// ```
+///
+/// The MV is then clamped to:
+///
+/// ```text
+/// col in [mb_to_left_edge - MV_BORDER, mb_to_right_edge + MV_BORDER]
+/// row in [mb_to_top_edge  - MV_BORDER, mb_to_bottom_edge + MV_BORDER]
+/// ```
+///
+/// At MB position (mb_x, mb_y) in a (mb_w × mb_h)-MB frame, this
+/// permits the MV to point at most one MB beyond the visible image
+/// edge — exactly the size of the §18.1 extended reference border.
+pub fn clamp_mv_to_border(mv: Mv, mb_x: usize, mb_y: usize, mb_w: usize, mb_h: usize) -> Mv {
+    let mb_to_left_edge = -((mb_x as i32) * 128);
+    let mb_to_right_edge = ((mb_w as i32) - 1 - (mb_x as i32)) * 128;
+    let mb_to_top_edge = -((mb_y as i32) * 128);
+    let mb_to_bottom_edge = ((mb_h as i32) - 1 - (mb_y as i32)) * 128;
+    let col = (mv.col as i32).clamp(mb_to_left_edge - MV_BORDER, mb_to_right_edge + MV_BORDER);
+    let row = (mv.row as i32).clamp(mb_to_top_edge - MV_BORDER, mb_to_bottom_edge + MV_BORDER);
+    Mv::new(row, col)
+}
+
 /// Decode a single MV component. Returns a signed integer in 1/8-pel
 /// units.
 pub fn decode_mv_component(d: &mut BoolDecoder<'_>, probs: &MvContext) -> i32 {

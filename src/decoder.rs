@@ -27,7 +27,7 @@ use crate::loopfilter::{
     filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
     filter_simple_vertical, FilterParams,
 };
-use crate::mv::{decode_mv, Mv};
+use crate::mv::{clamp_mv_to_border, decode_mv, Mv};
 use crate::tables::quant::{
     clamp_qindex, uv_ac_step, uv_dc_step, y2_ac_step, y2_dc_step, y_ac_step, y_dc_step,
 };
@@ -453,6 +453,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
                     mb_x,
                     mb_y,
                     mb_w,
+                    mb_h,
                     &header,
                     bmode_above.as_mut_slice(),
                 )?
@@ -920,6 +921,7 @@ fn decode_mb_mode_info_inter(
     mb_x: usize,
     mb_y: usize,
     mb_w: usize,
+    mb_h: usize,
     header: &FrameHeader,
     bmode_above: &mut [[i32; 4]],
 ) -> Result<MbInfo> {
@@ -982,8 +984,19 @@ fn decode_mb_mode_info_inter(
     };
 
     // Find nearest / near / best MV context from neighbours.
-    let (nearest, near, best_mv, cnt) =
+    // RFC 6386 §16.3 calls `vp8_clamp_mv` on `nearest`, `near`, and
+    // `best_mv` at the end of `vp8_find_near_mvs`, before any of them
+    // is fed back into the prediction. The clamp restricts each
+    // component to within one MB beyond the visible image edge in
+    // 1/8-pel units; without it a neighbour-inherited MV at frame-edge
+    // MBs (mb_y close to mb_h-1 or mb_x close to mb_w-1) can point
+    // arbitrarily far outside the §18.1 1-MB extended border, breaking
+    // sub-pel reconstruction at all four ReportOnly P-frame fixtures.
+    let (raw_nearest, raw_near, raw_best, cnt) =
         find_near_mvs(mb_info, mb_x, mb_y, mb_w, info.ref_frame, header);
+    let nearest = clamp_mv_to_border(raw_nearest, mb_x, mb_y, mb_w, mb_h);
+    let near = clamp_mv_to_border(raw_near, mb_x, mb_y, mb_w, mb_h);
+    let best_mv = clamp_mv_to_border(raw_best, mb_x, mb_y, mb_w, mb_h);
 
     let ctx_probs = mv_ref_probs(&cnt);
     // Tree leaves start at 10 in this decoder's int namespace.
@@ -995,12 +1008,18 @@ fn decode_mb_mode_info_inter(
         NEAR_MV => info.mv = near,
         ZERO_MV => info.mv = Mv::ZERO,
         NEW_MV => {
-            // Decode MV difference, add to best_mv.
+            // Decode MV difference, add to best_mv. RFC 6386 §18.1
+            // mandates a *secondary* clamp here for NEWMV: "the final
+            // motion vector is clamped again after combining the 'best'
+            // predictor and the differential vector decoded from the
+            // stream." This secondary clamp is NOT applied to SPLITMV
+            // sub-MVs (per the same §18.1 paragraph).
             let dmv = decode_mv(dec, &header.mv_context);
-            info.mv = Mv::new(
+            let combined = Mv::new(
                 best_mv.row as i32 + dmv.row as i32,
                 best_mv.col as i32 + dmv.col as i32,
             );
+            info.mv = clamp_mv_to_border(combined, mb_x, mb_y, mb_w, mb_h);
         }
         SPLIT_MV => {
             // Decode split mode then sub-MVs.
@@ -1110,19 +1129,36 @@ fn left_edge_mv(l: &MbInfo, row: usize) -> Mv {
 }
 
 /// Pick the SUB_MV_REF_PROBS row based on neighbour MV pair.
+///
+/// Mirrors RFC 6386 §16.3 `vp8_mvCont` exactly:
+///
+/// ```c
+/// if (left == above && left == 0) return 4; /* LEFT_ABOVE_ZED */
+/// if (left == above)              return 3; /* LEFT_ABOVE_SAME (both non-zero) */
+/// if (above == 0)                 return 2; /* ABOVE_ZED      (left non-zero) */
+/// if (left  == 0)                 return 1; /* LEFT_ZED       (above non-zero) */
+/// return 0;                                 /* NORMAL */
+/// ```
+///
+/// The returned value indexes [`SUB_MV_REF_PROBS`] in RFC order. An
+/// earlier version of this function used a different (scrambled) row
+/// numbering and the wrong probability vector was applied to every
+/// SPLITMV sub-block, producing garbage sub-MVs (often
+/// 3-digit-magnitude) at frame-edge MBs in P-frames.
 fn sub_mv_context(left: &Mv, above: &Mv) -> usize {
     let l_zero = left.row == 0 && left.col == 0;
     let a_zero = above.row == 0 && above.col == 0;
-    if l_zero && a_zero {
-        0
-    } else if !l_zero && a_zero {
-        1
-    } else if l_zero && !a_zero {
-        2
-    } else if left == above {
-        4
+    let same = left == above;
+    if same && l_zero {
+        4 // LEFT_ABOVE_ZED
+    } else if same {
+        3 // LEFT_ABOVE_SAME (both non-zero, identical)
+    } else if a_zero {
+        2 // ABOVE_ZED (left non-zero)
+    } else if l_zero {
+        1 // LEFT_ZED (above non-zero)
     } else {
-        3
+        0 // NORMAL (both non-zero, distinct)
     }
 }
 

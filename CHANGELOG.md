@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drift on multi-frame sequences where keyframe deltas are not re-emitted
   by every P-frame; nets +55 / +57 exact-pixel matches on the
   `golden-update-cycle` and `altref-arnr-on` corpus fixtures.
+- *(decoder)* SPLITMV sub-block context selector now matches RFC 6386
+  §16.3 `vp8_mvCont` exactly. The previous scrambled mapping returned
+  context indices `{0,1,2,3,4}` for `{both-zero, above-zero, left-zero,
+  normal, both-equal-nonzero}` while `SUB_MV_REF_PROBS` rows are stored
+  in RFC numeric order `{NORMAL, LEFT_ZED, ABOVE_ZED, LEFT_ABOVE_SAME,
+  LEFT_ABOVE_ZED}`. Every SPLITMV sub-block was therefore decoded with
+  the wrong probability vector, sometimes producing 3-digit-magnitude
+  garbage sub-MVs at frame-edge MBs. Encoder side updated symmetrically
+  so the in-tree roundtrip stays consistent.
+- *(decoder)* P-frame `find_near_mvs` results are now clamped to the
+  per-MB legal range (RFC 6386 §16.3 `vp8_clamp_mv`): each of `nearest`,
+  `near`, and `best_mv` is clipped to `[mb_to_*_edge ± 128]` (one MB
+  beyond the visible image edge in 1/8-pel units, matching the §18.1
+  extended reference border). NEWMV macroblocks get the secondary clamp
+  on the combined `best_mv + dmv` per the same paragraph; SPLITMV
+  sub-blocks remain unclamped per §18.1.
 
 ## [0.1.6](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.5...v0.1.6) - 2026-05-04
 

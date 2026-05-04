@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.4...v0.1.5) - 2026-05-04
+
+### Added
+
+- gate oxideav-core behind default-on `registry` feature ([#358](https://github.com/OxideAV/oxideav-vp8/pull/358))
+- *(encoder)* simple-mode loop-filter selection (RFC 6386 §15.2)
+
+### Fixed
+
+- drop unused positional arg in encoder_mode_coverage eprintln
+- *(clippy)* rewrite per_mb_filter_level docstring as a bullet list
+- *(clippy)* tame doc-list indent + lazy-continuation lints
+- per-MB loop-filter level deltas + libvpx-correct interior_limit shift
+
+### Other
+
+- ignore pframe_near_mv_neighbour_chain_roundtrip (encoder RDO picks SKIP)
+- audit ([#327](https://github.com/OxideAV/oxideav-vp8/pull/327)): refresh stale lib.rs surface doc + add mode-coverage tests
+
 ### Added
 
 - New default-on `registry` feature. With `default-features = false`

@@ -3338,14 +3338,17 @@ fn integer_motion_search(
 }
 
 /// Encode-time replica of `find_near_mvs` in the decoder. Returns
-/// `(nearest, near, best, cnt)` for a candidate `ref_frame`. Out-of-frame
-/// neighbours, intra neighbours, and neighbours whose ref differs from
-/// `ref_frame` all contribute NOTHING (not a ZERO MV). See the decoder's
+/// `(nearest, near, best, cnt)`. Out-of-frame neighbours and intra
+/// neighbours contribute NOTHING; every other neighbour contributes its
+/// MV regardless of which reference it points at. See the decoder's
 /// `find_near_mvs` for the RFC 6386 §16.3 walk.
 ///
 /// Note: with all reference frames sharing sign-bias = false in this
 /// encoder, the sign-bias flip is a no-op so we omit it (the decoder
 /// would XOR neighbour vs current ref bias and negate when they differ).
+/// `ref_frame` and `mb_ref_frames` are kept in the signature for parity
+/// with the decoder's `find_near_mvs` signature and so a future
+/// non-zero sign-bias would have the inputs it needs.
 #[allow(clippy::too_many_arguments)]
 fn find_near_mvs_enc(
     mb_mvs: &[Mv],
@@ -3354,7 +3357,7 @@ fn find_near_mvs_enc(
     mb_x: usize,
     mb_y: usize,
     mb_w: usize,
-    ref_frame: u8,
+    _ref_frame: u8,
 ) -> (Mv, Mv, Mv, [u8; 4]) {
     let mut mvs: [Mv; 4] = [Mv::ZERO; 4];
     let mut cnt = [0u8; 4];
@@ -3371,14 +3374,21 @@ fn find_near_mvs_enc(
         let nmv = match mb_decisions.get(idx) {
             Some(d) if d.is_intra() => continue, // intra, no contribution
             Some(_) => {
-                // Filter neighbours whose reference differs from ours —
-                // the decoder's find_near_mvs only contributes neighbours
-                // whose ref_frame matches the current MB's ref (with
-                // sign-bias-aware MV negation; here all biases are false).
-                let nref = mb_ref_frames.get(idx).copied().unwrap_or(ENC_REF_LAST);
-                if nref != ref_frame {
-                    continue;
-                }
+                // Mirror the decoder's `find_near_mvs`: ALL non-intra
+                // neighbours contribute, regardless of which reference they
+                // point at. The reference frame only matters for the
+                // sign-bias flip — with all our refs sharing
+                // `sign_bias = false` (we hard-code `sign_bias_golden = 0`
+                // and `sign_bias_alternate = 0` in the inter header) the
+                // flip is a no-op. An earlier (pre-#373) version of this
+                // walk filtered out neighbours with a different ref to
+                // mirror the comment, but the decoder NEVER filters — so
+                // doing so here desynced the encoder's neighbour chain
+                // from the decoder's whenever a row mixed LAST / GOLDEN /
+                // ALT picks, breaking NEAREST / NEAR reconstruction. (The
+                // bug was latent until #373 made the picker aggressive
+                // enough to pick non-LAST refs mid-row.)
+                let _ = mb_ref_frames; // kept for signature/future sign-bias use
                 mb_mvs[idx]
             }
             None => continue,

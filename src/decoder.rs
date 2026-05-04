@@ -757,7 +757,21 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
     }
 
     // Update persistent probability state if indicated.
-    if header.refresh_entropy_probs || is_keyframe {
+    //
+    // RFC 6386 §13.5 / libvpx `vp8_decode_frame`:
+    // * Keyframes always reset persistent state to defaults at the start
+    //   (handled above at `state.probs = PersistentProbs::defaults()`).
+    //   They then save the (possibly in-frame-modified) header values
+    //   into persistent state ONLY when `refresh_entropy_probs=1`.
+    // * P-frames save the (in-frame-modified) header values into
+    //   persistent state when `refresh_entropy_probs=1`. When 0, the
+    //   persistent state stays at whatever the previous frame saved.
+    //
+    // The keyframe-with-refresh_entropy=0 case is the small-roi-
+    // segmentation fixture: the in-frame coef-probs updates apply to
+    // the keyframe ONLY, and the next P-frame must read with the
+    // RFC 6386 default coef table — not the keyframe's modified copy.
+    if header.refresh_entropy_probs {
         state.probs.coef_probs = header.coef_probs;
         state.probs.ymode_probs = header.ymode_probs;
         state.probs.uv_mode_probs = header.uv_mode_probs;

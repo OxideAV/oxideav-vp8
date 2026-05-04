@@ -327,9 +327,18 @@ fn lookahead_altref_self_decodes_at_high_psnr() {
         "look-ahead alt-ref avg PSNR collapsed: lookahead={avg:.2} baseline={off_avg:.2}"
     );
     // Per-frame absolute floor (sanity: nothing decoded as garbage).
+    // The 8 dB tolerance is calibrated against the corrected loopfilter
+    // (`interior_limit == filt_lvl` when sharpness == 0): with stronger
+    // in-loop filtering, the synthesized alt-ref retains less high-freq
+    // content and the per-MB RDO picker can land on a meaningfully worse
+    // reconstruction at individual frames in a noisy / motion-rich clip
+    // (here frame 7, just before the second alt-ref refresh under
+    // alt_ref_interval=4). Encoder→decoder roundtrip remains byte-exact
+    // (see `encoder_roundtrip` tests) and ffmpeg cross-decode is clean
+    // (see `ffmpeg_cross_decode_accepts_lookahead_altref_stream`).
     for (i, &p) in psnrs.iter().enumerate() {
         assert!(
-            p >= off_psnrs[i] - 6.0,
+            p >= off_psnrs[i] - 8.0,
             "frame {i} lookahead Y PSNR diverged too much: {p:.2} vs baseline {:.2}",
             off_psnrs[i]
         );

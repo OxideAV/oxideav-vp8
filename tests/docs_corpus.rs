@@ -370,8 +370,10 @@ fn corpus_partition_padding_16x16_4parts() {
 //     bug surfaces in a follow-up round. Each is paired with a
 //     TODO(vp8-corpus) tag so the bug is grep-able. ---
 
-// i-only-64x64: 98.49% match after the IDCT pass-order fix (round 24).
-// Residual differences are in the loopfilter pass, not B_PRED context.
+// Bit-exact after the libvpx-correct interior_limit fix
+// (`interior_limit == filt_lvl` when sharpness == 0): loopfilter mask
+// thresholds now match the trace's `LOOPFILTER level=N inner=N` (e.g.
+// level=7 inner=7 on this 64×64 keyframe at filter_level=1).
 #[test]
 fn corpus_i_only_64x64() {
     evaluate(&CorpusCase {
@@ -379,7 +381,7 @@ fn corpus_i_only_64x64() {
         width: 64,
         height: 64,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -462,6 +464,10 @@ fn corpus_vp8_with_loopfilter_mode_simple() {
     });
 }
 
+// Bit-exact after the libvpx-correct interior_limit fix — the IVF-
+// packaged half of the WebM/IVF container-parity pair. Same VP8
+// elementary stream as `webm-mux-vs-ivf-webm` (SHA c8a2264d...) so
+// promoting i-only-64x64 promoted this fixture too.
 #[test]
 fn corpus_webm_mux_vs_ivf_ivf() {
     evaluate(&CorpusCase {
@@ -469,7 +475,7 @@ fn corpus_webm_mux_vs_ivf_ivf() {
         width: 64,
         height: 64,
         n_frames: 1,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 

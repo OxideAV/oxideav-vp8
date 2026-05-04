@@ -160,15 +160,16 @@ fn normal_filter(
 }
 
 /// Filter `level` parameters helper — derives the three thresholds
-/// per RFC 6386 §15.4.
+/// per RFC 6386 §15.4 / libvpx `vp8_loop_filter_update_sharpness`.
 ///
-///   interior_limit = loop_filter_level >> ((sharpness >= 4) ? 2 : 1)
+///   block_inside_limit = filt_lvl >> (sharpness > 0)
+///   block_inside_limit = block_inside_limit >> (sharpness > 4)
 ///   if sharpness > 0:
-///       interior_limit = min(interior_limit, 9 - sharpness)
-///   interior_limit = max(interior_limit, 1)
+///       block_inside_limit = min(block_inside_limit, 9 - sharpness)
+///   block_inside_limit = max(block_inside_limit, 1)
 ///
-///   mbedge_limit   = ((loop_filter_level + 2) * 2) + interior_limit
-///   sub_bedge_limit = (loop_filter_level * 2) + interior_limit
+///   mbedge_limit   = (2 * (filt_lvl + 2)) + block_inside_limit
+///   sub_bedge_limit = (2 *  filt_lvl)     + block_inside_limit
 ///
 ///   hev_threshold (key frames):
 ///       level >= 40 → 2
@@ -181,14 +182,14 @@ fn normal_filter(
 ///       level >= 15 → 1
 ///       else → 0
 ///
-/// **The `>> 1` (or `>> 2`) shift on `interior_limit` is unconditional**
-/// — libvpx's `vp8_loop_filter_init` always shifts; the prior code
-/// gated the shift on `sharpness > 0`, which produced
-/// `interior_limit = level` and hence `mbedge_limit = (level+2)*2 +
-/// level = 3*level + 4` instead of the libvpx-correct
-/// `2*(level+2) + (level >> 1)`. The discrepancy compounds as the
-/// frame-wide `filter_level` grows, manifesting as ±1..±3 pixel
-/// drift at every edge for any nonzero filter level.
+/// **`interior_limit` is NOT shifted when `sharpness == 0`.** libvpx's
+/// formula uses two boolean shifts: `>> (sharpness > 0)` then
+/// `>> (sharpness > 4)`, both of which are 0 when sharpness is 0 — so
+/// `interior_limit == filt_lvl` in the common (and corpus-wide)
+/// `sharpness == 0` case. The fixture trace events confirm:
+/// `LOOPFILTER level=7 inner=7` for `i-only-64x64` (sharpness=0,
+/// per-MB level=7). Only `1 <= sharpness <= 4` applies a single shift,
+/// and `sharpness >= 5` applies two shifts.
 ///
 /// `mb_edge=true` returns the inter-macroblock variant; `false` returns
 /// the inter-subblock variant.
@@ -208,10 +209,18 @@ impl FilterParams {
 
     pub fn for_mb_typed(level: u8, sharpness: u8, mb_edge: bool, key_frame: bool) -> Self {
         let l = level as i32;
-        // `interior_limit = level >> ((sharpness >= 4) ? 2 : 1)` —
-        // shift is unconditional per `vp8_loop_filter_init`. The
-        // sharpness>0 branch only adds the additional 9-sharpness cap.
-        let mut interior = l >> if sharpness >= 4 { 2 } else { 1 };
+        // libvpx `vp8_loop_filter_update_sharpness`:
+        //   block_inside_limit = filt_lvl >> (sharpness > 0);
+        //   block_inside_limit = block_inside_limit >> (sharpness > 4);
+        // i.e. shift by 1 when sharpness in 1..=4, by 2 when sharpness >= 5,
+        // and by 0 (no shift) when sharpness == 0.
+        let mut interior = l;
+        if sharpness > 0 {
+            interior >>= 1;
+        }
+        if sharpness > 4 {
+            interior >>= 1;
+        }
         if sharpness > 0 {
             let cap = 9 - sharpness as i32;
             if interior > cap {

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.7...v0.1.8) - 2026-05-04
+
+### Fixed
+
+- *(decoder, encoder)* correct RFC 6386 §16.3 split_mv_tree leaves
+
+### Other
+
+- tidy CHANGELOG after release-plz 0.1.7 rebase
+
 ### Fixed
 
 - *(decoder, encoder)* `MB_SPLIT_TREE` (RFC 6386 §16.3 `split_mv_tree`)

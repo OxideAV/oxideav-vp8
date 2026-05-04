@@ -2965,8 +2965,7 @@ fn estimate_distortion(
                     sse_intra_b_pred(src_y, rec_y, y_stride, mb_xp, mb_yp, mb_w, mb_h);
                 sse
             } else {
-                let (sse, _pred) =
-                    sse_intra_16x16(*y_mode, src_y, rec_y, y_stride, mb_xp, mb_yp);
+                let (sse, _pred) = sse_intra_16x16(*y_mode, src_y, rec_y, y_stride, mb_xp, mb_yp);
                 sse
             }
         }

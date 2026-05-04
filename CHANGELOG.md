@@ -7,36 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.6...v0.1.7) - 2026-05-04
-
-### Added
-
-- *(encoder)* per-frequency quant_indices deltas ([#417](https://github.com/OxideAV/oxideav-vp8/pull/417))
-
-### Fixed
-
-- *(decoder)* RFC-correct SPLITMV sub-block context + MV clamp at frame edges
-- *(decoder)* persist loop-filter ref/mode deltas across frames ([#416](https://github.com/OxideAV/oxideav-vp8/pull/416))
-- *(loopfilter)* each MB filters only its own 16-pixel slab per edge
-- *(inter)* chroma uses 6-tap, not bilinear, in profile 0
-- *(decoder)* persist coef probs only when refresh_entropy_probs=1
-- *(loopfilter)* interior_limit shift gated on sharpness, per libvpx
-
-### Other
-
-- chroma 6-tap (profile 0) + corpus tier roster after fixes
-
-### Added
-
-- *(encoder)* per-frequency `quant_indices` deltas (RFC 6386 §9.6) — five
-  new `Vp8EncoderConfig` fields (`y_dc_delta`, `y2_dc_delta`,
-  `y2_ac_delta`, `uv_dc_delta`, `uv_ac_delta`) round-trip through the
-  emitted `quant_indices` block. Each delta is clipped to the 4-bit
-  signed range `-15..=15` and the dequant context applies it to the
-  matching frequency band before the per-segment qindex is added. Y AC
-  is intentionally absent because the bitstream has no `y_ac_delta`
-  field. Defaults are zero (legacy single-qi behaviour).
-
 ### Fixed
 
 - *(decoder, encoder)* `MB_SPLIT_TREE` (RFC 6386 §16.3 `split_mv_tree`)
@@ -60,29 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   99 respectively. `small-roi-segmentation` is unchanged at 41.92%
   (independent root cause downstream of segmentation's per-segment
   qindex application).
-- *(decoder)* loop-filter `ref_deltas` and `mode_deltas` now persist
-  across frames (RFC 6386 §9.4). When `mode_ref_lf_delta_update` is 0
-  or only some per-element present flags are set, the decoder keeps the
-  previous frame's values verbatim instead of resetting to zero. Fixes
-  drift on multi-frame sequences where keyframe deltas are not re-emitted
-  by every P-frame; nets +55 / +57 exact-pixel matches on the
-  `golden-update-cycle` and `altref-arnr-on` corpus fixtures.
-- *(decoder)* SPLITMV sub-block context selector now matches RFC 6386
-  §16.3 `vp8_mvCont` exactly. The previous scrambled mapping returned
-  context indices `{0,1,2,3,4}` for `{both-zero, above-zero, left-zero,
-  normal, both-equal-nonzero}` while `SUB_MV_REF_PROBS` rows are stored
-  in RFC numeric order `{NORMAL, LEFT_ZED, ABOVE_ZED, LEFT_ABOVE_SAME,
-  LEFT_ABOVE_ZED}`. Every SPLITMV sub-block was therefore decoded with
-  the wrong probability vector, sometimes producing 3-digit-magnitude
-  garbage sub-MVs at frame-edge MBs. Encoder side updated symmetrically
-  so the in-tree roundtrip stays consistent.
-- *(decoder)* P-frame `find_near_mvs` results are now clamped to the
-  per-MB legal range (RFC 6386 §16.3 `vp8_clamp_mv`): each of `nearest`,
-  `near`, and `best_mv` is clipped to `[mb_to_*_edge ± 128]` (one MB
-  beyond the visible image edge in 1/8-pel units, matching the §18.1
-  extended reference border). NEWMV macroblocks get the secondary clamp
-  on the combined `best_mv + dmv` per the same paragraph; SPLITMV
-  sub-blocks remain unclamped per §18.1.
+
+## [0.1.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.6...v0.1.7) - 2026-05-04
+
+### Added
+
+- *(encoder)* per-frequency quant_indices deltas ([#417](https://github.com/OxideAV/oxideav-vp8/pull/417))
+
+### Fixed
+
+- *(decoder)* RFC-correct SPLITMV sub-block context + MV clamp at frame edges
+- *(decoder)* persist loop-filter ref/mode deltas across frames ([#416](https://github.com/OxideAV/oxideav-vp8/pull/416))
+- *(loopfilter)* each MB filters only its own 16-pixel slab per edge
+- *(inter)* chroma uses 6-tap, not bilinear, in profile 0
+- *(decoder)* persist coef probs only when refresh_entropy_probs=1
+- *(loopfilter)* interior_limit shift gated on sharpness, per libvpx
+
+### Other
+
+- chroma 6-tap (profile 0) + corpus tier roster after fixes
 
 ## [0.1.6](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.5...v0.1.6) - 2026-05-04
 

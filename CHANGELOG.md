@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(encoder)* `estimate_distortion` now computes per-mode SSE for
+  `PMbDecision::Intra` instead of returning a fixed `8000` placeholder
+  (issue #392). For 16×16 modes (DC/V/H/TM) the helper invokes
+  `sse_intra_16x16(y_mode, ...)` against the running reconstruction; for
+  `B_PRED` it invokes `sse_intra_b_pred(...)`. With #340's bit-accurate
+  rate input the Lagrangian comparison `D + λ·R/256` now sees the same
+  distortion units on every branch — intra-vs-inter on textured MBs is
+  decided by real per-mode quality, not a constant that biased the
+  picker against intra. The 17 BitExact corpus fixtures still
+  round-trip exactly and the encoder-side roundtrip / mode-coverage /
+  altref-RDO / scene-cut / segments suites stay green.
 - *(encoder)* RDO rate input now sourced from a real bool-coded bit
   accumulator (issue #340). The previous 7-step `floor(log2(256/p))`
   cost LUT (1/8-bit precision, only 7 distinct values across the whole

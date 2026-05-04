@@ -1854,10 +1854,13 @@ fn encode_pframe_and_reconstruct(
                     &dec,
                     &src_y,
                     &ref_plane.y,
+                    &rec_y,
                     y_stride,
                     y_buf_h,
                     mb_x,
                     mb_y,
+                    mb_w,
+                    mb_h,
                     ref_frame,
                     plan,
                     nearest,
@@ -2889,17 +2892,26 @@ fn estimate_mode_rate_x256(
 
 /// Approximate the SSE for a candidate decision (the distortion `D` of
 /// the Lagrangian cost). For inter modes we use the sub-pel SSE against
-/// the chosen reference; for intra we return a fixed moderate value
-/// since intra-in-P is gated by SAD upstream.
+/// the chosen reference; for intra we evaluate the chosen Y prediction
+/// (16×16 DC/V/H/TM or B_PRED) against the source using the running
+/// reconstruction `rec_y` for neighbour context — bit-accurate per-mode
+/// SSE so the Lagrangian comparison weighs intra-vs-inter on the same
+/// distortion scale (#392). The placeholder constant `8000` previously
+/// used here biased the picker against intra on textured MBs because it
+/// was orders of magnitude smaller than the real intra SSE on such MBs.
+#[cfg(feature = "registry")]
 #[allow(clippy::too_many_arguments)]
 fn estimate_distortion(
     decision: &PMbDecision,
     src_y: &[u8],
     ref_y: &[u8],
+    rec_y: &[u8],
     y_stride: usize,
     y_buf_h: usize,
     mb_x: usize,
     mb_y: usize,
+    mb_w: usize,
+    mb_h: usize,
 ) -> u64 {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
@@ -2940,7 +2952,24 @@ fn estimate_distortion(
             }
             sse
         }
-        PMbDecision::Intra { .. } => 8000,
+        PMbDecision::Intra { y_mode, .. } => {
+            // Per-mode Y-plane SSE against the source. Chroma is omitted
+            // — the inter branches above also measure Y-only SSE so this
+            // keeps the distortion units comparable across branches.
+            // Same neighbour-gathering convention (`rec_y` + the same
+            // helper) as `choose_pmb_decision`'s intra fallback at
+            // `src/encoder.rs` ~3170 so the SSE the picker sees here is
+            // exactly the one that branch already minimised over.
+            if *y_mode == B_PRED {
+                let (sse, _modes) =
+                    sse_intra_b_pred(src_y, rec_y, y_stride, mb_xp, mb_yp, mb_w, mb_h);
+                sse
+            } else {
+                let (sse, _pred) =
+                    sse_intra_16x16(*y_mode, src_y, rec_y, y_stride, mb_xp, mb_yp);
+                sse
+            }
+        }
     }
 }
 
@@ -2961,10 +2990,13 @@ fn rd_cost_for_decision(
     decision: &PMbDecision,
     src_y: &[u8],
     ref_y: &[u8],
+    rec_y: &[u8],
     y_stride: usize,
     y_buf_h: usize,
     mb_x: usize,
     mb_y: usize,
+    mb_w: usize,
+    mb_h: usize,
     ref_frame: u8,
     plan: RefPlan,
     nearest: Mv,
@@ -2976,7 +3008,9 @@ fn rd_cost_for_decision(
     mb_skip_prob: u8,
     lambda: u32,
 ) -> u64 {
-    let d = estimate_distortion(decision, src_y, ref_y, y_stride, y_buf_h, mb_x, mb_y);
+    let d = estimate_distortion(
+        decision, src_y, ref_y, rec_y, y_stride, y_buf_h, mb_x, mb_y, mb_w, mb_h,
+    );
     let r = estimate_mode_rate_x256(
         decision,
         ref_frame,

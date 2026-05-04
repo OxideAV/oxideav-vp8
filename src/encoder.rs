@@ -44,7 +44,7 @@ use crate::frame::Vp8Frame;
 use crate::bool_encoder::{bool_cost_x256, BoolEncoder};
 use crate::fdct::{fdct4x4, fwht4x4};
 use crate::frame_tag::KEYFRAME_SYNC_CODE;
-use crate::inter::{bilinear_predict, sixtap_predict, RefPlane};
+use crate::inter::{sixtap_predict, RefPlane};
 use crate::intra::{predict_16x16, predict_4x4, predict_8x8, B4x4Neighbours};
 use crate::loopfilter::{
     filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
@@ -3710,10 +3710,12 @@ fn encode_inter_mb_at_mv(
         }
     }
 
-    // Chroma prediction via bilinear_predict. The decoder derives a
-    // per-4×4 chroma MV as the `chroma_round` of the sum of 4 covered
-    // luma sub-MVs. For a non-SPLIT MB every sub-MV equals `mv`, so the
-    // sum is `4*mv`.
+    // Chroma prediction via sixtap_predict (profile 0 — same 6-tap
+    // filter as luma; libvpx `vp8_setup_version` sets
+    // `use_bilinear_mc_filter = 0` for `version == 0`). The decoder
+    // derives a per-4×4 chroma MV as the `chroma_round` of the sum of 4
+    // covered luma sub-MVs. For a non-SPLIT MB every sub-MV equals
+    // `mv`, so the sum is `4*mv`.
     let cmv_r = chroma_round_enc(4 * mv.row as i32);
     let cmv_c = chroma_round_enc(4 * mv.col as i32);
     let mb_xc = mb_x * 8;
@@ -3732,7 +3734,7 @@ fn encode_inter_mb_at_mv(
             height: uv_buf_h,
         };
         let mut pred_uv = [0u8; 64];
-        // Decoder applies the bilinear filter per 4×4 chroma sub-block
+        // Decoder applies the 6-tap filter per 4×4 chroma sub-block
         // (bw=bh=4), not as one 8×8 call — the horizontal-pass temporary
         // rounding differs at block boundaries when fx/fy are both
         // non-zero, so mirror the per-subblock loop exactly.
@@ -3743,7 +3745,7 @@ fn encode_inter_mb_at_mv(
             let dst_y = by * 4;
             let ref_x_fp = (mb_xc + dst_x) as i32 * 8 + cmv_c;
             let ref_y_fp = (mb_yc + dst_y) as i32 * 8 + cmv_r;
-            bilinear_predict(
+            sixtap_predict(
                 &ref_plane_uv,
                 ref_x_fp,
                 ref_y_fp,
@@ -5762,7 +5764,10 @@ fn encode_inter_mb_split(
             let dst_y = by * 4;
             let ref_x_fp = (mb_xc + dst_x) as i32 * 8 + cmv_c;
             let ref_y_fp = (mb_yc + dst_y) as i32 * 8 + cmv_r;
-            bilinear_predict(
+            // Profile 0: chroma uses the same 6-tap filter as luma
+            // (libvpx `vp8_setup_version`: `use_bilinear_mc_filter = 0`
+            // for `version == 0`).
+            sixtap_predict(
                 &ref_plane_uv,
                 ref_x_fp,
                 ref_y_fp,

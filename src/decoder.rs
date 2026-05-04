@@ -21,7 +21,7 @@ use crate::frame_header::{
     parse_inter_header, parse_keyframe_header, FrameHeader, PersistentProbs,
 };
 use crate::frame_tag::{parse_header, FrameType};
-use crate::inter::{bilinear_predict, sixtap_predict, RefPlane};
+use crate::inter::{sixtap_predict, RefPlane};
 use crate::intra::{predict_16x16, predict_4x4, predict_8x8, B4x4Neighbours};
 use crate::loopfilter::{
     filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
@@ -1641,7 +1641,7 @@ fn reconstruct_inter_mb(
         );
     }
 
-    // --- Chroma prediction via bilinear 2-tap filter ---
+    // --- Chroma prediction via 6-tap filter (profile 0) ---
     // Each 4×4 chroma sub-block covers 2×2 luma sub-blocks. The chroma
     // MV is the average of the 4 luma sub-MVs it covers (RFC 6386 §18.1):
     //
@@ -1649,6 +1649,12 @@ fn reconstruct_inter_mb(
     //   chroma_mv = -((-sum + 4) / 8)   for sum < 0
     //
     // Result is already in 1/8-chroma-pel units (no further scaling).
+    //
+    // Profile 0 (the only profile RFC 6386 standardises) uses the SAME
+    // 6-tap filter for chroma as for luma — see libvpx's
+    // `vp8_setup_version`: `use_bilinear_mc_filter = 0` for `version == 0`.
+    // Profiles 1..3 (libvpx speed/quality variants, out of scope per the
+    // corpus README) switch to bilinear; we don't decode those.
     let mb_xc = mb_x * 8;
     let mb_yc = mb_y * 8;
     for i in 0..4 {
@@ -1670,7 +1676,7 @@ fn reconstruct_inter_mb(
         let dst_y = mb_yc + by * 4;
         let ref_x_fp = (dst_x as i32) * 8 + cmv_c;
         let ref_y_fp = (dst_y as i32) * 8 + cmv_r;
-        bilinear_predict(
+        sixtap_predict(
             &ref_frame.u_plane(),
             ref_x_fp,
             ref_y_fp,
@@ -1681,7 +1687,7 @@ fn reconstruct_inter_mb(
             4,
             4,
         );
-        bilinear_predict(
+        sixtap_predict(
             &ref_frame.v_plane(),
             ref_x_fp,
             ref_y_fp,

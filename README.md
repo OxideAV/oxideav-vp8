@@ -54,7 +54,8 @@ shuffling. Turning the `registry` feature back on adds the
 ### Decoder
 
 I-frame and P-frame decode against LAST / GOLDEN / ALTREF references,
-with the 6-tap luma sub-pel filter, the 2-tap bilinear chroma filter,
+with the 6-tap sub-pel filter (luma AND chroma — profile 0 sets
+`use_bilinear_mc_filter = 0`, see libvpx `vp8_setup_version`),
 reference sign-bias and refresh / copy-buffer flags, and the in-loop
 deblocking filter (simple + normal modes). Parses all inter MB modes
 (NEAREST / NEAR / ZERO / NEW / SPLIT) and decodes MV diffs via the
@@ -171,8 +172,8 @@ each fixture's `expected.yuv` ground truth. Three tiers:
 
 | Tier | Fixtures | Behaviour |
 | --- | --- | --- |
-| `BitExact` (CI gate) | `tiny-i-only-16x16`, `i-only-loopfilter-off`, `partition-padding-16x16-4parts`, `q-low`, `segment-4-partitions` | Test fails on any divergence |
-| `ReportOnly` | 11 fixtures (loopfilter / inter / multi-frame chains) | Logs match% + max diff; does not gate CI |
+| `BitExact` (CI gate) | `tiny-i-only-16x16`, `partition-padding-16x16-4parts`, `q-low`, `segment-4-partitions`, `i-only-loopfilter-off`, `i-only-64x64`, `webm-mux-vs-ivf-ivf`, `q-high`, `i-only-loopfilter-high`, `gradient-and-noise-128x128`, `vp8-with-loopfilter-mode-simple` (every keyframe-only fixture in the corpus) | Test fails on any divergence |
+| `ReportOnly` | 4 multi-frame inter-decode fixtures (`i-frame-then-p-frame-64x64`, `golden-update-cycle`, `altref-arnr-on`, `small-roi-segmentation`) | Logs match% + max diff; does not gate CI |
 | `Ignored` | `webm-mux-vs-ivf-webm` | Disabled until oxideav-mkv is wired in for WebM demux (paired IVF version is still scored) |
 
 Plus a two-part check for the `yuv422-not-supported` negative case:

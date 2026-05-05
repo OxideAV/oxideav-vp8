@@ -25,19 +25,35 @@ pub mod mv_ctx {
     pub const LONG_WIDTH: usize = 10; // bit positions 0..=9, bit 3 is last
 }
 
-/// Default MV probability context from RFC 6386 §17.1 `vp8_default_mv_context`.
-/// Indexed as `[component][entry]` where component 0 is row (y) and 1 is col
-/// (x), matching libvpx. The external boundary uses component 0 first when
-/// decoding is done MV-by-MV.
+/// Default MV probability context from RFC 6386 §17.1 `vp8_default_mv_context`
+/// (page 110-111). Indexed as `[component][entry]` where component 0 is row
+/// (y) and 1 is col (x). Each component is 19 entries:
+///
+/// * `[0]` IS_SHORT, `[1]` SIGN, `[2..=8]` 7-entry short tree, `[9..=18]`
+///   10-entry long-bit probabilities for bits 0..9 (bit 3 handled last).
+///
+/// Earlier versions of this table had the trailing three long-bit entries
+/// for bits 7/8/9 (`[16]`/`[17]`/`[18]`) populated with low values
+/// (`145/162/163` for row, `166/172/182` for col). The RFC values are
+/// `239/254/254` (row) and `236/254/254` (col); the low values caused
+/// inter MV components in the long-magnitude path to receive incorrect
+/// high-bit probabilities (P(bit=0) ≈ 57-64% instead of 93-99%), so
+/// any MV with magnitude ≥ 128 (long-path) sub-decoded its top bits as
+/// near-50/50, producing wildly wrong magnitudes that landed exactly on
+/// the §16.3 `vp8_clamp_mv` lower bound. Visible in
+/// `small-roi-segmentation/trace.txt` MB(4,0) frame 1: our pre-fix
+/// decode produced mv=(0, -640), the row's `mb_to_left_edge - MV_BORDER`
+/// clamp boundary; with the corrected probs the same MB decodes a
+/// short-path zero-magnitude MV.
 pub const DEFAULT_MV_CONTEXT: [MvContext; 2] = [
     // Row / y component.
     [
-        162, 128, 225, 146, 172, 147, 214, 39, 156, 128, 129, 132, 75, 145, 178, 206, 145, 162, 163,
+        162, 128, 225, 146, 172, 147, 214, 39, 156, 128, 129, 132, 75, 145, 178, 206, 239, 254, 254,
     ],
     // Col / x component.
     [
-        164, 128, 204, 170, 119, 235, 140, 230, 228, 128, 130, 130, 74, 148, 180, 203, 166, 172,
-        182,
+        164, 128, 204, 170, 119, 235, 140, 230, 228, 128, 130, 130, 74, 148, 180, 203, 236, 254,
+        254,
     ],
 ];
 

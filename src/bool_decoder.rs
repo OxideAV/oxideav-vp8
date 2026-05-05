@@ -123,6 +123,13 @@ impl<'a> BoolDecoder<'a> {
     pub fn position(&self) -> usize {
         self.pos
     }
+
+    /// Snapshot of (pos, range, value, bit_count) — used by trace
+    /// harnesses to localise where the decoder loses sync against a
+    /// reference trace.
+    pub fn debug_state(&self) -> (usize, u32, u32, i32) {
+        (self.pos, self.range, self.value, self.bit_count)
+    }
 }
 
 #[cfg(test)]

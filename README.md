@@ -183,32 +183,43 @@ ReportOnly fixtures track residual loopfilter rounding ±1 / inter-
 frame chain accumulation; each is tagged `TODO(vp8-corpus)` in the
 test source.
 
-Round-28 delta (this round, see CHANGELOG): RFC 6386 §16.3
-`split_mv_tree` had three of its four leaves transcribed in the wrong
-slots — the bit-`10` branch decoded as 16x8 instead of 8x8 quarters,
-bit-`110` as 8x16 instead of 16x8, bit-`111` as quarters instead of
-8x16. The encoder used the same swapped emit table, so our own
-encode/decode roundtrips passed; spec-encoded P-frames that exercised
-SPLITMV (every multi-frame ReportOnly fixture) corrupted the entire
-mb_y row containing the first SPLITMV MB — the decoder picked a
-different partition than the encoder used and read the wrong number
-of sub-MV ref trees, mis-aligning the bool decoder for every
-following MB on the row. Net pixel-match improvement:
+Round-29 delta (this round, see CHANGELOG): RFC 6386 §17.1
+`vp8_default_mv_context` had its trailing three long-bit
+probabilities (entries `[16]`/`[17]`/`[18]`, controlling decoded
+high bits 7/8/9 of long-magnitude MV components) transcribed wrong
+— `145/162/163` for row and `166/172/182` for col instead of the
+spec's `239/254/254` and `236/254/254`. Inter MV components in the
+long-magnitude path (any |component| ≥ 1 pixel) had their high
+bits decoded against near-50/50 probabilities instead of the
+near-deterministic spec values, so any non-trivial encoder-written
+MV decoded with wildly wrong top bits and almost always saturated
+on the §16.3 `vp8_clamp_mv` lower bound. Reproduced byte-by-byte
+on `small-roi-segmentation` frame 1 MB(4,0) NEW_MV decoding as
+`mv=(0, -640)` (exactly the `mb_to_left_edge - MV_BORDER` clamp).
+Net pixel-match improvement:
 
 | Fixture | Was | Now |
 | --- | --- | --- |
-| `i-frame-then-p-frame-64x64` | 88.57% | **96.98%** (Y max diff 196 → 6) |
-| `golden-update-cycle` | 93.23% | **96.59%** (Y max diff 171 → 11) |
-| `altref-arnr-on` | 82.31% | **90.36%** (Y max diff 208 → 99) |
-| `small-roi-segmentation` | 41.91% | 41.92% (independent root cause) |
+| `small-roi-segmentation` | 41.92% | **78.92%** (Y max diff 209 → 158) |
+| `altref-arnr-on` | 90.36% | **90.75%** (Y max diff 99 → 21) |
 
-11 BitExact fixtures (every keyframe-only fixture) remain at 100% and
-unchanged; SPLITMV is only reached in the 4 ReportOnly P-frame
-fixtures. The remaining 3-9% gap on the 3 fixed fixtures is small
-loopfilter / sub-pel MC residue downstream of mode decode, not the
-mode tree itself; max Y diff is now in the single digits except for
-altref-arnr-on (max 99 from one cluster of frames 7-9 that exercise
-ARNR temporal filtering on the alt-ref hidden frame).
+Every per-MB `mode/ref/seg/skip` field in `small-roi-segmentation`
+now matches the trace bit-exactly across all three frames (192
+MBs); the residual ~21% pixel divergence is in inter-MB motion
+compensation / sub-pel filter / dequant for non-zero MVs and is
+the next natural target. The encoder side was symmetrically wrong
+(`encode_mv_component` and `mv_component_cost_x256` use the same
+table), so encoder round-trips on our own bitstream stayed green
+even with the bad probs — the bug only surfaced against bitstreams
+written by a spec-compliant encoder.
+
+Round-28 delta (previous round, see CHANGELOG): RFC 6386 §16.3
+`split_mv_tree` had three of its four leaves transcribed in the wrong
+slots — the bit-`10` branch decoded as 16x8 instead of 8x8 quarters,
+bit-`110` as 8x16 instead of 16x8, bit-`111` as quarters instead of
+8x16. Brought `i-frame-then-p-frame-64x64` 88.57% → 96.98%,
+`golden-update-cycle` 93.23% → 96.59%, `altref-arnr-on` 82.31% →
+90.36%.
 
 Round-24 deltas (previous round, see CHANGELOG): IDCT pass-order, Y2
 DC-step uncap, loopfilter formula + per-MB iteration, encoder TL-

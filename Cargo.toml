@@ -21,6 +21,12 @@ categories = ["multimedia::encoding", "multimedia::video"]
 # `decode_vp8` / `encode_vp8_keyframe` API plus local `Vp8Frame` /
 # `Vp8Error` types and never references `oxideav-core`.
 oxideav-core = { version = "0.1", optional = true }
+# Distributed-slice auto-registration into `oxideav_core::REGISTRARS`
+# via the `oxideav_core::register!` macro. Tiny crate, no transitive
+# deps; works on every target including wasm. Gated behind the
+# default-on `registry` feature alongside `oxideav-core` so the
+# standalone build path stays decoupled.
+linkme = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -32,7 +38,7 @@ default = ["registry"]
 # implementations against `oxideav-core` so the crate can plug into the
 # `oxideav` framework registry. Default-on; turn off for image-library
 # use-cases that just want the standalone `decode_vp8` API.
-registry = ["dep:oxideav-core"]
+registry = ["dep:oxideav-core", "dep:linkme"]
 
 # Enables `portable_simd`-based loop-filter horizontal edges. Requires
 # nightly Rust (the feature gate is only stable on nightly as of

@@ -73,10 +73,17 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Unified registration entry point — installs the VP8 codec into the
 /// codec sub-registry and the IVF container into the container
 /// sub-registry of the supplied [`RuntimeContext`].
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick VP8 up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
     register_containers(&mut ctx.containers);
 }
+
+oxideav_core::register!("vp8", register);
 
 fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     crate::decoder::make_decoder(params)

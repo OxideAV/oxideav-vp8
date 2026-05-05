@@ -41,7 +41,12 @@ use oxideav_core::{
 use crate::error::{Result, Vp8Error as Error};
 use crate::frame::Vp8Frame;
 
-use crate::bool_encoder::{bool_cost_x256, BoolEncoder};
+use crate::bool_encoder::BoolEncoder;
+// `bool_cost_x256` is only used by the registry-gated rate-estimation
+// path (`estimate_mode_rate_x256`); gating the import keeps the
+// `--no-default-features` build clean.
+#[cfg(feature = "registry")]
+use crate::bool_encoder::bool_cost_x256;
 use crate::fdct::{fdct4x4, fwht4x4};
 use crate::frame_tag::KEYFRAME_SYNC_CODE;
 use crate::inter::{sixtap_predict, RefPlane};
@@ -50,7 +55,12 @@ use crate::loopfilter::{
     filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
     filter_simple_vertical, FilterParams,
 };
-use crate::mv::{encode_mv_component, mv_component_cost_x256, Mv};
+use crate::mv::{encode_mv_component, Mv};
+// `mv_component_cost_x256` is only used by the registry-gated
+// rate-estimation path (`estimate_mode_rate_x256`); gating the import
+// keeps the `--no-default-features` build clean.
+#[cfg(feature = "registry")]
+use crate::mv::mv_component_cost_x256;
 use crate::tables::coeff_probs::{CoeffProbs, DEFAULT_COEF_PROBS};
 use crate::tables::mv::DEFAULT_MV_CONTEXT;
 use crate::tables::quant::{

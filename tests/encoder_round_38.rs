@@ -97,7 +97,7 @@ fn make_noisy_pan_clip(n: usize) -> Vec<VideoFrame> {
         for row in 0..H as usize {
             for col in 0..W as usize {
                 // Base: soft gradient shifted by pan.
-                let base = (128u32 + ((col + pan_x) as u32 * 64 / W as u32)) as u8;
+                let base = (128u32 + ((col + pan_x) as u32 * 64 / W)) as u8;
                 // Noise: pseudo-random ±20.
                 let mut h: u32 = (row as u32)
                     .wrapping_mul(2246822519)
@@ -131,44 +131,35 @@ fn measure(cfg: Vp8EncoderConfig, clip: &[VideoFrame]) -> (usize, f64) {
 
     for f in clip.iter() {
         enc.send_frame(&Frame::Video(f.clone())).expect("send");
-        loop {
-            match enc.receive_packet() {
-                Ok(pkt) => {
-                    total_bytes += pkt.data.len();
-                    dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
-                        .expect("decode");
-                    loop {
-                        match dec.receive_frame() {
-                            Ok(Frame::Video(vf)) => {
-                                // Only score visible frames (skip hidden alt-ref).
-                                let y_src = &f.planes[0].data;
-                                let y_dec = &vf.planes[0].data;
-                                // Decoded frame may have different stride than source;
-                                // compare pixel-by-pixel for the actual W×H region.
-                                let src_stride = f.planes[0].stride;
-                                let dec_stride = vf.planes[0].stride;
-                                let mut se = 0f64;
-                                for r in 0..H as usize {
-                                    for c in 0..W as usize {
-                                        let a = y_src[r * src_stride + c] as f64;
-                                        let b = y_dec[r * dec_stride + c] as f64;
-                                        se += (a - b) * (a - b);
-                                    }
-                                }
-                                let mse = se / (W as f64 * H as f64);
-                                psnr_sum += if mse == 0.0 {
-                                    60.0
-                                } else {
-                                    10.0 * (255.0f64 * 255.0 / mse).log10()
-                                };
-                                psnr_n += 1;
-                            }
-                            Ok(_) => {}
-                            Err(_) => break,
+        while let Ok(pkt) = enc.receive_packet() {
+            total_bytes += pkt.data.len();
+            dec.send_packet(&Packet::new(0, TimeBase::new(1, 30), pkt.data))
+                .expect("decode");
+            while let Ok(frame) = dec.receive_frame() {
+                if let Frame::Video(vf) = frame {
+                    // Only score visible frames (skip hidden alt-ref).
+                    let y_src = &f.planes[0].data;
+                    let y_dec = &vf.planes[0].data;
+                    // Decoded frame may have different stride than source;
+                    // compare pixel-by-pixel for the actual W×H region.
+                    let src_stride = f.planes[0].stride;
+                    let dec_stride = vf.planes[0].stride;
+                    let mut se = 0f64;
+                    for r in 0..H as usize {
+                        for c in 0..W as usize {
+                            let a = y_src[r * src_stride + c] as f64;
+                            let b = y_dec[r * dec_stride + c] as f64;
+                            se += (a - b) * (a - b);
                         }
                     }
+                    let mse = se / (W as f64 * H as f64);
+                    psnr_sum += if mse == 0.0 {
+                        60.0
+                    } else {
+                        10.0 * (255.0f64 * 255.0 / mse).log10()
+                    };
+                    psnr_n += 1;
                 }
-                Err(_) => break,
             }
         }
     }

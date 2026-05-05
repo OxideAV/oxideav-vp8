@@ -25,8 +25,8 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS,
-    DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SEGMENT_LF_DELTAS,
+    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::frame_header::{parse_inter_header, parse_keyframe_header, PersistentProbs};
 use oxideav_vp8::{parse_header, FrameType};
@@ -175,6 +175,10 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 
@@ -208,6 +212,10 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 
@@ -252,6 +260,10 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 
@@ -344,6 +356,10 @@ fn frame_headers_carry_segment_lf_deltas() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

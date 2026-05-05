@@ -18,9 +18,9 @@ use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     first_pass_analyze, make_encoder_with_config, two_pass_qindices, LoopFilterMode,
     Vp8EncoderConfig, Vp8TwoPassConfig, DEFAULT_ALT_REF_INTERVAL, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD,
-    DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
-    QP_SENSITIVITY_X8,
+    DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SCENE_CUT_BOOST_FRAMES,
+    DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SEGMENT_LF_DELTAS,
+    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL, QP_SENSITIVITY_X8,
 };
 
 const W: u32 = 128;
@@ -142,6 +142,10 @@ fn default_enc_cfg(qindex: u8) -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 

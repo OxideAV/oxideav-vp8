@@ -25,7 +25,7 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::{parse_header, FrameType};
 
@@ -171,6 +171,10 @@ fn refresh_flags_follow_plan() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -245,6 +249,10 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -307,6 +315,10 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -377,6 +389,10 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -417,6 +433,10 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -542,6 +562,10 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -615,6 +639,10 @@ fn legacy_single_ref_path_still_works() {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

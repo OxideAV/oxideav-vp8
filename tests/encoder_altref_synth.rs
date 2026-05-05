@@ -28,7 +28,7 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_LOOKAHEAD_WINDOW, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_LOOKAHEAD_WINDOW, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::{parse_header, FrameType};
 
@@ -185,6 +185,10 @@ fn baseline_cfg(alt_ref_interval: u32) -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 

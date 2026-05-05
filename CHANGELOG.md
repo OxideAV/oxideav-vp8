@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Perceptual RDO activity mask — psy-RDO (#38). When
+  `Vp8EncoderConfig::enable_psy_rdo = true`, the Lagrangian lambda is
+  scaled per-MB by an activity mask derived from luma variance plus
+  `EDGE_WEIGHT × Laplacian edge energy`. Flat MBs receive a higher
+  lambda (fewer bits allocated), textured and edge-rich MBs receive a
+  lower lambda (distortion-penalised). The frame-mean activity is
+  computed once before the per-MB loop (`frame_mean_activity`); the
+  per-MB scale is clamped to [64, 512] / 256 to prevent degenerate
+  cases. Strength is controlled by `psy_rd_strength` (default 64 ≙ ~
+  ±75 % swing for a 2× activity ratio). Default off (opt-in, zero
+  impact on existing bitstreams). On a mixed smooth+noise 64×64 clip
+  the psy mask redistributes bits toward the noisy half without
+  regressing PSNR_Y vs the flat-lambda baseline.
+
+- *(encoder)* NLM temporal denoising on the alt-ref frame — ARNR NLM
+  (#38). When `Vp8EncoderConfig::enable_arnr_nlm = true` and
+  `enable_lookahead_altref = true`, the lookahead alt-ref synthesis runs
+  an additional NLM (non-local means) denoising pass over the Y plane
+  after the existing Gaussian temporal filter. For each MC-aligned
+  source frame (all non-centre frames in the lookahead window), a
+  sliding 5×5 patch MSE is computed against the corresponding patch in
+  the Gaussian-filtered composite; per-pixel NLM weights `w = exp(-mse /
+  h²)` blend the MC-aligned frame's pixels into the final composite.
+  Strength is controlled by `nlm_h2` (default 225.0; higher values
+  accept noisier patches). Enabling NLM without a lookahead buffer is a
+  no-op and does not panic. On a slow-pan noisy clip the NLM pass
+  maintains or improves PSNR_Y vs the Gaussian-only baseline. Default
+  off (opt-in).
+
 - *(encoder)* Two-pass ABR rate control (#536). A first-pass complexity
   analyser (`first_pass_analyze`) scans every source frame's luma plane
   for per-frame mean MB variance and inter-frame MAD (per-pixel

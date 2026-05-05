@@ -24,8 +24,9 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_GOLDEN_INTERVAL, DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST,
-    DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
+    DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD,
+    DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 
 const W: u32 = 64;
@@ -197,6 +198,10 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 
@@ -230,6 +235,10 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         lambda_long_ref_scale_x256: 256,
         enable_trellis_quant: false,
         enable_subpel_mv_cost: false,
+        enable_psy_rdo: false,
+        psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+        enable_arnr_nlm: false,
+        nlm_h2: DEFAULT_NLM_H2,
     }
 }
 

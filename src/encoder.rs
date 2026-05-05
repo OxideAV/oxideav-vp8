@@ -611,6 +611,45 @@ pub struct Vp8EncoderConfig {
     /// over a slightly worse pixel SAD that uses a much cheaper MV. Opt-in;
     /// default `false`. Effective only when `enable_rdo = true`.
     pub enable_subpel_mv_cost: bool,
+    /// Enable perceptual (Psy-RDO) lambda modulation. When `true`, the
+    /// per-MB Lagrangian lambda is scaled by an activity mask derived
+    /// from the source luma variance and Laplacian edge energy of the
+    /// macroblock: flat regions (low variance, low edge energy) receive a
+    /// higher lambda so the rate term dominates and the encoder spends
+    /// fewer bits there (the HVS notices banding in flat areas from
+    /// quantisation artifacts more than from coding a few extra bits);
+    /// textured / edge-rich MBs receive a lower lambda so the distortion
+    /// term dominates and the encoder preserves more detail. The effect
+    /// is analogous to libvpx's SATD + perceptual masking path. Opt-in;
+    /// default `false`. Effective only when `enable_rdo = true`.
+    pub enable_psy_rdo: bool,
+    /// Strength of the psy-RDO lambda modulation (in 1/64 units). The
+    /// per-MB lambda scale factor is
+    /// `clamp(256 ± psy_rd_strength × delta, 64, 512)` where `delta` is
+    /// derived from the activity mask relative to the frame mean. Default
+    /// `64` (= 1.0 strength); larger values push more bits toward textured
+    /// areas. Ignored when `enable_psy_rdo = false`.
+    pub psy_rd_strength: u32,
+    /// Enable NLM (non-local means) patch denoising on the alt-ref frame
+    /// before it is encoded as a hidden P-frame. When `true`, the temporal
+    /// filter blends in an NLM-denoised version of the centre frame (using
+    /// the motion-compensated window as the patch library) to suppress
+    /// sensor noise before the alt-ref goes into the prediction pool. The
+    /// NLM pass computes per-pixel similarity weights from small 5×5 patch
+    /// MSEs across the MC-aligned frames, then averages within those
+    /// weights — structurally the same as the existing Gaussian temporal
+    /// filter but with patch-level (not pixel-level) similarity measure.
+    /// This is the "ARNR refinement" phase described in libvpx's
+    /// `vp8_temporal_filter_apply`. Opt-in; default `false`.
+    pub enable_arnr_nlm: bool,
+    /// NLM patch comparison weight denominator. Per-pixel weight is
+    /// `exp(-patch_mse / nlm_h2)` where `patch_mse` is the mean squared
+    /// error of the 5×5 patch around the candidate pixel vs the centre
+    /// patch. Expressed in squared luma units (raw intensity²); default
+    /// `225` (h ≈ 15 luma units, roughly one noise-floor). Smaller values
+    /// give narrower weighting (keep only very similar patches), larger
+    /// values blend more broadly. Ignored when `enable_arnr_nlm = false`.
+    pub nlm_h2: f32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -644,6 +683,10 @@ impl Default for Vp8EncoderConfig {
             lambda_long_ref_scale_x256: 256,
             enable_trellis_quant: false,
             enable_subpel_mv_cost: false,
+            enable_psy_rdo: false,
+            psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
+            enable_arnr_nlm: false,
+            nlm_h2: DEFAULT_NLM_H2,
         }
     }
 }
@@ -672,6 +715,23 @@ pub const DEFAULT_LAMBDA_LONG_REF_SCALE_X256: u32 = 320;
 /// Empirically the third pass barely moves on the test fixtures and the
 /// fourth converges to the same MVs; 4 is a generous upper bound.
 pub const SPLIT_MV_JOINT_REFINE_PASSES_MAX: u32 = 4;
+
+/// Default strength for psy-RDO lambda modulation (in 1/64 units).
+/// At strength 64 (= 1.0), a MB one standard-deviation above the frame
+/// mean in activity gets lambda reduced by ~25% and a MB one s.d. below
+/// gets lambda increased by ~25%, matching the libvpx psychovisual bias
+/// heuristic without over-suppressing rate in any single region.
+pub const DEFAULT_PSY_RD_STRENGTH: u32 = 64;
+
+/// Default NLM h² parameter (squared luma units). h = 15 luma units,
+/// so h² = 225. A 5×5 patch with every pixel differing by ±h from the
+/// centre patch has `patch_mse = h²` and gets weight `exp(-1) ≈ 0.37`
+/// — still a meaningful contributor. Pixels within ±h/3 ≈ 5 units get
+/// weight ≈ 0.90 (nearly full), providing strong denoising without
+/// erasing legitimate fine detail. Tune lower (e.g. 100) for a noisier
+/// source or higher (e.g. 400) for a cleaner source with residual
+/// fine grain you want to preserve.
+pub const DEFAULT_NLM_H2: f32 = 225.0;
 
 /// Encoder factory used by [`crate::register_codecs`].
 #[cfg(feature = "registry")]
@@ -1124,8 +1184,13 @@ impl Vp8Encoder {
             return None;
         }
         // Synthesize a Yuv420P VideoFrame from the lookahead buffer.
-        let synth =
-            synthesize_altref_image(self.width as usize, self.height as usize, &self.lookahead)?;
+        let synth = synthesize_altref_image_with_config(
+            self.width as usize,
+            self.height as usize,
+            &self.lookahead,
+            cfg.enable_arnr_nlm,
+            cfg.nlm_h2,
+        )?;
         // Encode the synthesized image as a hidden P-frame against LAST,
         // refreshing only ALT.
         encode_hidden_altref_pframe(self.width, self.height, *cfg, &synth, last_ref).ok()
@@ -1991,6 +2056,15 @@ fn encode_pframe_and_reconstruct(
     } else {
         0
     };
+    // Psy-RDO: pre-compute per-frame mean activity and per-MB activity
+    // array. Only materialised when `enable_psy_rdo` is set and RDO is
+    // active; otherwise the vectors stay empty and the per-MB picker uses
+    // the flat frame lambda (same behaviour as before this round).
+    let psy_mean_activity: u64 = if config.enable_psy_rdo && config.enable_rdo {
+        frame_mean_activity(&src_y, y_stride, mb_w, mb_h)
+    } else {
+        0
+    };
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             let mb_idx = mb_y * mb_w + mb_x;
@@ -2054,6 +2128,24 @@ fn encode_pframe_and_reconstruct(
                 } else {
                     lambda
                 };
+                // Psy-RDO lambda modulation. When enabled, the per-MB
+                // lambda is scaled by an activity-mask factor derived from
+                // the source luma variance + Laplacian edge energy relative
+                // to the frame mean: flat MBs get higher lambda (fewer
+                // bits saved on content the HVS scrutinises for banding),
+                // textured / edge-rich MBs get lower lambda (preserve
+                // detail where the HVS scrutinises sharpness loss).
+                // The scale is computed once per closure invocation from
+                // the same `mb_x` / `mb_y` the outer loop is processing.
+                let ref_lambda =
+                    if config.enable_psy_rdo && config.enable_rdo && psy_mean_activity > 0 {
+                        let act = mb_activity(&src_y, y_stride, mb_x * 16, mb_y * 16);
+                        let scale =
+                            psy_lambda_scale(act, psy_mean_activity, config.psy_rd_strength);
+                        ((ref_lambda as u64) * (scale as u64) / 256) as u32
+                    } else {
+                        ref_lambda
+                    };
                 let cost = rd_cost_for_decision(
                     &dec,
                     &src_y,
@@ -2795,6 +2887,147 @@ fn synthesize_altref_image(
     })
 }
 
+/// Config-aware wrapper around `synthesize_altref_image`. When
+/// `enable_nlm` is `true` the function applies a two-step process:
+/// first it runs the standard motion-compensated Gaussian temporal
+/// filter (as `synthesize_altref_image` does), then it applies one
+/// NLM patch-denoising pass over the Y plane of the resulting image
+/// using the MC-aligned frames as the patch library. The NLM step
+/// suppresses residual noise / grain that the Gaussian filter cannot
+/// remove because it shows up in every frame of the window (correlated
+/// noise — e.g. fixed-pattern sensor noise). When `enable_nlm = false`
+/// the call delegates directly to `synthesize_altref_image`.
+#[cfg(feature = "registry")]
+fn synthesize_altref_image_with_config(
+    width: usize,
+    height: usize,
+    buf: &VecDeque<VideoFrame>,
+    enable_nlm: bool,
+    nlm_h2: f32,
+) -> Option<SynthesizedAltRef> {
+    let mut synth = synthesize_altref_image(width, height, buf)?;
+
+    if !enable_nlm || buf.len() < 2 || width == 0 || height == 0 {
+        return Some(synth);
+    }
+
+    // NLM patch denoising on the Y plane of the synthesized image.
+    //
+    // Algorithm: for each output pixel (r, c) in the centre frame,
+    // collect candidate pixels from the MC-aligned frames. For each
+    // candidate at displaced position (r', c') (within a search window),
+    // compute the MSE of a 5×5 patch around (r, c) in the synthesized
+    // image vs the 5×5 patch around (r', c') in the candidate frame. Use
+    // `weight = exp(-patch_mse / nlm_h2)` and form a weighted average
+    // including the centre frame itself.
+    //
+    // Implementation note: we use the *synthesized* image as the centre
+    // reference (not the raw centre frame) so the NLM pass is a
+    // refinement on top of the already-denoised Gaussian output rather
+    // than working from the noisy raw centre.
+    const PATCH_HALF: i32 = 2; // 5×5 patch
+    const NLM_SEARCH: i32 = 4; // ±4 pixel search window in each frame
+
+    let n = buf.len();
+    let centre_idx = n / 2;
+    let mb_w = (width + 15) / 16;
+    let mb_h = (height + 15) / 16;
+
+    // Re-compute per-frame per-MB MVs from the synthesize pass so we can
+    // look up the MC-aligned position for each candidate. We reuse
+    // `altref_search_mb` which operates on natural-stride source planes.
+    let mut frame_mvs: Vec<Vec<(i32, i32)>> = Vec::with_capacity(n);
+    for (i, f) in buf.iter().enumerate() {
+        if i == centre_idx {
+            frame_mvs.push(vec![(0i32, 0i32); mb_w * mb_h]);
+            continue;
+        }
+        let centre_plane = &buf[centre_idx].planes[0];
+        let mut mvs = Vec::with_capacity(mb_w * mb_h);
+        let src = &f.planes[0];
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let mv = altref_search_mb(
+                    &centre_plane.data,
+                    centre_plane.stride,
+                    &src.data,
+                    src.stride,
+                    width,
+                    height,
+                    mb_x,
+                    mb_y,
+                );
+                mvs.push(mv);
+            }
+        }
+        frame_mvs.push(mvs);
+    }
+
+    let synth_y = &synth.y.clone(); // centre reference for patch similarity
+    let mut nlm_y = vec![0u8; width * height];
+
+    for row in 0..height as i32 {
+        let mb_y = (row as usize) / 16;
+        for col in 0..width as i32 {
+            let mb_x = (col as usize) / 16;
+            let centre_px = synth_y[row as usize * width + col as usize] as f32;
+
+            // Collect weighted samples from all frames' search windows.
+            let mut wsum = 1.0f32;
+            let mut acc = centre_px;
+
+            for (i, f) in buf.iter().enumerate() {
+                if i == centre_idx {
+                    continue;
+                }
+                let (dy, dx) = frame_mvs[i][mb_y * mb_w + mb_x];
+                let src_plane = &f.planes[0];
+
+                // Base aligned position in this frame.
+                let base_r = row + dy;
+                let base_c = col + dx;
+
+                // Candidate positions in an NLM_SEARCH window around the
+                // aligned location.
+                for dr in -NLM_SEARCH..=NLM_SEARCH {
+                    for dc in -NLM_SEARCH..=NLM_SEARCH {
+                        let cr = (base_r + dr).clamp(0, height as i32 - 1);
+                        let cc = (base_c + dc).clamp(0, width as i32 - 1);
+                        let cand_px =
+                            src_plane.data[cr as usize * src_plane.stride + cc as usize] as f32;
+
+                        // 5×5 patch MSE between synth (centre) and candidate.
+                        let mut patch_mse = 0.0f32;
+                        let mut patch_count = 0u32;
+                        for pr in -PATCH_HALF..=PATCH_HALF {
+                            for pc in -PATCH_HALF..=PATCH_HALF {
+                                let sy_r = (row + pr).clamp(0, height as i32 - 1) as usize;
+                                let sy_c = (col + pc).clamp(0, width as i32 - 1) as usize;
+                                let sp_r = (cr + pr).clamp(0, height as i32 - 1) as usize;
+                                let sp_c = (cc + pc).clamp(0, width as i32 - 1) as usize;
+                                let a = synth_y[sy_r * width + sy_c] as f32;
+                                let b = src_plane.data[sp_r * src_plane.stride + sp_c] as f32;
+                                let d = a - b;
+                                patch_mse += d * d;
+                                patch_count += 1;
+                            }
+                        }
+                        patch_mse /= patch_count as f32;
+                        let w = (-patch_mse / nlm_h2).exp();
+                        acc += w * cand_px;
+                        wsum += w;
+                    }
+                }
+            }
+            nlm_y[row as usize * width + col as usize] =
+                (acc / wsum).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    synth.y = nlm_y;
+    Some(synth)
+}
+
 /// Per-MB integer-pel motion search aligning `src` (one of the buffered
 /// frames) to `centre`. Searches a small ±`ALTREF_MC_RANGE` window
 /// around (0, 0) and returns the `(dy, dx)` displacement (in pixels)
@@ -3530,6 +3763,96 @@ fn mb_luma_variance(src_y: &[u8], y_stride: usize, mb_xp: usize, mb_yp: usize) -
     }
     let n = 256u64;
     sum2.saturating_sub((sum * sum) / n)
+}
+
+/// Sum of absolute Laplacian responses (edge energy) across the interior
+/// pixels of a 16×16 luma macroblock. For each pixel at `(r, c)` with
+/// `1 ≤ r,c ≤ 14` we compute the 4-neighbour Laplacian
+/// `|4·p - p_n - p_s - p_e - p_w|` and accumulate the result. Border
+/// pixels are skipped to avoid out-of-bounds loads (they carry a small
+/// edge contribution relative to interior pixels). The output is an
+/// integer sum in `[0, 255 × 4 × 14 × 14]` ≈ 200k range; callers
+/// compare it against frame-mean to detect edge-rich vs flat MBs.
+fn mb_luma_edge_energy(src_y: &[u8], y_stride: usize, mb_xp: usize, mb_yp: usize) -> u64 {
+    let mut acc: u64 = 0;
+    for r in 1..15usize {
+        let row = mb_yp + r;
+        for c in 1..15usize {
+            let col = mb_xp + c;
+            let p = src_y[row * y_stride + col] as i32;
+            let pn = src_y[(row - 1) * y_stride + col] as i32;
+            let ps = src_y[(row + 1) * y_stride + col] as i32;
+            let pw = src_y[row * y_stride + (col - 1)] as i32;
+            let pe = src_y[row * y_stride + (col + 1)] as i32;
+            acc += (4 * p - pn - ps - pw - pe).unsigned_abs() as u64;
+        }
+    }
+    acc
+}
+
+/// Per-MB activity level combining luma variance and Laplacian edge energy.
+/// Returns a raw `u64` activity score on the same relative scale as
+/// `mb_luma_variance` — callers compare it against the frame-mean
+/// activity to derive a psy-RDO lambda scale factor.
+///
+/// Weight: `variance + EDGE_WEIGHT × edge_energy`. The `EDGE_WEIGHT`
+/// term converts edge energy (which is in ~`4 × 255 × 14 × 14` units for
+/// a fully-saturated block) to roughly the same numeric scale as variance
+/// (max `256 × 128²` ≈ 4M). A weight of 16 brings a fully-textured MB's
+/// edge energy up to ~3M, in range with its variance, so neither term
+/// dominates.
+const EDGE_WEIGHT: u64 = 16;
+
+fn mb_activity(src_y: &[u8], y_stride: usize, mb_xp: usize, mb_yp: usize) -> u64 {
+    let var = mb_luma_variance(src_y, y_stride, mb_xp, mb_yp);
+    let edge = mb_luma_edge_energy(src_y, y_stride, mb_xp, mb_yp);
+    var + EDGE_WEIGHT * edge
+}
+
+/// Compute the psy-RDO lambda scale for a single MB given its activity
+/// level and the per-frame mean activity. Returns a fixed-point scale
+/// in 1/256 units: `256` = no change; values < 256 reduce lambda (favor
+/// distortion fidelity on active MBs); values > 256 increase lambda
+/// (favor rate savings on flat MBs).
+///
+/// Formula: `scale = clamp(256 - strength × (activity - mean) / mean, 64, 512)`
+/// where `strength = psy_rd_strength` (1/64 units, so `strength / 64`
+/// is the dimensionless multiplier). The asymmetric clamping is tight
+/// enough that no single MB gets a lambda reduction > 75% or increase
+/// > 100% vs the frame mean.
+#[inline]
+fn psy_lambda_scale(activity: u64, frame_mean_activity: u64, strength: u32) -> u32 {
+    if frame_mean_activity == 0 {
+        return 256;
+    }
+    // delta = (activity - mean) / mean, in the range [-1, +∞).
+    // We compute in integer arithmetic: delta_num / delta_den
+    // where delta_num = (activity as i64 - mean as i64) * 256.
+    let mean = frame_mean_activity as i64;
+    let act = activity as i64;
+    let delta_x256 = ((act - mean) * 256) / mean; // fixed-point, /256 = fraction
+                                                  // scale = 256 - (strength / 64) * delta_x256
+                                                  // strength is in 1/64 units, so (strength * delta_x256) / 64.
+    let shift = (strength as i64) * delta_x256 / 64;
+    let scale = 256i64 - shift;
+    scale.clamp(64, 512) as u32
+}
+
+/// Compute per-frame mean activity for the psy-RDO mask, scanning
+/// every macroblock in the padded luma plane (`src_y` at `y_stride`,
+/// `mb_w × mb_h` MBs). Returns 0 when there are no MBs.
+fn frame_mean_activity(src_y: &[u8], y_stride: usize, mb_w: usize, mb_h: usize) -> u64 {
+    let n = (mb_w * mb_h) as u64;
+    if n == 0 {
+        return 0;
+    }
+    let mut total: u64 = 0;
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            total = total.saturating_add(mb_activity(src_y, y_stride, mb_x * 16, mb_y * 16));
+        }
+    }
+    total / n
 }
 
 /// Variance threshold (in `mb_luma_variance` units) above which the

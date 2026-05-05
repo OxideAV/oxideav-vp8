@@ -262,6 +262,26 @@ plain frame qindex would give. Disable with
 `enable_scene_cut = false` to recover the legacy
 single-keyframe-at-frame-0 cadence bit-for-bit.
 
+**Perceptual RDO activity mask (round-38)** — when
+`enable_psy_rdo = true`, the Lagrangian lambda is scaled per-MB by an
+activity mask: `activity = MB_luma_variance + 16 × Laplacian_edge_energy`.
+Flat MBs (activity < frame_mean) receive a higher lambda (fewer bits
+allocated); textured/edge-rich MBs (activity > frame_mean) receive a
+lower lambda (distortion-penalised). The scale is clamped to [64, 512]/256
+so outlier MBs cannot dominate. Strength is set by `psy_rd_strength`
+(0 = neutral / no change; default 64 ≙ ≈ ±75 % swing per 2× activity
+ratio). Effective only when `enable_rdo = true`; off by default.
+
+**NLM ARNR temporal denoising (round-38)** — when `enable_arnr_nlm = true`
+and `enable_lookahead_altref = true`, the alt-ref synthesis appends an NLM
+(non-local means) denoising pass over the Y plane after the Gaussian filter.
+For each non-centre MC-aligned frame in the lookahead window, a sliding 5×5
+patch MSE drives per-pixel weights `w = exp(−mse / h²)`; pixels from the
+MC-aligned frames are blended into the composite in proportion to their
+weight. Strength is set by `nlm_h2` (higher = accept noisier patches;
+default 225.0 ≈ σ=15 noise tolerance). Off by default; harmless (no-op) if
+lookahead is disabled.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,
@@ -269,8 +289,9 @@ fine-grained control over `qindex`, `golden_interval`,
 `scene_cut_threshold`, `scene_cut_quant_boost`,
 `scene_cut_boost_frames`, `adaptive_segment_thresholds`,
 `enable_split_mv_joint_refine`, `split_mv_joint_refine_passes`,
-`lambda_long_ref_scale_x256`, `enable_trellis_quant`, and
-`enable_subpel_mv_cost`.
+`lambda_long_ref_scale_x256`, `enable_trellis_quant`,
+`enable_subpel_mv_cost`, `enable_psy_rdo`, `psy_rd_strength`,
+`enable_arnr_nlm`, and `nlm_h2`.
 
 ### Container
 

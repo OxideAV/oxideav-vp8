@@ -172,46 +172,51 @@ each fixture's `expected.yuv` ground truth. Three tiers:
 
 | Tier | Fixtures | Behaviour |
 | --- | --- | --- |
-| `BitExact` (CI gate) | `tiny-i-only-16x16`, `partition-padding-16x16-4parts`, `q-low`, `segment-4-partitions`, `i-only-loopfilter-off`, `i-only-64x64`, `webm-mux-vs-ivf-ivf`, `q-high`, `i-only-loopfilter-high`, `gradient-and-noise-128x128`, `vp8-with-loopfilter-mode-simple` (every keyframe-only fixture in the corpus) | Test fails on any divergence |
-| `ReportOnly` | 4 multi-frame inter-decode fixtures (`i-frame-then-p-frame-64x64`, `golden-update-cycle`, `altref-arnr-on`, `small-roi-segmentation`) | Logs match% + max diff; does not gate CI |
+| `BitExact` (CI gate) | every active fixture in the corpus — keyframe + inter (`tiny-i-only-16x16`, `partition-padding-16x16-4parts`, `q-low`, `segment-4-partitions`, `i-only-loopfilter-off`, `i-only-64x64`, `webm-mux-vs-ivf-ivf`, `q-high`, `i-only-loopfilter-high`, `gradient-and-noise-128x128`, `vp8-with-loopfilter-mode-simple`, `i-frame-then-p-frame-64x64`, `golden-update-cycle`, `altref-arnr-on`, `small-roi-segmentation`) | Test fails on any divergence |
 | `Ignored` | `webm-mux-vs-ivf-webm` | Disabled until oxideav-mkv is wired in for WebM demux (paired IVF version is still scored) |
 
 Plus a two-part check for the `yuv422-not-supported` negative case:
 the decoder accepts libvpx's auto-converted yuv420 stream, and the
-encoder does not panic on a 4:2:2-shaped frame. The remaining
-ReportOnly fixtures track residual loopfilter rounding ±1 / inter-
-frame chain accumulation; each is tagged `TODO(vp8-corpus)` in the
-test source.
+encoder does not panic on a 4:2:2-shaped frame.
 
-Round-29 delta (this round, see CHANGELOG): RFC 6386 §17.1
-`vp8_default_mv_context` had its trailing three long-bit
-probabilities (entries `[16]`/`[17]`/`[18]`, controlling decoded
-high bits 7/8/9 of long-magnitude MV components) transcribed wrong
-— `145/162/163` for row and `166/172/182` for col instead of the
-spec's `239/254/254` and `236/254/254`. Inter MV components in the
-long-magnitude path (any |component| ≥ 1 pixel) had their high
-bits decoded against near-50/50 probabilities instead of the
-near-deterministic spec values, so any non-trivial encoder-written
-MV decoded with wildly wrong top bits and almost always saturated
-on the §16.3 `vp8_clamp_mv` lower bound. Reproduced byte-by-byte
-on `small-roi-segmentation` frame 1 MB(4,0) NEW_MV decoding as
-`mv=(0, -640)` (exactly the `mb_to_left_edge - MV_BORDER` clamp).
-Net pixel-match improvement:
+Round-30 delta (this round, see CHANGELOG): the §18.1 luma-MV
+doubling step was missing from `decode_mv_component`. RFC 6386
+§17.1 encodes the bitstream MV component as a quarter-pel value
+V; §18.1 mandates that "the stored luma motion vectors are all
+doubled, each component of each luma vector becoming an even
+integer in the range -2046 to +2046, inclusive" — i.e. the
+decoded value is shifted left by 1 to land at 1/8-pel resolution
+(matching chroma + the 8-phase sub-pel filters). The dixie
+reference decoder shipped with RFC 6386 §20.11 ends
+`read_mv_component` with `return x << 1;`. Without that shift
+every inter-MB MV is half its encoder-intended value, so motion-
+compensated predictions point at a different reference area and
+every inter or inter-adjacent intra MB drifts by a few luma units.
+The encoder side (`encode_mv_component`, `mv_component_cost_x256`)
+was symmetrically wrong, so encoder round-trips on our own
+bitstream stayed bit-exact even pre-fix — the bug only surfaced
+against bitstreams written by a spec-compliant encoder. Net pixel-
+match improvement, every previously-divergent inter-frame fixture
+to bit-exact:
 
 | Fixture | Was | Now |
 | --- | --- | --- |
-| `small-roi-segmentation` | 41.92% | **78.92%** (Y max diff 209 → 158) |
-| `altref-arnr-on` | 90.36% | **90.75%** (Y max diff 99 → 21) |
+| `small-roi-segmentation` | 78.92% | **100.00%** |
+| `altref-arnr-on` | 90.75% | **100.00%** |
+| `golden-update-cycle` | 96.59% | **100.00%** |
+| `i-frame-then-p-frame-64x64` | 96.98% | **100.00%** |
 
-Every per-MB `mode/ref/seg/skip` field in `small-roi-segmentation`
-now matches the trace bit-exactly across all three frames (192
-MBs); the residual ~21% pixel divergence is in inter-MB motion
-compensation / sub-pel filter / dequant for non-zero MVs and is
-the next natural target. The encoder side was symmetrically wrong
-(`encode_mv_component` and `mv_component_cost_x256` use the same
-table), so encoder round-trips on our own bitstream stayed green
-even with the bad probs — the bug only surfaced against bitstreams
-written by a spec-compliant encoder.
+All four ReportOnly inter-frame fixtures promote to `Tier::BitExact`;
+the corpus is now uniformly bit-exact except for the `Ignored`
+WebM-container fixture (paired IVF version still scored).
+
+Round-29 delta (previous round, see CHANGELOG): RFC 6386 §17.1
+`vp8_default_mv_context` trailing three long-bit probabilities
+(entries `[16]`/`[17]`/`[18]`, controlling decoded high bits 7/8/9
+of long-magnitude MV components) were `145/162/163` for row and
+`166/172/182` for col instead of the spec's `239/254/254` and
+`236/254/254`. Brought `small-roi-segmentation` 41.92% → 78.92%
+(setting up the round-30 fix above to land cleanly).
 
 Round-28 delta (previous round, see CHANGELOG): RFC 6386 §16.3
 `split_mv_tree` had three of its four leaves transcribed in the wrong

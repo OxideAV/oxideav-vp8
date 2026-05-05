@@ -46,6 +46,80 @@ const REF_LAST: u8 = 1;
 const REF_GOLDEN: u8 = 2;
 const REF_ALT: u8 = 3;
 
+/// Env-gated trace harness — emits per-MB / per-token events in the
+/// format described by `docs/video/vp8/vp8-fixtures-and-traces.md`.
+/// Activate with `VP8_TRACE=1` (writes to stderr) and optionally
+/// `VP8_TRACE_FILE=path`. Designed to be diff-able against the
+/// reference `trace.txt.gz` that ships with each fixture: the only way
+/// to know whether a per-MB Y2 / Y / UV nnz / dc0/ac1/ac2 diverges
+/// without writing a parallel decoder is to dump the same shape from
+/// the in-tree decoder. This is the dump side.
+mod trace {
+    use std::cell::RefCell;
+    use std::env;
+    use std::fs::File;
+    use std::io::{BufWriter, Write};
+
+    pub struct Sink {
+        out: Box<dyn Write>,
+    }
+
+    thread_local! {
+        static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+        static INIT: RefCell<bool> = const { RefCell::new(false) };
+    }
+
+    pub fn enabled() -> bool {
+        INIT.with(|init| {
+            if !*init.borrow() {
+                *init.borrow_mut() = true;
+                if env::var("VP8_TRACE").is_ok() {
+                    let out: Box<dyn Write> = if let Ok(p) = env::var("VP8_TRACE_FILE") {
+                        match File::create(&p) {
+                            Ok(f) => Box::new(BufWriter::new(f)),
+                            Err(e) => {
+                                eprintln!("VP8_TRACE_FILE: cannot create {p}: {e}");
+                                Box::new(std::io::stderr())
+                            }
+                        }
+                    } else {
+                        Box::new(std::io::stderr())
+                    };
+                    SINK.with(|s| *s.borrow_mut() = Some(Sink { out }));
+                }
+            }
+            SINK.with(|s| s.borrow().is_some())
+        })
+    }
+
+    pub fn emit(line: &str) {
+        if !enabled() {
+            return;
+        }
+        SINK.with(|s| {
+            if let Some(ref mut sink) = *s.borrow_mut() {
+                let _ = writeln!(sink.out, "{line}");
+            }
+        });
+    }
+
+    pub fn flush() {
+        SINK.with(|s| {
+            if let Some(ref mut sink) = *s.borrow_mut() {
+                let _ = sink.out.flush();
+            }
+        });
+    }
+}
+
+macro_rules! vp8_trace {
+    ($($t:tt)*) => {
+        if $crate::decoder::trace::enabled() {
+            $crate::decoder::trace::emit(&format!($($t)*));
+        }
+    };
+}
+
 /// Public factory used by the registry.
 #[cfg(feature = "registry")]
 pub fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
@@ -106,6 +180,9 @@ struct DecoderState {
     last: RefFrame,
     golden: RefFrame,
     altref: RefFrame,
+    /// Frame counter for the env-gated VP8_TRACE harness. Not used by
+    /// any decode path.
+    frame_idx: u32,
     /// Per-frame scratch buffers reused across decode_frame_with_state
     /// calls. Sized lazily at the top of each frame; capacity is
     /// retained between frames so a steady-state stream allocates only
@@ -168,6 +245,7 @@ impl DecoderState {
             golden: RefFrame::default(),
             altref: RefFrame::default(),
             scratch: Scratch::default(),
+            frame_idx: 0,
         }
     }
 }
@@ -331,6 +409,16 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
     } else {
         parse_inter_header(&mut hdr_dec, &state.probs)?
     };
+
+    vp8_trace!(
+        "FRAME\tidx={}\ttype={}\tfilter_level={}\tseg_enabled={}\tqi_y_ac={}",
+        state.frame_idx,
+        if is_keyframe { "I" } else { "P" },
+        header.loop_filter.level,
+        if header.segmentation.enabled { 1 } else { 0 },
+        header.quant.y_ac_qi,
+    );
+    state.frame_idx += 1;
 
     // --- token partitions ---
     let first_part_size = parsed.tag.first_partition_size as usize;
@@ -514,6 +602,21 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
             let mut info = mb_info[mb_y * mb_w + mb_x].clone();
             let skip = info.skip;
 
+            // MB event — match the trace.txt vocabulary in
+            // docs/video/vp8/vp8-fixtures-and-traces.md. `mode` is the
+            // FFmpeg internal enum (DC=0/H=1/V=2/TM=3/B=4/ZERO=5/MV=6/SPLIT=7),
+            // not the bitstream codeword: we map our internal Y_mode
+            // (DC=0,V=1,H=2,TM=3,B=4 for intra; 10..=14 for inter) to
+            // it for diff-friendliness.
+            vp8_trace!(
+                "MB\tmb_x={mb_x}\tmb_y={mb_y}\tmode={}\tref={}\tseg={}\tskip={}\tpartition={}",
+                trace_mb_mode(info.y_mode, info.ref_frame),
+                info.ref_frame,
+                info.segment_id,
+                if info.skip { 1 } else { 0 },
+                part_idx,
+            );
+
             let is_intra = info.ref_frame == REF_INTRA;
             let has_y2 = if is_intra {
                 info.y_mode != B_PRED
@@ -553,6 +656,12 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
                     if nz > 0 {
                         any_coeffs = true;
                     }
+                    vp8_trace!(
+                        "TOKEN\tplane=Y2\tnnz_pred={nctx}\tnnz={nz}\tdc0={}\tac1={}\tac2={}",
+                        y2_coeffs[0],
+                        y2_coeffs[1],
+                        y2_coeffs[2],
+                    );
                 }
 
                 let block_type = if has_y2 {
@@ -581,6 +690,9 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
                         if nz > 0 {
                             any_coeffs = true;
                         }
+                        vp8_trace!(
+                            "TOKEN\tplane=Y\tsby={by}\tsbx={bx}\tnnz_pred={nctx}\tnnz={nz}\tstart={start}",
+                        );
                     }
                 }
 
@@ -609,6 +721,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
                         if nz > 0 {
                             any_coeffs = true;
                         }
+                        vp8_trace!("TOKEN\tplane=U\tsby={by}\tsbx={bx}\tnnz_pred={nctx}\tnnz={nz}",);
                     }
                 }
                 for by in 0..2 {
@@ -631,6 +744,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
                         if nz > 0 {
                             any_coeffs = true;
                         }
+                        vp8_trace!("TOKEN\tplane=V\tsby={by}\tsbx={bx}\tnnz_pred={nctx}\tnnz={nz}",);
                     }
                 }
             } else {
@@ -804,6 +918,7 @@ fn decode_frame_with_state(buf: &[u8], state: &mut DecoderState) -> Result<Vp8Fr
         v_out[j * cw..j * cw + cw].copy_from_slice(src_v);
     }
 
+    trace::flush();
     Ok(Vp8Frame {
         width: width as u32,
         height: height as u32,
@@ -1788,6 +1903,31 @@ fn reconstruct_inter_mb(
                     plane[(dst_y + r) * uv_stride + dst_x + c] = (p + rr).clamp(0, 255) as u8;
                 }
             }
+        }
+    }
+}
+
+/// Map our internal Y_mode to the FFmpeg-trace `mode` enum
+/// documented in `docs/video/vp8/vp8-fixtures-and-traces.md`:
+/// 0=DC_PRED8x8, 1=HOR_PRED8x8 (H_PRED), 2=VERT_PRED8x8 (V_PRED),
+/// 3=PLANE_PRED8x8 (TM_PRED), 4=MODE_I4x4 (B_PRED),
+/// 5=ZERO_MV, 6=any non-zero MV (NEAREST/NEAR/NEW), 7=SPLIT_MV.
+fn trace_mb_mode(y_mode: i32, ref_frame: u8) -> i32 {
+    if ref_frame == REF_INTRA {
+        match y_mode {
+            DC_PRED => 0,
+            H_PRED => 1,
+            V_PRED => 2,
+            TM_PRED => 3,
+            B_PRED => 4,
+            _ => -1,
+        }
+    } else {
+        match y_mode {
+            ZERO_MV => 5,
+            NEAREST_MV | NEAR_MV | NEW_MV => 6,
+            SPLIT_MV => 7,
+            _ => -1,
         }
     }
 }

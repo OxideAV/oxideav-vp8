@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- *(decoder, encoder)* `decode_mv_component` was missing the RFC 6386
+  §18.1 luma-MV doubling step. §17.1 encodes the bitstream MV
+  component as a quarter-pel value V, and §18.1 mandates that "the
+  stored luma motion vectors are all doubled, each component of each
+  luma vector becoming an even integer in the range -2046 to +2046,
+  inclusive" so the decoded value is shifted left by 1 to land at
+  1/8-pel resolution (the same precision used for chroma and the
+  8-phase sub-pel filters). The dixie reference decoder shipped with
+  RFC 6386 §20.11 ends `read_mv_component` with `return x << 1;`.
+  Without that shift every inter-MB MV was half its encoder-intended
+  value, so motion-compensated predictions pointed at a different
+  reference area and every inter or inter-adjacent intra MB drifted
+  by a few luma units. Verified by re-running the four previously-
+  divergent inter-frame fixtures: `small-roi-segmentation` 78.92% →
+  100.00%, `altref-arnr-on` 90.75% → 100.00%, `golden-update-cycle`
+  96.59% → 100.00%, `i-frame-then-p-frame-64x64` 96.98% → 100.00%.
+  All four are now `Tier::BitExact` in `tests/docs_corpus.rs` and the
+  whole active fixture roster is uniformly bit-exact. The encoder
+  side (`encode_mv_component`, `mv_component_cost_x256`) was
+  symmetrically wrong (it accepted the half-magnitude bitstream value
+  as input, so our own write→read round-tripped); both now operate on
+  the 1/8-pel doubled representation and halve back to the bitstream's
+  quarter-pel before writing. Internal `mv::tests::*` round-trip cases
+  rewritten to use even-only inputs (1/8-pel grid).
+- *(decoder)* `inter::sixtap_predict` was missing the `CLAMP_255`
+  between its horizontal and vertical passes. RFC 6386 §20.13's
+  reference `sixtap_2d` materialises the intermediate buffer as
+  `unsigned char temp[16*(16+5)]`, so each horizontal-pass result is
+  clamped to 0..255 before being fed into the vertical pass; with
+  some sub-pel taps (e.g. position 1 = `[0, -6, 123, 12, -1, 0]`) the
+  unclamped `(v + 64) >> 7` overshoots 0..255 for certain input
+  neighbourhoods, drifting the two-pass output by ±1 luma unit per
+  affected sample. Now clamps the intermediate before the vertical
+  pass.
+
+### Added
+
+- *(decoder)* `VP8_TRACE` env-gated trace harness. When `VP8_TRACE` is
+  set, the decoder emits per-frame `FRAME` / per-MB `MB` /
+  per-block-coefficient `TOKEN` events to stderr (or to
+  `VP8_TRACE_FILE` if set) in the tab-separated key=value format
+  documented in `docs/video/vp8/vp8-fixtures-and-traces.md`. Output
+  is diff-able against the per-fixture `trace.txt.gz` reference
+  produced by the patched FFmpeg native VP8 decoder, which made the
+  round-30 §18.1 doubling bug isolatable without writing a parallel
+  decoder. No effect when the env variable is unset.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.9...v0.1.10) - 2026-05-05
 
 ### Other

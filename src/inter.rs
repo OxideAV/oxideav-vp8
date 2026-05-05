@@ -133,13 +133,23 @@ pub fn sixtap_predict(
         tmp_h <= MAX_TMP_H,
         "sixtap_predict: tmp_h {tmp_h} > {MAX_TMP_H}"
     );
+    // Per RFC 6386 §20.13 (`sixtap_2d` / `sixtap_horiz`), the intermediate
+    // buffer is `unsigned char temp[16*(16+5)]` — i.e. each horizontal-pass
+    // result is `CLAMP_255((v + 64) >> 7)` before being fed into the
+    // vertical pass. With sub-pel filters whose taps can be negative
+    // (e.g. position 1: [0, -6, 123, 12, -1, 0]) the unclamped
+    // `(v + 64) >> 7` overshoots 0..255 for some input neighbourhoods,
+    // and the absent clamp made our two-pass output drift from libvpx /
+    // ffmpeg by a few luma units per inter MB. Found by a per-MB
+    // pixel-diff against the trace's reconstructed frame; explained by
+    // the §20.13 reference's `CLAMP_255(temp); reference++;` pair.
     let mut tmp = [0i32; MAX_TMP_BW * MAX_TMP_H];
     let row_stride = bw;
     for j in 0..tmp_h {
         let yy = int_y + j as i32 - 2;
         for i in 0..bw {
             let v = sixtap_h(plane, int_x + i as i32, yy, fx);
-            tmp[j * row_stride + i] = (v + 64) >> 7;
+            tmp[j * row_stride + i] = ((v + 64) >> 7).clamp(0, 255);
         }
     }
     let taps = &SIXTAP_FILTERS[fy];

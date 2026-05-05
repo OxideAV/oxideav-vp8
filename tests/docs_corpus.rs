@@ -7,20 +7,19 @@
 //! the expected YUV.
 //!
 //! Acceptance:
-//! * The simpler fixtures (i-only-64x64, tiny-i-only-16x16, q-low,
-//!   q-high) MUST decode bit-exactly. A regression in any of those
-//!   fails CI.
-//! * Loopfilter / multi-partition / inter / segmentation / altref
-//!   fixtures MAY still diverge from the reference YUV — they exercise
-//!   code paths we know are still under development (tracked in
-//!   `tests/decode_keyframe.rs` and `tests/decode_pframes.rs`). For
-//!   those we report the divergence (pixel-match percentage + max diff)
-//!   without failing, so the matrix stays visible while individual
-//!   bugs are picked off in follow-up rounds.
+//! * Every active fixture decodes bit-exactly against its
+//!   `expected.yuv`. The four previously-divergent inter-frame
+//!   fixtures (i-frame-then-p-frame-64x64, golden-update-cycle,
+//!   altref-arnr-on, small-roi-segmentation) hit BitExact in round-30
+//!   after the §18.1 MV-doubling fix to `decode_mv_component`.
+//! * The `Tier::ReportOnly` enum variant is retained for future
+//!   diagnostic work (e.g. screening a freshly-added fixture before
+//!   promoting it to BitExact).
 //!
 //! Per-fixture classification:
 //! * `Tier::BitExact` — must round-trip exactly. Failure = CI red.
-//! * `Tier::ReportOnly` — currently divergent; logged but not asserted.
+//! * `Tier::ReportOnly` — divergence permitted (logged, not asserted);
+//!   no fixture currently uses this tier.
 //! * `Tier::Ignored` — disabled (e.g. WebM container, which oxideav-vp8
 //!   doesn't currently demux).
 //!
@@ -310,9 +309,9 @@ fn evaluate(case: &CorpusCase) {
             );
         }
         Tier::ReportOnly => {
-            // Don't fail. Just record; the human reads the eprintln output.
-            // TODO(vp8-corpus): tighten to BitExact once the underlying
-            // bug for this fixture is fixed.
+            // Don't fail. Just record; the human reads the eprintln
+            // output. Used as a screening-tier when adding new fixtures
+            // before promoting them to BitExact.
             let _ = pct;
         }
     }
@@ -366,9 +365,8 @@ fn corpus_partition_padding_16x16_4parts() {
     });
 }
 
-// --- Tier::ReportOnly: known divergent until the underlying decoder
-//     bug surfaces in a follow-up round. Each is paired with a
-//     TODO(vp8-corpus) tag so the bug is grep-able. ---
+// --- Tier::BitExact (round-30 promotions): every active fixture in
+//     the corpus now decodes bit-for-bit. ---
 
 // Bit-exact after the libvpx-correct interior_limit fix
 // (`interior_limit == filt_lvl` when sharpness == 0): loopfilter mask
@@ -485,6 +483,12 @@ fn corpus_webm_mux_vs_ivf_ivf() {
     });
 }
 
+// Bit-exact after the round-30 §18.1 MV-doubling fix
+// (`decode_mv_component` now returns `mag << 1` per the dixie reference
+// `read_mv_component`, matching ffmpeg / libvpx 1/8-pel storage). All
+// four previously-ReportOnly inter-frame fixtures
+// (`i-frame-then-p-frame-64x64`, `golden-update-cycle`, `altref-arnr-on`,
+// `small-roi-segmentation`) now reconstruct bit-for-bit.
 #[test]
 fn corpus_i_frame_then_p_frame_64x64() {
     evaluate(&CorpusCase {
@@ -492,7 +496,7 @@ fn corpus_i_frame_then_p_frame_64x64() {
         width: 64,
         height: 64,
         n_frames: 2,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -503,7 +507,7 @@ fn corpus_golden_update_cycle() {
         width: 64,
         height: 64,
         n_frames: 5,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -514,7 +518,7 @@ fn corpus_altref_arnr_on() {
         width: 64,
         height: 64,
         n_frames: 10,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 
@@ -525,7 +529,7 @@ fn corpus_small_roi_segmentation() {
         width: 128,
         height: 128,
         n_frames: 3,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 

@@ -76,7 +76,21 @@ pub fn clamp_mv_to_border(mv: Mv, mb_x: usize, mb_y: usize, mb_w: usize, mb_h: u
 }
 
 /// Decode a single MV component. Returns a signed integer in 1/8-pel
-/// units.
+/// units (luma resolution after the §18.1 doubling).
+///
+/// Per RFC 6386 §17.1 the bitstream encodes V as a quarter-pel value
+/// (V in -1023..1023). §18.1 mandates that "the stored luma motion
+/// vectors are all doubled, each component of each luma vector
+/// becoming an even integer in the range -2046 to +2046, inclusive"
+/// so the decoded value is **doubled** before storage to land at
+/// 1/8-pel resolution (the same precision used for chroma and the
+/// 8-phase sub-pel filters). The reference dixie decoder shipped with
+/// RFC 6386 §20.11 ends `read_mv_component` with `return x << 1;`;
+/// without the `<< 1` every inter-MB MV is half the encoder's value
+/// and reconstructions diverge from the reference by a few pixels per
+/// component (visible as a constant brightness shift in the
+/// motion-compensated MB and a ~21% pixel divergence on the
+/// `small-roi-segmentation` corpus fixture).
 pub fn decode_mv_component(d: &mut BoolDecoder<'_>, probs: &MvContext) -> i32 {
     // Probability at index 0 indicates "is large" (long). When true we take
     // the long path, otherwise use the 3-bit short tree.
@@ -103,7 +117,10 @@ pub fn decode_mv_component(d: &mut BoolDecoder<'_>, probs: &MvContext) -> i32 {
     if mag != 0 && d.read_bool(probs[1] as u32) {
         mag = -mag;
     }
-    mag
+    // §18.1 doubling. Every consumer of `decode_mv_component` (NEW_MV,
+    // NEW_4X4, the encoder's symmetric `encode_mv_component` /
+    // `mv_component_cost_x256`) treats the result as 1/8-pel.
+    mag << 1
 }
 
 /// Decode a full MV given a pair of component probability contexts
@@ -117,7 +134,20 @@ pub fn decode_mv(d: &mut BoolDecoder<'_>, mv_probs: &[MvContext; 2]) -> Mv {
 /// Bit-exact write-side inverse of [`decode_mv_component`]. Given the same
 /// probability context, emits the boolean-coded bits that
 /// `decode_mv_component` will read back as `value`.
+///
+/// `value` is in 1/8-pel units (the same units `decode_mv_component`
+/// returns); the encoder halves it back to the bitstream's quarter-pel
+/// representation before writing, mirroring the §18.1 doubling the
+/// decoder applies on the way out. Inputs must be even — odd values
+/// would lose information in the half-and-double round-trip; the
+/// encoder's mode-decision path always produces even MVs since they
+/// originate from the (already-1/8-pel) sub-pel search grid.
 pub fn encode_mv_component(enc: &mut BoolEncoder, probs: &MvContext, value: i32) {
+    debug_assert!(
+        value % 2 == 0,
+        "MV component {value} must be even (1/8-pel storage)"
+    );
+    let value = value >> 1;
     let sign = value < 0;
     let mag = value.unsigned_abs() as i32;
     let large = mag >= 8;
@@ -195,6 +225,9 @@ pub fn encode_mv(enc: &mut BoolEncoder, mv_probs: &[MvContext; 2], mv: Mv) {
 /// of emitting bits it accumulates each bool's
 /// `bool_encoder::bool_cost_x256(prob, outcome)`.
 pub fn mv_component_cost_x256(probs: &MvContext, value: i32) -> u32 {
+    // `value` is in 1/8-pel units; the bitstream stores quarter-pel
+    // (see encode_mv_component). Halve before costing.
+    let value = value >> 1;
     let sign = value < 0;
     let mag = value.unsigned_abs() as i32;
     let large = mag >= 8;
@@ -261,16 +294,21 @@ mod tests {
 
     #[test]
     fn mv_component_roundtrip_short() {
-        for v in -7..=7 {
+        // Per RFC 6386 §18.1, stored luma MVs are even integers in
+        // 1/8-pel units (twice the bitstream's quarter-pel value). The
+        // encoder/decoder pair operates on the doubled (even-only)
+        // representation, so every value here must be even.
+        for v in [-14, -12, -10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10, 12, 14] {
             roundtrip_component(v);
         }
     }
 
     #[test]
     fn mv_component_roundtrip_long_boundary() {
-        // Covers the 8..=15 "bit-3 implicit" range and a few larger values.
+        // Doubled bitstream values 8..=15 → stored 16..=30, and a few
+        // larger values. All entries are even (1/8-pel units).
         for v in [
-            8, -8, 15, -15, 16, -16, 17, -17, 24, 40, 127, -127, 256, 1023,
+            16, -16, 30, -30, 32, -32, 34, -34, 48, 80, 254, -254, 512, 2046,
         ] {
             roundtrip_component(v);
         }
@@ -278,13 +316,10 @@ mod tests {
 
     #[test]
     fn mv_component_cost_matches_real_emit_bits() {
-        // mv_component_cost_x256 must agree with the bit count produced
-        // by piping the same value through encode_mv_component into a
-        // real BoolEncoder. We emit each value into its own fresh
-        // encoder (so the buffered-state slack is bounded by ~25 bits)
-        // and compare totals in 1/256-bit units.
+        // Even values only — the encoder's `encode_mv_component`
+        // contract is "value is in 1/8-pel units" (doubled).
         for &v in &[
-            0, 1, -1, 4, 7, -7, 8, -8, 15, -15, 16, 33, -33, 127, -127, 256, 1023,
+            0, 2, -2, 8, 14, -14, 16, -16, 30, -30, 32, 66, -66, 254, -254, 512, 2046,
         ] {
             let mut enc = BoolEncoder::new();
             encode_mv_component(&mut enc, &DEFAULT_MV_CONTEXT[0], v);

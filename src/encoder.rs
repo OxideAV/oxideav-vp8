@@ -56,10 +56,6 @@ use crate::loopfilter::{
     filter_simple_vertical, FilterParams,
 };
 use crate::mv::{encode_mv_component, Mv};
-// `mv_component_cost_x256` is only used by the registry-gated
-// rate-estimation path (`estimate_mode_rate_x256`); gating the import
-// keeps the `--no-default-features` build clean.
-#[cfg(feature = "registry")]
 use crate::mv::mv_component_cost_x256;
 use crate::tables::coeff_probs::{CoeffProbs, DEFAULT_COEF_PROBS};
 use crate::tables::mv::DEFAULT_MV_CONTEXT;

@@ -55,8 +55,8 @@ use crate::loopfilter::{
     filter_normal_horizontal, filter_normal_vertical, filter_simple_horizontal,
     filter_simple_vertical, FilterParams,
 };
-use crate::mv::{encode_mv_component, Mv};
 use crate::mv::mv_component_cost_x256;
+use crate::mv::{encode_mv_component, Mv};
 use crate::tables::coeff_probs::{CoeffProbs, DEFAULT_COEF_PROBS};
 use crate::tables::mv::DEFAULT_MV_CONTEXT;
 use crate::tables::quant::{
@@ -1655,12 +1655,7 @@ fn encode_keyframe_and_reconstruct_with_config(
             // inside apply_trellis_to_mb (calibrated for coeff-level RD).
             if config.enable_trellis_quant {
                 let has_y2 = y_mode != B_PRED;
-                apply_trellis_to_mb(
-                    &mut mb_rec,
-                    q,
-                    &DEFAULT_COEF_PROBS,
-                    has_y2,
-                );
+                apply_trellis_to_mb(&mut mb_rec, q, &DEFAULT_COEF_PROBS, has_y2);
             }
             mb_encoded.push(mb_rec);
         }
@@ -2262,12 +2257,7 @@ fn encode_pframe_and_reconstruct(
             if config.enable_trellis_quant && mb_rec.has_coeffs {
                 let has_y2 = !matches!(decision, PMbDecision::SplitMv(_))
                     && !matches!(decision, PMbDecision::Intra { y_mode, .. } if y_mode == B_PRED);
-                apply_trellis_to_mb(
-                    &mut mb_rec,
-                    q,
-                    &DEFAULT_COEF_PROBS,
-                    has_y2,
-                );
+                apply_trellis_to_mb(&mut mb_rec, q, &DEFAULT_COEF_PROBS, has_y2);
             }
             mb_encoded.push(mb_rec);
         }
@@ -4811,12 +4801,7 @@ fn encode_intra_mb(
 /// Distortion is measured as `(q[i] * step)^2`, i.e. the squared dequant
 /// value of the zeroed coefficient — an approximation that matches libvpx's
 /// `vp8_optimize_b` behaviour and avoids needing the pre-quant residual.
-fn apply_trellis_to_mb(
-    mb_enc: &mut MbEncoded,
-    q: &QuantCtx,
-    probs: &CoeffProbs,
-    has_y2: bool,
-) {
+fn apply_trellis_to_mb(mb_enc: &mut MbEncoded, q: &QuantCtx, probs: &CoeffProbs, has_y2: bool) {
     // Compute per-plane lambda from the dequant step size. The trellis
     // operates in (dequant)^2 distortion units vs. 1/256-bit rate units,
     // so the lambda must be calibrated differently from the mode-selection
@@ -4853,7 +4838,11 @@ fn apply_trellis_to_mb(
     }
 
     // Y blocks. Y-after-Y2: plane=0, start=1. Y-without-Y2: plane=3, start=0.
-    let (y_plane, y_start) = if has_y2 { (0usize, 1usize) } else { (3usize, 0usize) };
+    let (y_plane, y_start) = if has_y2 {
+        (0usize, 1usize)
+    } else {
+        (3usize, 0usize)
+    };
     for bi in 0..16 {
         mb_enc.y_coeffs[bi] = trellis_quant_block(
             &mb_enc.y_coeffs[bi],
@@ -4900,9 +4889,21 @@ fn apply_trellis_to_mb(
 
     // Update has_coeffs.
     mb_enc.has_coeffs = mb_enc.y2_coeffs.iter().any(|&v| v != 0)
-        || mb_enc.y_coeffs.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
-        || mb_enc.u_coeffs.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
-        || mb_enc.v_coeffs.iter().flat_map(|b| b.iter()).any(|&v| v != 0);
+        || mb_enc
+            .y_coeffs
+            .iter()
+            .flat_map(|b| b.iter())
+            .any(|&v| v != 0)
+        || mb_enc
+            .u_coeffs
+            .iter()
+            .flat_map(|b| b.iter())
+            .any(|&v| v != 0)
+        || mb_enc
+            .v_coeffs
+            .iter()
+            .flat_map(|b| b.iter())
+            .any(|&v| v != 0);
 }
 
 /// Build 4×4 neighbour array for a sub-block. Matches the decoder's
@@ -5155,7 +5156,13 @@ const TRELLIS_LAMBDA_DENOM: u64 = 16;
 /// cost in 1/256-bit units. Available for future optimisations.
 #[allow(dead_code)]
 #[inline]
-fn cost_zeros_x256(probs: &crate::tables::coeff_probs::CoeffProbs, plane: usize, pos: usize, start_ctx: usize, n_zeros: usize) -> u32 {
+fn cost_zeros_x256(
+    probs: &crate::tables::coeff_probs::CoeffProbs,
+    plane: usize,
+    pos: usize,
+    start_ctx: usize,
+    n_zeros: usize,
+) -> u32 {
     use crate::bool_encoder::PROB_COST_BITS_X256;
     let plane_probs = &probs[plane];
     let mut cost = 0u32;
@@ -5212,7 +5219,15 @@ fn cost_nonzero_x256(p: &[u8; 11], v: i32) -> u32 {
                 }
             } else {
                 cost += PROB_COST_BITS_X256[1][p[6] as usize] as u32;
-                let (cat, base) = if v < 19 { (0usize, 11i32) } else if v < 35 { (1, 19) } else if v < 67 { (2, 35) } else { (3, 67) };
+                let (cat, base) = if v < 19 {
+                    (0usize, 11i32)
+                } else if v < 35 {
+                    (1, 19)
+                } else if v < 67 {
+                    (2, 35)
+                } else {
+                    (3, 67)
+                };
                 let bit1 = (cat >> 1) & 1;
                 let bit0 = cat & 1;
                 cost += PROB_COST_BITS_X256[bit1][p[8] as usize] as u32;
@@ -5240,7 +5255,12 @@ fn cost_nonzero_x256(p: &[u8; 11], v: i32) -> u32 {
 /// Cost of the EOB token at position `pos` with context `ctx` in 1/256-bit
 /// units. EOB = writing "has_coeff = false" (p[0] bit = false).
 #[inline]
-fn cost_eob_x256(probs: &crate::tables::coeff_probs::CoeffProbs, plane: usize, pos: usize, ctx: usize) -> u32 {
+fn cost_eob_x256(
+    probs: &crate::tables::coeff_probs::CoeffProbs,
+    plane: usize,
+    pos: usize,
+    ctx: usize,
+) -> u32 {
     use crate::bool_encoder::PROB_COST_BITS_X256;
     let p = &probs[plane][COEF_BANDS[pos]][ctx];
     PROB_COST_BITS_X256[0][p[0] as usize] as u32
@@ -5380,9 +5400,10 @@ fn trellis_quant_block(
     // Rate of the prefix start..eob (not including EOB token itself).
     // Compute incrementally by subtracting the cost of the last coefficient.
     let mut prefix_rate = best_rate; // currently = rate of start..last+1 (incl. EOB if last < 15)
-    // Remove the EOB token that was at last+1 (only if it was actually counted).
+                                     // Remove the EOB token that was at last+1 (only if it was actually counted).
     if last < 15 {
-        prefix_rate = prefix_rate.saturating_sub(cost_eob_x256(probs, plane, last + 1, ctx_at[last + 1]));
+        prefix_rate =
+            prefix_rate.saturating_sub(cost_eob_x256(probs, plane, last + 1, ctx_at[last + 1]));
     }
 
     // The last coefficient at position `last` can only be a new EOB candidate

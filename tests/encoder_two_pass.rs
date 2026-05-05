@@ -365,7 +365,7 @@ fn two_pass_qp_clamped_to_min_max() {
     let qps = two_pass_qindices(&complexity, &cfg);
     for &q in &qps {
         assert!(
-            q >= 20 && q <= 80,
+            (20..=80).contains(&q),
             "QP {q} out of [min=20, max=80] range (sensitivity=1000)"
         );
     }

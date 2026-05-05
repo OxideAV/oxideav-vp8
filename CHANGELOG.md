@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.8...v0.1.9) - 2026-05-05
+
+### Fixed
+
+- *(decoder, encoder)* correct RFC 6386 §17.1 default_mv_context high-bit probs
+
+### Other
+
+- tidy CHANGELOG after release-plz 0.1.8 rebase
+
 ### Fixed
 
 - *(decoder, encoder)* `DEFAULT_MV_CONTEXT` (RFC 6386 §17.1

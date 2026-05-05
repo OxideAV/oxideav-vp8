@@ -173,6 +173,8 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     }
 }
 
@@ -204,6 +206,8 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     }
 }
 
@@ -246,6 +250,8 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     }
 }
 
@@ -336,6 +342,8 @@ fn frame_headers_carry_segment_lf_deltas() {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

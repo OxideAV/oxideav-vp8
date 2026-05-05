@@ -195,6 +195,8 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     }
 }
 
@@ -226,6 +228,8 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     }
 }
 

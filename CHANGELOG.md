@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.10...v0.1.11) - 2026-05-05
+
+### Other
+
+- fix clippy::unnecessary_cast + while_let_loop in encoder_round_38
+- psy-RDO activity mask + ARNR NLM temporal denoiser (round-38)
+- fix clippy::manual_range_contains in encoder_two_pass
+- two-pass ABR rate control (round-36)
+- add enable_trellis_quant + enable_subpel_mv_cost to all struct literals
+- rustfmt fixes (import merge, short fn collapses, if-else expand)
+- fix no-default-features build (mv_component_cost_x256 import)
+- trellis quantisation + rate-aware sub-pel ME (round-32)
+- per-MB QP refinement + SPLIT_MV joint refine + long-ref lambda tilt
+- apply RFC 6386 §18.1 luma-MV doubling on decode
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+
 ### Added
 
 - *(encoder)* Perceptual RDO activity mask — psy-RDO (#38). When

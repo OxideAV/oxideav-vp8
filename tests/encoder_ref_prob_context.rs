@@ -113,6 +113,10 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         y2_ac_delta: 0,
         uv_dc_delta: 0,
         uv_ac_delta: 0,
+        adaptive_segment_thresholds: false,
+        enable_split_mv_joint_refine: false,
+        split_mv_joint_refine_passes: 0,
+        lambda_long_ref_scale_x256: 256,
     };
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);

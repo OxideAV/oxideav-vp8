@@ -169,6 +169,10 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         y2_ac_delta: 0,
         uv_dc_delta: 0,
         uv_ac_delta: 0,
+        adaptive_segment_thresholds: false,
+        enable_split_mv_joint_refine: false,
+        split_mv_joint_refine_passes: 0,
+        lambda_long_ref_scale_x256: 256,
     }
 }
 
@@ -196,6 +200,10 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         y2_ac_delta: 0,
         uv_dc_delta: 0,
         uv_ac_delta: 0,
+        adaptive_segment_thresholds: false,
+        enable_split_mv_joint_refine: false,
+        split_mv_joint_refine_passes: 0,
+        lambda_long_ref_scale_x256: 256,
     }
 }
 
@@ -234,6 +242,10 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         y2_ac_delta: 0,
         uv_dc_delta: 0,
         uv_ac_delta: 0,
+        adaptive_segment_thresholds: false,
+        enable_split_mv_joint_refine: false,
+        split_mv_joint_refine_passes: 0,
+        lambda_long_ref_scale_x256: 256,
     }
 }
 
@@ -320,6 +332,10 @@ fn frame_headers_carry_segment_lf_deltas() {
         y2_ac_delta: 0,
         uv_dc_delta: 0,
         uv_ac_delta: 0,
+        adaptive_segment_thresholds: false,
+        enable_split_mv_joint_refine: false,
+        split_mv_joint_refine_passes: 0,
+        lambda_long_ref_scale_x256: 256,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

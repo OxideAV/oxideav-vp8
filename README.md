@@ -132,6 +132,49 @@ in-tree decode stays bit-exact with what `ffmpeg` produces. Disable
 with `enable_segments = false` to recover the legacy single-segment
 encoding bit-for-bit.
 
+**Per-MB QP refinement (round-31 / #522)** — the segment classifier
+optionally derives its three variance breakpoints from the actual
+per-frame variance distribution (population quartiles) instead of the
+static `SEGMENT_VARIANCE_THRESHOLDS` ladder. This is the per-MB QP
+refinement webp's lossy encoder was waiting on (#479): on diverse
+content where one half of the frame is smooth and the other textured
+the static thresholds lump every MB into segment 0 (or 3) and the
+per-segment quant deltas have nothing to bite on; the adaptive variant
+keeps every segment slot well-populated. Opt-in via
+`adaptive_segment_thresholds = true`. On a 128×128 mixed-content clip
+at qindex=50 it shaves ~4% bytes for +0.11 dB Y vs the static-threshold
+baseline; combined with the long-ref lambda boost (below) it lands
+~14% smaller for +0.77 dB Y. Falls back to the static table on
+flat-or-tiny frames so the legacy single-segment behaviour is preserved
+bit-for-bit.
+
+**SPLIT_MV joint refinement (round-31 / #522)** — after the initial
+per-partition motion search picks each partition's MV independently,
+optional joint-refinement passes walk every partition again,
+hill-climbing each MV in a 3×3 quarter-pel neighbourhood while holding
+the others fixed and accepting moves that strictly reduce the
+partition's sub-pel-filtered SAD. Catches boundary cases where the
+independent search lands one quarter-pel off the joint optimum. Opt-in
+via `enable_split_mv_joint_refine = true` + `split_mv_joint_refine_passes`
+(0..=`SPLIT_MV_JOINT_REFINE_PASSES_MAX`). Same commit straightens out
+a latent bug where the initial pass wrote MVs to `part_mvs[sub_block_idx]`
+instead of `part_mvs[partition_id]`, silently aliasing the per-partition
+MVs for SPLIT_16X8 / QUARTERS — the mode-0/2 reconstructions were
+taking partition 0's MV for both halves until #522. Joint refine off
+(default) so legacy callers see the prior search behaviour.
+
+**Long-reference lambda tilt (round-31 / #522)** — the per-MB picker's
+Lagrangian cost gets a per-reference scale: GOLDEN / ALTREF candidates
+have lambda multiplied by `lambda_long_ref_scale_x256 / 256` (default
+`256` = no change; `320` ≈ +25% is the libvpx ballpark). Drift across
+the GOP makes long-term references disproportionately expensive in the
+residual coding tail; boosting their lambda makes the rate term weigh
+more on those candidates so the picker only takes them when the
+distortion improvement is large enough to justify the higher amortised
+cost. On the mixed-content clip with this knob set to 320, the
+encoder shaves ~8% bytes for +0.60 dB Y. Set to `256` to recover the
+uniform-lambda behaviour bit-for-bit.
+
 **Per-frame scene-cut adaptation** watches each incoming source
 frame's per-pixel luma mean-absolute-difference (MAD) versus the
 previous source frame, then compares it against the running
@@ -151,8 +194,10 @@ Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,
 `enable_segments`, `segment_quant_deltas`, `enable_scene_cut`,
-`scene_cut_threshold`, `scene_cut_quant_boost`, and
-`scene_cut_boost_frames`.
+`scene_cut_threshold`, `scene_cut_quant_boost`,
+`scene_cut_boost_frames`, `adaptive_segment_thresholds`,
+`enable_split_mv_joint_refine`, `split_mv_joint_refine_passes`, and
+`lambda_long_ref_scale_x256`.
 
 ### Container
 

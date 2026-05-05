@@ -7,8 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* Per-MB QP refinement via adaptive segment-variance
+  thresholds (#522). When `Vp8EncoderConfig::adaptive_segment_thresholds
+  = true`, the segment classifier picks its three variance breakpoints
+  from the actual per-frame variance distribution (population
+  quartiles) instead of the static `SEGMENT_VARIANCE_THRESHOLDS`
+  ladder, so every segment slot stays well-populated regardless of
+  whether the source is mostly smooth or mostly textured. Falls back
+  to the static table on flat-or-tiny frames so the legacy
+  single-segment behaviour is preserved bit-for-bit. This is the
+  per-MB QP refinement webp's lossy encoder was waiting on (#479) — on
+  a 128×128 mixed smooth+textured clip at qindex=50 it shaves ~4%
+  bytes for +0.11 dB Y vs the static-threshold baseline. Default off
+  (opt-in).
+- *(encoder)* SPLIT_MV joint refinement (#522). When
+  `enable_split_mv_joint_refine = true` (with
+  `split_mv_joint_refine_passes` in 0..=`SPLIT_MV_JOINT_REFINE_PASSES_MAX`),
+  the SPLIT_MV per-partition motion search runs additional passes
+  after the initial independent search, hill-climbing each partition's
+  MV in a 3×3 quarter-pel neighbourhood while holding the others fixed
+  and accepting moves that strictly reduce the partition's
+  sub-pel-filtered SAD. Catches boundary cases where the independent
+  search lands one quarter-pel off the joint optimum. Default off
+  (opt-in).
+- *(encoder)* Long-reference lambda tilt (#522). The per-MB Lagrangian
+  cost takes a per-reference scale: GOLDEN / ALTREF candidates have
+  lambda multiplied by `lambda_long_ref_scale_x256 / 256` (default
+  `256` = neutral; `320` ≈ +25% is the libvpx ballpark). Long-term
+  references accumulate drift across the GOP and the residual coding
+  on top of them is disproportionately expensive in the long tail;
+  boosting lambda for those candidates makes the rate term weigh more
+  so the picker only takes them when the distortion improvement is
+  large enough to justify the cost. On the mixed-content clip with
+  this knob at 320 the encoder shaves ~8% bytes for +0.60 dB Y. With
+  all three new opt-in features on simultaneously the combination
+  lands ~14% smaller bitstream for +0.77 dB Y.
+
 ### Fixed
 
+- *(encoder)* SPLIT_MV per-partition MV storage was writing to
+  `part_mvs[sub_block_idx]` while the consumer code reads
+  `part_mvs[partition_id]`, silently aliasing the per-partition MVs
+  for SPLIT_16X8 and SPLIT_QUARTERS — both halves of a SPLIT_16X8
+  decision were taking partition 0's MV in the bitstream and
+  reconstruction. SPLIT_8X16 and SPLIT_4X4 happened to work because
+  their partition-id ↔ sub-block-id mapping coincides at the slots
+  the consumer reads. Surfaced by the joint-refinement pass added in
+  this round (the refined MVs landed in different aliasing slots than
+  the initial ones, so half the per-partition refinements never
+  reached the bitstream). The fix straightens out non-refined
+  SPLIT_16X8 / QUARTERS reconstructions too.
 - *(decoder, encoder)* `decode_mv_component` was missing the RFC 6386
   §18.1 luma-MV doubling step. §17.1 encodes the bitstream MV
   component as a quarter-pel value V, and §18.1 mandates that "the

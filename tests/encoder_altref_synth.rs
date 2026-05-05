@@ -179,6 +179,10 @@ fn baseline_cfg(alt_ref_interval: u32) -> Vp8EncoderConfig {
         y2_ac_delta: 0,
         uv_dc_delta: 0,
         uv_ac_delta: 0,
+        adaptive_segment_thresholds: false,
+        enable_split_mv_joint_refine: false,
+        split_mv_joint_refine_passes: 0,
+        lambda_long_ref_scale_x256: 256,
     }
 }
 

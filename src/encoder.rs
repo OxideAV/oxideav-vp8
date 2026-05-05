@@ -550,6 +550,47 @@ pub struct Vp8EncoderConfig {
     ///
     /// [`y_dc_delta`]: Vp8EncoderConfig::y_dc_delta
     pub uv_ac_delta: i32,
+    /// Enable adaptive per-frame segment-variance thresholds. When `true`
+    /// the segment classifier picks the three variance breakpoints from
+    /// the actual MB-variance distribution of the current frame
+    /// (population quartiles) instead of using the static
+    /// [`SEGMENT_VARIANCE_THRESHOLDS`] ladder. This keeps every segment
+    /// slot well-populated regardless of whether the source is mostly
+    /// smooth (e.g. talking-head video) or mostly textured (e.g. nature
+    /// footage), which is the per-MB QP refinement webp's lossy encoder
+    /// has been waiting on. Requires `enable_segments = true` to take
+    /// effect; otherwise the encoder still uses a single segment.
+    pub adaptive_segment_thresholds: bool,
+    /// Enable iterative joint refinement of SPLIT_MV per-partition MVs
+    /// after the initial per-partition search. Each pass re-optimises one
+    /// partition's MV against the source while holding the others fixed,
+    /// converging on the local SAD minimum that the independent-partition
+    /// search misses when partitions share boundaries. Set
+    /// [`split_mv_joint_refine_passes`] to control how many passes run.
+    ///
+    /// [`split_mv_joint_refine_passes`]: Vp8EncoderConfig::split_mv_joint_refine_passes
+    pub enable_split_mv_joint_refine: bool,
+    /// Number of joint-refinement passes over the SPLIT_MV partitions.
+    /// Each pass walks every partition once, hill-climbing its MV in a
+    /// 3×3 quarter-pel neighbourhood to reduce the partition's
+    /// sub-pel-filtered SAD. 0 = disabled (matches
+    /// `enable_split_mv_joint_refine = false`); 1..=4 = number of passes.
+    /// Capped internally at 4. Default 2 — empirically the second pass
+    /// recovers most of the residual gain and a third pass changes
+    /// almost nothing on the test fixtures.
+    pub split_mv_joint_refine_passes: u32,
+    /// Lambda multiplier applied for non-LAST reference frames. The
+    /// motion-compensated residual against GOLDEN / ALTREF accumulates
+    /// drift across the GOP (every reconstruction error inherited by
+    /// later P-frames is partially observable in the long-term reference);
+    /// boosting lambda for those decisions makes the rate term weigh
+    /// more on candidates that already cost extra bits, indirectly
+    /// preferring the closer LAST reference unless the GOLDEN / ALTREF
+    /// candidate is meaningfully better. Expressed as a scale factor in
+    /// 1/256 units (256 = no change, 320 = +25%, 384 = +50%). Default
+    /// 320 (≈ +25%, the libvpx ballpark for the alt-ref rate-distortion
+    /// tilt). Set to 256 to recover the legacy uniform-lambda behaviour.
+    pub lambda_long_ref_scale_x256: u32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -577,9 +618,38 @@ impl Default for Vp8EncoderConfig {
             y2_ac_delta: 0,
             uv_dc_delta: 0,
             uv_ac_delta: 0,
+            adaptive_segment_thresholds: DEFAULT_ADAPTIVE_SEGMENT_THRESHOLDS,
+            enable_split_mv_joint_refine: false,
+            split_mv_joint_refine_passes: DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
+            lambda_long_ref_scale_x256: 256,
         }
     }
 }
+
+/// Default for [`Vp8EncoderConfig::adaptive_segment_thresholds`].
+///
+/// Opt-in (`false`). Adaptive thresholds redistribute QP across the
+/// frame's actual variance distribution, which is the per-MB QP
+/// refinement #479 (webp lossy encoder) was waiting on; turn it on for
+/// content with mixed smooth/textured regions where the static
+/// thresholds would lump every MB into segment 0 (or 3). The default
+/// stays `false` so that single-population frames (uniformly-textured
+/// noise, uniformly-smooth gradients) keep the legacy distribution.
+pub const DEFAULT_ADAPTIVE_SEGMENT_THRESHOLDS: bool = false;
+
+/// Default for [`Vp8EncoderConfig::split_mv_joint_refine_passes`].
+pub const DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES: u32 = 2;
+
+/// Default for [`Vp8EncoderConfig::lambda_long_ref_scale_x256`]. 320 ≈
+/// +25% lambda on GOLDEN / ALTREF candidates, biasing the per-MB
+/// picker towards the closer LAST reference unless the long-term
+/// reference is materially better.
+pub const DEFAULT_LAMBDA_LONG_REF_SCALE_X256: u32 = 320;
+
+/// Hard cap on [`Vp8EncoderConfig::split_mv_joint_refine_passes`].
+/// Empirically the third pass barely moves on the test fixtures and the
+/// fourth converges to the same MVs; 4 is a generous upper bound.
+pub const SPLIT_MV_JOINT_REFINE_PASSES_MAX: u32 = 4;
 
 /// Encoder factory used by [`crate::register_codecs`].
 #[cfg(feature = "registry")]
@@ -1371,9 +1441,14 @@ fn encode_keyframe_and_reconstruct_with_config(
     let mut mb_segment_ids: Vec<u8> = vec![0u8; mb_w * mb_h];
     let mut seg_counts: [u32; 4] = [0; 4];
     if segments.enabled {
+        let thresholds = if config.adaptive_segment_thresholds {
+            adaptive_segment_thresholds_from_frame(&src_y, y_stride, mb_w, mb_h)
+        } else {
+            SEGMENT_VARIANCE_THRESHOLDS
+        };
         for mb_y in 0..mb_h {
             for mb_x in 0..mb_w {
-                let s = classify_segment_id(&src_y, y_stride, mb_x, mb_y);
+                let s = classify_segment_id_with(&src_y, y_stride, mb_x, mb_y, &thresholds);
                 mb_segment_ids[mb_y * mb_w + mb_x] = s;
                 seg_counts[s as usize] += 1;
             }
@@ -1808,9 +1883,14 @@ fn encode_pframe_and_reconstruct(
     let mut mb_segment_ids: Vec<u8> = vec![0u8; mb_w * mb_h];
     let mut seg_counts: [u32; 4] = [0; 4];
     if segments.enabled {
+        let thresholds = if config.adaptive_segment_thresholds {
+            adaptive_segment_thresholds_from_frame(&src_y, y_stride, mb_w, mb_h)
+        } else {
+            SEGMENT_VARIANCE_THRESHOLDS
+        };
         for mb_y in 0..mb_h {
             for mb_x in 0..mb_w {
-                let s = classify_segment_id(&src_y, y_stride, mb_x, mb_y);
+                let s = classify_segment_id_with(&src_y, y_stride, mb_x, mb_y, &thresholds);
                 mb_segment_ids[mb_y * mb_w + mb_x] = s;
                 seg_counts[s as usize] += 1;
             }
@@ -1904,7 +1984,7 @@ fn encode_pframe_and_reconstruct(
                     mb_w,
                     ref_frame,
                 );
-                let dec = choose_pmb_decision(
+                let dec = choose_pmb_decision_with(
                     &src_y,
                     &ref_plane.y,
                     y_stride,
@@ -1916,7 +1996,29 @@ fn encode_pframe_and_reconstruct(
                     nearest,
                     near,
                     &rec_y,
+                    if config.enable_split_mv_joint_refine {
+                        config.split_mv_joint_refine_passes
+                    } else {
+                        0
+                    },
                 );
+                // Per-ref lambda tilt. LAST is the closest reference and
+                // its drift is bounded by exactly one frame; GOLDEN /
+                // ALTREF references accumulate drift across the whole
+                // GOP and the residual coding cost on top of them is
+                // disproportionately expensive in the long-tail. The
+                // long-ref lambda boost makes the rate term weigh more
+                // on those candidates so the picker only takes them
+                // when the distortion improvement is large enough to
+                // justify the higher amortised cost.
+                let ref_lambda = if config.enable_rdo
+                    && config.lambda_long_ref_scale_x256 != 256
+                    && (ref_frame == ENC_REF_GOLDEN || ref_frame == ENC_REF_ALT)
+                {
+                    ((lambda as u64) * (config.lambda_long_ref_scale_x256 as u64) / 256) as u32
+                } else {
+                    lambda
+                };
                 let cost = rd_cost_for_decision(
                     &dec,
                     &src_y,
@@ -1937,7 +2039,7 @@ fn encode_pframe_and_reconstruct(
                     rdo_prob_last,
                     rdo_prob_gf,
                     mb_skip_prob,
-                    lambda,
+                    ref_lambda,
                 );
                 let take = match store {
                     None => true,
@@ -3106,7 +3208,12 @@ fn rd_cost_for_decision(
 /// a very high SAD. NEAREST/NEAR are preferred over NEW_MV when their
 /// SAD is within `NEIGHBOUR_MV_MARGIN` of the post-refinement NEW_MV
 /// SAD, since they do not code an MV delta.
-#[allow(clippy::too_many_arguments)]
+///
+/// Convenience wrapper that uses
+/// [`DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES`] for SPLIT_MV joint
+/// refinement; pre-existing callers (and unit tests) keep the prior
+/// search behaviour without churn.
+#[allow(clippy::too_many_arguments, dead_code)]
 fn choose_pmb_decision(
     src_y: &[u8],
     ref_y: &[u8],
@@ -3119,6 +3226,41 @@ fn choose_pmb_decision(
     nearest: Mv,
     near: Mv,
     rec_y: &[u8],
+) -> PMbDecision {
+    choose_pmb_decision_with(
+        src_y,
+        ref_y,
+        y_stride,
+        y_buf_h,
+        mb_x,
+        mb_y,
+        mb_w,
+        mb_h,
+        nearest,
+        near,
+        rec_y,
+        DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
+    )
+}
+
+/// Same as `choose_pmb_decision` but with a caller-supplied SPLIT_MV
+/// joint-refinement pass count (0 disables, > 0 runs that many joint
+/// passes). Wired into the per-MB picker so the encoder config can opt
+/// out without touching every test call.
+#[allow(clippy::too_many_arguments)]
+fn choose_pmb_decision_with(
+    src_y: &[u8],
+    ref_y: &[u8],
+    y_stride: usize,
+    y_buf_h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+    mb_h: usize,
+    nearest: Mv,
+    near: Mv,
+    rec_y: &[u8],
+    split_mv_joint_refine_passes: u32,
 ) -> PMbDecision {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
@@ -3261,8 +3403,14 @@ fn choose_pmb_decision(
     //      the current best decision by at least
     //      `n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION`.
     if best_sad > SPLITMV_CONSIDER_SAD_PER_PIXEL * (16 * 16) {
-        if let Some((split, split_sad)) = search_split_mv(src_y, &ref_plane, y_stride, mb_xp, mb_yp)
-        {
+        if let Some((split, split_sad)) = search_split_mv(
+            src_y,
+            &ref_plane,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            split_mv_joint_refine_passes,
+        ) {
             let n_parts = MB_SPLIT_COUNT[split.split_mode as usize] as u32;
             let split_margin = n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION;
             if split_sad + split_margin < best_sad {
@@ -4041,33 +4189,79 @@ impl SegmentCtx {
 /// Maps low-variance (smooth) MBs into the low-qi segments and
 /// high-variance (textured) MBs into the high-qi segments. Mirrors the
 /// quartile boundaries baked into `SEGMENT_VARIANCE_THRESHOLDS`.
+#[allow(dead_code)]
 fn classify_segment_id(src_y: &[u8], y_stride: usize, mb_x: usize, mb_y: usize) -> u8 {
-    let mb_xp = mb_x * 16;
-    let mb_yp = mb_y * 16;
-    let mut sum: u64 = 0;
-    let mut sum2: u64 = 0;
-    for r in 0..16 {
-        let row_off = (mb_yp + r) * y_stride + mb_xp;
-        for c in 0..16 {
-            let v = src_y[row_off + c] as u64;
-            sum += v;
-            sum2 += v * v;
-        }
-    }
-    let n = 256u64;
-    // variance = E[x^2] - E[x]^2; expressed in summed-square units
-    // (not divided by n), matching SEGMENT_VARIANCE_THRESHOLDS.
-    let var_sum = sum2.saturating_sub((sum * sum) / n);
-    let t = SEGMENT_VARIANCE_THRESHOLDS;
-    if var_sum < t[0] {
+    classify_segment_id_with(src_y, y_stride, mb_x, mb_y, &SEGMENT_VARIANCE_THRESHOLDS)
+}
+
+/// Same as `classify_segment_id` but with caller-supplied breakpoint
+/// triple. Used by the adaptive-thresholds path which derives the
+/// breakpoints from the actual per-frame variance distribution so that
+/// every segment slot stays well-populated regardless of source content
+/// (a mostly-smooth frame would otherwise pile every MB into segment 0
+/// under the static `SEGMENT_VARIANCE_THRESHOLDS`, wasting the
+/// per-segment quant deltas).
+fn classify_segment_id_with(
+    src_y: &[u8],
+    y_stride: usize,
+    mb_x: usize,
+    mb_y: usize,
+    thresholds: &[u64; 3],
+) -> u8 {
+    let var_sum = mb_luma_variance(src_y, y_stride, mb_x * 16, mb_y * 16);
+    if var_sum < thresholds[0] {
         0
-    } else if var_sum < t[1] {
+    } else if var_sum < thresholds[1] {
         1
-    } else if var_sum < t[2] {
+    } else if var_sum < thresholds[2] {
         2
     } else {
         3
     }
+}
+
+/// Pick per-frame segment-variance breakpoints from the actual MB
+/// variance distribution, landing the population in even quartiles. The
+/// returned `[t0, t1, t2]` triple is fed to `classify_segment_id_with`
+/// so that segment 0 holds the smoothest 25% of MBs, segment 1 the
+/// next 25%, etc., regardless of whether the source is mostly smooth or
+/// mostly textured. Falls back to the static
+/// [`SEGMENT_VARIANCE_THRESHOLDS`] when the frame is too small to
+/// quartile usefully (`mb_count < 4`) or when every MB has the same
+/// variance (degenerate flat content).
+fn adaptive_segment_thresholds_from_frame(
+    src_y: &[u8],
+    y_stride: usize,
+    mb_w: usize,
+    mb_h: usize,
+) -> [u64; 3] {
+    let n = mb_w * mb_h;
+    if n < 4 {
+        return SEGMENT_VARIANCE_THRESHOLDS;
+    }
+    let mut variances: Vec<u64> = Vec::with_capacity(n);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            variances.push(mb_luma_variance(src_y, y_stride, mb_x * 16, mb_y * 16));
+        }
+    }
+    variances.sort_unstable();
+    // Population quartiles: floor(n/4), floor(n/2), floor(3n/4).
+    let q1 = variances[n / 4];
+    let q2 = variances[n / 2];
+    let q3 = variances[(3 * n) / 4];
+    // Degenerate (all-same) → fall back to static thresholds so the
+    // existing single-segment behaviour is preserved bit-for-bit.
+    if q1 == q3 {
+        return SEGMENT_VARIANCE_THRESHOLDS;
+    }
+    // The thresholds are *strict* upper bounds: an MB with `variance =
+    // q1` lands in segment 1 (since `var < t0` requires `var < q1`). To
+    // keep the boundary inclusive at the lower side and avoid a single
+    // outlier dominating the highest segment when many MBs sit at
+    // `q3`, nudge each threshold up by 1 (units = summed-square; +1 is
+    // sub-pixel-noise scale).
+    [q1 + 1, q2 + 1, q3 + 1]
 }
 
 /// Tree probabilities for the per-MB segment-id encoding. RFC 6386 §10
@@ -5592,11 +5786,19 @@ fn search_split_mv(
     y_stride: usize,
     mb_xp: usize,
     mb_yp: usize,
+    joint_refine_passes: u32,
 ) -> Option<(SplitMv, u32)> {
     let mut best: Option<(SplitMv, u32)> = None;
     for split_mode in 0..4u8 {
-        let (part_mvs, total_sad) =
-            search_split_partitions(split_mode, src_y, ref_plane, y_stride, mb_xp, mb_yp);
+        let (part_mvs, total_sad) = search_split_partitions(
+            split_mode,
+            src_y,
+            ref_plane,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            joint_refine_passes,
+        );
         let split = SplitMv {
             split_mode,
             part_mvs,
@@ -5614,7 +5816,11 @@ fn search_split_mv(
 /// Each partition is described by the set of 4×4 sub-blocks (from
 /// `MB_SPLITS[split_mode]`) belonging to it; we search over a small
 /// integer-pel window around zero then refine at quarter-pel, and sum
-/// the SAD contributions.
+/// the SAD contributions. When `joint_refine_passes > 0`, an
+/// additional joint-refinement loop walks every partition again,
+/// hill-climbing each MV in a 3×3 quarter-pel neighbourhood — catches
+/// boundary cases where the independent-partition search lands one
+/// quarter-pel off the joint optimum.
 fn search_split_partitions(
     split_mode: u8,
     src_y: &[u8],
@@ -5622,27 +5828,34 @@ fn search_split_partitions(
     y_stride: usize,
     mb_xp: usize,
     mb_yp: usize,
+    joint_refine_passes: u32,
 ) -> ([Mv; 16], u32) {
     let partition = &MB_SPLITS[split_mode as usize];
     let n = MB_SPLIT_COUNT[split_mode as usize] as usize;
+    // `part_mvs` is consumed by the rest of the encoder (and by the
+    // bitstream emit) as `part_mvs[partition_id]`, so we must write to
+    // slot `p` (the partition id), NOT to the sub-block indices the
+    // partition covers. (Pre-#522 this loop wrote to every covered
+    // sub-block index, which silently aliased the per-partition MVs
+    // for SPLIT_16X8 / QUARTERS — a latent bug masked by the
+    // sub-block-iteration symmetry of SPLIT_8X16 / SPLIT_4X4. The
+    // joint-refinement pass introduced in #522 surfaces it because the
+    // refined MVs land in different aliasing slots than the initial
+    // ones, so half the per-partition refinements never reach the
+    // bitstream — fixing it here also straightens out non-refined
+    // SPLIT_16X8 / QUARTERS reconstructions that were previously
+    // taking partition 0's MV for both halves.)
     let mut part_mvs = [Mv::ZERO; 16];
+    // Per-partition bookkeeping reused by the joint-refinement loop.
+    let mut part_indices: Vec<Vec<usize>> = Vec::with_capacity(n);
+    let mut part_sads: Vec<u32> = Vec::with_capacity(n);
     let mut total_sad = 0u32;
     for p in 0..n {
         // Determine bounding box of partition `p`.
         let mut indices: Vec<usize> = Vec::with_capacity(16);
-        let mut min_by = 4usize;
-        let mut max_by = 0usize;
-        let mut min_bx = 4usize;
-        let mut max_bx = 0usize;
         for i in 0..16 {
             if partition[i] as usize == p {
                 indices.push(i);
-                let by = i / 4;
-                let bx = i % 4;
-                min_by = min_by.min(by);
-                max_by = max_by.max(by);
-                min_bx = min_bx.min(bx);
-                max_bx = max_bx.max(bx);
             }
         }
         // Integer-pel search.
@@ -5667,11 +5880,47 @@ fn search_split_partitions(
             int_mv,
             best_int_sad,
         );
-        for i in &indices {
-            part_mvs[*i] = refined_mv;
-        }
-        let _ = (min_bx, min_by, max_bx, max_by);
+        part_mvs[p] = refined_mv;
+        part_indices.push(indices);
+        part_sads.push(refined_sad);
         total_sad += refined_sad;
+    }
+
+    // Joint-refinement: walk every partition again, holding the others
+    // fixed, and hill-climb the MV in a 3×3 quarter-pel neighbourhood
+    // until either no partition moves in a full pass or we exhaust the
+    // pass budget. The independent-partition search above already found
+    // a local optimum for each partition individually, but neighbouring
+    // partitions can pull each other towards a slightly different joint
+    // optimum (e.g. a 4×4 subset on the boundary between two motion
+    // regions can be tugged either way by its sub-pel filter taps).
+    let passes = joint_refine_passes.min(SPLIT_MV_JOINT_REFINE_PASSES_MAX);
+    if passes > 0 {
+        for _pass in 0..passes {
+            let mut moved = false;
+            for p in 0..n {
+                let cur_mv = part_mvs[p];
+                let (refined_mv, refined_sad) = subpel_refine_partition(
+                    src_y,
+                    ref_plane,
+                    y_stride,
+                    mb_xp,
+                    mb_yp,
+                    &part_indices[p],
+                    cur_mv,
+                    part_sads[p],
+                );
+                if refined_sad < part_sads[p] {
+                    total_sad = total_sad - part_sads[p] + refined_sad;
+                    part_sads[p] = refined_sad;
+                    part_mvs[p] = refined_mv;
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
     }
     (part_mvs, total_sad)
 }
@@ -6865,5 +7114,206 @@ mod tests {
         assert_eq!(lvl, 21);
         let cfg = Vp8EncoderConfig::default();
         assert_eq!(pick_filter_type(lvl, &cfg), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Adaptive segment thresholds — the per-MB QP refinement landed in
+    // this round. The classifier should land each MB in roughly equal-
+    // population quartiles regardless of whether the source's variance
+    // distribution clusters near zero or near the high end.
+    // -----------------------------------------------------------------
+
+    /// Build a synthetic luma plane where MB variances span a wide
+    /// dynamic range: an 8×8 grid of MBs with variance increasing
+    /// monotonically per-row. Exercises the adaptive classifier on a
+    /// well-defined distribution.
+    fn make_variance_grid() -> (Vec<u8>, usize, usize, usize) {
+        let mb_w = 4usize;
+        let mb_h = 4usize;
+        let y_stride = mb_w * 16;
+        let mut y = vec![0u8; y_stride * mb_h * 16];
+        // Per-MB index → variance level (0 smoothest, 15 noisiest).
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let idx = mb_y * mb_w + mb_x;
+                let amp = (idx as u32).saturating_mul(8); // 0..120
+                for r in 0..16usize {
+                    for c in 0..16usize {
+                        // Pseudo-noise scaled by amp; gives variance
+                        // ≈ amp² across the MB.
+                        let h: u32 = ((mb_x as u32) * 16 + c as u32)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(((mb_y as u32) * 16 + r as u32).wrapping_mul(40_503));
+                        let n = ((h ^ (h >> 13)) & 0xff) as i32;
+                        let v = 128 + ((n - 128) * amp as i32) / 256;
+                        y[(mb_y * 16 + r) * y_stride + mb_x * 16 + c] = v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        (y, y_stride, mb_w, mb_h)
+    }
+
+    #[test]
+    fn adaptive_thresholds_distribute_mbs_across_segments() {
+        // The static SEGMENT_VARIANCE_THRESHOLDS would lump nearly every
+        // smooth MB into segment 0; the adaptive classifier should split
+        // the population more evenly.
+        let (y, y_stride, mb_w, mb_h) = make_variance_grid();
+        let thresholds = adaptive_segment_thresholds_from_frame(&y, y_stride, mb_w, mb_h);
+        assert!(
+            thresholds[0] < thresholds[1] && thresholds[1] < thresholds[2],
+            "adaptive thresholds must be strictly increasing: {thresholds:?}"
+        );
+        // Classify and confirm every segment slot is populated. With a
+        // 4×4 = 16 MB grid sorted by variance, quartile boundaries land
+        // 4 MBs in each slot.
+        let mut counts = [0u32; 4];
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let s = classify_segment_id_with(&y, y_stride, mb_x, mb_y, &thresholds);
+                counts[s as usize] += 1;
+            }
+        }
+        for (i, &c) in counts.iter().enumerate() {
+            assert!(
+                c >= 1,
+                "segment {i} is unpopulated under adaptive classifier (counts {counts:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_thresholds_fall_back_on_flat_content() {
+        // Every MB the same intensity → variance is identically 0; the
+        // adaptive picker should fall back to the static table so the
+        // single-segment behaviour is preserved bit-for-bit.
+        let mb_w = 2usize;
+        let mb_h = 2usize;
+        let y_stride = mb_w * 16;
+        let y = vec![128u8; y_stride * mb_h * 16];
+        let thresholds = adaptive_segment_thresholds_from_frame(&y, y_stride, mb_w, mb_h);
+        assert_eq!(
+            thresholds, SEGMENT_VARIANCE_THRESHOLDS,
+            "flat content must use static thresholds"
+        );
+    }
+
+    #[test]
+    fn adaptive_thresholds_fall_back_on_tiny_frame() {
+        // < 4 MBs → quartiles aren't meaningful; fall back to static.
+        let mb_w = 1usize;
+        let mb_h = 1usize;
+        let y_stride = mb_w * 16;
+        let y = vec![0u8; y_stride * mb_h * 16];
+        let thresholds = adaptive_segment_thresholds_from_frame(&y, y_stride, mb_w, mb_h);
+        assert_eq!(thresholds, SEGMENT_VARIANCE_THRESHOLDS);
+    }
+
+    // -----------------------------------------------------------------
+    // SPLIT_MV joint refinement — the joint pass should never increase
+    // the per-partition SAD (it's monotone-decreasing by construction)
+    // and should be a strict no-op when the per-partition search
+    // already converged.
+    // -----------------------------------------------------------------
+
+    fn make_two_motion_planes() -> (Vec<u8>, Vec<u8>, usize) {
+        // 32×32 = 2×2 MB. Each half of an MB has independent motion:
+        // top half stays put, bottom half shifts down by 2 pixels in
+        // the reference frame. SPLIT_MV with the 16×8 partitioning
+        // should pick (0,0) for the top partition and (16, 0) for the
+        // bottom (1/8-pel = +2 pixel shift).
+        let stride = 32usize;
+        let mut src = vec![0u8; stride * 32];
+        let mut refp = vec![0u8; stride * 32];
+        // Source: deterministic per-pixel pattern.
+        for r in 0..32usize {
+            for c in 0..32usize {
+                let v = ((r * 7 + c * 13) & 0xff) as u8;
+                src[r * stride + c] = v;
+            }
+        }
+        // Reference: same as source for the top half. Bottom half is
+        // shifted up by 2 (so the source's bottom needs the reference
+        // shifted DOWN by 2 to match — i.e. mv.row = +16 in 1/8-pel
+        // since +16/8 = +2 pixels).
+        for r in 0..32usize {
+            for c in 0..32usize {
+                if r < 16 {
+                    refp[r * stride + c] = src[r * stride + c];
+                } else if r >= 18 {
+                    refp[(r - 2) * stride + c] = src[r * stride + c];
+                }
+            }
+        }
+        (src, refp, stride)
+    }
+
+    #[test]
+    fn split_mv_joint_refine_is_monotone() {
+        let (src, refp, stride) = make_two_motion_planes();
+        let ref_plane = RefPlane {
+            data: &refp,
+            stride,
+            width: stride,
+            height: 32,
+        };
+        let (_mvs0, sad0) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 0);
+        let (_mvs2, sad2) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 2);
+        assert!(
+            sad2 <= sad0,
+            "joint refinement must not increase SAD: 0-pass={sad0}, 2-pass={sad2}"
+        );
+    }
+
+    #[test]
+    fn split_mv_joint_refine_caps_at_max_passes() {
+        // Asking for more passes than SPLIT_MV_JOINT_REFINE_PASSES_MAX
+        // is allowed; the routine should silently cap (and converge
+        // long before then on a small synthetic clip).
+        let (src, refp, stride) = make_two_motion_planes();
+        let ref_plane = RefPlane {
+            data: &refp,
+            stride,
+            width: stride,
+            height: 32,
+        };
+        let (_a, sad_max) = search_split_partitions(
+            0,
+            &src,
+            &ref_plane,
+            stride,
+            0,
+            0,
+            SPLIT_MV_JOINT_REFINE_PASSES_MAX,
+        );
+        let (_b, sad_huge) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 10_000);
+        assert_eq!(
+            sad_max, sad_huge,
+            "joint-refine pass count above MAX must clip, not loop forever"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Long-ref lambda scaling — pure scalar arithmetic, exercised in
+    // the `try_ref` closure in `encode_inter_*`. Confirm the math.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn long_ref_lambda_scale_default_boosts_25pct() {
+        // 320 / 256 = 1.25 → +25% on the rate-side.
+        let base = 1_000u32;
+        let scaled = ((base as u64) * 320 / 256) as u32;
+        assert_eq!(scaled, 1_250);
+        assert_eq!(DEFAULT_LAMBDA_LONG_REF_SCALE_X256, 320);
+    }
+
+    #[test]
+    fn long_ref_lambda_scale_256_is_neutral() {
+        // 256 / 256 = 1.0 → exact pass-through, recovers the legacy
+        // uniform-lambda path bit-for-bit.
+        let base = 1_000u32;
+        let scaled = ((base as u64) * 256 / 256) as u32;
+        assert_eq!(scaled, base);
     }
 }

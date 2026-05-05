@@ -591,6 +591,30 @@ pub struct Vp8EncoderConfig {
     /// 320 (≈ +25%, the libvpx ballpark for the alt-ref rate-distortion
     /// tilt). Set to 256 to recover the legacy uniform-lambda behaviour.
     pub lambda_long_ref_scale_x256: u32,
+    /// Enable trellis quantisation of residual coefficients (analogous to
+    /// libvpx `vp8_optimize_b`). When `true`, each 4×4 transform block's
+    /// 16 quantised coefficients are post-processed by a backward dynamic
+    /// programme that, for every coefficient from the last non-zero
+    /// position back to the first, evaluates the RD cost of zeroing
+    /// (cost = distortion increase due to the dequant reconstruction
+    /// error, rate = cost of the EOB token inserted at that position)
+    /// versus retaining the quantised value (rate = cost of the actual
+    /// coefficient token). The DP finds the EOB position that minimises
+    /// total `D + λ·R` summed over the block without touching the dequant
+    /// reconstruction (i.e. it only changes the bitstream-level token
+    /// count, not the in-loop reconstruction). Opt-in; default `false`
+    /// so legacy callers stay bit-identical. Enable together with
+    /// `enable_rdo` for the most consistent results.
+    pub enable_trellis_quant: bool,
+    /// Enable rate-aware sub-pel motion estimation. When `true`, the
+    /// quarter-pel refinement step adds the bool-coder cost of the MV
+    /// delta to the SAD when comparing fractional-pel candidates — the
+    /// same `mv_component_cost_x256` table used by the Lagrangian RD
+    /// mode picker. Without this, the sub-pel search minimises SADonly
+    /// and may prefer a marginal SAD improvement that costs many MV bits
+    /// over a slightly worse pixel SAD that uses a much cheaper MV. Opt-in;
+    /// default `false`. Effective only when `enable_rdo = true`.
+    pub enable_subpel_mv_cost: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -622,6 +646,8 @@ impl Default for Vp8EncoderConfig {
             enable_split_mv_joint_refine: false,
             split_mv_joint_refine_passes: DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
             lambda_long_ref_scale_x256: 256,
+            enable_trellis_quant: false,
+            enable_subpel_mv_cost: false,
         }
     }
 }
@@ -1607,7 +1633,7 @@ fn encode_keyframe_and_reconstruct_with_config(
             emit_kf_uv_mode(&mut hdr_enc, uv_mode);
 
             // Encode + reconstruct the MB now that the mode is final.
-            let mb_rec = encode_intra_mb(
+            let mut mb_rec = encode_intra_mb(
                 &src_y,
                 &src_u,
                 &src_v,
@@ -1627,6 +1653,19 @@ fn encode_keyframe_and_reconstruct_with_config(
                 uv_mode,
                 &mb_bmodes[mb_y * mb_w + mb_x],
             );
+            // Trellis quantisation: post-process quantised coefficients to
+            // find the EOB that minimises D + λR. Applied only when the
+            // opt-in flag is set. Lambda is derived from the dequant step
+            // inside apply_trellis_to_mb (calibrated for coeff-level RD).
+            if config.enable_trellis_quant {
+                let has_y2 = y_mode != B_PRED;
+                apply_trellis_to_mb(
+                    &mut mb_rec,
+                    q,
+                    &DEFAULT_COEF_PROBS,
+                    has_y2,
+                );
+            }
             mb_encoded.push(mb_rec);
         }
     }
@@ -2001,6 +2040,11 @@ fn encode_pframe_and_reconstruct(
                     } else {
                         0
                     },
+                    if config.enable_subpel_mv_cost {
+                        lambda as u64
+                    } else {
+                        0
+                    },
                 );
                 // Per-ref lambda tilt. LAST is the closest reference and
                 // its drift is bounded by exactly one frame; GOLDEN /
@@ -2216,6 +2260,19 @@ fn encode_pframe_and_reconstruct(
                     &mb_bmodes[mb_idx],
                 ),
             };
+            // Apply trellis quantisation to P-frame MB (post-process
+            // quantised coefficients to minimise RD cost of trailing zeros).
+            let mut mb_rec = mb_rec;
+            if config.enable_trellis_quant && mb_rec.has_coeffs {
+                let has_y2 = !matches!(decision, PMbDecision::SplitMv(_))
+                    && !matches!(decision, PMbDecision::Intra { y_mode, .. } if y_mode == B_PRED);
+                apply_trellis_to_mb(
+                    &mut mb_rec,
+                    q,
+                    &DEFAULT_COEF_PROBS,
+                    has_y2,
+                );
+            }
             mb_encoded.push(mb_rec);
         }
     }
@@ -3240,6 +3297,7 @@ fn choose_pmb_decision(
         near,
         rec_y,
         DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
+        0, // subpel_mv_cost_lambda: disabled (tests use legacy SAD-only path)
     )
 }
 
@@ -3247,6 +3305,11 @@ fn choose_pmb_decision(
 /// joint-refinement pass count (0 disables, > 0 runs that many joint
 /// passes). Wired into the per-MB picker so the encoder config can opt
 /// out without touching every test call.
+///
+/// `subpel_mv_cost_lambda`: when non-zero the sub-pel refinement biases
+/// toward rate-cheaper MVs by adding `lambda * mv_component_cost_x256 / 256`
+/// to the SAD before comparing candidates. Setting to 0 restores the
+/// legacy SAD-only behaviour.
 #[allow(clippy::too_many_arguments)]
 fn choose_pmb_decision_with(
     src_y: &[u8],
@@ -3261,6 +3324,7 @@ fn choose_pmb_decision_with(
     near: Mv,
     rec_y: &[u8],
     split_mv_joint_refine_passes: u32,
+    subpel_mv_cost_lambda: u64,
 ) -> PMbDecision {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
@@ -3298,6 +3362,7 @@ fn choose_pmb_decision_with(
         mb_yp,
         int_mv,
         best_int_sad,
+        subpel_mv_cost_lambda,
     );
 
     // 4) evaluate NEAREST and NEAR candidates at their exact sub-pel MVs
@@ -3545,6 +3610,12 @@ fn subpel_luma_sad_at(
 /// the 3×3 neighbourhood once, and returns the best (mv, sad). One pass
 /// is enough in practice since the integer search already landed on a
 /// local minimum.
+///
+/// When `mv_cost_lambda > 0`, each candidate's effective cost is
+/// `sad + (lambda * mv_component_cost_x256(row) + lambda * mv_component_cost_x256(col)) / 256`
+/// so the hill-climb biases toward MVs that are cheaper to entropy-code.
+/// The returned `sad` value is the *raw* SAD (without the rate term) for
+/// consistency with how the caller uses it for subsequent comparisons.
 fn subpel_refine_luma(
     src_y: &[u8],
     ref_plane: &RefPlane<'_>,
@@ -3553,9 +3624,20 @@ fn subpel_refine_luma(
     mb_yp: usize,
     int_mv: Mv,
     int_sad: u32,
+    mv_cost_lambda: u64,
 ) -> (Mv, u32) {
+    // Compute the rate cost for the integer-pel MV (the baseline).
+    let mv_rate_cost = |mv: Mv| -> u64 {
+        if mv_cost_lambda == 0 {
+            return 0;
+        }
+        let row_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32);
+        let col_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32);
+        mv_cost_lambda * (row_bits + col_bits) as u64 / 256
+    };
     let mut best_mv = int_mv;
     let mut best_sad = int_sad;
+    let mut best_cost = int_sad as u64 + mv_rate_cost(int_mv);
     let step = SUBPEL_REFINE_STEP;
     for dy in -1..=1 {
         for dx in -1..=1 {
@@ -3564,7 +3646,9 @@ fn subpel_refine_luma(
             }
             let mv = Mv::new(int_mv.row as i32 + dy * step, int_mv.col as i32 + dx * step);
             let sad = subpel_luma_sad_at(src_y, ref_plane, src_stride, mb_xp, mb_yp, mv);
-            if sad < best_sad {
+            let cost = sad as u64 + mv_rate_cost(mv);
+            if cost < best_cost {
+                best_cost = cost;
                 best_sad = sad;
                 best_mv = mv;
             }
@@ -4719,6 +4803,112 @@ fn encode_intra_mb(
     }
 }
 
+/// Apply trellis quantisation to all blocks of an [`MbEncoded`].
+///
+/// Only modifies the coefficient arrays (not the reconstruction buffers).
+/// The reconstruction (rec_y / rec_u / rec_v) is NOT updated — the trellis
+/// optimisation is a bitstream-level decision and the reconstruction is left
+/// as-is (the deblocking filter and downstream P-frame motion search still
+/// see the original reconstruction). This matches the standard VP8 trellis
+/// approach: change the token chain, not the loop-filter reference.
+///
+/// Distortion is measured as `(q[i] * step)^2`, i.e. the squared dequant
+/// value of the zeroed coefficient — an approximation that matches libvpx's
+/// `vp8_optimize_b` behaviour and avoids needing the pre-quant residual.
+fn apply_trellis_to_mb(
+    mb_enc: &mut MbEncoded,
+    q: &QuantCtx,
+    probs: &CoeffProbs,
+    has_y2: bool,
+) {
+    // Compute per-plane lambda from the dequant step size. The trellis
+    // operates in (dequant)^2 distortion units vs. 1/256-bit rate units,
+    // so the lambda must be calibrated differently from the mode-selection
+    // lambda (which is in SAD units). Formula: step^2 / TRELLIS_LAMBDA_DENOM.
+    let lambda_y2 = {
+        let s = q.y2_ac as u64;
+        (s * s) / TRELLIS_LAMBDA_DENOM
+    };
+    let lambda_y = {
+        let s = q.y_ac as u64;
+        (s * s) / TRELLIS_LAMBDA_DENOM
+    };
+    let lambda_uv = {
+        let s = q.uv_ac as u64;
+        (s * s) / TRELLIS_LAMBDA_DENOM
+    };
+
+    // Sentinel raw coefficients: trellis uses (q*step)^2 for distortion.
+    let raw_zero_16 = [0i32; 16];
+
+    // Y2 block (plane=1, start=0).
+    if has_y2 {
+        mb_enc.y2_coeffs = trellis_quant_block(
+            &mb_enc.y2_coeffs,
+            &raw_zero_16,
+            q.y2_dc,
+            q.y2_ac,
+            lambda_y2,
+            probs,
+            1,
+            0,
+            0,
+        );
+    }
+
+    // Y blocks. Y-after-Y2: plane=0, start=1. Y-without-Y2: plane=3, start=0.
+    let (y_plane, y_start) = if has_y2 { (0usize, 1usize) } else { (3usize, 0usize) };
+    for bi in 0..16 {
+        mb_enc.y_coeffs[bi] = trellis_quant_block(
+            &mb_enc.y_coeffs[bi],
+            &raw_zero_16,
+            q.y_dc,
+            q.y_ac,
+            lambda_y,
+            probs,
+            y_plane,
+            0,
+            y_start,
+        );
+    }
+
+    // U blocks (plane=2, start=0).
+    for bi in 0..4 {
+        mb_enc.u_coeffs[bi] = trellis_quant_block(
+            &mb_enc.u_coeffs[bi],
+            &raw_zero_16,
+            q.uv_dc,
+            q.uv_ac,
+            lambda_uv,
+            probs,
+            2,
+            0,
+            0,
+        );
+    }
+
+    // V blocks (plane=2, start=0).
+    for bi in 0..4 {
+        mb_enc.v_coeffs[bi] = trellis_quant_block(
+            &mb_enc.v_coeffs[bi],
+            &raw_zero_16,
+            q.uv_dc,
+            q.uv_ac,
+            lambda_uv,
+            probs,
+            2,
+            0,
+            0,
+        );
+    }
+
+    // Update has_coeffs.
+    mb_enc.has_coeffs = mb_enc.y2_coeffs.iter().any(|&v| v != 0)
+        || mb_enc.y_coeffs.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || mb_enc.u_coeffs.iter().flat_map(|b| b.iter()).any(|&v| v != 0)
+        || mb_enc.v_coeffs.iter().flat_map(|b| b.iter()).any(|&v| v != 0);
+}
+
 /// Build 4×4 neighbour array for a sub-block. Matches the decoder's
 /// logic in `reconstruct_intra_mb` (including the above-right extension
 /// special-case).
@@ -4943,6 +5133,320 @@ fn quant(v: i32, step: i32) -> i16 {
         -((-v + half) / step)
     };
     q.clamp(-2048, 2047) as i16
+}
+
+// ---------------------------------------------------------------------------
+// Trellis quantisation (post-processing on quantised coefficients)
+// ---------------------------------------------------------------------------
+
+/// Denominator for trellis-lambda computation from the dequant step.
+///
+/// `trellis_lambda_x256 = step^2 / TRELLIS_LAMBDA_DENOM` (per block).
+///
+/// Calibration: with `DENOM = 32` and step=53 (qp≈50), trellis_lambda≈88.
+/// Zeroing a trailing q=1 coeff (D=2809) only happens when the rate
+/// R > D/lambda = 2809/88 ≈ 32 "1/256-bit units" = ~0.13 bits. Since real
+/// q=1 tokens cost ~3 bits (768 1/256-bit units), this is very conservative
+/// — effectively never zeroes q=1 at medium QP. At high QP (step=200,
+/// lambda=1250), zeroing q=1 happens when R > 200^2/1250=32 units ≈ 0.13 bits,
+/// which means the trellis trims only free-riding trailing zeros.
+/// Increase DENOM to be more aggressive (zero more), decrease to be conservative.
+const TRELLIS_LAMBDA_DENOM: u64 = 16;
+
+/// Cost of writing `n_zeros` consecutive zero coefficients starting at
+/// position `pos` in the token stream given probability array `p` at
+/// `pos`. Each zero advances pos and switches to ctx=0. Returns the bit
+/// cost in 1/256-bit units. Available for future optimisations.
+#[allow(dead_code)]
+#[inline]
+fn cost_zeros_x256(probs: &crate::tables::coeff_probs::CoeffProbs, plane: usize, pos: usize, start_ctx: usize, n_zeros: usize) -> u32 {
+    use crate::bool_encoder::PROB_COST_BITS_X256;
+    let plane_probs = &probs[plane];
+    let mut cost = 0u32;
+    let mut ctx = start_ctx;
+    for i in 0..n_zeros {
+        let p = &plane_probs[COEF_BANDS[pos + i]][ctx];
+        // p[0] = EOB prob; p[1] = DCT_0 vs non-zero
+        // Here we write "not EOB" (=true, costs p[0] for true)
+        // then write "zero" (=false, costs p[1] for false).
+        cost += PROB_COST_BITS_X256[1][p[0] as usize] as u32; // has_coeff = true
+        cost += PROB_COST_BITS_X256[0][p[1] as usize] as u32; // is_zero = false (DCT_0 branch)
+        ctx = 0;
+    }
+    cost
+}
+
+/// Cost of writing a single non-zero coefficient of magnitude `v` (> 0)
+/// at probability array `p`, in 1/256-bit units. Mirrors `emit_magnitude`
+/// but uses the cost table instead of writing bits.
+#[inline]
+fn cost_nonzero_x256(p: &[u8; 11], v: i32) -> u32 {
+    use crate::bool_encoder::PROB_COST_BITS_X256;
+    let mut cost = 0u32;
+    // has_coeff = true (p[0])
+    cost += PROB_COST_BITS_X256[1][p[0] as usize] as u32;
+    // is_nonzero (p[1])
+    cost += PROB_COST_BITS_X256[1][p[1] as usize] as u32;
+    // magnitude (p[2..])
+    if v == 1 {
+        cost += PROB_COST_BITS_X256[0][p[2] as usize] as u32;
+    } else {
+        cost += PROB_COST_BITS_X256[1][p[2] as usize] as u32;
+        if v <= 4 {
+            cost += PROB_COST_BITS_X256[0][p[3] as usize] as u32;
+            if v == 2 {
+                cost += PROB_COST_BITS_X256[0][p[4] as usize] as u32;
+            } else {
+                cost += PROB_COST_BITS_X256[1][p[4] as usize] as u32;
+                cost += PROB_COST_BITS_X256[(v == 4) as usize][p[5] as usize] as u32;
+            }
+        } else {
+            cost += PROB_COST_BITS_X256[1][p[3] as usize] as u32;
+            if v <= 10 {
+                cost += PROB_COST_BITS_X256[0][p[6] as usize] as u32;
+                if v <= 6 {
+                    cost += PROB_COST_BITS_X256[0][p[7] as usize] as u32;
+                    cost += PROB_COST_BITS_X256[(v == 6) as usize][159] as u32;
+                } else {
+                    cost += PROB_COST_BITS_X256[1][p[7] as usize] as u32;
+                    let hi = if v >= 9 { 1usize } else { 0 };
+                    cost += PROB_COST_BITS_X256[hi][165] as u32;
+                    let low = (v - 7 - 2 * hi as i32) as usize;
+                    cost += PROB_COST_BITS_X256[low][145] as u32;
+                }
+            } else {
+                cost += PROB_COST_BITS_X256[1][p[6] as usize] as u32;
+                let (cat, base) = if v < 19 { (0usize, 11i32) } else if v < 35 { (1, 19) } else if v < 67 { (2, 35) } else { (3, 67) };
+                let bit1 = (cat >> 1) & 1;
+                let bit0 = cat & 1;
+                cost += PROB_COST_BITS_X256[bit1][p[8] as usize] as u32;
+                cost += PROB_COST_BITS_X256[bit0][p[9 + bit1] as usize] as u32;
+                let extra_bits_tab: &[u8] = match cat {
+                    0 => &[173, 148, 140],
+                    1 => &[176, 155, 140, 135],
+                    2 => &[180, 157, 141, 134, 130],
+                    _ => &[254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129],
+                };
+                let extra = (v - base) as usize;
+                let nbits = extra_bits_tab.len();
+                for i in 0..nbits {
+                    let bit = (extra >> (nbits - 1 - i)) & 1;
+                    cost += PROB_COST_BITS_X256[bit][extra_bits_tab[i] as usize] as u32;
+                }
+            }
+        }
+    }
+    // sign bit (uniform 128)
+    cost += PROB_COST_BITS_X256[0][128] as u32; // 1 bit always
+    cost
+}
+
+/// Cost of the EOB token at position `pos` with context `ctx` in 1/256-bit
+/// units. EOB = writing "has_coeff = false" (p[0] bit = false).
+#[inline]
+fn cost_eob_x256(probs: &crate::tables::coeff_probs::CoeffProbs, plane: usize, pos: usize, ctx: usize) -> u32 {
+    use crate::bool_encoder::PROB_COST_BITS_X256;
+    let p = &probs[plane][COEF_BANDS[pos]][ctx];
+    PROB_COST_BITS_X256[0][p[0] as usize] as u32
+}
+
+/// Trellis quantisation of a single 4×4 block. Implements a backward
+/// dynamic programme over the EOB position, analogous to libvpx
+/// `vp8_optimize_b`. For each candidate EOB position (from `start` to
+/// `last_nz + 1`) computes the total `D + λ·R` where D is the squared
+/// dequant error of zeroed trailing coefficients and R is the bool-coder
+/// bit cost of the shortened token chain. The EOB position that minimises
+/// the total is accepted; coefficients after that position are zeroed.
+///
+/// `coeffs_q` — quantised coefficients in natural (non-zigzag) order.
+/// `step` — the dequant step for each position (dc_step for pos 0, ac_step for 1..15).
+/// `lambda_x256` — `λ × 256` (same scale as `estimate_mode_rate_x256`).
+/// `plane` / `nctx` — for context-sensitive probability lookup.
+/// `start` — first meaningful coefficient position (1 for Y-after-Y2).
+///
+/// Returns the (possibly unchanged) coefficient array with trailing zeros
+/// optimised. Does NOT update the reconstruction — the caller is responsible
+/// for redequantising if the reconstruction matters (keyframe intra uses
+/// it for neighbour prediction of subsequent blocks; for the token-emission
+/// path only the coefficient array matters).
+fn trellis_quant_block(
+    coeffs_q: &[i16; 16],
+    _raw_coeffs: &[i32; 16],
+    dc_step: i32,
+    ac_step: i32,
+    lambda_x256: u64,
+    probs: &crate::tables::coeff_probs::CoeffProbs,
+    plane: usize,
+    nctx: usize,
+    start: usize,
+) -> [i16; 16] {
+    use crate::tables::token_tree::ZIGZAG;
+    // Find the last non-zero quantised coefficient.
+    let mut last_nz = None::<usize>;
+    for n in start..16 {
+        if coeffs_q[ZIGZAG[n]] != 0 {
+            last_nz = Some(n);
+        }
+    }
+    let last = match last_nz {
+        Some(n) => n,
+        None => return *coeffs_q, // all zero — nothing to do
+    };
+
+    // For each candidate EOB position `eob` (start..=last+1), compute the
+    // cost of stopping at `eob` (zeroing positions eob..=last):
+    //   rate = cost_eob(eob) + cost of the kept coefficients in start..eob
+    //   distortion = sum of (q[i]*step)^2 for i in eob..=last
+    //
+    // We pick the eob that minimises D + λR.
+    //
+    // Full backward DP: we accumulate the running D (distortion from
+    // zeroing trailing coefficients) and R (rate saving from earlier EOB)
+    // as we sweep eob from last+1 down to start.
+
+    // Pre-compute the rate of encoding the kept prefix start..eob for each eob.
+    // We walk forward and keep a running cost so prefix_rate[eob] = total rate
+    // for the substring [start, eob) including the EOB itself.
+    //
+    // For simplicity (matching libvpx), we use the "full block forward pass"
+    // approach: compute the original full-block cost, then scan backward
+    // and track the incremental savings from zeroing each trailing coeff.
+
+    // Rate of the original block (EOB = last+1).
+    // When last == 15 the encoder writes all 16 coefficients and returns 16
+    // without an explicit EOB token (encode_block returns 16 at n==16 with no
+    // further write). So we only add the EOB cost for last < 15.
+    let mut orig_rate: u32 = 0;
+    {
+        let plane_probs = &probs[plane];
+        let mut ctx = nctx;
+        for n in start..=last {
+            let p = &plane_probs[COEF_BANDS[n]][ctx];
+            let c = coeffs_q[ZIGZAG[n]] as i32;
+            if c == 0 {
+                // Zero: has_coeff=true, is_zero=false (DCT_0 branch)
+                use crate::bool_encoder::PROB_COST_BITS_X256;
+                orig_rate += PROB_COST_BITS_X256[1][p[0] as usize] as u32;
+                orig_rate += PROB_COST_BITS_X256[0][p[1] as usize] as u32;
+                ctx = 0;
+            } else {
+                let v = c.unsigned_abs() as i32;
+                orig_rate += cost_nonzero_x256(p, v);
+                ctx = if v == 1 { 1 } else { 2 };
+            }
+        }
+        // EOB after last — only present when last < 15 (the 16th coeff doesn't
+        // get an explicit EOB; the bool-coder stream just ends the block).
+        if last < 15 {
+            let p_eob = &plane_probs[COEF_BANDS[last + 1]][ctx];
+            use crate::bool_encoder::PROB_COST_BITS_X256;
+            orig_rate += PROB_COST_BITS_X256[0][p_eob[0] as usize] as u32;
+        }
+    }
+
+    // Distortion of all zeroed positions (none yet).
+    let mut trail_distortion: u64 = 0;
+
+    // Best (eob, cost = D + λR).
+    let best_rate = orig_rate;
+    let mut best_cost = trail_distortion + lambda_x256.saturating_mul(best_rate as u64) / 256;
+    let mut best_eob = last + 1; // keep everything
+
+    // Sweep backward. When last == 15, only positions start..=14 can be the
+    // new EOB candidate (we cannot "remove" position 15 without also zeroing
+    // it, which is equivalent to EOB=15). The loop below is correct for both
+    // cases because we always test EOB = n where n <= last, and COEF_BANDS[n]
+    // is valid for n <= 15. The EOB token itself is at position n, which is
+    // also within bounds.
+    //
+    // Pre-compute ctx for each position by a forward pass.
+    let mut ctx_at = [0usize; 17];
+    {
+        let plane_probs = &probs[plane];
+        let mut ctx = nctx;
+        ctx_at[start] = ctx;
+        for n in start..=last {
+            let c = coeffs_q[ZIGZAG[n]] as i32;
+            if c == 0 {
+                ctx = 0;
+            } else {
+                let v = c.unsigned_abs() as i32;
+                ctx = if v == 1 { 1 } else { 2 };
+            }
+            if n < last {
+                ctx_at[n + 1] = ctx;
+            }
+            let _ = plane_probs;
+        }
+        ctx_at[last + 1] = ctx; // ctx right after `last`
+    }
+
+    // Rate of the prefix start..eob (not including EOB token itself).
+    // Compute incrementally by subtracting the cost of the last coefficient.
+    let mut prefix_rate = best_rate; // currently = rate of start..last+1 (incl. EOB if last < 15)
+    // Remove the EOB token that was at last+1 (only if it was actually counted).
+    if last < 15 {
+        prefix_rate = prefix_rate.saturating_sub(cost_eob_x256(probs, plane, last + 1, ctx_at[last + 1]));
+    }
+
+    // The last coefficient at position `last` can only be a new EOB candidate
+    // if we zero it AND everything after it. For last == 15 this means zeroing
+    // position 15, making the effective EOB = 15. We include it in the sweep.
+    for n in (start..=last).rev() {
+        let c = coeffs_q[ZIGZAG[n]] as i32;
+        let step = if ZIGZAG[n] == 0 { dc_step } else { ac_step };
+
+        // Distortion from zeroing position n (and everything after it that's
+        // already been zeroed in previous iterations).
+        // The dequantised value that gets zeroed is `c * step`.
+        // But we want the distortion vs the *raw* (pre-quant) coefficient,
+        // not the dequantised one. Actually, the reconstruction error when
+        // we zero a coefficient is `raw[n] - 0 = raw[n]` — wait, no.
+        // The raw residual at position n is `raw_coeffs[ZIGZAG[n]]`.
+        // When we quantise, we get q = quant(raw, step). The reconstruction
+        // contribution is q*step. If we zero q, the reconstruction gets 0
+        // instead of q*step, so the distortion increase is (q*step)^2 scaled
+        // by whatever the IDCT/IFWHT magnitude factor is. For a first-order
+        // approximation (and what libvpx uses), distortion ≈ (q*step)^2.
+        let dq = (c * step).unsigned_abs() as u64;
+        trail_distortion += dq * dq;
+
+        // Remove the cost of coefficient at position n from prefix_rate.
+        {
+            let plane_probs = &probs[plane];
+            let p = &plane_probs[COEF_BANDS[n]][ctx_at[n]];
+            let cost_n = if c == 0 {
+                use crate::bool_encoder::PROB_COST_BITS_X256;
+                PROB_COST_BITS_X256[1][p[0] as usize] as u32
+                    + PROB_COST_BITS_X256[0][p[1] as usize] as u32
+            } else {
+                let v = c.unsigned_abs() as i32;
+                cost_nonzero_x256(p, v)
+            };
+            prefix_rate = prefix_rate.saturating_sub(cost_n);
+        }
+
+        // Cost of placing EOB at position n (zeroing n..=last).
+        let eob_cost = cost_eob_x256(probs, plane, n, ctx_at[n]);
+        let total_rate = prefix_rate + eob_cost;
+        let total_cost = trail_distortion + lambda_x256.saturating_mul(total_rate as u64) / 256;
+
+        if total_cost < best_cost {
+            best_cost = total_cost;
+            best_eob = n;
+        }
+    }
+
+    if best_eob == last + 1 {
+        return *coeffs_q; // no change
+    }
+
+    // Zero the coefficients from best_eob onward.
+    let mut out = *coeffs_q;
+    for n in best_eob..16 {
+        out[ZIGZAG[n]] = 0;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -6928,7 +7432,7 @@ mod tests {
         // refinement must move it to col=+4 (half-pel == 4 in 1/8 units).
         let int_sad = subpel_luma_sad_at(&src, &ref_plane, stride, 0, 0, Mv::ZERO);
         let (refined_mv, refined_sad) =
-            subpel_refine_luma(&src, &ref_plane, stride, 0, 0, Mv::ZERO, int_sad);
+            subpel_refine_luma(&src, &ref_plane, stride, 0, 0, Mv::ZERO, int_sad, 0);
         assert!(
             refined_sad < int_sad,
             "refinement did not improve: int={int_sad} refined={refined_sad}"

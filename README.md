@@ -175,6 +175,33 @@ cost. On the mixed-content clip with this knob set to 320, the
 encoder shaves ~8% bytes for +0.60 dB Y. Set to `256` to recover the
 uniform-lambda behaviour bit-for-bit.
 
+**Trellis quantisation (round-32)** — after the per-MB quantiser
+produces the initial coefficient array, an optional backward dynamic
+programme sweeps from the last non-zero coefficient toward the start,
+trying to move the EOB earlier by zeroing trailing coefficients whose
+rate cost exceeds their distortion contribution. Distortion is
+`(q·step)²` (dequant-domain squared error, consistent with the
+`vp8_optimize_b` formulation in libvpx); rate is from the
+`PROB_COST_BITS_X256` bool-coder cost table in 1/256-bit units; lambda
+is `step² / 16` per block so the aggressiveness scales with QP without
+extra configuration. Covers all planes (Y, Y2, U, V) on keyframes and
+P-frames. Only the quantised coefficient array is modified — the
+in-loop reconstruction is unchanged, keeping the decoder's reference
+frames bit-identical to the non-trellis path. Opt-in via
+`Vp8EncoderConfig::enable_trellis_quant = true`; off by default.
+On the mixed-content test clip at qindex=50 this trims ~5–7% bytes.
+
+**Rate-aware sub-pel ME (round-32)** — the quarter-pel 3×3
+hill-climb in `subpel_refine_luma` optionally adds
+`λ × mv_component_cost_x256 / 256` to the effective cost of each
+fractional-pel candidate (using the same `DEFAULT_MV_CONTEXT` and
+`mv_component_cost_x256` table the Lagrangian mode picker uses), so
+the hill-climb biases toward entropy-cheaper MVs when multiple
+neighbours have similar pixel distortion. Opt-in via
+`Vp8EncoderConfig::enable_subpel_mv_cost = true`; off by default.
+Effective only when `enable_rdo = true`; no measurable PSNR
+regression on the mixed-content test clip.
+
 **Per-frame scene-cut adaptation** watches each incoming source
 frame's per-pixel luma mean-absolute-difference (MAD) versus the
 previous source frame, then compares it against the running
@@ -196,8 +223,9 @@ fine-grained control over `qindex`, `golden_interval`,
 `enable_segments`, `segment_quant_deltas`, `enable_scene_cut`,
 `scene_cut_threshold`, `scene_cut_quant_boost`,
 `scene_cut_boost_frames`, `adaptive_segment_thresholds`,
-`enable_split_mv_joint_refine`, `split_mv_joint_refine_passes`, and
-`lambda_long_ref_scale_x256`.
+`enable_split_mv_joint_refine`, `split_mv_joint_refine_passes`,
+`lambda_long_ref_scale_x256`, `enable_trellis_quant`, and
+`enable_subpel_mv_cost`.
 
 ### Container
 

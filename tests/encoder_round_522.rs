@@ -130,6 +130,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_split_mv_joint_refine: false,
         split_mv_joint_refine_passes: 0,
         lambda_long_ref_scale_x256: 256,
+        enable_trellis_quant: false,
+        enable_subpel_mv_cost: false,
     }
 }
 
@@ -285,5 +287,99 @@ fn all_three_features_combine_for_meaningful_win() {
     assert!(
         psnr_gain >= 0.3,
         "combined opt-ins did not gain at least 0.3 dB Y: {psnr_gain:+.2}"
+    );
+}
+
+#[test]
+fn trellis_quant_shrinks_bitstream_without_psnr_loss() {
+    // Trellis quantisation minimises D + λR by zeroing trailing coefficients
+    // whose rate cost exceeds their distortion contribution. On a
+    // mixed-content clip (half smooth, half textured) with non-trivial
+    // inter-frame residuals it must shrink the bitstream measurably while
+    // holding PSNR within 0.3 dB of the baseline.
+    let clip = make_mixed_clip(8);
+    let (bytes_baseline, psnr_baseline) = measure(cfg_baseline(), &clip);
+    let mut cfg = cfg_baseline();
+    cfg.enable_trellis_quant = true;
+    let (bytes_trellis, psnr_trellis) = measure(cfg, &clip);
+    eprintln!(
+        "baseline: {bytes_baseline} bytes / {psnr_baseline:.2} dB; \
+         trellis:  {bytes_trellis} bytes / {psnr_trellis:.2} dB"
+    );
+    // Trellis must reduce the bitstream on a clip with substantial residuals.
+    assert!(
+        bytes_trellis < bytes_baseline,
+        "trellis_quant did not shrink bitstream: \
+         baseline={bytes_baseline}, trellis={bytes_trellis}"
+    );
+    // PSNR is allowed to drop slightly (trailing coefficients zeroed = more
+    // distortion) but must not collapse by more than 0.3 dB.
+    assert!(
+        psnr_trellis >= psnr_baseline - 0.3,
+        "trellis_quant dropped PSNR too much: \
+         baseline={psnr_baseline:.2}, trellis={psnr_trellis:.2}"
+    );
+}
+
+#[test]
+fn subpel_mv_cost_does_not_regress_psnr() {
+    // Rate-aware sub-pel refinement biases the 1/8-pel hill-climb toward
+    // entropy-cheaper MVs. The direct cost of the bias is a possible tiny
+    // SAD increase, but the net effect (fewer MV-delta bits) should hold
+    // PSNR within 0.2 dB and must not *increase* the bitstream on a clip
+    // that has plenty of inter prediction opportunities.
+    let clip = make_mixed_clip(8);
+    let (bytes_baseline, psnr_baseline) = measure(cfg_baseline(), &clip);
+    let mut cfg = cfg_baseline();
+    cfg.enable_subpel_mv_cost = true;
+    let (bytes_subpel, psnr_subpel) = measure(cfg, &clip);
+    eprintln!(
+        "baseline:     {bytes_baseline} bytes / {psnr_baseline:.2} dB; \
+         subpel-cost: {bytes_subpel} bytes / {psnr_subpel:.2} dB"
+    );
+    // Must not substantially increase the bitstream.
+    assert!(
+        bytes_subpel <= bytes_baseline + bytes_baseline / 20,
+        "subpel_mv_cost grew bitstream by more than 5%: \
+         baseline={bytes_baseline}, subpel={bytes_subpel}"
+    );
+    // PSNR must not collapse by more than 0.2 dB.
+    assert!(
+        psnr_subpel >= psnr_baseline - 0.2,
+        "subpel_mv_cost dropped PSNR too much: \
+         baseline={psnr_baseline:.2}, subpel={psnr_subpel:.2}"
+    );
+}
+
+#[test]
+fn all_five_features_combine_for_best_rd() {
+    // Combining all five opt-in features (adaptive-thresholds,
+    // split-mv-joint-refine, long-ref-lambda, trellis-quant,
+    // subpel-mv-cost) must achieve >= 5% bitstream savings and +0.3 dB
+    // PSNR vs the plain-RDO baseline on the mixed-content synthetic clip.
+    let clip = make_mixed_clip(8);
+    let (bytes_baseline, psnr_baseline) = measure(cfg_baseline(), &clip);
+    let mut cfg = cfg_baseline();
+    cfg.adaptive_segment_thresholds = true;
+    cfg.enable_split_mv_joint_refine = true;
+    cfg.split_mv_joint_refine_passes = DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES;
+    cfg.lambda_long_ref_scale_x256 = DEFAULT_LAMBDA_LONG_REF_SCALE_X256;
+    cfg.enable_trellis_quant = true;
+    cfg.enable_subpel_mv_cost = true;
+    let (bytes_full, psnr_full) = measure(cfg, &clip);
+    eprintln!(
+        "baseline:  {bytes_baseline} bytes / {psnr_baseline:.2} dB; \
+         all five: {bytes_full} bytes / {psnr_full:.2} dB"
+    );
+    let saved_pct = (bytes_baseline as f64 - bytes_full as f64) / bytes_baseline as f64 * 100.0;
+    let psnr_gain = psnr_full - psnr_baseline;
+    eprintln!("delta: {saved_pct:.2}% bytes saved, {psnr_gain:+.2} dB PSNR");
+    assert!(
+        saved_pct >= 5.0,
+        "all-five opt-ins did not save at least 5% bytes: {saved_pct:.2}%"
+    );
+    assert!(
+        psnr_gain >= 0.3,
+        "all-five opt-ins did not gain at least 0.3 dB Y: {psnr_gain:+.2}"
     );
 }

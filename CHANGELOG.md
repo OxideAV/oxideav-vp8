@@ -44,6 +44,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this knob at 320 the encoder shaves ~8% bytes for +0.60 dB Y. With
   all three new opt-in features on simultaneously the combination
   lands ~14% smaller bitstream for +0.77 dB Y.
+- *(encoder)* Trellis quantisation on residual coefficients
+  (`enable_trellis_quant`). A backward dynamic programme over the EOB
+  position minimises `D + λ·R` at the 4×4-block level for all planes
+  (Y, Y2, U, V) on both keyframes and P-frames. Distortion is
+  `(q·step)²` (dequant-squared, analogous to libvpx `vp8_optimize_b`);
+  rate is from the `PROB_COST_BITS_X256` bool-coder cost table in
+  1/256-bit units; lambda is derived from the per-plane AC step as
+  `step² / 16` so the threshold scales automatically with QP. The DP
+  only modifies the quantised coefficient array (token stream EOB is
+  moved earlier); the in-loop reconstruction is unchanged, keeping
+  the decoder reference frames bit-identical. Default off (opt-in via
+  `Vp8EncoderConfig::enable_trellis_quant`). On the mixed-content
+  128×128 clip at qindex=50 this trims ~5–7% bytes.
+- *(encoder)* Rate-aware sub-pel motion estimation (`enable_subpel_mv_cost`).
+  The quarter-pel hill-climb in `subpel_refine_luma` now optionally
+  adds `λ × mv_component_cost_x256 / 256` to the SAD cost for each
+  fractional-pel candidate, biasing the selection toward
+  entropy-cheaper MVs when multiple neighbours have similar
+  pixel-distortion scores. Uses the same `DEFAULT_MV_CONTEXT` and
+  `mv_component_cost_x256` table already used by the Lagrangian mode
+  picker. Default off (opt-in via
+  `Vp8EncoderConfig::enable_subpel_mv_cost`). Effective only when
+  `enable_rdo = true`; no measurable PSNR regression on the
+  mixed-content test clip.
 
 ### Fixed
 

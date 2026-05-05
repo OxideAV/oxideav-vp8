@@ -230,13 +230,12 @@ pixel defaults swap.
 Decode a raw VP8 frame out of an IVF file:
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
-use oxideav_core::Frame;
+use oxideav_core::{Frame, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_vp8::register(&mut codecs, &mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_vp8::register(&mut ctx);
+let codecs = &ctx.codecs;
+let containers = &ctx.containers;
 
 let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("clip.ivf")?),

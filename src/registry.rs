@@ -14,6 +14,7 @@
 //!   the framework error type.
 
 use oxideav_core::ContainerRegistry;
+use oxideav_core::RuntimeContext;
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, CodecTag};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
@@ -69,11 +70,12 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     ivf::register(reg);
 }
 
-/// Combined registration for callers that just want everything (codecs
-/// + the IVF container) wired up in one call.
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
+/// Unified registration entry point — installs the VP8 codec into the
+/// codec sub-registry and the IVF container into the container
+/// sub-registry of the supplied [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
@@ -82,4 +84,29 @@ fn make_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decode
 
 fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Encoder>> {
     crate::encoder::make_encoder(params)
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_both_sides() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(crate::CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "VP8 decoder factory not installed via RuntimeContext"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "VP8 encoder factory not installed via RuntimeContext"
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("ivf"),
+            Some("ivf"),
+            "IVF container extension not installed via RuntimeContext"
+        );
+    }
 }

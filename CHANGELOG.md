@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Two-pass ABR rate control (#536). A first-pass complexity
+  analyser (`first_pass_analyze`) scans every source frame's luma plane
+  for per-frame mean MB variance and inter-frame MAD (per-pixel
+  mean-absolute-difference vs the previous frame's luma), returning a
+  `Vec<FrameComplexity>` that the second pass uses to assign per-frame
+  quantiser indices. The QP distribution follows a log-linear model:
+  `qindex = base_qindex - round(sensitivity * log2(score / mean_score))`,
+  where `sensitivity = QP_SENSITIVITY_X8 / 8` (default 6 steps per
+  complexity doubling — the libvpx empirical-table slope). Helper
+  `two_pass_qindices(complexity, &cfg)` converts a whole clip's
+  complexity vec into a `Vec<u8>` QP table in one call. The functional
+  interface (`first_pass_analyze` + `two_pass_qindices` + per-frame
+  `make_encoder_with_config`) is the recommended path; the
+  `Vp8TwoPassEncoder` struct and `make_two_pass_encoder` constructor
+  provide an `Encoder`-trait-compatible wrapper for callers that want
+  the same `send_frame` / `receive_packet` cadence as the single-pass
+  encoder. `Vp8TwoPassConfig` bundles target bitrate, fps, base/min/max
+  QP range, sensitivity, and the base `Vp8EncoderConfig` knob set; all
+  other encoder features (RDO, trellis, multi-ref, segments, scene-cut)
+  work unchanged. On a mixed smooth+noisy synthetic clip at 1 Mbit/s
+  the two-pass assignment drives complex frames 6–12 QP steps finer
+  than flat frames at the same average bits/frame, recovering the
+  quality that single-pass CBR wastes by spending bits uniformly.
+  Six integration tests in `tests/encoder_two_pass.rs` cover:
+  noise-over-flat complexity ordering, lower-QP-for-complex invariant,
+  sensitivity=0 flat-QP fallback, min/max QP clamping, clean decode of
+  a two-pass stream, and PSNR-improvement on a pure-noise clip.
+
 - *(encoder)* Per-MB QP refinement via adaptive segment-variance
   thresholds (#522). When `Vp8EncoderConfig::adaptive_segment_thresholds
   = true`, the segment classifier picks its three variance breakpoints

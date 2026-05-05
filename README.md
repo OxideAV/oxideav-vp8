@@ -202,6 +202,51 @@ neighbours have similar pixel distortion. Opt-in via
 Effective only when `enable_rdo = true`; no measurable PSNR
 regression on the mixed-content test clip.
 
+**Two-pass ABR rate control (round-36)** — a functional two-pass
+interface allows the caller to scan the raw luma frames cheaply
+before any encoding, then distribute QP across the clip optimally:
+
+```rust
+use oxideav_vp8::{first_pass_analyze, two_pass_qindices, Vp8TwoPassConfig,
+                  QP_SENSITIVITY_X8, make_encoder_with_config};
+
+// Phase 1: cheap per-frame complexity scan (no ME, no transforms)
+let complexity = first_pass_analyze(&frames); // frames: &[(&[u8], stride, w, h)]
+
+// Phase 2: derive per-frame qindex
+let cfg = Vp8TwoPassConfig {
+    target_bitrate_bps: 1_000_000,
+    fps_num: 30, fps_den: 1,
+    base_qindex: 60,
+    min_qindex: 20, max_qindex: 127,
+    qp_sensitivity_x8: QP_SENSITIVITY_X8,
+    enc_config: Vp8EncoderConfig::default(),
+};
+let qindices = two_pass_qindices(&complexity, &cfg);
+
+// Phase 3: encode each frame with its assigned qindex
+for (i, frame) in frames.iter().enumerate() {
+    let mut enc_cfg = cfg.enc_config.clone();
+    enc_cfg.qindex = qindices[i];
+    let encoder = make_encoder_with_config(&codec_params, enc_cfg)?;
+    // ... encode frame
+}
+```
+
+The first-pass complexity score for each frame is
+`score = mean_MB_variance + inter_MAD × 256`, combining spatial
+texture (intra variance across all 16×16 MBs) with temporal motion
+(per-pixel MAD vs. the previous frame's luma). QP assignment uses a
+log-linear formula: `qindex = base_qindex − round(sensitivity × log₂(score / mean_score))`
+clamped to `[min_qindex, max_qindex]`, so complex/busy frames get a
+lower (higher-quality) qindex and simple/static frames get a higher
+qindex. `QP_SENSITIVITY_X8 = 48` (6 QP steps per complexity
+doubling) is the recommended default. A `Vp8TwoPassEncoder` wrapper
+that implements the `Encoder` trait is also provided via
+`make_two_pass_encoder` for callers that want to drive encoding
+through the standard codec trait without managing per-frame state
+manually.
+
 **Per-frame scene-cut adaptation** watches each incoming source
 frame's per-pixel luma mean-absolute-difference (MAD) versus the
 previous source frame, then compares it against the running

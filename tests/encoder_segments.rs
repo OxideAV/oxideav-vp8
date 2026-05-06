@@ -179,6 +179,10 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     }
 }
 
@@ -216,6 +220,10 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     }
 }
 
@@ -264,6 +272,10 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     }
 }
 
@@ -360,6 +372,10 @@ fn frame_headers_carry_segment_lf_deltas() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

@@ -202,6 +202,10 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     }
 }
 
@@ -239,6 +243,10 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     }
 }
 

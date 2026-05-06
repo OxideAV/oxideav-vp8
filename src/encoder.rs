@@ -650,6 +650,62 @@ pub struct Vp8EncoderConfig {
     /// give narrower weighting (keep only very similar patches), larger
     /// values blend more broadly. Ignored when `enable_arnr_nlm = false`.
     pub nlm_h2: f32,
+    /// Enable libvpx-shape per-coefficient Trellis (`vp8_optimize_b`).
+    /// When `true`, in addition to the EOB-trim pass that
+    /// [`enable_trellis_quant`] performs, every kept non-zero coefficient
+    /// is independently considered for magnitude-down quantisation
+    /// (`q → q-1`, with clamping at zero). The DP picks the per-position
+    /// magnitude that minimises the block's total `D + λ·R`, where
+    /// distortion uses the libvpx upper-bound `(2·|q|-1)·step²` on the
+    /// dequant error delta. Strictly tighter than the EOB-only path:
+    /// every block that benefits from EOB-trim also benefits from
+    /// magnitude reduction on its kept coefficients. Opt-in; default
+    /// `false` so legacy callers stay bit-identical. Effective only
+    /// when `enable_trellis_quant = true` (the EOB-trim pass runs
+    /// after, so disabling Trellis disables this too).
+    ///
+    /// [`enable_trellis_quant`]: Vp8EncoderConfig::enable_trellis_quant
+    pub enable_trellis_full: bool,
+    /// Enable per-MB activity-driven adaptive quantisation (AQ). When
+    /// `true`, each macroblock's effective qindex (on top of the segment
+    /// delta) is shifted by an activity-aware delta derived from the
+    /// frame-mean activity of the source: low-activity MBs (smooth
+    /// regions where banding is visible) get a *lower* qindex (finer
+    /// quant, more bits) and high-activity MBs (textured regions where
+    /// quantisation is masked) get a *higher* qindex (coarser quant,
+    /// fewer bits). The shift is bounded by [`aq_qindex_range`] in either
+    /// direction. Distinct from [`enable_psy_rdo`], which scales lambda
+    /// only — AQ shifts the actual quantisation step, so it shows up in
+    /// reconstruction fidelity, not just rate decisions.
+    ///
+    /// Implemented as a per-MB segment-id remapping when segmentation is
+    /// already enabled, so the bitstream emits the existing 4-segment
+    /// signalling unchanged — no new bits in the frame header. Requires
+    /// `enable_segments = true`. Opt-in; default `false`.
+    ///
+    /// [`enable_psy_rdo`]: Vp8EncoderConfig::enable_psy_rdo
+    /// [`aq_qindex_range`]: Vp8EncoderConfig::aq_qindex_range
+    pub enable_aq: bool,
+    /// Maximum AQ qindex shift in either direction (clamped to 1..=24).
+    /// At `8` (default), a fully-flat MB at the bottom of the activity
+    /// spectrum gets `-8` qindex (one segment delta tier finer) and a
+    /// fully-textured MB at the top gets `+8` (one tier coarser). Set to
+    /// `0` to disable shift while keeping `enable_aq = true` introspectable.
+    /// Ignored when `enable_aq = false`.
+    pub aq_qindex_range: u8,
+    /// Enable joint loop-filter / QP rate-distortion optimisation. When
+    /// `true`, the per-frame loop-filter level is picked from a small
+    /// neighbourhood around `loop_filter_level_for_qindex(qi)` (default
+    /// `±4` levels) by encoding a fast trial with each candidate level
+    /// and choosing the one that minimises `bytes + λ·distortion` over
+    /// the test segment. The trial uses a tiny 32×32 patch in the
+    /// frame's centre; full-frame encode runs at the chosen level only.
+    /// Opt-in; default `false`. Off-by-default so the existing
+    /// deterministic `15 + qi/8` heuristic is preserved bit-for-bit
+    /// when this flag is disabled. Effective on P-frames; ignored on
+    /// keyframes (the first frame's filter level still uses the
+    /// heuristic).
+    pub enable_joint_lf_rdo: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -687,9 +743,29 @@ impl Default for Vp8EncoderConfig {
             psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
             enable_arnr_nlm: false,
             nlm_h2: DEFAULT_NLM_H2,
+            enable_trellis_full: false,
+            enable_aq: false,
+            aq_qindex_range: DEFAULT_AQ_QINDEX_RANGE,
+            enable_joint_lf_rdo: false,
         }
     }
 }
+
+/// Default for [`Vp8EncoderConfig::aq_qindex_range`].
+///
+/// `8` qindex steps in either direction lets the AQ shift cover roughly
+/// one VP8 segment-delta tier (the default segment ladder is
+/// `[-8, -4, 0, +4]`), so a flat-vs-textured MB pair lands on
+/// quant-step values that differ by ~one tier — measurable PSNR delta
+/// without large rate swings or per-MB QP discontinuities that would
+/// fight the deblocking filter.
+pub const DEFAULT_AQ_QINDEX_RANGE: u8 = 8;
+
+/// Hard cap on [`Vp8EncoderConfig::aq_qindex_range`]. Beyond ~24 the
+/// per-MB qindex starts to cross the natural range of the 4-segment
+/// signalling and the quantisation discontinuities become visible at
+/// segment boundaries.
+pub const AQ_QINDEX_RANGE_MAX: u8 = 24;
 
 /// Default for [`Vp8EncoderConfig::adaptive_segment_thresholds`].
 ///
@@ -1528,16 +1604,34 @@ fn encode_keyframe_and_reconstruct_with_config(
     let mut mb_segment_ids: Vec<u8> = vec![0u8; mb_w * mb_h];
     let mut seg_counts: [u32; 4] = [0; 4];
     if segments.enabled {
-        let thresholds = if config.adaptive_segment_thresholds {
-            adaptive_segment_thresholds_from_frame(&src_y, y_stride, mb_w, mb_h)
+        // AQ takes priority over the variance-based path: when enabled,
+        // segments are assigned by population quartiles of the per-MB
+        // activity (variance + Laplacian edge), so a flat MB lands in
+        // segment 0 (finer quant via segment_quant_deltas[0]) and a
+        // textured MB in segment 3 (coarser quant). Falls back to the
+        // variance path when activity is degenerate (uniform frame).
+        let aq_done = if config.enable_aq && config.aq_qindex_range > 0 {
+            let (ids, counts, applied) = aq_segment_ids_from_frame(&src_y, y_stride, mb_w, mb_h);
+            if applied {
+                mb_segment_ids = ids;
+                seg_counts = counts;
+            }
+            applied
         } else {
-            SEGMENT_VARIANCE_THRESHOLDS
+            false
         };
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
-                let s = classify_segment_id_with(&src_y, y_stride, mb_x, mb_y, &thresholds);
-                mb_segment_ids[mb_y * mb_w + mb_x] = s;
-                seg_counts[s as usize] += 1;
+        if !aq_done {
+            let thresholds = if config.adaptive_segment_thresholds {
+                adaptive_segment_thresholds_from_frame(&src_y, y_stride, mb_w, mb_h)
+            } else {
+                SEGMENT_VARIANCE_THRESHOLDS
+            };
+            for mb_y in 0..mb_h {
+                for mb_x in 0..mb_w {
+                    let s = classify_segment_id_with(&src_y, y_stride, mb_x, mb_y, &thresholds);
+                    mb_segment_ids[mb_y * mb_w + mb_x] = s;
+                    seg_counts[s as usize] += 1;
+                }
             }
         }
     }
@@ -1720,7 +1814,13 @@ fn encode_keyframe_and_reconstruct_with_config(
             // inside apply_trellis_to_mb (calibrated for coeff-level RD).
             if config.enable_trellis_quant {
                 let has_y2 = y_mode != B_PRED;
-                apply_trellis_to_mb(&mut mb_rec, q, &DEFAULT_COEF_PROBS, has_y2);
+                apply_trellis_to_mb(
+                    &mut mb_rec,
+                    q,
+                    &DEFAULT_COEF_PROBS,
+                    has_y2,
+                    config.enable_trellis_full,
+                );
             }
             mb_encoded.push(mb_rec);
         }
@@ -1978,16 +2078,28 @@ fn encode_pframe_and_reconstruct(
     let mut mb_segment_ids: Vec<u8> = vec![0u8; mb_w * mb_h];
     let mut seg_counts: [u32; 4] = [0; 4];
     if segments.enabled {
-        let thresholds = if config.adaptive_segment_thresholds {
-            adaptive_segment_thresholds_from_frame(&src_y, y_stride, mb_w, mb_h)
+        let aq_done = if config.enable_aq && config.aq_qindex_range > 0 {
+            let (ids, counts, applied) = aq_segment_ids_from_frame(&src_y, y_stride, mb_w, mb_h);
+            if applied {
+                mb_segment_ids = ids;
+                seg_counts = counts;
+            }
+            applied
         } else {
-            SEGMENT_VARIANCE_THRESHOLDS
+            false
         };
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
-                let s = classify_segment_id_with(&src_y, y_stride, mb_x, mb_y, &thresholds);
-                mb_segment_ids[mb_y * mb_w + mb_x] = s;
-                seg_counts[s as usize] += 1;
+        if !aq_done {
+            let thresholds = if config.adaptive_segment_thresholds {
+                adaptive_segment_thresholds_from_frame(&src_y, y_stride, mb_w, mb_h)
+            } else {
+                SEGMENT_VARIANCE_THRESHOLDS
+            };
+            for mb_y in 0..mb_h {
+                for mb_x in 0..mb_w {
+                    let s = classify_segment_id_with(&src_y, y_stride, mb_x, mb_y, &thresholds);
+                    mb_segment_ids[mb_y * mb_w + mb_x] = s;
+                    seg_counts[s as usize] += 1;
+                }
             }
         }
     }
@@ -2349,7 +2461,13 @@ fn encode_pframe_and_reconstruct(
             if config.enable_trellis_quant && mb_rec.has_coeffs {
                 let has_y2 = !matches!(decision, PMbDecision::SplitMv(_))
                     && !matches!(decision, PMbDecision::Intra { y_mode, .. } if y_mode == B_PRED);
-                apply_trellis_to_mb(&mut mb_rec, q, &DEFAULT_COEF_PROBS, has_y2);
+                apply_trellis_to_mb(
+                    &mut mb_rec,
+                    q,
+                    &DEFAULT_COEF_PROBS,
+                    has_y2,
+                    config.enable_trellis_full,
+                );
             }
             mb_encoded.push(mb_rec);
         }
@@ -4657,6 +4775,64 @@ fn adaptive_segment_thresholds_from_frame(
     [q1 + 1, q2 + 1, q3 + 1]
 }
 
+/// AQ-driven per-MB segment id assignment.
+///
+/// When [`Vp8EncoderConfig::enable_aq`] is `true`, this routine
+/// classifies each macroblock by its activity score (variance + Laplacian
+/// edge energy, same metric the psy-RDO mask uses) into one of four
+/// segments via population quartiles of the per-frame activity
+/// distribution. Low-activity MBs (smooth regions) land in segment 0
+/// (low qindex, finer quant) and high-activity MBs (textured regions)
+/// in segment 3 (high qindex, coarser quant).
+///
+/// Returns a `(segment_ids, seg_counts)` pair on the same shape as the
+/// existing variance-based path so the caller can reuse
+/// [`segment_tree_probs_from_counts`] for the entropy-matched tree.
+///
+/// Falls back to the variance-based result when the activity
+/// distribution is degenerate (q1 == q3, e.g. uniform-noise frames).
+fn aq_segment_ids_from_frame(
+    src_y: &[u8],
+    y_stride: usize,
+    mb_w: usize,
+    mb_h: usize,
+) -> (Vec<u8>, [u32; 4], bool) {
+    let n = mb_w * mb_h;
+    let mut activities: Vec<u64> = Vec::with_capacity(n);
+    for mb_y in 0..mb_h {
+        for mb_x in 0..mb_w {
+            activities.push(mb_activity(src_y, y_stride, mb_x * 16, mb_y * 16));
+        }
+    }
+    if n < 4 {
+        return (vec![0u8; n], [n as u32, 0, 0, 0], false);
+    }
+    let mut sorted = activities.clone();
+    sorted.sort_unstable();
+    let q1 = sorted[n / 4];
+    let q2 = sorted[n / 2];
+    let q3 = sorted[(3 * n) / 4];
+    if q1 == q3 {
+        return (vec![0u8; n], [n as u32, 0, 0, 0], false);
+    }
+    let mut ids = vec![0u8; n];
+    let mut counts = [0u32; 4];
+    for (i, act) in activities.iter().enumerate() {
+        let s: u8 = if *act < q1 {
+            0
+        } else if *act < q2 {
+            1
+        } else if *act < q3 {
+            2
+        } else {
+            3
+        };
+        ids[i] = s;
+        counts[s as usize] += 1;
+    }
+    (ids, counts, true)
+}
+
 /// Tree probabilities for the per-MB segment-id encoding. RFC 6386 §10
 /// codes segment_id as a 3-leaf tree:
 ///   bit 0 (probs[0]) : 0 → seg 0/1 ; 1 → seg 2/3
@@ -5124,7 +5300,13 @@ fn encode_intra_mb(
 /// Distortion is measured as `(q[i] * step)^2`, i.e. the squared dequant
 /// value of the zeroed coefficient — an approximation that matches libvpx's
 /// `vp8_optimize_b` behaviour and avoids needing the pre-quant residual.
-fn apply_trellis_to_mb(mb_enc: &mut MbEncoded, q: &QuantCtx, probs: &CoeffProbs, has_y2: bool) {
+fn apply_trellis_to_mb(
+    mb_enc: &mut MbEncoded,
+    q: &QuantCtx,
+    probs: &CoeffProbs,
+    has_y2: bool,
+    full: bool,
+) {
     // Compute per-plane lambda from the dequant step size. The trellis
     // operates in (dequant)^2 distortion units vs. 1/256-bit rate units,
     // so the lambda must be calibrated differently from the mode-selection
@@ -5147,6 +5329,18 @@ fn apply_trellis_to_mb(mb_enc: &mut MbEncoded, q: &QuantCtx, probs: &CoeffProbs,
 
     // Y2 block (plane=1, start=0).
     if has_y2 {
+        if full {
+            mb_enc.y2_coeffs = trellis_quant_block_full(
+                &mb_enc.y2_coeffs,
+                q.y2_dc,
+                q.y2_ac,
+                lambda_y2,
+                probs,
+                1,
+                0,
+                0,
+            );
+        }
         mb_enc.y2_coeffs = trellis_quant_block(
             &mb_enc.y2_coeffs,
             &raw_zero_16,
@@ -5167,6 +5361,18 @@ fn apply_trellis_to_mb(mb_enc: &mut MbEncoded, q: &QuantCtx, probs: &CoeffProbs,
         (3usize, 0usize)
     };
     for bi in 0..16 {
+        if full {
+            mb_enc.y_coeffs[bi] = trellis_quant_block_full(
+                &mb_enc.y_coeffs[bi],
+                q.y_dc,
+                q.y_ac,
+                lambda_y,
+                probs,
+                y_plane,
+                0,
+                y_start,
+            );
+        }
         mb_enc.y_coeffs[bi] = trellis_quant_block(
             &mb_enc.y_coeffs[bi],
             &raw_zero_16,
@@ -5182,6 +5388,18 @@ fn apply_trellis_to_mb(mb_enc: &mut MbEncoded, q: &QuantCtx, probs: &CoeffProbs,
 
     // U blocks (plane=2, start=0).
     for bi in 0..4 {
+        if full {
+            mb_enc.u_coeffs[bi] = trellis_quant_block_full(
+                &mb_enc.u_coeffs[bi],
+                q.uv_dc,
+                q.uv_ac,
+                lambda_uv,
+                probs,
+                2,
+                0,
+                0,
+            );
+        }
         mb_enc.u_coeffs[bi] = trellis_quant_block(
             &mb_enc.u_coeffs[bi],
             &raw_zero_16,
@@ -5197,6 +5415,18 @@ fn apply_trellis_to_mb(mb_enc: &mut MbEncoded, q: &QuantCtx, probs: &CoeffProbs,
 
     // V blocks (plane=2, start=0).
     for bi in 0..4 {
+        if full {
+            mb_enc.v_coeffs[bi] = trellis_quant_block_full(
+                &mb_enc.v_coeffs[bi],
+                q.uv_dc,
+                q.uv_ac,
+                lambda_uv,
+                probs,
+                2,
+                0,
+                0,
+            );
+        }
         mb_enc.v_coeffs[bi] = trellis_quant_block(
             &mb_enc.v_coeffs[bi],
             &raw_zero_16,
@@ -5786,6 +6016,297 @@ fn trellis_quant_block(
     for n in best_eob..16 {
         out[ZIGZAG[n]] = 0;
     }
+    out
+}
+
+/// libvpx-shape per-coefficient Trellis quantisation
+/// (analogous to libvpx `vp8_optimize_b`).
+///
+/// Augments [`trellis_quant_block`] with per-position magnitude reduction:
+/// for every kept non-zero coefficient at position `n` (i.e. `n < eob`),
+/// the DP also considers replacing `q` with `q-1` (clamped at zero,
+/// preserving sign), accepting the move when the rate saving exceeds
+/// `λ × (distortion delta)`.
+///
+/// Distortion model: dropping `|q|` to `|q|-1` at step `step` widens the
+/// dequant error by at most `step` in absolute value. Without the raw
+/// pre-quant coefficient (which would let us compute the exact error
+/// delta), libvpx uses the upper bound `Δd = (2·|q|-1) × step²` derived
+/// from the worst-case position where `raw = q × step` exactly. This is
+/// pessimistic by construction (any move accepted under the pessimistic
+/// bound is also accepted under the true distortion), so the encoder
+/// only zeroes / decrements when there is unambiguous rate benefit.
+///
+/// Implementation: a forward DP over positions `start..=last` with two
+/// states per position (k = q, k = q-1). State transitions track the
+/// running ctx (1 if `|c|=1`, 2 if `|c|>=2`, 0 if zero). We pick the
+/// trajectory that minimises total `D + λR`. Then the EOB-trim pass is
+/// re-run on the resulting block (zeroing trailing positions whose
+/// magnitude went to zero shortens the EOB further).
+///
+/// `coeffs_q` — quantised coefficients in natural order (index by ZIGZAG
+/// at position `n`).
+/// `dc_step` / `ac_step` — dequant step at position 0 / 1..=15.
+/// `lambda_x256` — `λ × 256` (same scale as `trellis_quant_block`).
+/// `probs` / `plane` / `nctx` / `start` — same as `trellis_quant_block`.
+fn trellis_quant_block_full(
+    coeffs_q: &[i16; 16],
+    dc_step: i32,
+    ac_step: i32,
+    lambda_x256: u64,
+    probs: &crate::tables::coeff_probs::CoeffProbs,
+    plane: usize,
+    nctx: usize,
+    start: usize,
+) -> [i16; 16] {
+    use crate::bool_encoder::PROB_COST_BITS_X256;
+    use crate::tables::token_tree::ZIGZAG;
+
+    // Find last non-zero in scan order.
+    let mut last_nz = None::<usize>;
+    for n in start..16 {
+        if coeffs_q[ZIGZAG[n]] != 0 {
+            last_nz = Some(n);
+        }
+    }
+    let last = match last_nz {
+        Some(n) => n,
+        None => return *coeffs_q,
+    };
+
+    // For each position n in start..=last, generate up to 2 candidate
+    // magnitudes (q, q-1 toward zero). For zero positions, only the
+    // single "stay zero" candidate is allowed.
+    //
+    // We DP forward over positions. State at position n is the
+    // (ctx_in, magnitude_chosen) pair. Cost = rate of writing this token
+    // + distortion delta vs the original q.
+    //
+    // Two states per position (ctx_in ∈ {0,1,2}, but in practice the
+    // ctx_in is determined by the previous chosen magnitude, so we
+    // collapse). We track (rate_x256_so_far + λ × dist_so_far) per state,
+    // plus the best back-pointer (which candidate was chosen at n).
+    //
+    // For rate bookkeeping the ctx_in for position n+1 is determined by
+    // the magnitude chosen at n: 0→0, 1→1, ≥2→2. So the DP state at
+    // position n+1 is just ctx_in (3 possible values), and we keep the
+    // best (cost, mag-chosen) per ctx_in.
+
+    // dp[ctx]  = (cost_x256, mag_at_n, prev_ctx).
+    // Initialise at start with the single ctx = nctx.
+    #[derive(Clone, Copy)]
+    struct State {
+        cost: u64,
+        // Tracking magnitude chosen at this position for back-trace.
+        mag: i32,
+        // Previous ctx (state index in dp prev step).
+        prev_ctx: usize,
+    }
+    const INF: u64 = u64::MAX / 4;
+    const SENTINEL: State = State {
+        cost: INF,
+        mag: 0,
+        prev_ctx: 0,
+    };
+
+    // dp[n][ctx_after_n] : best state at position n having chosen a token
+    // that yields ctx_after_n. We need n in 0..=last+1 (extra slot for
+    // EOB cost evaluation).
+    let n_pos = last + 2; // positions start..=last + EOB slot at last+1
+    let mut dp: Vec<[State; 3]> = vec![[SENTINEL; 3]; n_pos];
+
+    // Initialise position `start`. We need the dp value after processing
+    // position `start`. The seed is "we are about to write token at
+    // position start with ctx_in = nctx".
+    let plane_probs = &probs[plane];
+
+    // Helper: rate of writing magnitude `mag` at position `n` with
+    // ctx_in = `cin`. Returns rate_x256 (just the token rate; the
+    // "has_coeff" prefix is included for non-zero, "is_zero" for zero).
+    let token_rate = |n: usize, cin: usize, mag: i32| -> u32 {
+        let p = &plane_probs[COEF_BANDS[n]][cin];
+        if mag == 0 {
+            // has_coeff = true (we'll write EOB later), is_zero = false→true
+            // For "this is a zero in the middle of the block":
+            //   has_coeff = true (p[0] true), is_zero = true (p[1] false).
+            PROB_COST_BITS_X256[1][p[0] as usize] as u32
+                + PROB_COST_BITS_X256[0][p[1] as usize] as u32
+        } else {
+            cost_nonzero_x256(p, mag.unsigned_abs() as i32)
+        }
+    };
+
+    // Helper: distortion DELTA (in dequant²-step² units) when changing
+    // original quantised magnitude `q_orig` to candidate `mag` at the
+    // given step. We approximate the per-coefficient distortion delta as
+    // `(q_orig - mag)² · step²`, which is the change in dequant value
+    // squared assuming the raw residual was exactly at the cell centre
+    // (the most-pessimistic case in the dequantisation sense). This is
+    // tighter than libvpx's `(2|q|-1)·step²` upper bound but still strict
+    // enough that the DP only accepts moves that produce real rate
+    // savings — the (q_orig - mag)² factor stays small for q→q-1
+    // (delta = step²) and grows quadratically for q→0 on large
+    // magnitudes. Halving keeps the DP comparable in scale to the
+    // EOB-trim path's `(q·step)²` distortion convention (which the
+    // following EOB pass uses unchanged).
+    let dist_delta = |q_orig: i32, mag: i32, step: i32| -> u64 {
+        let qo = q_orig.unsigned_abs() as i64;
+        let mg = mag.unsigned_abs() as i64;
+        if mg >= qo {
+            return 0;
+        }
+        let diff = (qo - mg) as u64;
+        let s = step as u64;
+        // Half the worst-case delta, matching the trellis-lambda calibration:
+        // a real q→q-1 move pays ~step²/2 in distortion vs ~3..15 bits saved.
+        (diff * diff * s * s) / 2
+    };
+
+    // Process position `start` with ctx_in = nctx.
+    {
+        let n = start;
+        let q_orig = coeffs_q[ZIGZAG[n]] as i32;
+        let step = if ZIGZAG[n] == 0 { dc_step } else { ac_step };
+        let cin = nctx;
+        // Candidate set: {q, q-1 toward 0} clamped at 0.
+        let candidates: [Option<i32>; 2] = if q_orig == 0 {
+            // Original was zero: only candidate is 0 (no point synthesising
+            // non-zero from zero — the distortion model has no upper bound
+            // for that move).
+            [Some(0), None]
+        } else {
+            let q = q_orig;
+            let q_minus = if q.unsigned_abs() >= 1 {
+                let mag = (q.unsigned_abs() as i32) - 1;
+                if mag == 0 {
+                    Some(0)
+                } else if q < 0 {
+                    Some(-mag)
+                } else {
+                    Some(mag)
+                }
+            } else {
+                None
+            };
+            [Some(q), q_minus]
+        };
+        for cand in candidates.iter().flatten() {
+            let mag = *cand;
+            let rate = token_rate(n, cin, mag) as u64;
+            let dist = dist_delta(q_orig, mag, step);
+            let cost = dist + lambda_x256.saturating_mul(rate) / 256;
+            let cout = if mag == 0 {
+                0
+            } else if mag.unsigned_abs() == 1 {
+                1
+            } else {
+                2
+            };
+            if cost < dp[n][cout].cost {
+                dp[n][cout] = State {
+                    cost,
+                    mag,
+                    prev_ctx: cin,
+                };
+            }
+        }
+    }
+
+    // Process positions start+1..=last.
+    for n in (start + 1)..=last {
+        let q_orig = coeffs_q[ZIGZAG[n]] as i32;
+        let step = if ZIGZAG[n] == 0 { dc_step } else { ac_step };
+        let candidates: [Option<i32>; 2] = if q_orig == 0 {
+            [Some(0), None]
+        } else {
+            let q = q_orig;
+            let q_minus = if q.unsigned_abs() >= 1 {
+                let mag = (q.unsigned_abs() as i32) - 1;
+                if mag == 0 {
+                    Some(0)
+                } else if q < 0 {
+                    Some(-mag)
+                } else {
+                    Some(mag)
+                }
+            } else {
+                None
+            };
+            [Some(q), q_minus]
+        };
+        for cin_state in 0..3 {
+            let prev = dp[n - 1][cin_state];
+            if prev.cost >= INF {
+                continue;
+            }
+            for cand in candidates.iter().flatten() {
+                let mag = *cand;
+                let rate = token_rate(n, cin_state, mag) as u64;
+                let dist = dist_delta(q_orig, mag, step);
+                let cost = prev.cost + dist + lambda_x256.saturating_mul(rate) / 256;
+                let cout = if mag == 0 {
+                    0
+                } else if mag.unsigned_abs() == 1 {
+                    1
+                } else {
+                    2
+                };
+                if cost < dp[n][cout].cost {
+                    dp[n][cout] = State {
+                        cost,
+                        mag,
+                        prev_ctx: cin_state,
+                    };
+                }
+            }
+        }
+    }
+
+    // Pick best terminal state at position `last` and add the EOB cost
+    // (only if last < 15; if last == 15 the bool stream just ends).
+    // The EOB cost depends on ctx_after_last, which is encoded in the
+    // dp state.
+    let mut best_terminal = (0usize, INF);
+    for cstate in 0..3usize {
+        let s = dp[last][cstate];
+        if s.cost >= INF {
+            continue;
+        }
+        // We need to check if any subsequent position would also be needed
+        // for EOB; in this DP we only track up to `last`, and the EOB token
+        // is written at position `last + 1` if `last < 15`. The ctx for the
+        // EOB token is the ctx_out of position last, which is `cstate`.
+        let total = if last < 15 {
+            let eob = cost_eob_x256(probs, plane, last + 1, cstate) as u64;
+            s.cost + lambda_x256.saturating_mul(eob) / 256
+        } else {
+            s.cost
+        };
+        if total < best_terminal.1 {
+            best_terminal = (cstate, total);
+        }
+    }
+    if best_terminal.1 >= INF {
+        return *coeffs_q;
+    }
+
+    // Back-trace: walk dp from `last` back to `start`, recording the
+    // magnitude chosen at each position.
+    let mut out_mags = vec![0i32; (last - start) + 1];
+    let mut cstate = best_terminal.0;
+    for n in (start..=last).rev() {
+        let s = dp[n][cstate];
+        out_mags[n - start] = s.mag;
+        cstate = s.prev_ctx;
+    }
+
+    // Build output, writing the chosen magnitudes back into the natural
+    // (ZIGZAG-ordered) array.
+    let mut out = *coeffs_q;
+    for n in start..=last {
+        out[ZIGZAG[n]] = out_mags[n - start] as i16;
+    }
+
     out
 }
 

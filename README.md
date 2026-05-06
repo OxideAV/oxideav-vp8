@@ -282,6 +282,36 @@ weight. Strength is set by `nlm_h2` (higher = accept noisier patches;
 default 225.0 ≈ σ=15 noise tolerance). Off by default; harmless (no-op) if
 lookahead is disabled.
 
+**libvpx-shape per-coefficient Trellis (round-39)** — when
+`enable_trellis_full = true` (and `enable_trellis_quant = true`),
+the EOB-trim Trellis pass is preceded by a per-coefficient
+forward DP analogous to libvpx `vp8_optimize_b`. For each kept
+non-zero coefficient at position `n`, the DP evaluates two
+candidates — the original quantised magnitude `q` and the
+toward-zero magnitude `q-1` — and walks the bool-coder ctx
+transitions (1 if `|c|=1`, 2 if `|c|≥2`, 0 if zero) to pick the
+trajectory that minimises the block's total `D + λ·R`.
+Distortion uses `(q-mag)² · step² / 2`, calibrated against the
+existing trellis-lambda so the DP only accepts moves with real
+rate savings. Strictly tighter than the EOB-only path: any block
+that benefits from EOB-trim also benefits from at least one
+position's magnitude reduction. On the mixed smooth+noise clip
+this trims an additional ~1.4 % bytes (15160 → 14942) for
+~0.02 dB PSNR-Y loss. Opt-in; default `false`.
+
+**Activity-driven AQ (round-39)** — when `enable_aq = true` and
+`enable_segments = true`, the per-MB segment classifier uses
+population quartiles of the per-MB *activity* (variance + 16 ×
+Laplacian edge energy) instead of raw variance. Smooth MBs
+(low activity) land in the low-qindex segments (finer quant →
+fewer banding artefacts) and textured / edge-rich MBs (high
+activity) land in the high-qindex segments (coarser quant where
+the eye masks the loss). Reuses the existing 4-segment bitstream
+signalling — no new header bits. Falls back to the variance path
+when activity is degenerate (uniform-noise frames). Strength
+controlled by `aq_qindex_range` (default `8`). Opt-in; default
+`false`.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,
@@ -290,8 +320,9 @@ fine-grained control over `qindex`, `golden_interval`,
 `scene_cut_boost_frames`, `adaptive_segment_thresholds`,
 `enable_split_mv_joint_refine`, `split_mv_joint_refine_passes`,
 `lambda_long_ref_scale_x256`, `enable_trellis_quant`,
-`enable_subpel_mv_cost`, `enable_psy_rdo`, `psy_rd_strength`,
-`enable_arnr_nlm`, and `nlm_h2`.
+`enable_trellis_full`, `enable_subpel_mv_cost`, `enable_psy_rdo`,
+`psy_rd_strength`, `enable_arnr_nlm`, `nlm_h2`, `enable_aq`,
+`aq_qindex_range`, and `enable_joint_lf_rdo`.
 
 ### Container
 

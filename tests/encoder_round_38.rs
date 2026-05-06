@@ -207,6 +207,10 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     }
 }
 
@@ -310,6 +314,10 @@ fn arnr_nlm_does_not_regress_psnr_vs_gaussian_arnr() {
     let nlm_cfg = Vp8EncoderConfig {
         enable_arnr_nlm: true,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
         ..gauss_cfg
     };
     let (_, gauss_psnr) = measure(gauss_cfg, &clip);
@@ -332,6 +340,10 @@ fn arnr_nlm_stream_decodes_cleanly() {
         enable_multi_ref: true,
         enable_arnr_nlm: true,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y) = measure(cfg, &clip);
@@ -373,6 +385,10 @@ fn psy_rdo_plus_arnr_nlm_combined_decodes_cleanly() {
         enable_multi_ref: true,
         enable_arnr_nlm: true,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y) = measure(cfg, &clip);

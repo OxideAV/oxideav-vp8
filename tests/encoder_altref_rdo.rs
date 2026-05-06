@@ -175,6 +175,10 @@ fn refresh_flags_follow_plan() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -253,6 +257,10 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -319,6 +327,10 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -393,6 +405,10 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -437,6 +453,10 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -566,6 +586,10 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -643,6 +667,10 @@ fn legacy_single_ref_path_still_works() {
         psy_rd_strength: DEFAULT_PSY_RD_STRENGTH,
         enable_arnr_nlm: false,
         nlm_h2: DEFAULT_NLM_H2,
+        enable_trellis_full: false,
+        enable_aq: false,
+        aq_qindex_range: 8,
+        enable_joint_lf_rdo: false,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

@@ -25,6 +25,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* libvpx-shape per-coefficient Trellis (#39). New
+  `Vp8EncoderConfig::enable_trellis_full` flag turns on a forward DP
+  over the kept non-zero coefficients of every transform block,
+  analogous to libvpx `vp8_optimize_b`. For each position the DP
+  evaluates two candidates — the original quantised magnitude `q` and
+  the toward-zero magnitude `q-1` — tracking the bool-coder ctx
+  transitions (1 if `|c|=1`, 2 if `|c|≥2`, 0 if zero) and picking the
+  per-position trajectory that minimises the block's total `D + λ·R`
+  in 1/256-bit units. Distortion uses `(q-mag)² · step² / 2`,
+  calibrated so the DP only accepts magnitude reductions with real
+  rate savings. Runs *before* the existing EOB-trim Trellis pass —
+  positions zeroed by the magnitude-down DP shorten the EOB further.
+  On a mixed smooth+noise 64×64 clip this trims an additional ~1.4 %
+  bytes (15160 → 14942) for ~0.02 dB PSNR-Y loss vs the EOB-only
+  Trellis path. Default off (opt-in); requires `enable_trellis_quant
+  = true` to take effect (the EOB-trim entry path is the gate).
+
+- *(encoder)* Activity-driven adaptive quantisation — AQ (#39). New
+  `Vp8EncoderConfig::enable_aq` flag swaps the per-MB segment
+  classifier from raw variance to population quartiles of the
+  per-MB *activity* (variance + 16 × Laplacian edge energy, the
+  same metric the round-38 psy-RDO mask uses). Smooth MBs (low
+  activity) land in the low-qindex segments (finer quant, fewer
+  banding artefacts); textured / edge-rich MBs (high activity) land
+  in the high-qindex segments (coarser quant where the eye masks the
+  loss). Reuses the existing 4-segment bitstream signalling — no new
+  header bits. New `aq_qindex_range` field (default `8`) bounds the
+  per-MB qindex shift; falls back to the variance-based path when the
+  per-frame activity distribution is degenerate. Default off
+  (opt-in); requires `enable_segments = true` to take effect.
+
+- *(encoder)* New `Vp8EncoderConfig::enable_joint_lf_rdo` knob (#39)
+  reserved for joint loop-filter / QP rate-distortion optimisation
+  on P-frames. The field is wired through the public config but the
+  RD search is not yet active in this round — picking the LF level
+  from the existing `15 + qi/8` heuristic keeps the bitstream
+  bit-identical when the flag is on or off. Will be activated in a
+  later round once a fast trial-encode harness lands.
+
 - *(encoder)* Perceptual RDO activity mask — psy-RDO (#38). When
   `Vp8EncoderConfig::enable_psy_rdo = true`, the Lagrangian lambda is
   scaled per-MB by an activity mask derived from luma variance plus

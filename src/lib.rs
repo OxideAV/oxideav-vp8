@@ -91,4 +91,4 @@ pub use frame_tag::{parse_header, FrameTag, FrameType, KeyframeHeader, ParsedHea
 #[cfg(feature = "registry")]
 pub use decoder::{decode_frame, Vp8Decoder};
 #[cfg(feature = "registry")]
-pub use registry::{register, register_codecs, register_containers};
+pub use registry::{__oxideav_entry, register, register_codecs, register_containers};

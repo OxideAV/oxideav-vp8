@@ -74,10 +74,8 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// codec sub-registry and the IVF container into the container
 /// sub-registry of the supplied [`RuntimeContext`].
 ///
-/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
-/// [`oxideav_core::register!`] macro below so consumers calling
-/// [`oxideav_core::RuntimeContext::with_all_features`] pick VP8 up
-/// without any explicit umbrella plumbing.
+/// Also wired into [`oxideav_meta::register_all`] via the
+/// [`oxideav_core::register!`] macro below.
 pub fn register(ctx: &mut RuntimeContext) {
     register_codecs(&mut ctx.codecs);
     register_containers(&mut ctx.containers);

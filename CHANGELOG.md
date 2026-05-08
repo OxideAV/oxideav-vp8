@@ -21,6 +21,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* UV-mode RDO + mode/ref loop-filter deltas (round-42).
+  Two complementary picker upgrades land together: the chroma intra
+  mode pick now scores `D + λ·R` against the UV-mode tree
+  probabilities (`KF_UV_MODE_PROBS` on keyframes,
+  `DEFAULT_UV_MODE_PROBS` on the intra-in-P fallback) when the
+  opt-in `Vp8EncoderConfig::enable_uv_rdo` flag is on, and the
+  in-loop deblocking filter now honours RFC 6386 §15.2 mode/ref
+  deltas when `Vp8EncoderConfig::enable_mode_ref_lf_deltas` is on.
+  The latter unlocks the joint LF-RDO picker's real rate term — with
+  per-MB level varying by ref_frame + (intra/inter, y_mode), the
+  candidate-level search now scores against the actual post-delta
+  reconstruction the decoder will compute, not the bare frame level.
+  Default ladder is libvpx-ish: `ref_deltas = [+2, 0, -2, -2]`,
+  `mode_deltas = [+4, -2, +1, +4]` (INTRA + B_PRED → +6 vs the LAST
+  + ZERO_MV bucket's +0; concentrates extra filtering on the
+  reconstruction-poor candidates that benefit most). Both knobs
+  default `false` so existing P-frame bitstreams stay byte-identical
+  when the flags are off; both gated on `enable_rdo = true` for
+  symmetry with the round-41 BMODE-RDO knob. Fifteen integration
+  tests in `tests/encoder_round_42.rs` pin: defaults-off,
+  off-path byte-identical to legacy, UV-RDO keyframe + P-frame
+  clean decode, byte-envelope ±20 %, PSNR-Y non-regression,
+  flat-content byte-identical, `enable_rdo`-required gating;
+  mode/ref deltas keyframe byte-identical (decoder zeros them per
+  §9.4), P-frame clean decode, byte-envelope ±15 %, PSNR-Y
+  non-regression, P-frame header grows when deltas are emitted, and
+  the three knobs (UV-RDO + mode/ref deltas + joint LF-RDO) compose
+  cleanly.
 - *(encoder)* Rate-aware B_PRED 4×4 sub-mode picker (round-41). New
   opt-in `Vp8EncoderConfig::enable_bpred_rdo` knob (default `false`)
   switches the per-4×4 mode selection from greedy SSE to `D + λ·R`,

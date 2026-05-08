@@ -200,6 +200,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         aq_qindex_range: DEFAULT_AQ_QINDEX_RANGE,
         enable_joint_lf_rdo: false,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
     }
 }
 
@@ -238,6 +240,8 @@ fn bpred_rdo_keyframe_decodes_cleanly() {
     let clip = make_edge_clip(1);
     let cfg = Vp8EncoderConfig {
         enable_bpred_rdo: true,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -253,6 +257,8 @@ fn bpred_rdo_pframe_decodes_cleanly() {
     let clip = make_edge_clip(8);
     let cfg = Vp8EncoderConfig {
         enable_bpred_rdo: true,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -274,6 +280,8 @@ fn bpred_rdo_byte_envelope_within_15pct() {
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
         enable_bpred_rdo: true,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -299,6 +307,8 @@ fn bpred_rdo_psnr_does_not_regress_significantly() {
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
         enable_bpred_rdo: true,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -329,6 +339,8 @@ fn bpred_rdo_flat_content_is_byte_identical() {
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
         enable_bpred_rdo: true,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -356,11 +368,15 @@ fn bpred_rdo_requires_enable_rdo() {
     let cfg_a = Vp8EncoderConfig {
         enable_rdo: false,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_rdo: false,
         enable_bpred_rdo: true,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 

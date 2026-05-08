@@ -151,6 +151,8 @@ fn default_enc_cfg(qindex: u8) -> Vp8EncoderConfig {
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
     }
 }
 

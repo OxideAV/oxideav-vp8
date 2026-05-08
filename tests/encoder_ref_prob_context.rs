@@ -128,6 +128,8 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
     };
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);

@@ -729,6 +729,36 @@ pub struct Vp8EncoderConfig {
     ///
     /// [`enable_rdo`]: Vp8EncoderConfig::enable_rdo
     pub enable_bpred_rdo: bool,
+    /// Enable rate-distortion optimisation for chroma intra mode pick
+    /// (round-42). When `false` (default), `choose_intra_chroma_mode`
+    /// picks the SSE-min of the four UV candidates (DC/V/H/TM) against
+    /// the source. When `true`, candidates are scored as `D + λ·R`,
+    /// where `R` is the bool-coder cost of writing the UV-mode tree
+    /// path under the appropriate probabilities (`KF_UV_MODE_PROBS` on
+    /// keyframes, `DEFAULT_UV_MODE_PROBS` on intra-in-P MBs). λ comes
+    /// from [`lambda_for_qp`] just like the per-MB ref/mode picker.
+    /// Off-by-default so the existing greedy SSE selection is
+    /// preserved bit-for-bit when this flag is disabled. Requires
+    /// [`enable_rdo`] = `true`; with `enable_rdo` = `false` the rate
+    /// term collapses to 0 and the gating is inert.
+    ///
+    /// [`enable_rdo`]: Vp8EncoderConfig::enable_rdo
+    pub enable_uv_rdo: bool,
+    /// Enable mode/ref loop-filter deltas (round-42, RFC 6386 §15.2).
+    /// When `false` (default) the encoder emits
+    /// `mode_ref_delta_enabled = 0`, the bitstream carries no
+    /// per-mode/per-ref deltas, and every MB uses the bare
+    /// segmentation-adjusted frame level. When `true`, the encoder
+    /// emits a small bias ladder favouring stronger filtering on
+    /// reconstruction-poor candidates (intra MBs and SPLIT_MV) and
+    /// lighter filtering on smoother ones (zero-MV inter against
+    /// LAST). The deltas applied to each MB inside
+    /// `apply_loop_filter_enc` use the same per-MB level the decoder
+    /// will compute via `per_mb_filter_level`, so the post-filter
+    /// reconstruction stays decoder-exact. Default `false` so the
+    /// existing P-frame bitstreams are byte-identical when this flag
+    /// is off.
+    pub enable_mode_ref_lf_deltas: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -771,6 +801,8 @@ impl Default for Vp8EncoderConfig {
             aq_qindex_range: DEFAULT_AQ_QINDEX_RANGE,
             enable_joint_lf_rdo: false,
             enable_bpred_rdo: false,
+            enable_uv_rdo: false,
+            enable_mode_ref_lf_deltas: false,
         }
     }
 }
@@ -1710,6 +1742,14 @@ fn encode_keyframe_and_reconstruct_with_config(
     } else {
         0
     };
+    // Round-42 UV-mode RDO lambda — same magnitude as the BMODE-RDO
+    // lambda above. `0` recovers SSE-greedy chroma mode pick bit-for-bit
+    // when the knob is off (or `enable_rdo` is off).
+    let uv_rdo_lambda_x256: u64 = if config.enable_uv_rdo && config.enable_rdo {
+        lambda_for_qp(qi as u32, config.lambda_scale) as u64
+    } else {
+        0
+    };
     // Track the 4x4 bmode of the bottom row of each MB column (propagation
     // context for B_PRED of the MB below). Matches decoder's `bmode_above`.
     let mut bmode_above: Vec<[i32; 4]> = vec![[B_DC_PRED; 4]; mb_w];
@@ -1753,16 +1793,32 @@ fn encode_keyframe_and_reconstruct_with_config(
             };
 
             // Chroma mode: evaluate DC/V/H/TM over the U+V source and pick
-            // the lowest total SSE.
-            let uv_mode = choose_intra_chroma_mode(
-                &src_u,
-                &src_v,
-                &rec_u,
-                &rec_v,
-                uv_stride,
-                mb_x * 8,
-                mb_y * 8,
-            );
+            // the lowest total SSE — or, with round-42 `enable_uv_rdo`,
+            // `D + λ·R` against `KF_UV_MODE_PROBS` (the bitstream emits
+            // those probs on keyframes via `emit_kf_uv_mode`).
+            let uv_mode = if uv_rdo_lambda_x256 > 0 {
+                choose_intra_chroma_mode_rdo(
+                    &src_u,
+                    &src_v,
+                    &rec_u,
+                    &rec_v,
+                    uv_stride,
+                    mb_x * 8,
+                    mb_y * 8,
+                    &KF_UV_MODE_PROBS,
+                    uv_rdo_lambda_x256,
+                )
+            } else {
+                choose_intra_chroma_mode(
+                    &src_u,
+                    &src_v,
+                    &rec_u,
+                    &rec_v,
+                    uv_stride,
+                    mb_x * 8,
+                    mb_y * 8,
+                )
+            };
 
             // Emit KF_YMODE_TREE path for the chosen y_mode.
             emit_kf_ymode(&mut hdr_enc, y_mode);
@@ -1861,6 +1917,8 @@ fn encode_keyframe_and_reconstruct_with_config(
 
     // Apply the in-loop deblocking filter to our reconstruction so the
     // next P-frame uses the same post-filter references the decoder will.
+    // Keyframes never carry mode/ref deltas (the decoder resets them to
+    // zero per RFC 6386 §9.4), so pass `None`.
     apply_loop_filter_enc(
         &mut rec_y,
         &mut rec_u,
@@ -1878,6 +1936,8 @@ fn encode_keyframe_and_reconstruct_with_config(
         &mb_segment_ids,
         &segments,
         true, // keyframe
+        None,
+        None,
     );
 
     let first_partition = hdr_enc.finish();
@@ -2214,6 +2274,15 @@ fn encode_pframe_and_reconstruct(
     } else {
         0
     };
+    // Round-42 UV-RDO lambda for the intra-in-P fallback; same magnitude
+    // as the per-MB ref/mode picker. `0` recovers the legacy
+    // hard-coded `uv_mode = DC_PRED` exactly. Only intra-in-P MBs are
+    // affected — inter MBs don't carry a UV-mode field at all.
+    let uv_rdo_lambda_x256: u64 = if config.enable_uv_rdo && config.enable_rdo {
+        lambda as u64
+    } else {
+        0
+    };
     // Psy-RDO: pre-compute per-frame mean activity and per-MB activity
     // array. Only materialised when `enable_psy_rdo` is set and RDO is
     // active; otherwise the vectors stay empty and the per-MB picker uses
@@ -2345,6 +2414,38 @@ fn encode_pframe_and_reconstruct(
 
             let (_cost, picked_ref, decision, _nearest, _near, best_for_newmv, cnt) =
                 best_choice.expect("LAST must always produce a candidate");
+            // Round-42 UV-RDO for intra-in-P: the decision constructor
+            // hard-codes `uv_mode = DC_PRED`. When the knob is on (and
+            // we're on an intra-in-P fallback), replace it with the
+            // `D + λ·R` minimiser against `DEFAULT_UV_MODE_PROBS` (the
+            // probs `emit_inter_uv_mode` will write). λ=0 (knob off
+            // or `enable_rdo` off) collapses to greedy SSE which then
+            // picks DC_PRED on the textureless chroma the existing
+            // path settles on, so toggling the knob is benign on the
+            // most common fallback content.
+            let decision = if uv_rdo_lambda_x256 > 0 {
+                if let PMbDecision::Intra { y_mode, .. } = decision {
+                    let new_uv = choose_intra_chroma_mode_rdo(
+                        &src_u,
+                        &src_v,
+                        &rec_u,
+                        &rec_v,
+                        uv_stride,
+                        mb_x * 8,
+                        mb_y * 8,
+                        &DEFAULT_UV_MODE_PROBS,
+                        uv_rdo_lambda_x256,
+                    );
+                    PMbDecision::Intra {
+                        y_mode,
+                        uv_mode: new_uv,
+                    }
+                } else {
+                    decision
+                }
+            } else {
+                decision
+            };
             mb_decisions.push(decision);
             mb_mode_info.push(PMbModeInfo {
                 cnt,
@@ -2579,6 +2680,19 @@ fn encode_pframe_and_reconstruct(
     let prob_gf = optimal_prob_8(n_golden, n_alt);
     let _ = n_total; // silence dead-store lint when assertions disabled
 
+    // Round-42 mode/ref deltas for the in-loop filter (RFC 6386 §15.2).
+    // When `enable_mode_ref_lf_deltas` is on we apply the round-42
+    // default ladder to the per-MB level the encoder uses to filter
+    // its own reconstruction (matches what the decoder will compute
+    // from the bitstream we emit below) and also feed it to the joint
+    // LF-RDO search so each candidate level is scored against the
+    // post-delta reconstruction the decoder will see.
+    let lf_deltas: Option<LfDeltas> = if config.enable_mode_ref_lf_deltas {
+        Some(LfDeltas::round42_default())
+    } else {
+        None
+    };
+
     // Joint loop-filter / QP rate-distortion optimisation (round-40, opt-in
     // via `enable_joint_lf_rdo`). On P-frames only — keyframes still use
     // the deterministic heuristic so the frame-0 bitstream is preserved
@@ -2588,6 +2702,12 @@ fn encode_pframe_and_reconstruct(
     // the frame header so the rate term is identical for every candidate).
     // After picking the new level, `pick_filter_type` may flip simple/normal
     // dispatch under `LoopFilterMode::Auto`.
+    //
+    // Round-42: with `enable_mode_ref_lf_deltas` on, the deltas are
+    // applied during the patch-level filter trial too, so the picker
+    // sees the actual post-delta reconstruction (different per-MB
+    // level than the bare frame level when intra / B_PRED MBs are
+    // present in the patch).
     if config.enable_joint_lf_rdo {
         let chosen = pick_lf_level_joint_rdo(
             &rec_y,
@@ -2602,6 +2722,8 @@ fn encode_pframe_and_reconstruct(
             &mb_encoded,
             &mb_segment_ids,
             &segments,
+            lf_deltas.as_ref(),
+            Some(&mb_ref_frames),
         );
         if chosen != lf_level {
             lf_level = chosen;
@@ -2628,6 +2750,8 @@ fn encode_pframe_and_reconstruct(
         &mb_segment_ids,
         &segments,
         false, // P-frame
+        lf_deltas.as_ref(),
+        Some(&mb_ref_frames),
     );
 
     // --- Pass 2: build the inter-frame header + emit per-MB mode info ---
@@ -2641,8 +2765,30 @@ fn encode_pframe_and_reconstruct(
     hdr_enc.write_literal(1, lf_filter_type as u32); // filter_type (0 normal, 1 simple)
     hdr_enc.write_literal(6, lf_level as u32);
     hdr_enc.write_literal(3, lf_sharpness as u32);
-    hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
-                                    //   log2_nb_partitions = 0 (single partition)
+    // Round-42: emit mode_ref_delta_enabled / mode_ref_delta_update + the
+    // 4 ref + 4 mode deltas when `enable_mode_ref_lf_deltas` is on.
+    // RFC 6386 §9.4 / §19.2 grammar:
+    //   mode_ref_delta_enabled (1 bit)
+    //   if mode_ref_delta_enabled:
+    //     mode_ref_delta_update (1 bit)
+    //     if mode_ref_delta_update:
+    //       for 4 ref deltas: present_flag (1 bit), [signed_literal(6)]
+    //       for 4 mode deltas: present_flag (1 bit), [signed_literal(6)]
+    if let Some(ref deltas) = lf_deltas {
+        hdr_enc.write_bool(128, true); // mode_ref_delta_enabled
+        hdr_enc.write_bool(128, true); // mode_ref_delta_update
+        for &d in &deltas.ref_deltas {
+            hdr_enc.write_bool(128, true); // present
+            hdr_enc.write_signed_literal(6, d);
+        }
+        for &d in &deltas.mode_deltas {
+            hdr_enc.write_bool(128, true); // present
+            hdr_enc.write_signed_literal(6, d);
+        }
+    } else {
+        hdr_enc.write_bool(128, false); // mode_ref_delta_enabled
+    }
+    //   log2_nb_partitions = 0 (single partition)
     hdr_enc.write_literal(2, 0);
     //   quant: y_ac_qi + 5 per-frequency deltas (RFC 6386 §9.6).
     //   Each delta gets a 1-bit "present" flag; zero deltas emit a
@@ -3378,6 +3524,87 @@ fn encode_hidden_altref_pframe(
         bitstream[0] &= !0x10;
     }
     Ok((bitstream, rec))
+}
+
+// ---------------------------------------------------------------------------
+// Round-42: per-MB loop-filter mode/ref deltas (RFC 6386 §15.2).
+// ---------------------------------------------------------------------------
+
+/// Per-frame loop-filter mode/ref delta vectors (RFC 6386 §15.2).
+/// `ref_deltas[ref_frame]` is added to the segmentation-adjusted level
+/// for every MB whose decoded ref_frame matches; `mode_deltas[i]` is
+/// added by the (intra/inter, y_mode) bucket the decoder uses (see
+/// `per_mb_filter_level` in the decoder for the canonical mapping).
+///
+/// All values are signed 6-bit (`-63..=63`); the per-MB level is
+/// always re-clamped to `0..=63` after addition.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LfDeltas {
+    /// Indexed by `ENC_REF_INTRA / LAST / GOLDEN / ALT`.
+    ref_deltas: [i32; 4],
+    /// Buckets:
+    ///   0 = INTRA + B_PRED
+    ///   1 = inter + ZERO_MV
+    ///   2 = inter + NEAREST/NEAR/NEW_MV
+    ///   3 = inter + SPLIT_MV
+    mode_deltas: [i32; 4],
+}
+
+impl LfDeltas {
+    /// Round-42 default ladder for `enable_mode_ref_lf_deltas = true`.
+    /// Light-touch values inspired by libvpx's pre-RC defaults: bias
+    /// toward stronger filtering on intra (no inter prediction so
+    /// reconstruction edges are crisp and benefit from extra
+    /// smoothing), neutral on LAST (the closest reference, lowest
+    /// drift), slight negative on GOLDEN / ALT (long-distance
+    /// references whose drift is best left visible to the next-stage
+    /// motion search), and per-mode bias on B_PRED / SPLIT_MV (the
+    /// two modes whose sub-block edges already get always-on inner
+    /// filtering — adding a small positive delta concentrates the
+    /// extra filtering exactly where we paid the bits to enable it).
+    /// All values fit in signed 6 bits; per-MB clamp to `0..=63`
+    /// keeps the post-add level legal regardless.
+    pub(crate) const fn round42_default() -> Self {
+        Self {
+            // INTRA, LAST, GOLDEN, ALT
+            ref_deltas: [2, 0, -2, -2],
+            // B_PRED, ZERO_MV, NEW/NEAREST/NEAR_MV, SPLIT_MV
+            mode_deltas: [4, -2, 1, 4],
+        }
+    }
+}
+
+/// Compute the per-MB loop-filter level after the round-42 mode/ref
+/// deltas (RFC 6386 §15.2). Mirrors the decoder's `per_mb_filter_level`
+/// so the post-filter reconstruction the encoder hands to the next
+/// reference is byte-identical to what the decoder will produce.
+///
+/// `ref_frame` uses the encoder's local `ENC_REF_*` mapping which is
+/// identical to the decoder's `REF_*` (INTRA=0, LAST=1, GOLDEN=2,
+/// ALT=3), so the decoder's lookup applies directly.
+fn per_mb_filter_level_enc(
+    base_level: u8,
+    ref_frame: u8,
+    y_mode: i32,
+    deltas: Option<&LfDeltas>,
+) -> u8 {
+    let mut lvl = base_level as i32;
+    if let Some(d) = deltas {
+        lvl += d.ref_deltas[(ref_frame as usize) & 3];
+        if ref_frame == ENC_REF_INTRA {
+            if y_mode == B_PRED {
+                lvl += d.mode_deltas[0];
+            }
+        } else {
+            let bucket = match y_mode {
+                ZERO_MV => 1,
+                SPLIT_MV => 3,
+                _ => 2, // NEAREST / NEAR / NEW
+            };
+            lvl += d.mode_deltas[bucket];
+        }
+    }
+    lvl.clamp(0, 63) as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -7351,6 +7578,69 @@ fn sse_intra_8x8_both(
     sse
 }
 
+/// Bool-coder rate cost (in 1/256-bit units) of writing the UV-mode
+/// tree path for `uv_mode` under the given 3-entry probability vector.
+/// Used by the round-42 UV-mode RDO picker to score `D + λ·R` per
+/// candidate. The four legal modes (DC / V / H / TM) match the
+/// branching shape `emit_kf_uv_mode` and `emit_inter_uv_mode` use, so
+/// the cost the picker minimises is the cost the bitstream will pay.
+#[inline]
+fn uv_mode_rate_x256(uv_mode: i32, probs: &[u8; 3]) -> u32 {
+    // Tree shape mirrors emit_kf_uv_mode / emit_inter_uv_mode:
+    //   [0] = DC vs (V/H/TM)
+    //   [1] = V vs (H/TM)
+    //   [2] = H vs TM
+    let p0 = probs[0];
+    let p1 = probs[1];
+    let p2 = probs[2];
+    match uv_mode {
+        DC_PRED => bool_cost_x256(p0, false),
+        V_PRED => bool_cost_x256(p0, true) + bool_cost_x256(p1, false),
+        H_PRED => bool_cost_x256(p0, true) + bool_cost_x256(p1, true) + bool_cost_x256(p2, false),
+        TM_PRED => bool_cost_x256(p0, true) + bool_cost_x256(p1, true) + bool_cost_x256(p2, true),
+        _ => unreachable!("invalid UV mode {}", uv_mode),
+    }
+}
+
+/// Rate-aware variant of [`choose_intra_chroma_mode`] used by the
+/// round-42 `enable_uv_rdo` path. Each of the four UV candidates is
+/// scored as `D + λ·R` where
+///
+///   * `D` = SSE over the U + V planes (same as the greedy path),
+///   * `R` = bool-coder cost (1/256-bit units) of the UV-mode tree
+///     path under the keyframe (`KF_UV_MODE_PROBS`) or intra-in-P
+///     (`DEFAULT_UV_MODE_PROBS`) probability vector.
+///
+/// `lambda_x256` is the same multiplier the per-MB ref/mode picker
+/// uses (`lambda_for_qp(qi, scale)`); `0` suppresses the rate term and
+/// recovers the greedy SSE-only mode bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn choose_intra_chroma_mode_rdo(
+    src_u: &[u8],
+    src_v: &[u8],
+    rec_u: &[u8],
+    rec_v: &[u8],
+    uv_stride: usize,
+    mb_xc: usize,
+    mb_yc: usize,
+    probs: &[u8; 3],
+    lambda_x256: u64,
+) -> i32 {
+    let mut best = DC_PRED;
+    let mut best_cost = u64::MAX;
+    for &m in &[DC_PRED, V_PRED, H_PRED, TM_PRED] {
+        let sse = sse_intra_8x8_both(m, src_u, rec_u, uv_stride, mb_xc, mb_yc)
+            + sse_intra_8x8_both(m, src_v, rec_v, uv_stride, mb_xc, mb_yc);
+        let rate = uv_mode_rate_x256(m, probs) as u64;
+        let cost = sse.saturating_add(lambda_x256.saturating_mul(rate));
+        if cost < best_cost {
+            best_cost = cost;
+            best = m;
+        }
+    }
+    best
+}
+
 /// Emit the 16 4×4 BMODE tree paths for a keyframe B_PRED MB, using
 /// `KF_BMODE_PROB[above][left]` context probabilities for each sub-block.
 /// Also populates `this_mb_bmodes` so the caller can propagate the
@@ -7927,6 +8217,8 @@ fn apply_loop_filter_enc(
     mb_segment_ids: &[u8],
     segments: &SegmentCtx,
     key_frame: bool,
+    lf_deltas: Option<&LfDeltas>,
+    mb_ref_frames: Option<&[u8]>,
 ) {
     if frame_level == 0 {
         return;
@@ -7941,7 +8233,16 @@ fn apply_loop_filter_enc(
             // Per-MB filter level (segmentation-aware). 0 → skip this MB
             // entirely so the encoder reconstruction matches what the
             // decoder will produce when `per_mb_filter_level` clamps to 0.
-            let mb_level = segments.filter_level_for(mb_segment_ids[mb_idx], frame_level);
+            let mut mb_level = segments.filter_level_for(mb_segment_ids[mb_idx], frame_level);
+            // Round-42: apply mode/ref deltas (RFC 6386 §15.2). Mirrors
+            // the decoder's `per_mb_filter_level` so encoder
+            // reconstruction stays decoder-exact.
+            if let Some(deltas) = lf_deltas {
+                let rf = mb_ref_frames
+                    .and_then(|r| r.get(mb_idx).copied())
+                    .unwrap_or(ENC_REF_INTRA);
+                mb_level = per_mb_filter_level_enc(mb_level, rf, mb.y_mode, Some(deltas));
+            }
             if mb_level == 0 {
                 continue;
             }
@@ -8121,6 +8422,8 @@ fn pick_lf_level_joint_rdo(
     mb_encoded: &[MbEncoded],
     mb_segment_ids: &[u8],
     segments: &SegmentCtx,
+    lf_deltas: Option<&LfDeltas>,
+    mb_ref_frames: Option<&[u8]>,
 ) -> u8 {
     // Need a 32×32 patch — if the frame's MB grid is smaller than 2×2,
     // the centre patch doesn't make sense; just stick with the heuristic.
@@ -8178,6 +8481,8 @@ fn pick_lf_level_joint_rdo(
                 mb_segment_ids,
                 segments,
                 false, // P-frame
+                lf_deltas,
+                mb_ref_frames,
             );
         }
 
@@ -8221,6 +8526,8 @@ fn apply_loop_filter_luma_only(
     mb_segment_ids: &[u8],
     segments: &SegmentCtx,
     key_frame: bool,
+    lf_deltas: Option<&LfDeltas>,
+    mb_ref_frames: Option<&[u8]>,
 ) {
     if frame_level == 0 {
         return;
@@ -8231,7 +8538,13 @@ fn apply_loop_filter_luma_only(
         for mb_x in 0..mb_w {
             let mb_idx = mb_y * mb_w + mb_x;
             let mb = &mb_encoded[mb_idx];
-            let mb_level = segments.filter_level_for(mb_segment_ids[mb_idx], frame_level);
+            let mut mb_level = segments.filter_level_for(mb_segment_ids[mb_idx], frame_level);
+            if let Some(deltas) = lf_deltas {
+                let rf = mb_ref_frames
+                    .and_then(|r| r.get(mb_idx).copied())
+                    .unwrap_or(ENC_REF_INTRA);
+                mb_level = per_mb_filter_level_enc(mb_level, rf, mb.y_mode, Some(deltas));
+            }
             if mb_level == 0 {
                 continue;
             }

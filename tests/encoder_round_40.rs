@@ -186,6 +186,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         aq_qindex_range: DEFAULT_AQ_QINDEX_RANGE,
         enable_joint_lf_rdo: false,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
     }
 }
 
@@ -203,6 +205,8 @@ fn joint_lf_rdo_keyframe_only_is_byte_identical() {
     let with_rdo = Vp8EncoderConfig {
         enable_joint_lf_rdo: true,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -236,6 +240,8 @@ fn joint_lf_rdo_pframe_bitstream_decodes_cleanly() {
     let cfg = Vp8EncoderConfig {
         enable_joint_lf_rdo: true,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -259,6 +265,8 @@ fn joint_lf_rdo_psnr_does_not_regress_significantly() {
     let with_rdo = Vp8EncoderConfig {
         enable_joint_lf_rdo: true,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -295,6 +303,8 @@ fn joint_lf_rdo_byte_budget_within_envelope() {
     let with_rdo = Vp8EncoderConfig {
         enable_joint_lf_rdo: true,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -322,6 +332,8 @@ fn joint_lf_rdo_with_segmentation_decodes_cleanly() {
         segment_lf_deltas: [-2, -1, 0, 2],
         enable_joint_lf_rdo: true,
         enable_bpred_rdo: false,
+        enable_uv_rdo: false,
+        enable_mode_ref_lf_deltas: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);

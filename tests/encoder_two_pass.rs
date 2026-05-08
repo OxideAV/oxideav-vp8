@@ -156,6 +156,8 @@ fn default_enc_cfg(qindex: u8) -> Vp8EncoderConfig {
         enable_split_mv_rdo: false,
         enable_adaptive_lf_deltas: false,
         enable_trellis_context_rate: false,
+        enable_mv_cost_aware_snap: false,
+        enable_split_mv_rdo_real_context: false,
     }
 }
 

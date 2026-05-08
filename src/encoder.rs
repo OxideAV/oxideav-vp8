@@ -822,6 +822,43 @@ pub struct Vp8EncoderConfig {
     /// nctx=0 calibration is preserved bit-for-bit when this flag is
     /// disabled.
     pub enable_trellis_context_rate: bool,
+    /// Enable MV-cost-aware NEAREST/NEAR/NEW disambiguation in the
+    /// per-MB picker (round-45). When `false` (default), the snap test
+    /// at the end of `choose_pmb_decision_with` only fires inside the
+    /// fixed `NEIGHBOUR_MV_SNAP_TOLERANCE = 4` (1/8-pel) window — a
+    /// refined NEW_MV that lands a quarter-pel away from a non-zero
+    /// neighbour candidate is rewritten as NEAREST / NEAR. When `true`,
+    /// the snap test is augmented with a Lagrangian check: if the SAD
+    /// penalty `(snap_sad − refined_sad)` is smaller than `λ` times the
+    /// bit-cost difference between coding NEW_MV (mv-tree path "1110" +
+    /// MV-delta literal) and the cheaper neighbour mode (NEAREST: "10",
+    /// NEAR: "110"), the picker prefers the lower-cost mode even when
+    /// the MV magnitude differs by more than `NEIGHBOUR_MV_SNAP_TOLERANCE`.
+    /// `λ` comes from [`lambda_for_qp`], the same multiplier the per-MB
+    /// ref/mode picker uses; setting it to 0 (or `enable_rdo = false`)
+    /// collapses to the legacy fixed-tolerance behaviour bit-for-bit.
+    /// Off-by-default so existing P-frame bitstreams stay byte-identical
+    /// when this flag is disabled. Requires [`enable_rdo`] = `true`.
+    ///
+    /// [`enable_rdo`]: Vp8EncoderConfig::enable_rdo
+    /// [`lambda_for_qp`]: Vp8EncoderConfig::lambda_scale
+    pub enable_mv_cost_aware_snap: bool,
+    /// Enable the SPLIT_MV RDO second pass with real per-partition
+    /// `SUB_MV_REF_PROBS` context (round-45). When `false` (default) and
+    /// `enable_split_mv_rdo = true`, `search_split_mv` scores each split
+    /// candidate with the neutral context row `[0]` (no neighbour sub-MVs
+    /// visible at search time). When `true`, after the per-MB picker
+    /// commits a `SplitMv` decision, the encoder re-evaluates the four
+    /// split-mode candidates using the actual neighbour sub-MVs from the
+    /// already-committed left/above MBs (the same context the bitstream
+    /// emit uses in `emit_split_submvs`): each partition's per-leaf
+    /// `SUB_MV_REF_PROBS` row + the actual leaf path (LEFT / ABOVE /
+    /// ZERO / NEW). If a different split mode wins under real context,
+    /// the picker swaps the decision before reconstruction. Requires
+    /// `enable_split_mv_rdo = true` and `enable_rdo = true`. Off-by-default
+    /// so existing SPLIT_MV bitstreams stay byte-identical when this
+    /// flag is disabled.
+    pub enable_split_mv_rdo_real_context: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -869,6 +906,8 @@ impl Default for Vp8EncoderConfig {
             enable_split_mv_rdo: false,
             enable_adaptive_lf_deltas: false,
             enable_trellis_context_rate: false,
+            enable_mv_cost_aware_snap: false,
+            enable_split_mv_rdo_real_context: false,
         }
     }
 }
@@ -2538,6 +2577,61 @@ fn encode_pframe_and_reconstruct(
                     PMbDecision::Intra {
                         y_mode,
                         uv_mode: new_uv,
+                    }
+                } else {
+                    decision
+                }
+            } else {
+                decision
+            };
+            // Round-45: SPLIT_MV RDO real-context second pass. When the
+            // picker chose SPLIT_MV and `enable_split_mv_rdo_real_context`
+            // is on, re-evaluate the four split-mode candidates with the
+            // actual neighbour-sub-MV context from the already-committed
+            // left/above MBs (round-43 used the neutral `[0]` context
+            // because the search ran before any MB was committed). If a
+            // different split-mode wins under real context, swap the
+            // decision before reconstruction. λ=0 collapses to SAD-min
+            // selection bit-for-bit.
+            let decision = if config.enable_split_mv_rdo_real_context
+                && config.enable_split_mv_rdo
+                && config.enable_rdo
+                && split_mv_rdo_lambda_x256 > 0
+            {
+                if let PMbDecision::SplitMv(_) = decision {
+                    let used_ref_for_rescore: &ReferenceFrame = match picked_ref {
+                        ENC_REF_GOLDEN => golden_ref.expect("plan.use_golden was true"),
+                        ENC_REF_ALT => alt_ref.expect("plan.use_alt was true"),
+                        _ => last_ref,
+                    };
+                    let ref_plane = RefPlane {
+                        data: &used_ref_for_rescore.y,
+                        stride: y_stride,
+                        width: y_stride,
+                        height: y_buf_h,
+                    };
+                    if let Some((new_split, _)) = search_split_mv_with_real_context(
+                        &src_y,
+                        &ref_plane,
+                        y_stride,
+                        mb_x * 16,
+                        mb_y * 16,
+                        if config.enable_split_mv_joint_refine {
+                            config.split_mv_joint_refine_passes
+                        } else {
+                            0
+                        },
+                        split_mv_rdo_lambda_x256,
+                        &mb_sub_mvs,
+                        &mb_decisions,
+                        mb_x,
+                        mb_y,
+                        mb_w,
+                        best_for_newmv,
+                    ) {
+                        PMbDecision::SplitMv(new_split)
+                    } else {
+                        decision
                     }
                 } else {
                     decision
@@ -8414,6 +8508,205 @@ fn split_mv_total_rate_x256(split: &SplitMv) -> u64 {
         }
     }
     r
+}
+
+/// Round-45 real-context variant of [`split_mv_total_rate_x256`]. Uses
+/// the actual neighbour sub-MVs (left/above) from the already-committed
+/// MBs to pick the correct `SUB_MV_REF_PROBS` row per partition, and
+/// the actual leaf path (LEFT / ABOVE / ZERO / NEW) instead of charging
+/// every partition the longest-path NEW leaf cost.
+///
+/// Mirrors the bitstream emit in `emit_split_submvs` exactly:
+///   * partitions iterate in 0..n order;
+///   * the sub-block context is taken from the first sub-block index
+///     (`partition[i] == p`) of each partition;
+///   * within-MB neighbours come from a running `part_mvs_running`
+///     buffer that mirrors the emit-time state, NOT from the input
+///     `split.part_mvs` (which is indexed by partition id).
+///
+/// `best_for_newmv` is the per-ref NEW-MV root the bitstream emits as
+/// the MV-delta base. Round-43's neutral-context approximation used
+/// the absolute MV; here we charge the *true* delta the decoder will
+/// observe, which is the dominant rate term on splits whose MVs cluster
+/// near `best_for_newmv`.
+#[allow(clippy::too_many_arguments)]
+fn split_mv_real_context_rate_x256(
+    split: &SplitMv,
+    mb_sub_mvs: &[[Mv; 16]],
+    mb_decisions: &[PMbDecision],
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+    best_for_newmv: Mv,
+) -> u64 {
+    // Split-tree path is identical to the neutral-context variant.
+    let mut r: u64 = 0;
+    let p = &MBSPLIT_PROBS;
+    match split.split_mode {
+        3 => {
+            r += bool_cost_x256(p[0], false) as u64;
+        }
+        2 => {
+            r += bool_cost_x256(p[0], true) as u64;
+            r += bool_cost_x256(p[1], false) as u64;
+        }
+        0 => {
+            r += bool_cost_x256(p[0], true) as u64;
+            r += bool_cost_x256(p[1], true) as u64;
+            r += bool_cost_x256(p[2], false) as u64;
+        }
+        1 => {
+            r += bool_cost_x256(p[0], true) as u64;
+            r += bool_cost_x256(p[1], true) as u64;
+            r += bool_cost_x256(p[2], true) as u64;
+        }
+        _ => unreachable!("invalid split_mode {}", split.split_mode),
+    }
+
+    let partition = &MB_SPLITS[split.split_mode as usize];
+    let n = MB_SPLIT_COUNT[split.split_mode as usize] as usize;
+    let mut part_mvs_running = [Mv::ZERO; 16];
+    for p_idx in 0..n {
+        let first_idx = (0..16)
+            .find(|&i| partition[i] as usize == p_idx)
+            .unwrap_or(0);
+        let row = first_idx / 4;
+        let col = first_idx % 4;
+        let left_mv = if col == 0 {
+            if mb_x > 0 {
+                let lidx = mb_y * mb_w + mb_x - 1;
+                edge_left_sub_mv(mb_sub_mvs, mb_decisions, lidx, row)
+            } else {
+                Mv::ZERO
+            }
+        } else {
+            part_mvs_running[row * 4 + col - 1]
+        };
+        let above_mv = if row == 0 {
+            if mb_y > 0 {
+                let aidx = (mb_y - 1) * mb_w + mb_x;
+                edge_above_sub_mv(mb_sub_mvs, mb_decisions, aidx, col)
+            } else {
+                Mv::ZERO
+            }
+        } else {
+            part_mvs_running[(row - 1) * 4 + col]
+        };
+        let chosen = split.part_mvs[p_idx];
+        let leaf: i32 = if chosen == left_mv {
+            0
+        } else if chosen == above_mv {
+            1
+        } else if chosen == Mv::ZERO {
+            2
+        } else {
+            3
+        };
+        let sub_prob_row = sub_mv_context_enc(&left_mv, &above_mv);
+        let probs = &SUB_MV_REF_PROBS[sub_prob_row];
+        // SUB_MV_REF_TREE leaf paths (mirroring `emit_split_submvs`).
+        match leaf {
+            0 => {
+                r += bool_cost_x256(probs[0], false) as u64;
+            }
+            1 => {
+                r += bool_cost_x256(probs[0], true) as u64;
+                r += bool_cost_x256(probs[1], false) as u64;
+            }
+            2 => {
+                r += bool_cost_x256(probs[0], true) as u64;
+                r += bool_cost_x256(probs[1], true) as u64;
+                r += bool_cost_x256(probs[2], false) as u64;
+            }
+            3 => {
+                r += bool_cost_x256(probs[0], true) as u64;
+                r += bool_cost_x256(probs[1], true) as u64;
+                r += bool_cost_x256(probs[2], true) as u64;
+                let dr = chosen.row as i32 - best_for_newmv.row as i32;
+                let dc = chosen.col as i32 - best_for_newmv.col as i32;
+                r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], dr) as u64;
+                r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], dc) as u64;
+            }
+            _ => unreachable!(),
+        }
+        // Update running MVs (every sub-block in this partition takes
+        // `chosen` so subsequent partitions see the right neighbour).
+        for i in 0..16 {
+            if partition[i] as usize == p_idx {
+                part_mvs_running[i] = chosen;
+            }
+        }
+    }
+    r
+}
+
+/// Round-45 second-pass SPLIT_MV picker with real per-partition
+/// `SUB_MV_REF_PROBS` context. Re-runs the four split-mode candidate
+/// searches (same `search_split_partitions` round-43 used) and rescores
+/// each with [`split_mv_real_context_rate_x256`], using the actual
+/// neighbour sub-MVs from the already-committed left/above MBs.
+/// Returns the winner; with `rdo_lambda_x256 == 0` reproduces the
+/// SAD-min selection bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn search_split_mv_with_real_context(
+    src_y: &[u8],
+    ref_plane: &RefPlane<'_>,
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    joint_refine_passes: u32,
+    rdo_lambda_x256: u64,
+    mb_sub_mvs: &[[Mv; 16]],
+    mb_decisions: &[PMbDecision],
+    mb_x: usize,
+    mb_y: usize,
+    mb_w: usize,
+    best_for_newmv: Mv,
+) -> Option<(SplitMv, u32)> {
+    let mut best: Option<(SplitMv, u32)> = None;
+    let mut best_cost: u64 = u64::MAX;
+    for split_mode in 0..4u8 {
+        let (part_mvs, total_sad) = search_split_partitions(
+            split_mode,
+            src_y,
+            ref_plane,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            joint_refine_passes,
+        );
+        let split = SplitMv {
+            split_mode,
+            part_mvs,
+        };
+        let rate_x256 = if rdo_lambda_x256 > 0 {
+            split_mv_real_context_rate_x256(
+                &split,
+                mb_sub_mvs,
+                mb_decisions,
+                mb_x,
+                mb_y,
+                mb_w,
+                best_for_newmv,
+            )
+        } else {
+            0
+        };
+        let cost =
+            (total_sad as u64).saturating_add(rdo_lambda_x256.saturating_mul(rate_x256) / 256);
+        match &best {
+            None => {
+                best = Some((split, total_sad));
+                best_cost = cost;
+            }
+            Some(_) if cost < best_cost => {
+                best = Some((split, total_sad));
+                best_cost = cost;
+            }
+            _ => {}
+        }
+    }
+    best
 }
 
 /// Search best per-partition MVs for one particular split mode.

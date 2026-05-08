@@ -153,6 +153,7 @@ fn default_enc_cfg(qindex: u8) -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     }
 }
 

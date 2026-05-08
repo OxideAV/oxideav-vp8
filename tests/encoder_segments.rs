@@ -186,6 +186,7 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     }
 }
 
@@ -230,6 +231,7 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     }
 }
 
@@ -285,6 +287,7 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     }
 }
 
@@ -388,6 +391,7 @@ fn frame_headers_carry_segment_lf_deltas() {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

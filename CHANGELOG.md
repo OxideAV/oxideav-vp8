@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* SPLIT_MV partition-selection RDO (round-43). New opt-in
+  `Vp8EncoderConfig::enable_split_mv_rdo` knob (default `false`)
+  switches `search_split_mv` from SAD-min split-mode selection to
+  Lagrangian `D + λ·R`, where `D` is the total partition SAD and `R`
+  is the bool-coder cost (in 1/256-bit units) of the `MBSPLIT_PROBS`
+  tree path plus per-partition `SUB_MV_REF_PROBS` longest-path leaf
+  cost (NEW_4X4 under the neutral [0] context — neighbour sub-MVs
+  aren't visible at search time, so we charge the worst-case "new MV"
+  branch which is the only leaf that adds an MV-delta literal) plus
+  per-partition `mv_component_cost_x256` MV-delta bits when the
+  partition's MV is non-zero. Counteracts the structural bias of the
+  legacy SAD-min path toward the 4×4 split (which nearly always wins
+  on raw SAD because of its 16 degrees of freedom but pays the most
+  bitstream bits — 16 sub-MV trees + 16 MV deltas + the longest
+  split-tree path). λ is `lambda_for_qp(qi, scale)`, the same
+  multiplier the per-MB ref/mode picker uses, so RDO trade-offs stay
+  coherent across all encoder decisions. Off-by-default so the
+  existing greedy SAD-min selection is preserved bit-for-bit; gated
+  on `enable_rdo = true` (with `enable_rdo = false` λ collapses to 0
+  and the gating is inert). Nine integration tests in
+  `tests/encoder_round_43.rs` pin: default-off, off-path
+  byte-identical to legacy, keyframe + P-frame clean decode,
+  byte-envelope ±20 %, PSNR-Y non-regression, flat-content
+  byte-identical (the cheap-skip test fires before the SPLIT_MV
+  search runs), `enable_rdo`-required gating, and composition with
+  the round-42 knobs (UV-RDO + mode/ref deltas + joint LF-RDO).
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.11...v0.1.12) - 2026-05-08
 
 ### Other

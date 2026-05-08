@@ -1,29 +1,37 @@
-//! Round-41 encoder push tests — rate-aware B_PRED 4×4 sub-mode picker
-//! (`enable_bpred_rdo`).
+//! Round-43 encoder push tests — SPLIT_MV partition-selection RDO
+//! (`enable_split_mv_rdo`).
 //!
-//! When `enable_bpred_rdo = true`, each B_PRED sub-block's mode is
-//! picked as the minimiser of `D + λ·R` where `D` is the SSE of the
-//! 4×4 prediction vs the source (same as the legacy greedy path) and
-//! `R` is the bool-coder cost of writing the BMODE_TREE path under
-//! the appropriate context probabilities (`KF_BMODE_PROB[above][left]`
-//! on keyframes, the static `vp8_bmode_prob` on intra-in-P MBs). The
-//! 16×16-vs-B_PRED outer selector continues to compare pure SSE — only
-//! the per-sub-block inner search is rate-aware.
+//! Round-43 lands the rate-aware variant of `search_split_mv`. Up to
+//! round-42 the SPLIT_MV picker chose the SAD-min split mode across the
+//! four candidates (16×8 / 8×16 / 8×8 / 4×4). The 4×4 split nearly
+//! always beats the coarser splits on raw SAD because it has the most
+//! per-partition freedom — but it also pays the most bitstream bits
+//! (16 partitions × per-partition tree + 16 MV deltas + the longest
+//! `MBSPLIT_PROBS` tree path). When `enable_split_mv_rdo` is on, each
+//! candidate is scored as `D + λ·R` where
+//!
+//!   * `D` = total partition SAD (same as the legacy path).
+//!   * `R` = `MBSPLIT_PROBS` tree-path cost + per-partition
+//!     `SUB_MV_REF_PROBS` longest-path leaf cost (NEW_4X4 under the
+//!     neutral [0] context, since neighbour sub-MVs aren't visible at
+//!     search time) + per-partition `mv_component_cost_x256` MV-delta
+//!     bits when the partition's MV is non-zero.
+//!
+//! λ comes from `lambda_for_qp(qi, scale)`, the same multiplier the
+//! per-MB ref/mode picker uses, so RDO trade-offs stay coherent across
+//! all encoder decisions.
 //!
 //! Tests:
-//!  1) Default config has `enable_bpred_rdo = false`.
-//!  2) With the knob off, encode is byte-identical against the legacy
-//!     greedy SSE path (regression guard against accidental engagement).
-//!  3) With the knob on, encoder produces a valid bitstream that
-//!     decodes cleanly through the in-tree decoder.
-//!  4) RDO-on byte total stays within ±15% of RDO-off (rate term is a
-//!     small per-frame perturbation; large drifts indicate a bug).
-//!  5) RDO-on must not regress luma PSNR by more than 0.5 dB on a clip
-//!     dominated by smooth content (where the rate term is the
-//!     primary tie-breaker between near-equivalent SSE candidates).
-//!  6) Toggling RDO with B_PRED disabled (force-DC content) leaves the
-//!     bitstream unchanged — a weaker but still informative cross-check
-//!     that the path is gated cleanly.
+//!  1) Default config has the knob off.
+//!  2) Off path produces byte-identical encoder output (regression
+//!     guard against accidental engagement).
+//!  3) RDO on: keyframe + P-frame encode/decode cleanly.
+//!  4) RDO byte envelope ±20 % vs greedy SAD baseline.
+//!  5) RDO PSNR not worse by more than 0.5 dB.
+//!  6) Flat-content byte-identical (the cheap-skip test fires before
+//!     `search_split_mv` is reached, so toggling the knob can't move
+//!     bytes).
+//!  7) `enable_rdo = false` makes the knob inert.
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -40,8 +48,6 @@ use oxideav_vp8::encoder::{
 const W: u32 = 32;
 const H: u32 = 32;
 const QINDEX: u8 = 50;
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
 
 fn make_frame(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
     let cw = (W / 2) as usize;
@@ -64,12 +70,12 @@ fn make_frame(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
     }
 }
 
-/// Diagonal-edge clip that triggers B_PRED on a meaningful number of MBs.
-/// The keyframe path's `B_PRED_SSE_MARGIN` (= 512 SSE units across the MB)
-/// requires a real prediction-quality edge over the 16×16 candidates;
-/// mixed diagonal + horizontal-burst content gives both 16×16 and 4×4
-/// candidates something to pick from.
-fn make_edge_clip(n: usize) -> Vec<VideoFrame> {
+/// Half-and-half clip — a horizontally-translating step between two
+/// luminance regions, designed to make the SPLIT_MV picker actually
+/// engage. The 16×8 and 8×16 split modes can capture the boundary in
+/// two halves; the 4×4 split would over-fit and pay more bits without
+/// matching SAD savings — so RDO should bias toward the coarser split.
+fn make_half_step_clip(n: usize) -> Vec<VideoFrame> {
     let cw = (W / 2) as usize;
     let ch = (H / 2) as usize;
     let mut out = Vec::with_capacity(n);
@@ -77,13 +83,16 @@ fn make_edge_clip(n: usize) -> Vec<VideoFrame> {
         let mut y = vec![0u8; (W * H) as usize];
         for row in 0..H as usize {
             for col in 0..W as usize {
-                // Diagonal gradient — favours B_LD / B_RD prediction.
-                let diag = ((row as i32 - col as i32) * 7).rem_euclid(255);
-                // Horizontal pulse on every fourth row — favours B_HE.
-                let pulse = if row % 4 == 0 { 64 } else { 0 };
-                // Per-frame phase shift for P-frame motion.
-                let v = (diag + pulse + (f as i32 * 3)).rem_euclid(255);
-                y[row * W as usize + col] = v as u8;
+                // Step boundary moves by `f` columns each frame, giving
+                // motion search something genuine to lock on. Left half
+                // is dark (60), right half is bright (200), with a small
+                // vertical wobble to keep some texture for sub-pel
+                // refinement.
+                let phase = (f as i32).rem_euclid(W as i32);
+                let bx = (col as i32 + phase).rem_euclid(W as i32);
+                let base = if bx < W as i32 / 2 { 60 } else { 200 };
+                let wobble = ((row as i32 * 3) % 7) - 3;
+                y[row * W as usize + col] = (base + wobble).clamp(0, 255) as u8;
             }
         }
         out.push(make_frame(y, vec![128u8; cw * ch], vec![128u8; cw * ch]));
@@ -91,10 +100,9 @@ fn make_edge_clip(n: usize) -> Vec<VideoFrame> {
     out
 }
 
-/// Constant-grey frame — every MB picks DC_PRED (B_PRED never wins
-/// against the 16×16 SSE because the 16×16 prediction is a perfect
-/// match). The toggle test uses this to assert that gating is clean
-/// even on content that doesn't engage B_PRED.
+/// Constant-grey clip — every MB skips the SPLIT_MV search outright via
+/// the cheap-skip test (`zero_sad <= MB_SKIP_SAD_PER_PIXEL * 256`), so
+/// toggling the RDO knob must not move bytes.
 fn make_flat_clip(n: usize) -> Vec<VideoFrame> {
     let cw = (W / 2) as usize;
     let ch = (H / 2) as usize;
@@ -206,24 +214,19 @@ fn cfg_baseline() -> Vp8EncoderConfig {
     }
 }
 
-// ─── default + bit-exact off path ────────────────────────────────────────────
-
 #[test]
-fn default_config_bpred_rdo_off() {
+fn default_config_split_mv_rdo_off() {
     let cfg = Vp8EncoderConfig::default();
     assert!(
-        !cfg.enable_bpred_rdo,
-        "round-41 default must be off (preserves bit-exact greedy SSE path)"
+        !cfg.enable_split_mv_rdo,
+        "round-43 default must keep SPLIT_MV RDO off (preserves bit-exact greedy SAD min)"
     );
 }
 
-/// Confirms gating is correct: with the knob off, encode must produce
-/// the same bytes as the legacy code path. This is the regression
-/// guard — any future refactor that tries to restructure the picker
-/// must keep this property.
+/// Round-43 must not perturb the bitstream when the knob is off.
 #[test]
-fn bpred_rdo_off_is_byte_identical_to_legacy() {
-    let clip = make_edge_clip(4);
+fn round43_off_path_byte_identical_to_legacy() {
+    let clip = make_half_step_clip(4);
     let cfg = cfg_baseline();
     let (b0, _, p0) = measure(cfg, &clip);
     let (b1, _, p1) = measure(cfg, &clip);
@@ -234,58 +237,46 @@ fn bpred_rdo_off_is_byte_identical_to_legacy() {
     }
 }
 
-// ─── functional + envelope tests ─────────────────────────────────────────────
-
 #[test]
-fn bpred_rdo_keyframe_decodes_cleanly() {
-    let clip = make_edge_clip(1);
+fn split_mv_rdo_keyframe_decodes_cleanly() {
+    let clip = make_half_step_clip(1);
     let cfg = Vp8EncoderConfig {
-        enable_bpred_rdo: true,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "BMODE-RDO produced zero bytes");
+    assert!(bytes > 0, "SPLIT_MV RDO keyframe produced zero bytes");
     assert!(
         psnr_y > 5.0,
-        "BMODE-RDO encode/decode PSNR collapsed: {psnr_y:.2} dB"
+        "SPLIT_MV RDO keyframe encode/decode PSNR collapsed: {psnr_y:.2} dB"
     );
 }
 
 #[test]
-fn bpred_rdo_pframe_decodes_cleanly() {
-    let clip = make_edge_clip(8);
+fn split_mv_rdo_pframe_decodes_cleanly() {
+    let clip = make_half_step_clip(8);
     let cfg = Vp8EncoderConfig {
-        enable_bpred_rdo: true,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "BMODE-RDO P-frame produced zero bytes");
+    assert!(bytes > 0, "SPLIT_MV RDO P-frame produced zero bytes");
     assert!(
         psnr_y > 5.0,
-        "BMODE-RDO P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
+        "SPLIT_MV RDO P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
     );
 }
 
-/// Toggling the knob can shift bytes in either direction — biasing
-/// towards cheaper-to-code modes saves bits in some MBs and may need
-/// extra residual energy in others. Pin the swing to ±15% of the legacy
-/// baseline; larger drifts indicate a bug (e.g. λ scaled wrong, or the
-/// picker walking off the predicted region).
+/// SPLIT_MV RDO biases the picker toward coarser splits when the SAD
+/// savings of the finer splits don't amortise the bits — so on
+/// translating content the bitstream can shrink. Pin the swing to
+/// ±20 % of the legacy baseline.
 #[test]
-fn bpred_rdo_byte_envelope_within_15pct() {
-    let clip = make_edge_clip(8);
+fn split_mv_rdo_byte_envelope_within_20pct() {
+    let clip = make_half_step_clip(8);
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
-        enable_bpred_rdo: true,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         ..cfg_baseline()
     };
 
@@ -294,59 +285,39 @@ fn bpred_rdo_byte_envelope_within_15pct() {
 
     let frac = (bytes_r as f64 - bytes_g as f64).abs() / bytes_g.max(1) as f64;
     assert!(
-        frac < 0.15,
-        "BMODE-RDO swung byte size by {:.1}% (greedy {bytes_g}, rdo {bytes_r}) — beyond +/-15%",
+        frac < 0.20,
+        "SPLIT_MV RDO swung byte size by {:.1}% (greedy {bytes_g}, rdo {bytes_r}) — beyond +/-20%",
         frac * 100.0
     );
 }
 
-/// PSNR sanity: BMODE-RDO trades a tiny amount of distortion for rate
-/// savings, so it can underperform pure SSE-greedy on a strict luma
-/// metric. The trade-off should be small — pin "PSNR_Y not worse than
-/// greedy by more than 0.5 dB" so an accidental flip of D and R (or a
-/// runaway λ) still trips the test.
 #[test]
-fn bpred_rdo_psnr_does_not_regress_significantly() {
-    let clip = make_edge_clip(6);
+fn split_mv_rdo_psnr_does_not_regress_significantly() {
+    let clip = make_half_step_clip(6);
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
-        enable_bpred_rdo: true,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         ..cfg_baseline()
     };
 
-    let (bytes_g, psnr_g, _) = measure(baseline, &clip);
-    let (bytes_r, psnr_r, _) = measure(with_rdo, &clip);
-
-    eprintln!(
-        "greedy: {bytes_g} bytes, PSNR_Y {psnr_g:.2} dB\n\
-         rdo:    {bytes_r} bytes, PSNR_Y {psnr_r:.2} dB"
-    );
+    let (_b_g, psnr_g, _) = measure(baseline, &clip);
+    let (_b_r, psnr_r, _) = measure(with_rdo, &clip);
 
     assert!(
         psnr_r >= psnr_g - 0.5,
-        "BMODE-RDO regressed PSNR_Y by {:.3} dB beyond 0.5 dB slack (greedy {psnr_g:.2}, rdo {psnr_r:.2})",
+        "SPLIT_MV RDO regressed PSNR_Y by {:.3} dB beyond 0.5 dB slack (greedy {psnr_g:.2}, rdo {psnr_r:.2})",
         psnr_g - psnr_r
     );
 }
 
-/// Cross-check on flat content: the 16×16 candidate is a perfect match
-/// (all-128) so B_PRED never wins the outer SSE comparison. Toggling
-/// the BMODE-RDO knob therefore must not perturb the bitstream because
-/// the flag's effect is gated entirely on the B_PRED branch being
-/// taken. This pins that the picker isn't accidentally engaged on
-/// non-B_PRED MBs.
+/// Flat content has every MB taking the cheap-skip path before the
+/// SPLIT_MV search runs, so toggling the knob can't move bytes.
 #[test]
-fn bpred_rdo_flat_content_is_byte_identical() {
+fn split_mv_rdo_flat_content_is_byte_identical() {
     let clip = make_flat_clip(4);
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
-        enable_bpred_rdo: true,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         ..cfg_baseline()
     };
 
@@ -355,7 +326,7 @@ fn bpred_rdo_flat_content_is_byte_identical() {
 
     assert_eq!(
         b0, b1,
-        "flat-content encode must be byte-identical with BMODE-RDO toggle: {b0} vs {b1}"
+        "flat-content encode must be byte-identical with SPLIT_MV RDO toggle: {b0} vs {b1}"
     );
     assert_eq!(p0.len(), p1.len());
     for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
@@ -363,28 +334,20 @@ fn bpred_rdo_flat_content_is_byte_identical() {
     }
 }
 
-/// `enable_rdo = false` zeros the BMODE-RDO lambda even when
-/// `enable_bpred_rdo = true`, recovering the SSE-greedy bit-exact path.
-/// This pins the gating: future refactors that surface BMODE-RDO
-/// independently of `enable_rdo` must update the test (and the
-/// docstring) deliberately.
+/// `enable_rdo = false` must zero the SPLIT_MV RDO lambda, making the
+/// knob inert — same gating contract round-41 BMODE-RDO and round-42
+/// UV-RDO use.
 #[test]
-fn bpred_rdo_requires_enable_rdo() {
-    let clip = make_edge_clip(4);
+fn split_mv_rdo_requires_enable_rdo() {
+    let clip = make_half_step_clip(4);
     let cfg_a = Vp8EncoderConfig {
         enable_rdo: false,
-        enable_bpred_rdo: false,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_rdo: false,
-        enable_bpred_rdo: true,
-        enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         ..cfg_baseline()
     };
 
@@ -393,10 +356,34 @@ fn bpred_rdo_requires_enable_rdo() {
 
     assert_eq!(
         b0, b1,
-        "BMODE-RDO must be inert when enable_rdo = false: {b0} vs {b1}"
+        "SPLIT_MV RDO must be inert when enable_rdo = false: {b0} vs {b1}"
     );
     assert_eq!(p0.len(), p1.len());
     for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
         assert_eq!(a, b, "enable_rdo-off packet {i} differs");
     }
+}
+
+/// Composition with round-42 knobs (UV-RDO + mode/ref deltas + joint
+/// LF-RDO): turn everything on at once and confirm a clean round-trip
+/// with reasonable PSNR.
+#[test]
+fn round43_combined_with_round42_decodes_cleanly() {
+    let clip = make_half_step_clip(8);
+    let cfg = Vp8EncoderConfig {
+        enable_split_mv_rdo: true,
+        enable_uv_rdo: true,
+        enable_mode_ref_lf_deltas: true,
+        enable_joint_lf_rdo: true,
+        ..cfg_baseline()
+    };
+    let (bytes, psnr_y, _) = measure(cfg, &clip);
+    assert!(
+        bytes > 0,
+        "combined round-43 + round-42 produced zero bytes"
+    );
+    assert!(
+        psnr_y > 5.0,
+        "combined round-43 + round-42 PSNR collapsed: {psnr_y:.2} dB"
+    );
 }

@@ -759,6 +759,29 @@ pub struct Vp8EncoderConfig {
     /// existing P-frame bitstreams are byte-identical when this flag
     /// is off.
     pub enable_mode_ref_lf_deltas: bool,
+    /// Enable rate-distortion optimisation for SPLIT_MV partition
+    /// selection (round-43). When `false` (default), `search_split_mv`
+    /// returns the SAD-min split mode across the four candidates
+    /// (16×8 / 8×16 / 8×8 / 4×4). When `true`, each candidate is scored
+    /// as `D + λ·R` where `D` is the total partition SAD and `R` is the
+    /// bool-coder cost (in 1/256-bit units) of writing the
+    /// `MBSPLIT_PROBS` tree path plus, per partition, the
+    /// `SUB_MV_REF_PROBS` ZERO/NEW leaf cost (neutral context — no
+    /// neighbour sub-MVs available at search time) plus the
+    /// `mv_component_cost_x256` MV-delta cost when the partition's MV
+    /// is non-zero. Tilts the picker toward coarser splits (16×8 / 8×16)
+    /// when the SAD savings of the finer splits don't amortise the
+    /// extra split-tree + per-partition tree + per-partition MV bits
+    /// the bitstream pays. λ comes from
+    /// [`lambda_for_qp`], the same multiplier the per-MB ref/mode
+    /// picker uses. Off-by-default so existing greedy SAD-min selection
+    /// is preserved bit-for-bit when this flag is disabled. Requires
+    /// [`enable_rdo`] = `true`; with `enable_rdo` = `false` λ collapses
+    /// to 0 and the gating is inert.
+    ///
+    /// [`enable_rdo`]: Vp8EncoderConfig::enable_rdo
+    /// [`lambda_for_qp`]: Vp8EncoderConfig::lambda_scale
+    pub enable_split_mv_rdo: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -803,6 +826,7 @@ impl Default for Vp8EncoderConfig {
             enable_bpred_rdo: false,
             enable_uv_rdo: false,
             enable_mode_ref_lf_deltas: false,
+            enable_split_mv_rdo: false,
         }
     }
 }
@@ -2292,6 +2316,14 @@ fn encode_pframe_and_reconstruct(
     } else {
         0
     };
+    // Round-43 SPLIT_MV RDO lambda. Same magnitude as the per-MB
+    // ref/mode picker lambda; `0` recovers the legacy SAD-min split-mode
+    // selection bit-for-bit.
+    let split_mv_rdo_lambda_x256: u64 = if config.enable_split_mv_rdo && config.enable_rdo {
+        lambda as u64
+    } else {
+        0
+    };
     for mb_y in 0..mb_h {
         for mb_x in 0..mb_w {
             let mb_idx = mb_y * mb_w + mb_x;
@@ -2337,6 +2369,7 @@ fn encode_pframe_and_reconstruct(
                     } else {
                         0
                     },
+                    split_mv_rdo_lambda_x256,
                 );
                 // Per-ref lambda tilt. LAST is the closest reference and
                 // its drift is bounded by exactly one frame; GOLDEN /
@@ -3974,6 +4007,7 @@ fn choose_pmb_decision(
         rec_y,
         DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
         0, // subpel_mv_cost_lambda: disabled (tests use legacy SAD-only path)
+        0, // split_mv_rdo_lambda: disabled (tests use legacy SAD-only path)
     )
 }
 
@@ -3986,6 +4020,13 @@ fn choose_pmb_decision(
 /// toward rate-cheaper MVs by adding `lambda * mv_component_cost_x256 / 256`
 /// to the SAD before comparing candidates. Setting to 0 restores the
 /// legacy SAD-only behaviour.
+///
+/// `split_mv_rdo_lambda`: when non-zero, `search_split_mv` scores each
+/// of the four split-mode candidates (16×8 / 8×16 / 8×8 / 4×4) as
+/// `D + λ·R` rather than picking the SAD-min candidate. `R` accounts
+/// for the `MBSPLIT_PROBS` tree path + per-partition `SUB_MV_REF_PROBS`
+/// leaf cost + per-partition MV-delta bits. Setting to 0 restores the
+/// legacy SAD-only `search_split_mv` behaviour bit-for-bit.
 #[allow(clippy::too_many_arguments)]
 fn choose_pmb_decision_with(
     src_y: &[u8],
@@ -4001,6 +4042,7 @@ fn choose_pmb_decision_with(
     rec_y: &[u8],
     split_mv_joint_refine_passes: u32,
     subpel_mv_cost_lambda: u64,
+    split_mv_rdo_lambda: u64,
 ) -> PMbDecision {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
@@ -4151,6 +4193,7 @@ fn choose_pmb_decision_with(
             mb_xp,
             mb_yp,
             split_mv_joint_refine_passes,
+            split_mv_rdo_lambda,
         ) {
             let n_parts = MB_SPLIT_COUNT[split.split_mode as usize] as u32;
             let split_margin = n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION;
@@ -7706,8 +7749,12 @@ fn emit_bmodes_keyframe(
 // SPLIT_MV search
 // ---------------------------------------------------------------------------
 
-/// For a given SPLIT mode (16×8 / 8×16 / 8×8 / 4×4), search the best
-/// per-partition MV and compute the total SAD.
+/// For each split mode (16×8 / 8×16 / 8×8 / 4×4), run the per-partition
+/// MV search and return the candidate that minimises either pure SAD
+/// (when `rdo_lambda_x256 == 0`, legacy bit-exact path) or the
+/// Lagrangian `D + λ·R` (round-43 SPLIT_MV RDO). `D` is the total SAD
+/// the partition search returns; `R` is built from
+/// [`split_mv_total_rate_x256`].
 fn search_split_mv(
     src_y: &[u8],
     ref_plane: &RefPlane<'_>,
@@ -7715,8 +7762,10 @@ fn search_split_mv(
     mb_xp: usize,
     mb_yp: usize,
     joint_refine_passes: u32,
+    rdo_lambda_x256: u64,
 ) -> Option<(SplitMv, u32)> {
     let mut best: Option<(SplitMv, u32)> = None;
+    let mut best_cost: u64 = u64::MAX;
     for split_mode in 0..4u8 {
         let (part_mvs, total_sad) = search_split_partitions(
             split_mode,
@@ -7731,13 +7780,100 @@ fn search_split_mv(
             split_mode,
             part_mvs,
         };
+        // Lagrangian cost. With `rdo_lambda_x256 == 0` the rate term
+        // collapses to 0 and we reproduce the legacy SAD-min selection
+        // bit-for-bit (matches the round-42 baseline).
+        let rate_x256 = if rdo_lambda_x256 > 0 {
+            split_mv_total_rate_x256(&split)
+        } else {
+            0
+        };
+        let cost =
+            (total_sad as u64).saturating_add(rdo_lambda_x256.saturating_mul(rate_x256) / 256);
         match &best {
-            None => best = Some((split, total_sad)),
-            Some((_, bs)) if total_sad < *bs => best = Some((split, total_sad)),
+            None => {
+                best = Some((split, total_sad));
+                best_cost = cost;
+            }
+            Some(_) if cost < best_cost => {
+                best = Some((split, total_sad));
+                best_cost = cost;
+            }
             _ => {}
         }
     }
     best
+}
+
+/// Bool-coder rate (in 1/256-bit units) the bitstream pays for one
+/// SPLIT_MV candidate. The rate is the sum of three terms: the
+/// `MBSPLIT_PROBS` split-tree path; per-partition `SUB_MV_REF_PROBS`
+/// leaf cost (assumed NEW_4X4 leaf under the neutral [0] context, since
+/// neighbour sub-MVs aren't visible inside `search_split_mv` — we
+/// charge the worst-case "new MV" branch, which is the longest path in
+/// the SUB_MV_REF tree and the only one that adds an MV-delta literal);
+/// and per-partition `mv_component_cost_x256` MV-delta bits when the
+/// partition's MV is non-zero.
+///
+/// This is deliberately a coarse but bit-grounded approximation: we
+/// don't have neighbour sub-MV context at search time (those are only
+/// known after the per-MB picker commits), so we charge every non-zero
+/// partition the longest-path SUB_MV_REF leaf cost. The resulting
+/// penalty grows with `MB_SPLIT_COUNT` (2 → 16 partitions), which is
+/// exactly the rate ordering the bitstream observes.
+fn split_mv_total_rate_x256(split: &SplitMv) -> u64 {
+    let mut r: u64 = 0;
+    // Split-tree path. RFC 6386 §16.3: tree leaves [0=16x8, 1=8x16,
+    // 2=quarters, 3=4x4]; branch probs are MBSPLIT_PROBS[0..3].
+    let p = &MBSPLIT_PROBS;
+    match split.split_mode {
+        // MB_SPLIT_4X4 = 3 → bit 0 (1 symbol).
+        3 => {
+            r += bool_cost_x256(p[0], false) as u64;
+        }
+        // MB_SPLIT_QUARTERS = 2 → bits 1,0 (2 symbols).
+        2 => {
+            r += bool_cost_x256(p[0], true) as u64;
+            r += bool_cost_x256(p[1], false) as u64;
+        }
+        // MB_SPLIT_16X8 = 0 → bits 1,1,0 (3 symbols).
+        0 => {
+            r += bool_cost_x256(p[0], true) as u64;
+            r += bool_cost_x256(p[1], true) as u64;
+            r += bool_cost_x256(p[2], false) as u64;
+        }
+        // MB_SPLIT_8X16 = 1 → bits 1,1,1 (3 symbols).
+        1 => {
+            r += bool_cost_x256(p[0], true) as u64;
+            r += bool_cost_x256(p[1], true) as u64;
+            r += bool_cost_x256(p[2], true) as u64;
+        }
+        _ => unreachable!("invalid split_mode {}", split.split_mode),
+    }
+    // Per-partition: assume worst-case NEW_4X4 leaf (path 1,1,1) under
+    // neutral context [0] (left != above, neither zero). Decoder picks
+    // the actual context per partition; charging the longest-path leaf
+    // here is a conservative upper bound that grows linearly with the
+    // partition count — same ordering the bitstream pays.
+    let n = MB_SPLIT_COUNT[split.split_mode as usize] as usize;
+    let probs = &SUB_MV_REF_PROBS[0];
+    let leaf_cost = bool_cost_x256(probs[0], true) as u64
+        + bool_cost_x256(probs[1], true) as u64
+        + bool_cost_x256(probs[2], true) as u64;
+    for p_idx in 0..n {
+        r += leaf_cost;
+        let mv = split.part_mvs[p_idx];
+        // MV-delta cost. We don't know `best_for_newmv` at this point
+        // (the picker commits the per-ref best MV later), so charge
+        // the absolute MV value as a proxy for delta cost — which is
+        // exact when `best_for_newmv == ZERO`, and otherwise a small
+        // upper bound on what the bitstream actually pays.
+        if mv != Mv::ZERO {
+            r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32) as u64;
+            r += mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32) as u64;
+        }
+    }
+    r
 }
 
 /// Search best per-partition MVs for one particular split mode.

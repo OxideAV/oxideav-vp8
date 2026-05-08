@@ -209,6 +209,7 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     }
 }
 
@@ -253,6 +254,7 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
+        enable_split_mv_rdo: false,
     }
 }
 

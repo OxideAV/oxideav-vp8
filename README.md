@@ -329,6 +329,22 @@ budget. Keyframes still use the heuristic (the frame-0 bitstream is
 bit-identical when this flag toggles). Effective only on P-frames;
 opt-in; default `false`.
 
+**SPLIT_MV partition-selection RDO (round-43)** — when
+`enable_split_mv_rdo = true`, `search_split_mv` picks the best split
+mode (16×8 / 8×16 / 8×8 / 4×4) by Lagrangian `D + λ·R` rather than
+SAD-min. `D` is the total partition SAD; `R` is the bool-coder cost
+(in 1/256-bit units) of the `MBSPLIT_PROBS` tree path plus, per
+partition, the longest-path `SUB_MV_REF_PROBS` leaf cost (NEW_4X4
+under the neutral [0] context — neighbour sub-MVs aren't visible at
+search time, so we charge the worst-case "new MV" branch) plus the
+`mv_component_cost_x256` MV-delta bits when the partition's MV is
+non-zero. Counteracts the legacy bias toward the 4×4 split (which
+nearly always wins on raw SAD because of its 16 degrees of freedom
+but pays the most bits — 16 sub-MV trees + 16 MV deltas + the
+longest split-tree path). λ comes from `lambda_for_qp(qi, scale)`,
+the same multiplier the per-MB ref/mode picker uses. Opt-in;
+default `false`. Requires `enable_rdo = true`.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,
@@ -339,7 +355,9 @@ fine-grained control over `qindex`, `golden_interval`,
 `lambda_long_ref_scale_x256`, `enable_trellis_quant`,
 `enable_trellis_full`, `enable_subpel_mv_cost`, `enable_psy_rdo`,
 `psy_rd_strength`, `enable_arnr_nlm`, `nlm_h2`, `enable_aq`,
-`aq_qindex_range`, and `enable_joint_lf_rdo`.
+`aq_qindex_range`, `enable_joint_lf_rdo`, `enable_bpred_rdo`,
+`enable_uv_rdo`, `enable_mode_ref_lf_deltas`, and
+`enable_split_mv_rdo`.
 
 ### Container
 

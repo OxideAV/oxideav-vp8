@@ -42,10 +42,11 @@ use crate::error::{Result, Vp8Error as Error};
 use crate::frame::Vp8Frame;
 
 use crate::bool_encoder::BoolEncoder;
-// `bool_cost_x256` is only used by the registry-gated rate-estimation
-// path (`estimate_mode_rate_x256`); gating the import keeps the
-// `--no-default-features` build clean.
-#[cfg(feature = "registry")]
+// `bool_cost_x256` is used by the round-41 BMODE-RDO picker
+// (`bmode_rate_x256`) on every keyframe + intra-in-P B_PRED MB, and
+// also (registry-gated) by the inter-frame rate-estimation path. Keep
+// the import unconditional so the `--no-default-features` build sees
+// the symbol when the BMODE-RDO call site references it.
 use crate::bool_encoder::bool_cost_x256;
 use crate::fdct::{fdct4x4, fwht4x4};
 use crate::frame_tag::KEYFRAME_SYNC_CODE;

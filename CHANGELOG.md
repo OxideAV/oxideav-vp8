@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.11...v0.1.12) - 2026-05-08
+
+### Other
+
+- ungate bool_cost_x256 import for round-41 BMODE-RDO
+- rate-aware B_PRED 4×4 sub-mode picker (round-41)
+- activate joint loop-filter / QP RDO (round-40)
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- re-export __oxideav_entry from registry sub-module
+- libvpx-shape per-coefficient Trellis + activity-driven AQ (round-39)
+
 ### Added
 
 - *(encoder)* Rate-aware B_PRED 4×4 sub-mode picker (round-41). New

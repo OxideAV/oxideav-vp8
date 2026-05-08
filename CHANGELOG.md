@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Adaptive loop-filter mode/ref deltas + Trellis
+  rate-from-context (round-44). Two complementary picker upgrades land
+  together. `Vp8EncoderConfig::enable_adaptive_lf_deltas` (default
+  `false`) replaces the static round-42 ladder
+  (`ref_deltas = [+2, 0, -2, -2]` / `mode_deltas = [+4, -2, +1, +4]`)
+  with a per-frame estimate from the per-MB unfiltered luma-SSE
+  distribution: each ref / mode bucket's delta is biased toward
+  stronger filtering for buckets whose mean SSE exceeds the frame
+  mean (deblocking helps reconstruction-noisy MBs the most) and toward
+  lighter filtering for buckets below the frame mean. Empty buckets
+  fall back to the static ladder so sparse-mode frames don't get wild
+  deltas. Magnitude is capped at ±6 (one segment-tier above/below the
+  bare frame level) so the effective per-MB level stays comparable to
+  the static-ladder behaviour. Only meaningful when
+  `enable_mode_ref_lf_deltas = true`; ignored on keyframes (which
+  always emit `mode_ref_delta_enabled = 0`). Off-by-default so the
+  existing static-ladder bitstream is preserved bit-for-bit.
+  `Vp8EncoderConfig::enable_trellis_context_rate` (default `false`)
+  defers the trellis pass until after the per-MB encode loop completes
+  and walks MBs in raster order tracking the running above/left
+  non-zero predictor — the same predictor `emit_tokens` uses — so each
+  block's `nctx ∈ {0,1,2}` matches the actual entropy-coder context.
+  The previous per-MB call always passed `nctx = 0` which
+  over-approximated EOB savings on blocks whose neighbours have
+  non-zero coefficients. Trellis decisions feed back into the nz
+  predictor for subsequent blocks so the context propagates the way
+  the entropy coder propagates it. Effective only when
+  `enable_trellis_quant = true`. Off-by-default so the existing
+  nctx=0 calibration is preserved bit-for-bit. Thirteen integration
+  tests in `tests/encoder_round_44.rs` pin: default-off, off-path
+  byte-identical, adaptive LF keyframe + P-frame clean decode,
+  byte-envelope ±20 % vs static ladder, flat-content envelope ±20 %
+  (sparse-mode fallback), `enable_mode_ref_lf_deltas`-required
+  gating, trellis-context keyframe + P-frame clean decode,
+  trellis-context byte-envelope ±10 % vs nctx=0 baseline, PSNR-Y
+  non-regression, `enable_trellis_quant`-required gating, and
+  composition with all round-42 / round-43 knobs.
 - *(encoder)* SPLIT_MV partition-selection RDO (round-43). New opt-in
   `Vp8EncoderConfig::enable_split_mv_rdo` knob (default `false`)
   switches `search_split_mv` from SAD-min split-mode selection to

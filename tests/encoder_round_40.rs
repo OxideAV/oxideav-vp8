@@ -189,6 +189,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
     }
 }
 
@@ -209,6 +211,8 @@ fn joint_lf_rdo_keyframe_only_is_byte_identical() {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -245,6 +249,8 @@ fn joint_lf_rdo_pframe_bitstream_decodes_cleanly() {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -271,6 +277,8 @@ fn joint_lf_rdo_psnr_does_not_regress_significantly() {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -310,6 +318,8 @@ fn joint_lf_rdo_byte_budget_within_envelope() {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -340,6 +350,8 @@ fn joint_lf_rdo_with_segmentation_decodes_cleanly() {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);

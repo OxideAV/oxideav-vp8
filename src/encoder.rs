@@ -782,6 +782,46 @@ pub struct Vp8EncoderConfig {
     /// [`enable_rdo`]: Vp8EncoderConfig::enable_rdo
     /// [`lambda_for_qp`]: Vp8EncoderConfig::lambda_scale
     pub enable_split_mv_rdo: bool,
+    /// Enable adaptive (content-aware) loop-filter mode/ref deltas
+    /// (round-44). When `false` (default) and
+    /// `enable_mode_ref_lf_deltas = true`, the encoder emits the
+    /// libvpx-style static ladder
+    /// `ref_deltas = [+2, 0, -2, -2]` / `mode_deltas = [+4, -2, +1, +4]`.
+    /// When `true`, the encoder estimates the per-bucket deltas from
+    /// the actual per-MB luma SSE distribution of the reconstructed
+    /// frame against the source: each bucket's delta is biased toward
+    /// stronger filtering for buckets whose mean SSE exceeds the frame
+    /// mean (the deblocking filter is most useful on
+    /// reconstruction-noisy MBs) and toward lighter filtering for
+    /// buckets whose mean SSE is below the frame mean. Deltas are
+    /// clamped to `±6` (signed-6-bit grammar fits any value, but a
+    /// tighter cap keeps the effective filter level inside a single
+    /// segment-level tier — the same range the static ladder uses).
+    /// Buckets without any observed MBs in the frame fall back to the
+    /// static ladder value. Only meaningful when
+    /// `enable_mode_ref_lf_deltas = true`; ignored on keyframes (which
+    /// always emit `mode_ref_delta_enabled = 0`). Off-by-default so
+    /// the existing static-ladder bitstream is preserved bit-for-bit
+    /// when this flag is disabled.
+    pub enable_adaptive_lf_deltas: bool,
+    /// Enable rate-from-context for the trellis quantiser (round-44).
+    /// When `false` (default) and `enable_trellis_quant = true`, every
+    /// trellis block evaluation runs with the neutral neighbour token
+    /// context (`nctx = 0`), which over-approximates EOB savings on
+    /// blocks whose neighbours have non-zero coefficients (the actual
+    /// `nctx ∈ {0,1,2}` raises the EOB probability for high-context
+    /// blocks, making EOB-trim cheaper). When `true`, the trellis
+    /// pass is run after the per-MB encode loop with a per-block
+    /// context derived from the running above/left non-zero predictor
+    /// (the same predictor `emit_tokens` uses), so the rate term in
+    /// `D + λ·R` matches the actual bool-coder cost the decoder will
+    /// pay. The trellis-decision changes flow back into the nz
+    /// predictor for subsequent blocks, so the context propagates the
+    /// way the real entropy coder propagates it. Effective only when
+    /// `enable_trellis_quant = true`. Off-by-default so the existing
+    /// nctx=0 calibration is preserved bit-for-bit when this flag is
+    /// disabled.
+    pub enable_trellis_context_rate: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -827,6 +867,8 @@ impl Default for Vp8EncoderConfig {
             enable_uv_rdo: false,
             enable_mode_ref_lf_deltas: false,
             enable_split_mv_rdo: false,
+            enable_adaptive_lf_deltas: false,
+            enable_trellis_context_rate: false,
         }
     }
 }
@@ -1925,7 +1967,12 @@ fn encode_keyframe_and_reconstruct_with_config(
             // find the EOB that minimises D + λR. Applied only when the
             // opt-in flag is set. Lambda is derived from the dequant step
             // inside apply_trellis_to_mb (calibrated for coeff-level RD).
-            if config.enable_trellis_quant {
+            //
+            // Round-44: when `enable_trellis_context_rate` is on, the
+            // trellis is deferred to a frame-wide pass below that
+            // tracks the actual per-block neighbour token-context the
+            // entropy coder will see — the per-MB call here is skipped.
+            if config.enable_trellis_quant && !config.enable_trellis_context_rate {
                 let has_y2 = y_mode != B_PRED;
                 apply_trellis_to_mb(
                     &mut mb_rec,
@@ -1937,6 +1984,25 @@ fn encode_keyframe_and_reconstruct_with_config(
             }
             mb_encoded.push(mb_rec);
         }
+    }
+
+    // Round-44 context-aware trellis: walk the per-MB encode results in
+    // raster order and re-quantise each block with the actual
+    // above/left non-zero predictor as the entropy-coder context. The
+    // per-MB pass inside the loop above was skipped when this flag
+    // is on, so this is the only trellis pass for the frame.
+    if config.enable_trellis_quant && config.enable_trellis_context_rate {
+        apply_trellis_to_frame_with_context(
+            &mut mb_encoded,
+            &[], // keyframe path — no PMbDecisions, every MB contributes
+            Some(&mb_ymodes),
+            mb_w,
+            mb_h,
+            &segments,
+            &mb_segment_ids,
+            &DEFAULT_COEF_PROBS,
+            config.enable_trellis_full,
+        );
     }
 
     // Apply the in-loop deblocking filter to our reconstruction so the
@@ -2673,8 +2739,17 @@ fn encode_pframe_and_reconstruct(
             };
             // Apply trellis quantisation to P-frame MB (post-process
             // quantised coefficients to minimise RD cost of trailing zeros).
+            //
+            // Round-44: with `enable_trellis_context_rate` on, the
+            // per-MB call is skipped and a frame-wide context-aware
+            // pass runs after the loop (so each block's `nctx` is the
+            // real entropy-coder neighbour predictor instead of the
+            // approximate `nctx=0`).
             let mut mb_rec = mb_rec;
-            if config.enable_trellis_quant && mb_rec.has_coeffs {
+            if config.enable_trellis_quant
+                && !config.enable_trellis_context_rate
+                && mb_rec.has_coeffs
+            {
                 let has_y2 = !matches!(decision, PMbDecision::SplitMv(_))
                     && !matches!(decision, PMbDecision::Intra { y_mode, .. } if y_mode == B_PRED);
                 apply_trellis_to_mb(
@@ -2687,6 +2762,22 @@ fn encode_pframe_and_reconstruct(
             }
             mb_encoded.push(mb_rec);
         }
+    }
+
+    // Round-44 context-aware trellis: deferred frame-wide pass that
+    // tracks the actual above/left non-zero predictor per-block.
+    if config.enable_trellis_quant && config.enable_trellis_context_rate {
+        apply_trellis_to_frame_with_context(
+            &mut mb_encoded,
+            &mb_decisions,
+            Some(&mb_ymodes),
+            mb_w,
+            mb_h,
+            &segments,
+            &mb_segment_ids,
+            &DEFAULT_COEF_PROBS,
+            config.enable_trellis_full,
+        );
     }
 
     // --- Compute optimal frame-level ref-frame probabilities ---
@@ -2720,8 +2811,26 @@ fn encode_pframe_and_reconstruct(
     // from the bitstream we emit below) and also feed it to the joint
     // LF-RDO search so each candidate level is scored against the
     // post-delta reconstruction the decoder will see.
+    //
+    // Round-44: with `enable_adaptive_lf_deltas` on, the static ladder
+    // is replaced by a per-frame estimate from the per-MB unfiltered
+    // luma-SSE distribution: each ref / mode bucket's delta is biased
+    // toward stronger filtering for buckets whose mean SSE exceeds the
+    // frame mean (deblocking helps reconstruction-noisy MBs the most)
+    // and toward lighter filtering for buckets below the frame mean.
+    // Empty buckets fall back to the static ladder so sparse-mode
+    // frames don't get wild deltas.
     let lf_deltas: Option<LfDeltas> = if config.enable_mode_ref_lf_deltas {
-        Some(LfDeltas::round42_default())
+        if config.enable_adaptive_lf_deltas {
+            let mb_sse_y = compute_per_mb_luma_sse(&src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h);
+            Some(LfDeltas::round44_adaptive(
+                &mb_sse_y,
+                &mb_ref_frames,
+                &mb_ymodes,
+            ))
+        } else {
+            Some(LfDeltas::round42_default())
+        }
     } else {
         None
     };
@@ -3605,6 +3714,125 @@ impl LfDeltas {
             mode_deltas: [4, -2, 1, 4],
         }
     }
+
+    /// Round-44 adaptive ladder: estimate per-bucket deltas from the
+    /// per-MB luma SSE distribution of the unfiltered reconstruction
+    /// against the source. The intuition is that the deblocking filter
+    /// is most useful on MBs whose reconstruction error already
+    /// straddles MB boundaries (intra DC blocks at low QP, SPLIT_MV
+    /// MBs whose 4×4 partitions disagree, etc.) and least useful on
+    /// MBs whose reconstruction is already close to the source (zero
+    /// MV against LAST on a static region). For each ref bucket
+    /// (INTRA, LAST, GOLDEN, ALT) and mode bucket (B_PRED,
+    /// ZERO_MV, NEAREST/NEAR/NEW_MV, SPLIT_MV) we compute the mean
+    /// per-MB SSE over the matching MBs. The frame mean is the
+    /// reference; bucket means above the frame mean → positive delta
+    /// (more filtering), buckets below → negative delta. Magnitude
+    /// scales with the bucket-vs-frame deviation in proportional
+    /// units, capped at `±DELTA_CAP` to keep the post-delta level
+    /// inside one segment-tier of the bare frame level (matches the
+    /// libvpx ballpark and the static round-42 ladder magnitudes).
+    /// Buckets with no observed MBs fall back to the static round-42
+    /// ladder so toggling adaptation on a frame with sparse mode
+    /// distribution doesn't introduce wild deltas.
+    ///
+    /// `mb_sse_y` — per-MB unfiltered luma-SSE in raster order.
+    /// `mb_ref_frames` — per-MB ENC_REF_* (INTRA=0, LAST=1, GOLDEN=2,
+    /// ALT=3).
+    /// `mb_ymodes` — per-MB y_mode (DC_PRED..=SPLIT_MV).
+    pub(crate) fn round44_adaptive(
+        mb_sse_y: &[u64],
+        mb_ref_frames: &[u8],
+        mb_ymodes: &[i32],
+    ) -> Self {
+        // Cap magnitude so the post-delta level stays inside one
+        // segment-tier of the bare frame level (matches the static
+        // round-42 ladder values, which max at +4 and min at -2).
+        const DELTA_CAP: i32 = 6;
+        // Frame-mean SSE; the bucket means are compared against this.
+        // Empty frame collapses to the static ladder.
+        let n = mb_sse_y.len();
+        if n == 0 || n != mb_ref_frames.len() || n != mb_ymodes.len() {
+            return Self::round42_default();
+        }
+        let frame_sum: u64 = mb_sse_y.iter().sum();
+        let frame_mean = (frame_sum / n as u64).max(1) as i64;
+
+        // Per-bucket sum/count.
+        let mut ref_sum = [0u64; 4];
+        let mut ref_cnt = [0u32; 4];
+        let mut mode_sum = [0u64; 4];
+        let mut mode_cnt = [0u32; 4];
+        for i in 0..n {
+            let r = (mb_ref_frames[i] as usize) & 3;
+            ref_sum[r] = ref_sum[r].saturating_add(mb_sse_y[i]);
+            ref_cnt[r] = ref_cnt[r].saturating_add(1);
+            let bucket = if mb_ref_frames[i] == ENC_REF_INTRA {
+                // Only B_PRED gets a non-zero entry in the static
+                // ladder; we treat all other intra y_modes as
+                // bucket-0 too so the delta applies uniformly to
+                // intra MBs (whose mode_deltas[0] entry is the
+                // "B_PRED bucket" but in practice fires for any
+                // intra MB whose ref_delta hasn't already steered
+                // the level — matching the decoder's per_mb_filter
+                // logic which tests `ref_frame == INTRA` first).
+                if mb_ymodes[i] == B_PRED {
+                    0
+                } else {
+                    // Non-B_PRED intra: contributes to the same
+                    // bucket as B_PRED for adaptation purposes (the
+                    // decoder doesn't apply mode_deltas[0] to
+                    // non-B_PRED intra, but the adaptation signal
+                    // for that bucket is informative regardless).
+                    0
+                }
+            } else {
+                match mb_ymodes[i] {
+                    ZERO_MV => 1,
+                    SPLIT_MV => 3,
+                    _ => 2, // NEAREST / NEAR / NEW
+                }
+            };
+            mode_sum[bucket] = mode_sum[bucket].saturating_add(mb_sse_y[i]);
+            mode_cnt[bucket] = mode_cnt[bucket].saturating_add(1);
+        }
+
+        // Convert mean deviation into a signed delta.
+        // delta = clamp((bucket_mean - frame_mean) / frame_mean * DELTA_CAP, -DELTA_CAP, DELTA_CAP)
+        // The static ladder is the fallback when a bucket has no
+        // observations (common on flat content where every MB picks
+        // ZERO_MV under LAST).
+        let fallback = Self::round42_default();
+        let bucket_delta = |sum: u64, cnt: u32, fallback_v: i32| -> i32 {
+            if cnt == 0 {
+                return fallback_v;
+            }
+            let mean = (sum / cnt as u64) as i64;
+            // Proportional deviation in 1/32 units: (mean - frame_mean) * 32 / frame_mean.
+            // Scaled by DELTA_CAP / 32 to stay in [-DELTA_CAP, +DELTA_CAP].
+            let dev_x32 = ((mean - frame_mean).saturating_mul(32)) / frame_mean;
+            // Map dev_x32 ∈ approximately [-32, +32] to ±DELTA_CAP.
+            let raw = (dev_x32 * DELTA_CAP as i64) / 32;
+            raw.clamp(-DELTA_CAP as i64, DELTA_CAP as i64) as i32
+        };
+
+        let ref_deltas = [
+            bucket_delta(ref_sum[0], ref_cnt[0], fallback.ref_deltas[0]),
+            bucket_delta(ref_sum[1], ref_cnt[1], fallback.ref_deltas[1]),
+            bucket_delta(ref_sum[2], ref_cnt[2], fallback.ref_deltas[2]),
+            bucket_delta(ref_sum[3], ref_cnt[3], fallback.ref_deltas[3]),
+        ];
+        let mode_deltas = [
+            bucket_delta(mode_sum[0], mode_cnt[0], fallback.mode_deltas[0]),
+            bucket_delta(mode_sum[1], mode_cnt[1], fallback.mode_deltas[1]),
+            bucket_delta(mode_sum[2], mode_cnt[2], fallback.mode_deltas[2]),
+            bucket_delta(mode_sum[3], mode_cnt[3], fallback.mode_deltas[3]),
+        ];
+        Self {
+            ref_deltas,
+            mode_deltas,
+        }
+    }
 }
 
 /// Compute the per-MB loop-filter level after the round-42 mode/ref
@@ -3667,6 +3895,51 @@ fn lambda_for_qp(qp: u32, scale: u32) -> u32 {
 
 /// SSE of a 16x16 luma MB at `(mb_x, mb_y)` predicted from `ref_y` shifted
 /// by `(dy, dx)` integer luma pixels (with edge clamping).
+/// Per-MB unfiltered luma-SSE between source and reconstruction, used by
+/// the round-44 adaptive LF-delta estimator. Each entry is the sum of
+/// `(src - rec)²` over the MB's 16×16 luma tile. The buffers are
+/// expected to share `stride` and `buf_h` (already padded to MB
+/// granularity by the encode-loop allocators).
+///
+/// Returned vector is in raster order (`mb_y * mb_w + mb_x`), one entry
+/// per MB.
+fn compute_per_mb_luma_sse(
+    src_y: &[u8],
+    rec_y: &[u8],
+    stride: usize,
+    buf_h: usize,
+    mb_w: usize,
+    mb_h: usize,
+) -> Vec<u64> {
+    let mut out = Vec::with_capacity(mb_w * mb_h);
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            let y0 = my * 16;
+            let x0 = mx * 16;
+            let mut sse: u64 = 0;
+            for r in 0..16 {
+                let yy = y0 + r;
+                if yy >= buf_h {
+                    break;
+                }
+                let row_off = yy * stride;
+                for c in 0..16 {
+                    let xx = x0 + c;
+                    if xx >= stride {
+                        break;
+                    }
+                    let s = src_y[row_off + xx] as i32;
+                    let p = rec_y[row_off + xx] as i32;
+                    let d = s - p;
+                    sse += (d * d) as u64;
+                }
+            }
+            out.push(sse);
+        }
+    }
+    out
+}
+
 fn mb_luma_sse_at_int(
     src_y: &[u8],
     ref_y: &[u8],
@@ -5839,6 +6112,273 @@ fn apply_trellis_to_mb(
             .iter()
             .flat_map(|b| b.iter())
             .any(|&v| v != 0);
+}
+
+/// Round-44 context-aware trellis pass. Walks the per-MB encode results
+/// in raster order, tracking the per-block above/left non-zero predictor
+/// the same way [`emit_tokens`] does, and re-runs the trellis with the
+/// actual `nctx ∈ {0,1,2}` for every block. The trellis decisions feed
+/// back into the running nz-state so subsequent blocks see the
+/// post-trellis neighbour context (matching what the entropy coder
+/// will see at write time).
+///
+/// `decisions` may be empty (keyframe path) — every MB contributes
+/// tokens with non-skip semantics. On the inter path, SKIP MBs reset
+/// neighbour state and skip the trellis (no tokens emitted, so no
+/// quantisation to optimise).
+///
+/// `ymodes` supplies each MB's Y mode (mirrors `emit_tokens` parameter
+/// of the same name) so `has_y2` matches the bitstream's actual block
+/// layout.
+fn apply_trellis_to_frame_with_context(
+    mb_encoded: &mut [MbEncoded],
+    decisions: &[PMbDecision],
+    ymodes: Option<&[i32]>,
+    mb_w: usize,
+    mb_h: usize,
+    segments: &SegmentCtx,
+    mb_segment_ids: &[u8],
+    probs: &CoeffProbs,
+    full: bool,
+) {
+    use crate::tables::token_tree::ZIGZAG;
+    let raw_zero_16 = [0i32; 16];
+
+    let mut nz_y_above = vec![[0u8; 4]; mb_w];
+    let mut nz_uv_above = vec![[0u8; 2]; mb_w];
+    let mut nz_v_above = vec![[0u8; 2]; mb_w];
+    let mut nz_y2_above = vec![0u8; mb_w];
+
+    for mb_y in 0..mb_h {
+        let mut nz_y_left = [0u8; 4];
+        let mut nz_u_left = [0u8; 2];
+        let mut nz_v_left = [0u8; 2];
+        let mut nz_y2_left = 0u8;
+        for mb_x in 0..mb_w {
+            let mb_idx = mb_y * mb_w + mb_x;
+            let decision = decisions.get(mb_idx);
+            let is_skip = decision.is_some_and(|d| matches!(d, PMbDecision::Skip));
+            let y_mode = ymodes
+                .and_then(|m| m.get(mb_idx))
+                .copied()
+                .unwrap_or(DC_PRED);
+            let is_split = matches!(decision, Some(PMbDecision::SplitMv(_)));
+            let has_y2 = y_mode != B_PRED && !is_split;
+            // Per-MB QuantCtx (segmentation-aware lambda).
+            let q = segments.quant_for(*mb_segment_ids.get(mb_idx).unwrap_or(&0));
+            let lambda_y2 = {
+                let s = q.y2_ac as u64;
+                (s * s) / TRELLIS_LAMBDA_DENOM
+            };
+            let lambda_y = {
+                let s = q.y_ac as u64;
+                (s * s) / TRELLIS_LAMBDA_DENOM
+            };
+            let lambda_uv = {
+                let s = q.uv_ac as u64;
+                (s * s) / TRELLIS_LAMBDA_DENOM
+            };
+
+            if is_skip {
+                if has_y2 {
+                    nz_y2_above[mb_x] = 0;
+                    nz_y2_left = 0;
+                }
+                for bx in 0..4 {
+                    nz_y_above[mb_x][bx] = 0;
+                    nz_y_left[bx] = 0;
+                }
+                for bx in 0..2 {
+                    nz_uv_above[mb_x][bx] = 0;
+                    nz_u_left[bx] = 0;
+                    nz_v_above[mb_x][bx] = 0;
+                    nz_v_left[bx] = 0;
+                }
+                continue;
+            }
+
+            let mb_enc = &mut mb_encoded[mb_idx];
+
+            // Y2 block (plane=1).
+            if has_y2 {
+                let nctx = (nz_y2_above[mb_x] + nz_y2_left) as usize;
+                if full {
+                    mb_enc.y2_coeffs = trellis_quant_block_full(
+                        &mb_enc.y2_coeffs,
+                        q.y2_dc,
+                        q.y2_ac,
+                        lambda_y2,
+                        probs,
+                        1,
+                        nctx,
+                        0,
+                    );
+                }
+                mb_enc.y2_coeffs = trellis_quant_block(
+                    &mb_enc.y2_coeffs,
+                    &raw_zero_16,
+                    q.y2_dc,
+                    q.y2_ac,
+                    lambda_y2,
+                    probs,
+                    1,
+                    nctx,
+                    0,
+                );
+                let nzf = if mb_enc.y2_coeffs.iter().any(|&v| v != 0) {
+                    1
+                } else {
+                    0
+                };
+                nz_y2_above[mb_x] = nzf;
+                nz_y2_left = nzf;
+            }
+
+            // Y blocks.
+            let (y_plane, y_start) = if has_y2 {
+                (0usize, 1usize)
+            } else {
+                (3usize, 0usize)
+            };
+            for by in 0..4 {
+                for bx in 0..4 {
+                    let bi = by * 4 + bx;
+                    let nctx = (nz_y_above[mb_x][bx] + nz_y_left[by]) as usize;
+                    if full {
+                        mb_enc.y_coeffs[bi] = trellis_quant_block_full(
+                            &mb_enc.y_coeffs[bi],
+                            q.y_dc,
+                            q.y_ac,
+                            lambda_y,
+                            probs,
+                            y_plane,
+                            nctx,
+                            y_start,
+                        );
+                    }
+                    mb_enc.y_coeffs[bi] = trellis_quant_block(
+                        &mb_enc.y_coeffs[bi],
+                        &raw_zero_16,
+                        q.y_dc,
+                        q.y_ac,
+                        lambda_y,
+                        probs,
+                        y_plane,
+                        nctx,
+                        y_start,
+                    );
+                    // Compute nz from the (possibly trimmed) post-trellis block.
+                    // For the `start` offset path, position 0 of the natural
+                    // array isn't part of the token stream — but the nz
+                    // predictor in the decoder tests "any token written" so
+                    // we walk start..16 in scan order.
+                    let nzf = if (y_start..16).any(|n| mb_enc.y_coeffs[bi][ZIGZAG[n]] != 0) {
+                        1
+                    } else {
+                        0
+                    };
+                    nz_y_above[mb_x][bx] = nzf;
+                    nz_y_left[by] = nzf;
+                }
+            }
+
+            // U blocks (plane=2).
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let bi = by * 2 + bx;
+                    let nctx = (nz_uv_above[mb_x][bx] + nz_u_left[by]) as usize;
+                    if full {
+                        mb_enc.u_coeffs[bi] = trellis_quant_block_full(
+                            &mb_enc.u_coeffs[bi],
+                            q.uv_dc,
+                            q.uv_ac,
+                            lambda_uv,
+                            probs,
+                            2,
+                            nctx,
+                            0,
+                        );
+                    }
+                    mb_enc.u_coeffs[bi] = trellis_quant_block(
+                        &mb_enc.u_coeffs[bi],
+                        &raw_zero_16,
+                        q.uv_dc,
+                        q.uv_ac,
+                        lambda_uv,
+                        probs,
+                        2,
+                        nctx,
+                        0,
+                    );
+                    let nzf = if mb_enc.u_coeffs[bi].iter().any(|&v| v != 0) {
+                        1
+                    } else {
+                        0
+                    };
+                    nz_uv_above[mb_x][bx] = nzf;
+                    nz_u_left[by] = nzf;
+                }
+            }
+
+            // V blocks (plane=2). Note: emit_tokens uses a SEPARATE
+            // nz_v_above tracker (V is encoded as a new plane after U
+            // completes), so we mirror that exactly.
+            for by in 0..2 {
+                for bx in 0..2 {
+                    let bi = by * 2 + bx;
+                    let nctx = (nz_v_above[mb_x][bx] + nz_v_left[by]) as usize;
+                    if full {
+                        mb_enc.v_coeffs[bi] = trellis_quant_block_full(
+                            &mb_enc.v_coeffs[bi],
+                            q.uv_dc,
+                            q.uv_ac,
+                            lambda_uv,
+                            probs,
+                            2,
+                            nctx,
+                            0,
+                        );
+                    }
+                    mb_enc.v_coeffs[bi] = trellis_quant_block(
+                        &mb_enc.v_coeffs[bi],
+                        &raw_zero_16,
+                        q.uv_dc,
+                        q.uv_ac,
+                        lambda_uv,
+                        probs,
+                        2,
+                        nctx,
+                        0,
+                    );
+                    let nzf = if mb_enc.v_coeffs[bi].iter().any(|&v| v != 0) {
+                        1
+                    } else {
+                        0
+                    };
+                    nz_v_above[mb_x][bx] = nzf;
+                    nz_v_left[by] = nzf;
+                }
+            }
+
+            // Update has_coeffs to reflect the post-trellis state.
+            mb_enc.has_coeffs = mb_enc.y2_coeffs.iter().any(|&v| v != 0)
+                || mb_enc
+                    .y_coeffs
+                    .iter()
+                    .flat_map(|b| b.iter())
+                    .any(|&v| v != 0)
+                || mb_enc
+                    .u_coeffs
+                    .iter()
+                    .flat_map(|b| b.iter())
+                    .any(|&v| v != 0)
+                || mb_enc
+                    .v_coeffs
+                    .iter()
+                    .flat_map(|b| b.iter())
+                    .any(|&v| v != 0);
+        }
+    }
 }
 
 /// Build 4×4 neighbour array for a sub-block. Matches the decoder's

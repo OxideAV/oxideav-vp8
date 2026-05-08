@@ -211,6 +211,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
     }
 }
 
@@ -242,6 +244,8 @@ fn split_mv_rdo_keyframe_decodes_cleanly() {
     let clip = make_half_step_clip(1);
     let cfg = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -257,6 +261,8 @@ fn split_mv_rdo_pframe_decodes_cleanly() {
     let clip = make_half_step_clip(8);
     let cfg = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -277,6 +283,8 @@ fn split_mv_rdo_byte_envelope_within_20pct() {
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -297,6 +305,8 @@ fn split_mv_rdo_psnr_does_not_regress_significantly() {
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -318,6 +328,8 @@ fn split_mv_rdo_flat_content_is_byte_identical() {
     let baseline = cfg_baseline();
     let with_rdo = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -343,11 +355,15 @@ fn split_mv_rdo_requires_enable_rdo() {
     let cfg_a = Vp8EncoderConfig {
         enable_rdo: false,
         enable_split_mv_rdo: false,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_rdo: false,
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         ..cfg_baseline()
     };
 
@@ -372,6 +388,8 @@ fn round43_combined_with_round42_decodes_cleanly() {
     let clip = make_half_step_clip(8);
     let cfg = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
+        enable_adaptive_lf_deltas: false,
+        enable_trellis_context_rate: false,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,
         enable_joint_lf_rdo: true,

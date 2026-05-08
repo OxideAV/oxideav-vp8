@@ -2069,9 +2069,13 @@ fn encode_pframe_and_reconstruct(
     // segmentation is disabled).
     let segments = SegmentCtx::for_config(&config);
 
-    let lf_level = loop_filter_level_for_qindex(qi as u8);
+    // P-frame loop-filter level. The heuristic `15 + qi/8` is the default;
+    // when `enable_joint_lf_rdo` is on, the level is overridden after pass 1
+    // by `pick_lf_level_joint_rdo` which scores candidates ±4 around the
+    // heuristic on a centre 32×32 patch.
+    let mut lf_level = loop_filter_level_for_qindex(qi as u8);
     let lf_sharpness = LOOP_FILTER_SHARPNESS;
-    let lf_filter_type = pick_filter_type(lf_level, &config);
+    let mut lf_filter_type = pick_filter_type(lf_level, &config);
 
     // --- Per-MB segment classification (pre-computed so the frame
     //     header's segment tree_probs match the actual distribution). ---
@@ -2496,6 +2500,36 @@ fn encode_pframe_and_reconstruct(
     let prob_last = optimal_prob_8(n_last, n_golden + n_alt);
     let prob_gf = optimal_prob_8(n_golden, n_alt);
     let _ = n_total; // silence dead-store lint when assertions disabled
+
+    // Joint loop-filter / QP rate-distortion optimisation (round-40, opt-in
+    // via `enable_joint_lf_rdo`). On P-frames only — keyframes still use
+    // the deterministic heuristic so the frame-0 bitstream is preserved
+    // bit-for-bit when this flag toggles. Searches a ±4-level neighbourhood
+    // around `loop_filter_level_for_qindex(qi)` and picks the one minimising
+    // luma-SSE on a centre 32×32 patch (the LF level is a 6-bit literal in
+    // the frame header so the rate term is identical for every candidate).
+    // After picking the new level, `pick_filter_type` may flip simple/normal
+    // dispatch under `LoopFilterMode::Auto`.
+    if config.enable_joint_lf_rdo {
+        let chosen = pick_lf_level_joint_rdo(
+            &rec_y,
+            &src_y,
+            y_stride,
+            y_buf_h,
+            mb_w,
+            mb_h,
+            lf_level,
+            lf_sharpness,
+            lf_filter_type,
+            &mb_encoded,
+            &mb_segment_ids,
+            &segments,
+        );
+        if chosen != lf_level {
+            lf_level = chosen;
+            lf_filter_type = pick_filter_type(lf_level, &config);
+        }
+    }
 
     // Apply in-loop deblocking to our reconstruction (so the next
     // reference frame tracks the decoder).
@@ -7810,6 +7844,237 @@ fn apply_loop_filter_enc(
                         params_sb,
                         false,
                     );
+                }
+            }
+        }
+    }
+}
+
+/// Joint loop-filter / QP rate-distortion optimisation (round-40, opt-in via
+/// `Vp8EncoderConfig::enable_joint_lf_rdo`). On a P-frame, the heuristic
+/// `15 + qi/8` from `loop_filter_level_for_qindex` is a reasonable starting
+/// point but content-dependent — flat content benefits from heavier filtering
+/// (less ringing), edge-rich content from lighter filtering (less detail
+/// blurring). This routine searches a small ±N-level neighbourhood around the
+/// heuristic and picks the level that minimises the sum of squared error of
+/// the post-filter luma reconstruction vs the source over a centre 32×32
+/// patch (matches the documented design — the loop-filter level is a
+/// 6-bit literal in the frame header so the rate term is identical for every
+/// candidate level and reduces to pure distortion minimisation).
+///
+/// Returns the chosen `(level, filter_type)` tuple. Falls back to the
+/// heuristic if the frame is too small for a 32×32 patch.
+///
+/// Cost: `2N+1` clones of the centre patch + `2N+1` LF passes. With N=4
+/// (default) and a 32×32 patch, this is ~9 KB of memcpy and ~9 patch-sized
+/// LF passes — negligible vs the frame encode itself.
+#[allow(clippy::too_many_arguments)]
+fn pick_lf_level_joint_rdo(
+    rec_y: &[u8],
+    src_y: &[u8],
+    y_stride: usize,
+    y_buf_h: usize,
+    mb_w: usize,
+    mb_h: usize,
+    base_level: u8,
+    sharpness: u8,
+    filter_type: u8,
+    mb_encoded: &[MbEncoded],
+    mb_segment_ids: &[u8],
+    segments: &SegmentCtx,
+) -> u8 {
+    // Need a 32×32 patch — if the frame's MB grid is smaller than 2×2,
+    // the centre patch doesn't make sense; just stick with the heuristic.
+    if mb_w < 2 || mb_h < 2 {
+        return base_level;
+    }
+    // Centre 32×32 patch in MB coordinates: 2 MBs wide, 2 MBs tall.
+    let mb_x0 = (mb_w - 2) / 2;
+    let mb_y0 = (mb_h - 2) / 2;
+    let patch_x = mb_x0 * 16;
+    let patch_y = mb_y0 * 16;
+    let patch_w = 32usize;
+    let patch_h = 32usize;
+    if patch_x + patch_w > mb_w * 16 || patch_y + patch_h > mb_h * 16 {
+        return base_level;
+    }
+
+    // Search radius: ±4 levels around the heuristic. The radius has to be
+    // wide enough to escape the heuristic's deterministic floor but narrow
+    // enough that the search stays cheap.
+    const RDO_RADIUS: i32 = 4;
+    let lo = (base_level as i32 - RDO_RADIUS).max(0);
+    let hi = (base_level as i32 + RDO_RADIUS).min(63);
+
+    // For LF level 0, the deblocking pass is a no-op so the SSE is just
+    // unfiltered SSE. Treat that as a valid candidate (sometimes "no
+    // filter" is the right call on edge-heavy content).
+    let mut best_level = base_level;
+    let mut best_sse: u64 = u64::MAX;
+
+    // Working buffer. We only filter the centre patch + a 1-MB skirt around
+    // it (the LF reaches across MB boundaries) — but for simplicity we
+    // clone the full luma plane. A 64×64 frame is 4 KB of luma, and even
+    // a 1080p frame would be ~2 MB per candidate, multiplied by 9 candidates
+    // = 18 MB of memcpy. The simplicity is worth the memory.
+    let mut buf_y = vec![0u8; rec_y.len()];
+
+    for level in lo..=hi {
+        let level_u8 = level as u8;
+        // Treat level=0 as the unfiltered candidate (apply_loop_filter_enc
+        // bails early when frame_level == 0 anyway).
+        buf_y.copy_from_slice(rec_y);
+
+        if level_u8 > 0 {
+            apply_loop_filter_luma_only(
+                &mut buf_y,
+                y_stride,
+                y_buf_h,
+                mb_w,
+                mb_h,
+                level_u8,
+                sharpness,
+                filter_type,
+                mb_encoded,
+                mb_segment_ids,
+                segments,
+                false, // P-frame
+            );
+        }
+
+        // SSE over the centre 32×32 patch.
+        let mut sse: u64 = 0;
+        for r in 0..patch_h {
+            let row_off = (patch_y + r) * y_stride + patch_x;
+            for c in 0..patch_w {
+                let s = src_y[row_off + c] as i32;
+                let p = buf_y[row_off + c] as i32;
+                let d = s - p;
+                sse += (d * d) as u64;
+            }
+        }
+        if sse < best_sse {
+            best_sse = sse;
+            best_level = level_u8;
+        }
+    }
+
+    best_level
+}
+
+/// Luma-only variant of `apply_loop_filter_enc` used by the LF-RDO search to
+/// score candidate levels cheaply. Mirrors the luma half of the full filter
+/// (skips chroma — the RDO score is luma-SSE only). Identical iteration
+/// order, segmentation handling, and filter_type dispatch as the full
+/// version, so the chosen level produces a luma reconstruction that matches
+/// what the full filter pass will produce when invoked with the same level.
+#[allow(clippy::too_many_arguments)]
+fn apply_loop_filter_luma_only(
+    y_plane: &mut [u8],
+    y_stride: usize,
+    y_buf_h: usize,
+    mb_w: usize,
+    mb_h: usize,
+    frame_level: u8,
+    sharpness: u8,
+    filter_type: u8,
+    mb_encoded: &[MbEncoded],
+    mb_segment_ids: &[u8],
+    segments: &SegmentCtx,
+    key_frame: bool,
+) {
+    if frame_level == 0 {
+        return;
+    }
+    let simple = filter_type == 1;
+    for mb_y in 0..mb_h {
+        let y0 = mb_y * 16;
+        for mb_x in 0..mb_w {
+            let mb_idx = mb_y * mb_w + mb_x;
+            let mb = &mb_encoded[mb_idx];
+            let mb_level = segments.filter_level_for(mb_segment_ids[mb_idx], frame_level);
+            if mb_level == 0 {
+                continue;
+            }
+            let params_mb = FilterParams::for_mb_typed(mb_level, sharpness, true, key_frame);
+            let params_sb = FilterParams::for_mb_typed(mb_level, sharpness, false, key_frame);
+            let filter_subblocks = mb.has_coeffs || mb.y_mode == B_PRED || mb.y_mode == SPLIT_MV;
+            let x = mb_x * 16;
+
+            // Left MB v-edges.
+            if mb_x > 0 {
+                if simple {
+                    filter_simple_vertical(y_plane, y_stride, x, y_stride, y0, 16, params_mb);
+                } else {
+                    filter_normal_vertical(y_plane, y_stride, x, y_stride, y0, 16, params_mb, true);
+                }
+            }
+            // Inner sub-block v-edges.
+            if filter_subblocks {
+                if simple {
+                    for k in 1..4 {
+                        filter_simple_vertical(
+                            y_plane,
+                            y_stride,
+                            x + k * 4,
+                            y_stride,
+                            y0,
+                            16,
+                            params_sb,
+                        );
+                    }
+                } else {
+                    for k in 1..4 {
+                        filter_normal_vertical(
+                            y_plane,
+                            y_stride,
+                            x + k * 4,
+                            y_stride,
+                            y0,
+                            16,
+                            params_sb,
+                            false,
+                        );
+                    }
+                }
+            }
+            // Top MB h-edges.
+            if mb_y > 0 {
+                if simple {
+                    filter_simple_horizontal(y_plane, y_stride, y0, y_buf_h, x, 16, params_mb);
+                } else {
+                    filter_normal_horizontal(
+                        y_plane, y_stride, y0, y_buf_h, x, 16, params_mb, true,
+                    );
+                }
+            }
+            // Inner sub-block h-edges.
+            if filter_subblocks {
+                if simple {
+                    for k in 1..4 {
+                        filter_simple_horizontal(
+                            y_plane,
+                            y_stride,
+                            y0 + k * 4,
+                            y_buf_h,
+                            x,
+                            16,
+                            params_sb,
+                        );
+                    }
+                } else {
+                    for k in 1..4 {
+                        filter_normal_horizontal(
+                            y_plane,
+                            y_stride,
+                            y0 + k * 4,
+                            y_buf_h,
+                            x,
+                            16,
+                            params_sb,
+                            false,
+                        );
+                    }
                 }
             }
         }

@@ -312,6 +312,23 @@ when activity is degenerate (uniform-noise frames). Strength
 controlled by `aq_qindex_range` (default `8`). Opt-in; default
 `false`.
 
+**Joint loop-filter / QP RDO (round-40)** — when
+`enable_joint_lf_rdo = true`, the per-frame loop-filter level on
+P-frames is picked by a small RDO search around the heuristic
+`loop_filter_level_for_qindex(qi) = 15 + qi/8`. After pass 1 builds
+the unfiltered reconstruction, the encoder iterates ±4 levels around
+the heuristic, applies a luma-only LF pass on a clone for each
+candidate, and picks the level that minimises luma SSE-vs-source on
+a centre 32×32 patch. The LF level is a 6-bit literal in the frame
+header so the rate term is identical for every candidate — the
+search reduces to pure distortion minimisation but lets content-
+dependent characteristics (edge density, residual magnitude) override
+the deterministic formula on a per-frame basis. Cost is bounded to
+9 luma-only LF passes per P-frame, negligible vs the per-MB ME / RDO
+budget. Keyframes still use the heuristic (the frame-0 bitstream is
+bit-identical when this flag toggles). Effective only on P-frames;
+opt-in; default `false`.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,

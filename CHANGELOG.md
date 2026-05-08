@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* Joint loop-filter / QP rate-distortion optimisation
+  (round-40). The previously-reserved `Vp8EncoderConfig::enable_joint_lf_rdo`
+  flag is now active. When set on a P-frame, after pass 1 has built the
+  unfiltered reconstruction the encoder searches a ±4-level neighbourhood
+  around the deterministic `loop_filter_level_for_qindex(qi) = 15 + qi/8`
+  heuristic and picks the level that minimises luma SSE-vs-source on a
+  centre 32×32 patch. The LF level is a 6-bit literal in the frame
+  header so the rate term `R(level)` is identical for every candidate;
+  the search is therefore pure distortion minimisation, but lets
+  content-dependent characteristics (edge density, residual magnitude)
+  override the deterministic formula on a per-frame basis. Cost is bounded
+  to `2·radius+1 = 9` luma-only LF passes on a clone of the reconstruction —
+  negligible vs the per-MB ME / RDO / quantiser budget. Implementation
+  introduces a luma-only variant of the existing `apply_loop_filter_enc`
+  walker (`apply_loop_filter_luma_only`) so the search doesn't pay for
+  chroma it doesn't score. After the new level is chosen, `pick_filter_type`
+  re-runs to keep the simple/normal dispatch consistent with the chosen
+  level under `LoopFilterMode::Auto`. Keyframes are unchanged — they still
+  use the heuristic so the frame-0 bitstream remains bit-identical when
+  the flag toggles. Default off (opt-in); enabling preserves a valid
+  decodable bitstream and PSNR_Y stays within 0.5 dB of the heuristic
+  path on a smooth-pan clip with high-frequency edge noise. Six
+  integration tests in `tests/encoder_round_40.rs` pin: keyframe-only
+  bit-identical, P-frame clean decode, PSNR-Y non-regression, byte
+  envelope ±15 %, segmentation interaction, default-off.
+
 ## [0.1.11](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.10...v0.1.11) - 2026-05-05
 
 ### Other

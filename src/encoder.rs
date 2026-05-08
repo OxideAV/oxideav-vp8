@@ -706,6 +706,28 @@ pub struct Vp8EncoderConfig {
     /// keyframes (the first frame's filter level still uses the
     /// heuristic).
     pub enable_joint_lf_rdo: bool,
+    /// Enable rate-distortion optimisation for B_PRED 4×4 intra sub-modes
+    /// (round-41). When `false` (default), each per-4×4 mode is picked
+    /// as the SSE-min of the 10 candidates against the source; when
+    /// `true`, each candidate is scored as `D + λ·R` where `D` is the
+    /// same SSE and `R` is the bool-coder cost (in 1/256-bit units) of
+    /// writing the `BMODE_TREE` path under the appropriate context
+    /// probabilities (`KF_BMODE_PROB[above][left]` on keyframes,
+    /// `vp8_bmode_prob` on intra-in-P). The 16×16-vs-B_PRED outer
+    /// selector still compares pure SSE — only the per-sub-block inner
+    /// search is rate-aware. λ comes from [`lambda_for_qp`], the same
+    /// multiplier the per-MB ref/mode picker uses, so RDO trade-offs
+    /// are coherent across all encoder decisions.
+    ///
+    /// Off-by-default so the existing greedy SSE selection is preserved
+    /// bit-for-bit when this flag is disabled. Requires
+    /// [`enable_rdo`] = `true`; ignored otherwise (with `enable_rdo` =
+    /// `false` λ collapses to 0 and the rate term washes out, but the
+    /// gating is explicit so the cost-table indexing isn't reached for
+    /// users who disable RDO entirely).
+    ///
+    /// [`enable_rdo`]: Vp8EncoderConfig::enable_rdo
+    pub enable_bpred_rdo: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -747,6 +769,7 @@ impl Default for Vp8EncoderConfig {
             enable_aq: false,
             aq_qindex_range: DEFAULT_AQ_QINDEX_RANGE,
             enable_joint_lf_rdo: false,
+            enable_bpred_rdo: false,
         }
     }
 }
@@ -1678,6 +1701,14 @@ fn encode_keyframe_and_reconstruct_with_config(
     //     and the best chroma mode per MB, emit the tree path, then encode
     //     the residual.
     let mut mb_encoded: Vec<MbEncoded> = Vec::with_capacity(mb_w * mb_h);
+    // Round-41 BMODE-RDO lambda. `0` recovers SSE-greedy bit-exactly; the
+    // round-41 knob multiplies by `lambda_for_qp(qi)` so the rate term is
+    // weighted at the same magnitude the per-MB ref/mode picker uses.
+    let bpred_rdo_lambda_x256: u64 = if config.enable_bpred_rdo && config.enable_rdo {
+        lambda_for_qp(qi as u32, config.lambda_scale) as u64
+    } else {
+        0
+    };
     // Track the 4x4 bmode of the bottom row of each MB column (propagation
     // context for B_PRED of the MB below). Matches decoder's `bmode_above`.
     let mut bmode_above: Vec<[i32; 4]> = vec![[B_DC_PRED; 4]; mb_w];
@@ -1766,6 +1797,7 @@ fn encode_keyframe_and_reconstruct_with_config(
                     mb_x,
                     mb_y,
                     mb_w,
+                    bpred_rdo_lambda_x256,
                 );
                 // After emission the per-block modes in mb_bmodes are
                 // populated; propagate the bottom row to bmode_above for
@@ -2172,6 +2204,15 @@ fn encode_pframe_and_reconstruct(
     } else {
         0
     };
+    // Round-41 BMODE-RDO lambda. Same magnitude as the per-MB ref/mode
+    // picker's lambda; `0` recovers the SSE-greedy bit-exact selection
+    // when the knob is disabled. Only used by the intra-in-P B_PRED
+    // pass-1 pre-compute below; non-B_PRED MBs are unaffected.
+    let bpred_rdo_lambda_x256: u64 = if config.enable_bpred_rdo && config.enable_rdo {
+        lambda as u64
+    } else {
+        0
+    };
     // Psy-RDO: pre-compute per-frame mean activity and per-MB activity
     // array. Only materialised when `enable_psy_rdo` is set and RDO is
     // active; otherwise the vectors stay empty and the per-MB picker uses
@@ -2347,15 +2388,51 @@ fn encode_pframe_and_reconstruct(
                     _ => unreachable!(),
                 };
                 if y_mode == B_PRED {
-                    let chosen = choose_b_pred_modes(
-                        &src_y,
-                        &rec_y,
-                        y_stride,
-                        mb_x * 16,
-                        mb_y * 16,
-                        mb_w,
-                        mb_h,
-                    );
+                    // Round-41 RDO knob: when `enable_bpred_rdo` is on,
+                    // pick per-4×4 modes by `D + λ·R` against the
+                    // intra-in-P static `DEFAULT_BMODE_PROBS` (the
+                    // probs the bitstream will pay). When the knob is
+                    // off this collapses to the legacy SSE-greedy
+                    // selection — preserves bit-exact behaviour by
+                    // construction (lambda is forced to 0 below).
+                    let chosen = if bpred_rdo_lambda_x256 > 0 {
+                        // `above` / `left` neighbour context, mirroring
+                        // pass-2's bool-emit path: above row from the
+                        // running `bmode_above` (defaults to B_DC_PRED on
+                        // row 0), left from the previous MB's bmodes
+                        // (or `intra_to_b_mode` of the MB Y-mode when
+                        // it isn't itself B_PRED).
+                        let above_for_mb = bmode_above[mb_x];
+                        let left_bmodes: [i32; 4] = if mb_x > 0 {
+                            let l_idx = mb_y * mb_w + mb_x - 1;
+                            let l_bm = &mb_bmodes[l_idx];
+                            [l_bm[3], l_bm[7], l_bm[11], l_bm[15]]
+                        } else {
+                            [B_DC_PRED; 4]
+                        };
+                        choose_b_pred_modes_rdo(
+                            &src_y,
+                            &rec_y,
+                            y_stride,
+                            mb_x * 16,
+                            mb_y * 16,
+                            mb_w,
+                            &above_for_mb,
+                            &left_bmodes,
+                            false,
+                            bpred_rdo_lambda_x256,
+                        )
+                    } else {
+                        choose_b_pred_modes(
+                            &src_y,
+                            &rec_y,
+                            y_stride,
+                            mb_x * 16,
+                            mb_y * 16,
+                            mb_w,
+                            mb_h,
+                        )
+                    };
                     let bm = &mut mb_bmodes[mb_idx];
                     bm.copy_from_slice(&chosen);
                     bmode_above[mb_x] = [bm[12], bm[13], bm[14], bm[15]];
@@ -7082,6 +7159,149 @@ fn choose_b_pred_modes(
     modes
 }
 
+/// Bool-coder rate cost (in 1/256-bit units) of writing the BMODE_TREE
+/// path for sub-mode `m` under the given 9-entry probability vector.
+/// Used by the round-41 B_PRED RDO path to score `D + λ·R` per
+/// candidate. `m` must be one of `B_DC_PRED..=B_HU_PRED`; the function
+/// indexes [`BMODE_PATHS`] without bounds-check fallback.
+#[inline]
+fn bmode_rate_x256(m: i32, probs: &[u8; 9]) -> u32 {
+    let path = BMODE_PATHS[m as usize];
+    let mut r = 0u32;
+    for &(idx, bit) in path {
+        r += bool_cost_x256(probs[idx as usize], bit);
+    }
+    r
+}
+
+/// Rate-aware variant of [`choose_b_pred_modes`] used by the round-41
+/// `enable_bpred_rdo` path. For each of the 16 sub-blocks we evaluate
+/// all 10 candidates and pick the minimiser of `D + λ·R` where
+///
+///   * `D` = SSE of the predicted 4×4 vs the source (same as the
+///     greedy path),
+///   * `R` = bool-coder cost (1/256 bit) of writing the BMODE_TREE
+///     path under `probs[above][left]` for keyframes (see
+///     `KF_BMODE_PROB`) or under the constant `vp8_bmode_prob` for
+///     intra-in-P MBs.
+///
+/// `lambda_x256` is the same multiplier the per-MB ref/mode picker
+/// uses; the unit is "lambda · (1/256 bit)" → exactly one term of
+/// `lambda_for_qp(qi, scale)` per `1/256` rate bit. With `λ = 0`
+/// (i.e. RDO disabled or `lambda_scale == 0`) the rate term is
+/// suppressed and the function recovers the SSE-greedy mode.
+///
+/// `keyframe = true` enables the `KF_BMODE_PROB[above][left]` lookup;
+/// `keyframe = false` uses the static intra-in-P table. The walk's
+/// `above` / `left` neighbour rules match those in
+/// [`emit_bmodes_keyframe`] so the cost the picker minimises is the
+/// cost the bitstream will actually pay.
+fn choose_b_pred_modes_rdo(
+    src_y: &[u8],
+    rec_y: &[u8],
+    y_stride: usize,
+    mb_xp: usize,
+    mb_yp: usize,
+    mb_w: usize,
+    bmode_above_for_mb: &[i32; 4],
+    left_bmodes_in: &[i32; 4],
+    keyframe: bool,
+    lambda_x256: u64,
+) -> [i32; 16] {
+    // Constant intra-in-P bmode probability vector (matches the static
+    // `DEFAULT_BMODE_PROBS` used by the bool-emit path on intra-in-P MBs).
+    const DEFAULT_BMODE_PROBS: [u8; 9] = [120, 90, 79, 133, 87, 85, 80, 111, 151];
+
+    let above_right_extension: [u8; 4] = if mb_yp > 0 {
+        let row = mb_yp - 1;
+        let mut ext = [0u8; 4];
+        for k in 0..4 {
+            let xx = mb_xp + 16 + k;
+            if xx < mb_w * 16 {
+                ext[k] = rec_y[row * y_stride + xx];
+            } else {
+                ext[k] = rec_y[row * y_stride + (mb_xp + 15)];
+            }
+        }
+        ext
+    } else {
+        [127; 4]
+    };
+    // `this_mb_bmodes` mirrors the live mode walk so per-block neighbour
+    // context (above / left) is observable at every step. Initialised to
+    // B_DC_PRED so reads of unfilled slots match the sub-block's
+    // pre-loop default.
+    let mut this_mb_bmodes: [i32; 16] = [B_DC_PRED; 16];
+    let mut left_bmodes = *left_bmodes_in;
+    for i in 0..16 {
+        let by = i / 4;
+        let bx = i % 4;
+        let dst_x = mb_xp + bx * 4;
+        let dst_y = mb_yp + by * 4;
+        // Above / left mode pickers — same rule the bool-emit path uses
+        // so the rate we score and the rate we pay are identical.
+        let above_mode = if by == 0 {
+            bmode_above_for_mb[bx]
+        } else {
+            this_mb_bmodes[(by - 1) * 4 + bx]
+        };
+        let left_mode = if bx == 0 {
+            left_bmodes[by]
+        } else {
+            this_mb_bmodes[by * 4 + bx - 1]
+        };
+        let probs: &[u8; 9] = if keyframe {
+            &KF_BMODE_PROB[above_mode as usize][left_mode as usize]
+        } else {
+            &DEFAULT_BMODE_PROBS
+        };
+        let neigh = gather_4x4_neighbours(
+            rec_y,
+            y_stride,
+            mb_xp,
+            mb_yp,
+            bx,
+            by,
+            mb_w,
+            &above_right_extension,
+        );
+        let mut best_mode = B_DC_PRED;
+        let mut best_cost = u64::MAX;
+        for &m in &[
+            B_DC_PRED, B_TM_PRED, B_VE_PRED, B_HE_PRED, B_LD_PRED, B_RD_PRED, B_VR_PRED, B_VL_PRED,
+            B_HD_PRED, B_HU_PRED,
+        ] {
+            let mut pred = [0u8; 16];
+            predict_4x4(m, &neigh, &mut pred, 4);
+            let mut sse = 0u64;
+            for r in 0..4 {
+                for c in 0..4 {
+                    let s = src_y[(dst_y + r) * y_stride + dst_x + c] as i32;
+                    let p = pred[r * 4 + c] as i32;
+                    let d = s - p;
+                    sse += (d * d) as u64;
+                }
+            }
+            let rate = bmode_rate_x256(m, probs) as u64;
+            // `D + λ·R` in (sse-units · 256). Using `saturating_add` is
+            // belt-and-braces — the worst case here is `sse ≤ 16·255² =
+            // ~1.04 M` and `λ·R ≤ (256·63²) · (8·256) ≈ 2 G` so a u64
+            // holds it comfortably, but the saturating form documents
+            // the intent for any future λ-scale bumps.
+            let cost = sse.saturating_add(lambda_x256.saturating_mul(rate));
+            if cost < best_cost {
+                best_cost = cost;
+                best_mode = m;
+            }
+        }
+        this_mb_bmodes[i] = best_mode;
+        if bx == 3 {
+            left_bmodes[by] = best_mode;
+        }
+    }
+    this_mb_bmodes
+}
+
 /// Pick the best chroma intra mode (DC/V/H/TM) for a keyframe by SSE
 /// of the prediction vs the source U + V planes.
 #[allow(clippy::too_many_arguments)]
@@ -7146,9 +7366,27 @@ fn emit_bmodes_keyframe(
     mb_x: usize,
     mb_y: usize,
     mb_w: usize,
+    bpred_rdo_lambda_x256: u64,
 ) {
-    // Pick per-sub-block modes greedily against the source.
-    let chosen = choose_b_pred_modes(src_y, rec_y, y_stride, mb_x * 16, mb_y * 16, mb_w, 0);
+    // Pick per-sub-block modes — greedy SSE when `bpred_rdo_lambda_x256
+    // == 0` (default, bit-exact), or `D + λ·R` against `KF_BMODE_PROB`
+    // when the round-41 RDO knob is on.
+    let chosen = if bpred_rdo_lambda_x256 > 0 {
+        choose_b_pred_modes_rdo(
+            src_y,
+            rec_y,
+            y_stride,
+            mb_x * 16,
+            mb_y * 16,
+            mb_w,
+            bmode_above_for_mb,
+            left_bmodes_in,
+            true,
+            bpred_rdo_lambda_x256,
+        )
+    } else {
+        choose_b_pred_modes(src_y, rec_y, y_stride, mb_x * 16, mb_y * 16, mb_w, 0)
+    };
     let mut left_bmodes = *left_bmodes_in;
     for i in 0..16 {
         let row = i / 4;

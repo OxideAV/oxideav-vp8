@@ -211,6 +211,7 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
     }
 }
 
@@ -318,6 +319,7 @@ fn arnr_nlm_does_not_regress_psnr_vs_gaussian_arnr() {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
         ..gauss_cfg
     };
     let (_, gauss_psnr) = measure(gauss_cfg, &clip);
@@ -344,6 +346,7 @@ fn arnr_nlm_stream_decodes_cleanly() {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y) = measure(cfg, &clip);
@@ -389,6 +392,7 @@ fn psy_rdo_plus_arnr_nlm_combined_decodes_cleanly() {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y) = measure(cfg, &clip);

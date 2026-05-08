@@ -183,6 +183,7 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
     }
 }
 
@@ -224,6 +225,7 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
     }
 }
 
@@ -276,6 +278,7 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
     }
 }
 
@@ -376,6 +379,7 @@ fn frame_headers_carry_segment_lf_deltas() {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

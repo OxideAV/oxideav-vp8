@@ -140,6 +140,7 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_aq: false,
         aq_qindex_range: 8,
         enable_joint_lf_rdo: false,
+        enable_bpred_rdo: false,
     }
 }
 

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Rate-aware B_PRED 4×4 sub-mode picker (round-41). New
+  opt-in `Vp8EncoderConfig::enable_bpred_rdo` knob (default `false`)
+  switches the per-4×4 mode selection from greedy SSE to `D + λ·R`,
+  where `D` is the same SSE the legacy path scores and `R` is the
+  bool-coder cost (in 1/256-bit units, via the calibrated
+  `PROB_COST_BITS_X256` table) of writing the `BMODE_TREE` path under
+  the appropriate context probabilities — `KF_BMODE_PROB[above][left]`
+  on keyframes, the static `vp8_bmode_prob` on intra-in-P MBs. λ is
+  the same `lambda_for_qp(qi, scale)` value the per-MB ref/mode picker
+  uses, so RDO trade-offs stay coherent across all encoder decisions.
+  The 16×16-vs-B_PRED outer selector continues to compare pure SSE so
+  the existing `B_PRED_SSE_MARGIN` threshold semantics are preserved;
+  only the inner per-sub-block search is rate-aware. Off-by-default so
+  the existing greedy SSE selection is preserved bit-for-bit;
+  additionally gated on `enable_rdo = true` (with `enable_rdo = false`
+  λ collapses to 0, but the gating is explicit so the cost-table
+  indexing isn't reached for users who disable RDO entirely). Eight
+  integration tests in `tests/encoder_round_41.rs` pin: default-off,
+  off-path byte-identical to legacy, keyframe + P-frame clean decode,
+  byte-envelope ±15 %, PSNR-Y non-regression, flat-content
+  byte-identical (gating is engaged only on B_PRED MBs), and
+  `enable_rdo`-required gating.
 - *(encoder)* Joint loop-filter / QP rate-distortion optimisation
   (round-40). The previously-reserved `Vp8EncoderConfig::enable_joint_lf_rdo`
   flag is now active. When set on a P-frame, after pass 1 has built the

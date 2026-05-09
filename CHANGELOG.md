@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Variance-driven adaptive LF cap + UV-channel adaptive LF
+  deltas (round-48). Two opt-in knobs generalise the round-47 high-QP
+  cap and the round-44 luma-only adaptive estimator.
+  `Vp8EncoderConfig::enable_variance_lf_cap` (default `false`) replaces
+  the round-47 `qindex`-proxy ramp with a content-driven model: the
+  per-bucket delta cap is computed directly from the per-frame SSE
+  distribution's normalised variance (coefficient of variation squared,
+  `cv2 = var / mean^2`). Homogeneous content (`cv2 ≤ 0.5`) keeps the
+  cap at `±6`; very heterogeneous content (`cv2 ≥ 1.0`) saturates at
+  `±10`; the slope between is linear (`cap = 6 + min(4,
+  max(0, cv2 - 0.5) * 8)`). When both this flag and
+  `enable_adaptive_lf_high_qp_cap` are on, the variance-driven cap
+  wins. `Vp8EncoderConfig::enable_adaptive_uv_lf_deltas` (default
+  `false`) extends the round-44 estimator to consider chroma SSE
+  alongside luma — the per-bucket delta is the average of the
+  luma-only and chroma-only adaptive estimates. Both inputs are inside
+  `±delta_cap`, so the average stays inside that envelope without
+  additional clamping. Implemented via the new `variance_lf_cap`
+  helper, `compute_per_mb_chroma_sse` (Cb + Cr combined per-MB SSE
+  computer), and `LfDeltas::round48_adaptive_with_uv` (averaging
+  constructor with length-mismatch fallback to luma-only). Both flags
+  off-by-default so the round-44 / round-47 calibrations are preserved
+  bit-for-bit and the 15-fixture corpus stays bit-exact. Nine
+  integration tests in `tests/encoder_round_48.rs` plus eight unit
+  tests in `src/encoder.rs` pin: default-off, off-path byte-identical,
+  variance-cap inert when adaptive LF deltas off, UV-deltas inert when
+  off, both flags clean P-frame decode, ±25 % byte-envelope vs round-44
+  baseline, length-mismatch fallback, edge cases (empty / zero /
+  uniform / saturated cv2), and combined-on round-trip.
 - *(encoder)* High-QP adaptive LF magnitude scaling + sub-pel rate-term
   refactor (round-47). New opt-in
   `Vp8EncoderConfig::enable_adaptive_lf_high_qp_cap` (default `false`)

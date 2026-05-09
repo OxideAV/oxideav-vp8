@@ -194,6 +194,8 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 
@@ -246,6 +248,8 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 
@@ -309,6 +313,8 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 
@@ -420,6 +426,8 @@ fn frame_headers_carry_segment_lf_deltas() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

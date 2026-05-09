@@ -204,6 +204,8 @@ fn cfg_baseline_high_qp() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 
@@ -245,6 +247,8 @@ fn high_qp_cap_pframe_decodes_cleanly() {
     let clip = make_half_step_clip(8);
     let cfg = Vp8EncoderConfig {
         enable_adaptive_lf_high_qp_cap: true,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -265,6 +269,8 @@ fn high_qp_cap_byte_envelope_within_20pct() {
     let baseline = cfg_baseline_high_qp();
     let with_high_cap = Vp8EncoderConfig {
         enable_adaptive_lf_high_qp_cap: true,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline_high_qp()
     };
 
@@ -288,6 +294,8 @@ fn high_qp_cap_inert_at_low_qp() {
     let baseline = cfg_baseline_low_qp();
     let with_high_cap = Vp8EncoderConfig {
         enable_adaptive_lf_high_qp_cap: true,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline_low_qp()
     };
 
@@ -313,11 +321,15 @@ fn high_qp_cap_requires_adaptive_lf_deltas() {
     let cfg_a = Vp8EncoderConfig {
         enable_adaptive_lf_deltas: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_adaptive_lf_deltas: false,
         enable_adaptive_lf_high_qp_cap: true,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline_high_qp()
     };
 
@@ -376,6 +388,8 @@ fn round47_combined_decodes_cleanly() {
         enable_mode_ref_lf_deltas: true,
         enable_adaptive_lf_deltas: true,
         enable_adaptive_lf_high_qp_cap: true,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         enable_joint_lf_rdo: true,
         ..cfg_baseline_high_qp()
     };

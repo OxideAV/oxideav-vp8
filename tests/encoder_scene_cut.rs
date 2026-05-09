@@ -217,6 +217,8 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 
@@ -269,6 +271,8 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 

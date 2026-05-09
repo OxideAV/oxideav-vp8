@@ -190,6 +190,8 @@ fn refresh_flags_follow_plan() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -283,6 +285,8 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -364,6 +368,8 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -453,6 +459,8 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -512,6 +520,8 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -656,6 +666,8 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -748,6 +760,8 @@ fn legacy_single_ref_path_still_works() {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

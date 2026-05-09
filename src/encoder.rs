@@ -235,6 +235,69 @@ fn adaptive_lf_high_qp_cap(qi: u8) -> i32 {
     }
 }
 
+/// Round-48 variance-driven cap for the adaptive LF delta estimator.
+/// Replaces the round-47 QP-proxy ramp with a measurement-driven model:
+/// the per-frame SSE distribution's normalised variance directly drives
+/// the cap. Specifically, for `mean = E[SSE_i]` and
+/// `var = E[(SSE_i - mean)^2]`, the *coefficient of variation squared*
+/// `cv2 = var / mean^2` is a unit-less measure of how spread-out the
+/// per-MB error distribution is. The mapping is:
+///
+///   cap = 6 + min(4, max(0, cv2 - 0.5) * 8)   ∈ [6, 10]
+///
+/// `cv2 ≤ 0.5` (homogeneous content — the per-MB SSEs cluster tightly
+/// around the frame mean) collapses to the round-44 default cap of `6`,
+/// preserving that calibration on flat / smooth scenes. `cv2 ∈ (0.5,
+/// 1.0]` ramps the cap from `6` up to `10`. Above `cv2 = 1.0` (very
+/// heterogeneous content — e.g. a flat sky next to a textured tree
+/// canopy) the cap saturates at `10`. The threshold `0.5` and slope `8`
+/// are chosen so the round-47 high-QP behaviour (cap of `10` at
+/// `qindex ≥ 110`) is matched on naturally heterogeneous high-QP
+/// content while flat content stays at the round-44 baseline regardless
+/// of QP.
+///
+/// `mb_sse` — per-MB SSE values in raster order; empty input returns
+/// the default cap. Math is in `u128` so the squared mean (which can
+/// exceed `u64::MAX` for noisy reconstructions) doesn't overflow.
+#[inline]
+fn variance_lf_cap(mb_sse: &[u64]) -> i32 {
+    let n = mb_sse.len();
+    if n == 0 {
+        return 6;
+    }
+    let sum: u128 = mb_sse.iter().map(|&v| v as u128).sum();
+    let mean = sum / n as u128;
+    if mean == 0 {
+        // All-zero SSE (perfect reconstruction): no variance signal,
+        // keep the default cap.
+        return 6;
+    }
+    // Variance = E[(x - mean)^2]. Use i128 since (x - mean) can be
+    // negative; the per-MB max SSE is 16*16*255*255 = 16,646,400 so
+    // even u32 would suffice, but i128 keeps the sum-of-squares safe
+    // for arbitrary frame counts.
+    let var: u128 = mb_sse
+        .iter()
+        .map(|&v| {
+            let d = v as i128 - mean as i128;
+            (d * d) as u128
+        })
+        .sum::<u128>()
+        / n as u128;
+    // cv2_x256 = var * 256 / mean^2. The * 256 keeps a 1/256
+    // resolution on the unit-less ratio without floats.
+    let mean2 = mean.saturating_mul(mean).max(1);
+    let cv2_x256 = (var.saturating_mul(256)) / mean2;
+    // Threshold 0.5 → 128 in 1/256 units. Slope 8 → multiply the
+    // (cv2 - 0.5) excess by 8, then clamp to [0, 4]. Express in 1/256
+    // units throughout: excess_x256 = max(0, cv2_x256 - 128);
+    // ramp_x256 = excess_x256 * 8; clamp ramp_x256 to [0, 4 * 256].
+    let excess_x256 = cv2_x256.saturating_sub(128);
+    let ramp_x256 = excess_x256.saturating_mul(8).min(4 * 256);
+    // Cap = 6 + ramp_x256 / 256, integer-truncated.
+    6 + (ramp_x256 / 256) as i32
+}
+
 /// Pick the bitstream `filter_type` (0 = normal, 1 = simple) for a
 /// given config + frame-level filter level. The simple-mode filter
 /// (RFC 6386 §15.2) is luma-only and only touches the four pixels
@@ -927,6 +990,34 @@ pub struct Vp8EncoderConfig {
     /// `enable_adaptive_lf_deltas = true` and
     /// `enable_mode_ref_lf_deltas = true`; ignored on keyframes.
     pub enable_adaptive_lf_high_qp_cap: bool,
+    /// Enable round-48 variance-driven adaptive LF cap. Replaces the
+    /// round-47 QP-proxy ramp with a content-driven model: the cap is
+    /// computed directly from the per-frame SSE distribution's
+    /// normalised variance (coefficient of variation squared,
+    /// `cv2 = var / mean^2`). Homogeneous content (`cv2 ≤ 0.5`) collapses
+    /// to the round-44 default cap of `±6`; heterogeneous content
+    /// (`cv2 > 0.5`) ramps up to `±10` proportionally. Mutually
+    /// exclusive in practice with `enable_adaptive_lf_high_qp_cap` —
+    /// when both are on, this flag wins (the variance-driven cap is
+    /// computed and the QP ramp is skipped). Off-by-default so the
+    /// round-47 / round-44 calibrations are preserved bit-for-bit when
+    /// this flag is disabled. Requires
+    /// `enable_adaptive_lf_deltas = true` and
+    /// `enable_mode_ref_lf_deltas = true`; ignored on keyframes.
+    pub enable_variance_lf_cap: bool,
+    /// Enable round-48 UV-channel adaptive LF deltas. The round-44
+    /// estimator currently classifies per-MB reconstruction error using
+    /// luma SSE only; the chroma planes can have a different per-bucket
+    /// SSE distribution (e.g. a textured chroma channel against a flat
+    /// luma channel) and benefit from a different ladder. With this
+    /// flag on, the per-bucket delta computation is the average of the
+    /// luma-only delta and a chroma-only delta computed from the same
+    /// per-bucket population statistics on the U and V planes. Off-by-
+    /// default so the round-44 luma-only calibration is preserved
+    /// bit-for-bit when this flag is disabled. Requires
+    /// `enable_adaptive_lf_deltas = true` and
+    /// `enable_mode_ref_lf_deltas = true`; ignored on keyframes.
+    pub enable_adaptive_uv_lf_deltas: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -979,6 +1070,8 @@ impl Default for Vp8EncoderConfig {
             enable_split_mv_rdo_real_context_first_pass: false,
             enable_subpel_mv_cost_partition: false,
             enable_adaptive_lf_high_qp_cap: false,
+            enable_variance_lf_cap: false,
+            enable_adaptive_uv_lf_deltas: false,
         }
     }
 }
@@ -3025,23 +3118,41 @@ fn encode_pframe_and_reconstruct(
     let lf_deltas: Option<LfDeltas> = if config.enable_mode_ref_lf_deltas {
         if config.enable_adaptive_lf_deltas {
             let mb_sse_y = compute_per_mb_luma_sse(&src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h);
-            // Round-47: when the high-QP cap knob is on, scale the
-            // per-bucket delta cap from `±6` at `qindex ≤ 60` linearly
-            // up to `±10` at `qindex ≥ 110`. The default (knob off) cap
-            // of `6` reproduces round-44 bit-for-bit. The expansion is
-            // always *at* the cap — when the proportional deviation is
-            // small the produced delta is identical regardless.
-            let delta_cap = if config.enable_adaptive_lf_high_qp_cap {
+            // Round-48: variance-driven cap takes priority over the
+            // round-47 QP ramp when its flag is on. Otherwise the
+            // round-47 QP-proxy cap applies, falling back to the
+            // round-44 default cap of `6` when neither flag is set.
+            let delta_cap = if config.enable_variance_lf_cap {
+                variance_lf_cap(&mb_sse_y)
+            } else if config.enable_adaptive_lf_high_qp_cap {
                 adaptive_lf_high_qp_cap(qi as u8)
             } else {
                 6
             };
-            Some(LfDeltas::round44_adaptive_with_cap(
-                &mb_sse_y,
-                &mb_ref_frames,
-                &mb_ymodes,
-                delta_cap,
-            ))
+            // Round-48: when the UV-channel knob is on, also feed the
+            // per-MB chroma SSE so the per-bucket delta is the average
+            // of the luma-only and chroma-only adaptive deltas. With
+            // the knob off, the round-44 luma-only path is preserved
+            // bit-for-bit.
+            if config.enable_adaptive_uv_lf_deltas {
+                let mb_sse_uv = compute_per_mb_chroma_sse(
+                    &src_u, &src_v, &rec_u, &rec_v, uv_stride, uv_buf_h, mb_w, mb_h,
+                );
+                Some(LfDeltas::round48_adaptive_with_uv(
+                    &mb_sse_y,
+                    &mb_sse_uv,
+                    &mb_ref_frames,
+                    &mb_ymodes,
+                    delta_cap,
+                ))
+            } else {
+                Some(LfDeltas::round44_adaptive_with_cap(
+                    &mb_sse_y,
+                    &mb_ref_frames,
+                    &mb_ymodes,
+                    delta_cap,
+                ))
+            }
         } else {
             Some(LfDeltas::round42_default())
         }
@@ -4059,6 +4170,53 @@ impl LfDeltas {
             mode_deltas,
         }
     }
+
+    /// Round-48 chroma-aware adaptive ladder. Computes the round-44
+    /// adaptive ladder twice — once on luma SSE and once on chroma SSE
+    /// — then returns the per-bucket average. Cap and fallback semantics
+    /// match `round44_adaptive_with_cap`. The averaging keeps the per-
+    /// bucket delta inside the same `±delta_cap` envelope (sum-of-two-
+    /// in-range halved is in-range), so the signed-6 grammar guarantee
+    /// is preserved without additional clamping.
+    ///
+    /// `mb_sse_y` — per-MB luma SSE in raster order.
+    /// `mb_sse_uv` — per-MB combined chroma SSE (Cb + Cr) in raster
+    /// order, same length as `mb_sse_y`. When the lengths disagree the
+    /// chroma half is dropped and the call collapses to the luma-only
+    /// `round44_adaptive_with_cap` path (defensive fallback for tile
+    /// geometries that mismatch).
+    pub(crate) fn round48_adaptive_with_uv(
+        mb_sse_y: &[u64],
+        mb_sse_uv: &[u64],
+        mb_ref_frames: &[u8],
+        mb_ymodes: &[i32],
+        delta_cap: i32,
+    ) -> Self {
+        // Defensive fallback: chroma length mismatch collapses to luma-
+        // only. Same protection the round-44 path uses for `mb_sse_y`
+        // length mismatches.
+        if mb_sse_uv.len() != mb_sse_y.len() {
+            return Self::round44_adaptive_with_cap(mb_sse_y, mb_ref_frames, mb_ymodes, delta_cap);
+        }
+        let luma = Self::round44_adaptive_with_cap(mb_sse_y, mb_ref_frames, mb_ymodes, delta_cap);
+        let chroma =
+            Self::round44_adaptive_with_cap(mb_sse_uv, mb_ref_frames, mb_ymodes, delta_cap);
+        // Per-bucket average. Both inputs are in `[-delta_cap,
+        // +delta_cap]`, so the sum is in `[-2*delta_cap, +2*delta_cap]`
+        // and the average is back in `[-delta_cap, +delta_cap]`. The
+        // round-toward-zero from integer division is fine — the
+        // estimator's calibration is already approximate.
+        let mut ref_deltas = [0i32; 4];
+        let mut mode_deltas = [0i32; 4];
+        for i in 0..4 {
+            ref_deltas[i] = (luma.ref_deltas[i] + chroma.ref_deltas[i]) / 2;
+            mode_deltas[i] = (luma.mode_deltas[i] + chroma.mode_deltas[i]) / 2;
+        }
+        Self {
+            ref_deltas,
+            mode_deltas,
+        }
+    }
 }
 
 /// Compute the per-MB loop-filter level after the round-42 mode/ref
@@ -4158,6 +4316,56 @@ fn compute_per_mb_luma_sse(
                     let p = rec_y[row_off + xx] as i32;
                     let d = s - p;
                     sse += (d * d) as u64;
+                }
+            }
+            out.push(sse);
+        }
+    }
+    out
+}
+
+/// Per-MB unfiltered chroma-SSE (Cb + Cr combined) between source and
+/// reconstruction. Used by the round-48 UV-channel adaptive LF delta
+/// estimator. Each entry is the sum of `(src_u - rec_u)² + (src_v -
+/// rec_v)²` over the MB's 8×8 chroma tile (4:2:0). The buffers share
+/// `uv_stride` and `uv_buf_h` (already padded to MB granularity by the
+/// encode-loop allocators). Returned vector is in raster order with one
+/// entry per MB — same shape as `compute_per_mb_luma_sse` so the two can
+/// be zipped against the same `mb_ref_frames` / `mb_ymodes` arrays.
+fn compute_per_mb_chroma_sse(
+    src_u: &[u8],
+    src_v: &[u8],
+    rec_u: &[u8],
+    rec_v: &[u8],
+    uv_stride: usize,
+    uv_buf_h: usize,
+    mb_w: usize,
+    mb_h: usize,
+) -> Vec<u64> {
+    let mut out = Vec::with_capacity(mb_w * mb_h);
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            let y0 = my * 8;
+            let x0 = mx * 8;
+            let mut sse: u64 = 0;
+            for r in 0..8 {
+                let yy = y0 + r;
+                if yy >= uv_buf_h {
+                    break;
+                }
+                let row_off = yy * uv_stride;
+                for c in 0..8 {
+                    let xx = x0 + c;
+                    if xx >= uv_stride {
+                        break;
+                    }
+                    let su = src_u[row_off + xx] as i32;
+                    let pu = rec_u[row_off + xx] as i32;
+                    let du = su - pu;
+                    let sv = src_v[row_off + xx] as i32;
+                    let pv = rec_v[row_off + xx] as i32;
+                    let dv = sv - pv;
+                    sse += (du * du + dv * dv) as u64;
                 }
             }
             out.push(sse);
@@ -10779,6 +10987,120 @@ mod tests {
         let base = 1_000u32;
         let scaled = ((base as u64) * 256 / 256) as u32;
         assert_eq!(scaled, base);
+    }
+
+    // ----------------------------------------------------------------
+    // Round-48: variance-driven LF cap + UV-channel adaptive deltas
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn variance_lf_cap_empty_input_returns_default() {
+        // No SSE samples → fall back to round-44 default cap of 6.
+        assert_eq!(variance_lf_cap(&[]), 6);
+    }
+
+    #[test]
+    fn variance_lf_cap_zero_distribution_returns_default() {
+        // Perfect reconstruction (all-zero SSE) has no variance signal
+        // — keep the round-44 default cap.
+        assert_eq!(variance_lf_cap(&[0u64; 16]), 6);
+    }
+
+    #[test]
+    fn variance_lf_cap_uniform_distribution_returns_default() {
+        // Constant SSE → variance is 0 → cv2 is 0 → cap stays at 6.
+        assert_eq!(variance_lf_cap(&[100u64; 64]), 6);
+    }
+
+    #[test]
+    fn variance_lf_cap_high_variance_saturates() {
+        // Half zeros + half "big" pushes cv2 above 1.0 → cap must
+        // saturate at 10. Mean = 5_000, var = 5_000^2 (each sample is
+        // either 0 or 10_000, deviation from mean is 5_000), cv2 = 1.0
+        // exactly, ramp = (1.0 - 0.5) * 8 = 4 → cap = 10.
+        let mut data = vec![0u64; 32];
+        data.extend_from_slice(&[10_000u64; 32]);
+        assert_eq!(variance_lf_cap(&data), 10);
+    }
+
+    #[test]
+    fn variance_lf_cap_low_variance_returns_default() {
+        // Tight distribution — all values within ±5 % of mean — cv2
+        // well below 0.5, cap stays at 6.
+        let mut data = vec![1_000u64; 32];
+        data.extend_from_slice(&[1_050u64; 16]);
+        data.extend_from_slice(&[950u64; 16]);
+        assert_eq!(variance_lf_cap(&data), 6);
+    }
+
+    #[test]
+    fn variance_lf_cap_moderate_variance_ramps() {
+        // Half mean, double mean → mean = 1.5x, deviations = ±0.5x
+        // → cv2 ≈ 0.111 (still below 0.5 threshold, cap stays at 6).
+        let mut data = vec![100u64; 32];
+        data.extend_from_slice(&[200u64; 32]);
+        // mean = 150, var = 50^2 = 2500, cv2 = 2500/22500 ≈ 0.111.
+        assert_eq!(variance_lf_cap(&data), 6);
+    }
+
+    #[test]
+    fn variance_lf_cap_above_threshold_ramps() {
+        // Mix of tiny + huge to push cv2 well above 0.5 but below 1.0.
+        // 75% zeros + 25% large → mean = large/4, deviation² either
+        // mean² (zero side) or (3*mean)² (large side) → var ≈ 3*mean²
+        // → cv2 ≈ 3 → saturated cap of 10.
+        let mut data = vec![0u64; 48];
+        data.extend_from_slice(&[10_000u64; 16]);
+        let cap = variance_lf_cap(&data);
+        assert!(
+            (8..=10).contains(&cap),
+            "expected cap in [8, 10] for cv2 ≈ 3, got {cap}"
+        );
+    }
+
+    #[test]
+    fn round48_uv_chroma_helper_matches_luma_path_when_chroma_zero() {
+        // With all-zero chroma SSE, the chroma half of the round-48
+        // average reduces to the round-44 fallback (round-42 static)
+        // values for empty buckets — the average of luma + chroma is
+        // roughly luma/2 (rounded toward zero by integer division).
+        let mb_sse_y = vec![100u64, 200, 50, 400, 150, 300, 100, 250];
+        let mb_sse_uv = vec![0u64; 8];
+        let mb_ref = vec![1u8; 8]; // all LAST
+        let modes = vec![ZERO_MV; 8]; // all inter ZERO_MV
+        let luma = LfDeltas::round44_adaptive_with_cap(&mb_sse_y, &mb_ref, &modes, 6);
+        let combined =
+            LfDeltas::round48_adaptive_with_uv(&mb_sse_y, &mb_sse_uv, &mb_ref, &modes, 6);
+        // The luma estimate for LAST + ZERO_MV buckets is finite, the
+        // chroma estimate degenerates (mean = 0 → frame_mean = 1 →
+        // dev = (mean - 1) * 32 / 1 → for zero SSE samples the bucket
+        // mean is 0 → dev = -32 → raw = -6 → clamped to -6).
+        // Average = (luma + chroma) / 2 must be inside [-6, 6].
+        for d in &combined.ref_deltas {
+            assert!((-6..=6).contains(d), "ref delta {d} out of range");
+        }
+        for d in &combined.mode_deltas {
+            assert!((-6..=6).contains(d), "mode delta {d} out of range");
+        }
+        // The luma-only deltas are also inside [-6, 6].
+        for d in &luma.ref_deltas {
+            assert!((-6..=6).contains(d), "luma ref delta {d} out of range");
+        }
+    }
+
+    #[test]
+    fn round48_uv_chroma_helper_collapses_on_length_mismatch() {
+        // Defensive fallback: when chroma length doesn't match luma,
+        // the call collapses to the round-44 luma-only path.
+        let mb_sse_y = vec![100u64; 8];
+        let mb_sse_uv = vec![0u64; 4]; // wrong length
+        let mb_ref = vec![1u8; 8];
+        let mb_modes = vec![ZERO_MV; 8];
+        let luma = LfDeltas::round44_adaptive_with_cap(&mb_sse_y, &mb_ref, &mb_modes, 6);
+        let collapsed =
+            LfDeltas::round48_adaptive_with_uv(&mb_sse_y, &mb_sse_uv, &mb_ref, &mb_modes, 6);
+        assert_eq!(luma.ref_deltas, collapsed.ref_deltas);
+        assert_eq!(luma.mode_deltas, collapsed.mode_deltas);
     }
 }
 

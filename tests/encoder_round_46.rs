@@ -199,6 +199,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
     }
 }
 
@@ -328,6 +330,8 @@ fn subpel_mv_cost_partition_pframe_decodes_cleanly() {
         enable_subpel_mv_cost: true,
         enable_subpel_mv_cost_partition: true,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -352,12 +356,16 @@ fn subpel_mv_cost_partition_requires_subpel_mv_cost() {
         enable_subpel_mv_cost: false,
         enable_subpel_mv_cost_partition: false,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_subpel_mv_cost: false,
         enable_subpel_mv_cost_partition: true,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         ..cfg_baseline()
     };
 
@@ -386,6 +394,8 @@ fn round46_combined_decodes_cleanly() {
         enable_subpel_mv_cost: true,
         enable_subpel_mv_cost_partition: true,
         enable_adaptive_lf_high_qp_cap: false,
+        enable_variance_lf_cap: false,
+        enable_adaptive_uv_lf_deltas: false,
         enable_mv_cost_aware_snap: true,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,

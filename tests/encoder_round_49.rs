@@ -291,6 +291,7 @@ fn cfg_baseline_segments_high_qp() -> Vp8EncoderConfig {
         spatial_lf_n_col_bands: DEFAULT_SPATIAL_LF_N_COL_BANDS,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
+        enable_kmeans_pp_seeding: false,
     }
 }
 

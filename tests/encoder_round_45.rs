@@ -213,6 +213,7 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
     }
 }
 
@@ -342,6 +343,7 @@ fn split_mv_real_context_keyframe_decodes_cleanly() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -372,6 +374,7 @@ fn split_mv_real_context_pframe_decodes_cleanly() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -409,6 +412,7 @@ fn split_mv_real_context_byte_envelope_within_10pct() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline()
     };
 
@@ -443,6 +447,7 @@ fn split_mv_real_context_requires_split_mv_rdo() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -459,6 +464,7 @@ fn split_mv_real_context_requires_split_mv_rdo() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline()
     };
 
@@ -494,6 +500,7 @@ fn round45_combined_decodes_cleanly() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         enable_mv_cost_aware_snap: true,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,

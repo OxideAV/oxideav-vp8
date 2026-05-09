@@ -212,6 +212,7 @@ fn cfg_baseline_high_qp() -> Vp8EncoderConfig {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
     }
 }
 
@@ -261,6 +262,7 @@ fn high_qp_cap_pframe_decodes_cleanly() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -289,6 +291,7 @@ fn high_qp_cap_byte_envelope_within_20pct() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline_high_qp()
     };
 
@@ -320,6 +323,7 @@ fn high_qp_cap_inert_at_low_qp() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline_low_qp()
     };
 
@@ -353,6 +357,7 @@ fn high_qp_cap_requires_adaptive_lf_deltas() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -366,6 +371,7 @@ fn high_qp_cap_requires_adaptive_lf_deltas() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline_high_qp()
     };
 
@@ -432,6 +438,7 @@ fn round47_combined_decodes_cleanly() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         enable_joint_lf_rdo: true,
         ..cfg_baseline_high_qp()
     };

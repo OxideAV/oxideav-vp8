@@ -305,6 +305,7 @@ fn cfg_baseline_high_qp() -> Vp8EncoderConfig {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
     }
 }
 
@@ -378,6 +379,7 @@ fn uv_lf_deltas_require_adaptive_lf_deltas() {
         spatial_lf_n_col_bands: 4,
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
+        enable_kmeans_pp_seeding: false,
         ..cfg_baseline_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {

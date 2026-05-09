@@ -1,41 +1,33 @@
-//! Round-45 encoder push tests — MV-cost-aware NEAREST/NEAR/NEW snap
-//! (`enable_mv_cost_aware_snap`) + SPLIT_MV RDO real-context second
-//! pass (`enable_split_mv_rdo_real_context`).
+//! Round-46 encoder push tests — first-pass real-context SPLIT_MV
+//! scoring (`enable_split_mv_rdo_real_context_first_pass`) + MV-cost-aware
+//! sub-pel partition refinement (`enable_subpel_mv_cost_partition`).
 //!
-//! Round-45 lands two complementary picker upgrades on top of the
-//! round-43 SPLIT_MV RDO + round-42 mode-info groundwork:
+//! Round-46 lands two complementary picker upgrades on top of the
+//! round-45 second-pass real-context swap + round-43 SPLIT_MV RDO:
 //!
-//!   * `enable_mv_cost_aware_snap` augments the fixed-tolerance NEW_MV
-//!     to NEAREST/NEAR snap with a Lagrangian check: when the SAD
-//!     penalty for snapping is smaller than `λ × Δbits / 256`, the
-//!     picker prefers the rate-cheaper neighbour mode even when the MV
-//!     magnitude is more than `NEIGHBOUR_MV_SNAP_TOLERANCE` away. λ
-//!     comes from `lambda_for_qp`, the same multiplier the per-MB
-//!     ref/mode picker uses; `Δbits` is the bool-coder cost difference
-//!     between coding NEW_MV (mv-tree path "1110" + MV-delta literal
-//!     under `DEFAULT_MV_CONTEXT`) and the cheaper neighbour mode
-//!     (NEAREST: "10", NEAR: "110").
+//!   * `enable_split_mv_rdo_real_context_first_pass` folds the
+//!     real-context rate model into the per-ref picker so the
+//!     SPLIT-vs-NEW competition under `D + λ·R` sees the bitstream
+//!     rate from the start, not the round-43 neutral-context upper
+//!     bound. Subsumes the round-45 second-pass swap (when both flags
+//!     are on the second pass becomes a no-op because the first-pass
+//!     picker already chose the real-context winner).
 //!
-//!   * `enable_split_mv_rdo_real_context` adds a second pass after the
-//!     per-MB picker commits a `SplitMv`: re-evaluate the four
-//!     split-mode candidates with the actual neighbour sub-MVs from the
-//!     already-committed left/above MBs (round-43 used the neutral
-//!     `[0]` context because the search ran before any MB was
-//!     committed). The real per-leaf path (LEFT / ABOVE / ZERO / NEW)
-//!     and the real per-row `SUB_MV_REF_PROBS` row replace the round-43
-//!     neutral approximation; if a different split mode wins under real
-//!     context, the picker swaps before reconstruction.
+//!   * `enable_subpel_mv_cost_partition` extends the 3×3 quarter-pel
+//!     `subpel_refine_partition` hill-climb with the same
+//!     `mv_cost_lambda` rate term used in `subpel_refine_luma`, so
+//!     SPLIT_MV partitions land on rate-cheaper MVs (smaller delta to
+//!     the absolute-MV proxy `split_mv_total_rate_x256` charges).
 //!
 //! Tests:
 //!  1) Default config has both knobs off.
 //!  2) Off path produces byte-identical encoder output.
-//!  3) MV-cost-aware snap on: keyframe + P-frame encode/decode cleanly.
-//!  4) MV-cost-aware snap byte envelope ±10 % vs fixed-tolerance baseline.
-//!  5) MV-cost-aware snap requires `enable_rdo`.
-//!  6) Real-context second pass on: keyframe + P-frame decode cleanly.
-//!  7) Real-context second pass byte envelope ±10 % vs neutral-context baseline.
-//!  8) Real-context second pass requires `enable_split_mv_rdo`.
-//!  9) Combined round-45 + round-44 + round-43: clean round-trip.
+//!  3) First-pass real-context on: keyframe + P-frame decode cleanly.
+//!  4) First-pass real-context byte envelope ±10 % vs round-45 baseline.
+//!  5) First-pass real-context requires `enable_split_mv_rdo`.
+//!  6) Sub-pel MV-cost partition refinement on: P-frame decodes cleanly.
+//!  7) Sub-pel MV-cost partition refinement requires `enable_subpel_mv_cost`.
+//!  8) Combined round-46 + round-45 + round-43: clean round-trip.
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -74,9 +66,11 @@ fn make_frame(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
     }
 }
 
-/// Pan clip — the whole frame translates by 1 pixel per frame so most
-/// inter MBs find a good NEW_MV close to a NEAREST/NEAR neighbour, the
-/// configuration where the MV-cost-aware snap most matters.
+/// Pan clip — frames translate by 1 pixel per frame so most inter MBs
+/// find a good NEW_MV close to their NEAREST/NEAR neighbours, the
+/// configuration where SPLIT_MV vs NEW_MV competition matters most
+/// (and where neutral-context vs real-context rate model differs the
+/// most).
 fn make_pan_clip(n: usize) -> Vec<VideoFrame> {
     let cw = (W / 2) as usize;
     let ch = (H / 2) as usize;
@@ -98,7 +92,6 @@ fn make_pan_clip(n: usize) -> Vec<VideoFrame> {
     out
 }
 
-/// Encode a clip, return `(total_bytes, avg_psnr_y, packets)`.
 fn measure(cfg: Vp8EncoderConfig, clip: &[VideoFrame]) -> (usize, f64, Vec<Vec<u8>>) {
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);
@@ -153,9 +146,10 @@ fn measure(cfg: Vp8EncoderConfig, clip: &[VideoFrame]) -> (usize, f64, Vec<Vec<u
     (total_bytes, avg_psnr, packets)
 }
 
-/// Round-45 baseline config: round-43 SPLIT_MV RDO on (so the
-/// real-context second pass has something to refine) and `enable_rdo`
-/// on (so the MV-cost-aware snap has a real λ to weight against).
+/// Round-46 baseline: round-43 SPLIT_MV RDO on (so the first-pass
+/// real-context flag has something to score) and round-45 MV-cost-aware
+/// snap on (the snap is independent and reflects the typical caller
+/// configuration).
 fn cfg_baseline() -> Vp8EncoderConfig {
     Vp8EncoderConfig {
         qindex: QINDEX,
@@ -197,7 +191,7 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
         enable_mode_ref_lf_deltas: false,
-        enable_split_mv_rdo: false,
+        enable_split_mv_rdo: true,
         enable_adaptive_lf_deltas: false,
         enable_trellis_context_rate: false,
         enable_mv_cost_aware_snap: false,
@@ -208,21 +202,21 @@ fn cfg_baseline() -> Vp8EncoderConfig {
 }
 
 #[test]
-fn default_config_round45_knobs_off() {
+fn default_config_round46_knobs_off() {
     let cfg = Vp8EncoderConfig::default();
     assert!(
-        !cfg.enable_mv_cost_aware_snap,
-        "round-45 default must keep MV-cost-aware snap off"
+        !cfg.enable_split_mv_rdo_real_context_first_pass,
+        "round-46 default must keep first-pass real-context off"
     );
     assert!(
-        !cfg.enable_split_mv_rdo_real_context,
-        "round-45 default must keep SPLIT_MV real-context second pass off"
+        !cfg.enable_subpel_mv_cost_partition,
+        "round-46 default must keep sub-pel MV-cost partition refine off"
     );
 }
 
-/// Round-45 must not perturb the bitstream when both knobs are off.
+/// Round-46 must not perturb the bitstream when both knobs are off.
 #[test]
-fn round45_off_path_byte_identical_to_legacy() {
+fn round46_off_path_byte_identical_to_legacy() {
     let clip = make_pan_clip(4);
     let cfg = cfg_baseline();
     let (b0, _, p0) = measure(cfg, &clip);
@@ -235,176 +229,81 @@ fn round45_off_path_byte_identical_to_legacy() {
 }
 
 #[test]
-fn mv_cost_aware_snap_keyframe_decodes_cleanly() {
+fn split_mv_real_context_first_pass_keyframe_decodes_cleanly() {
     let clip = make_pan_clip(1);
     let cfg = Vp8EncoderConfig {
-        enable_mv_cost_aware_snap: true,
+        enable_split_mv_rdo: true,
+        enable_split_mv_rdo_real_context_first_pass: true,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "MV-cost-aware-snap keyframe produced zero bytes");
+    assert!(
+        bytes > 0,
+        "first-pass real-context keyframe produced zero bytes"
+    );
     assert!(
         psnr_y > 5.0,
-        "MV-cost-aware-snap keyframe encode/decode PSNR collapsed: {psnr_y:.2} dB"
+        "first-pass real-context keyframe encode/decode PSNR collapsed: {psnr_y:.2} dB"
     );
 }
 
 #[test]
-fn mv_cost_aware_snap_pframe_decodes_cleanly() {
+fn split_mv_real_context_first_pass_pframe_decodes_cleanly() {
     let clip = make_pan_clip(8);
     let cfg = Vp8EncoderConfig {
-        enable_mv_cost_aware_snap: true,
+        enable_split_mv_rdo: true,
+        enable_split_mv_rdo_real_context_first_pass: true,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "MV-cost-aware-snap P-frame produced zero bytes");
+    assert!(
+        bytes > 0,
+        "first-pass real-context P-frame produced zero bytes"
+    );
     assert!(
         psnr_y > 5.0,
-        "MV-cost-aware-snap P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
+        "first-pass real-context P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
     );
 }
 
-/// MV-cost-aware snap only swaps NEW_MV for NEAREST/NEAR when the
-/// Lagrangian-aware test fires; the bitstream keeps the same coarse
-/// shape. ±10 % envelope vs the fixed-tolerance baseline.
+/// First-pass real-context refines the rate term but preserves the
+/// distortion model; byte envelope stays within ±10 % of the
+/// neutral-context baseline (same band the round-45 second-pass
+/// envelope enforces).
 #[test]
-fn mv_cost_aware_snap_byte_envelope_within_10pct() {
+fn split_mv_real_context_first_pass_byte_envelope_within_10pct() {
     let clip = make_pan_clip(8);
     let baseline = cfg_baseline();
-    let with_snap = Vp8EncoderConfig {
-        enable_mv_cost_aware_snap: true,
+    let with_first_pass = Vp8EncoderConfig {
+        enable_split_mv_rdo_real_context_first_pass: true,
         ..cfg_baseline()
     };
 
     let (bytes_g, _, _) = measure(baseline, &clip);
-    let (bytes_a, _, _) = measure(with_snap, &clip);
-
-    let frac = (bytes_a as f64 - bytes_g as f64).abs() / bytes_g.max(1) as f64;
-    assert!(
-        frac < 0.10,
-        "MV-cost-aware snap swung byte size by {:.1}% (fixed {bytes_g}, snap {bytes_a}) — beyond +/-10%",
-        frac * 100.0
-    );
-}
-
-/// MV-cost-aware snap uses `lambda_for_qp` as the rate weight; with
-/// `enable_rdo = false` λ collapses to 0 and the knob is inert.
-#[test]
-fn mv_cost_aware_snap_requires_enable_rdo() {
-    let clip = make_pan_clip(4);
-    let cfg_a = Vp8EncoderConfig {
-        enable_rdo: false,
-        enable_mv_cost_aware_snap: false,
-        ..cfg_baseline()
-    };
-    let cfg_b = Vp8EncoderConfig {
-        enable_rdo: false,
-        enable_mv_cost_aware_snap: true,
-        ..cfg_baseline()
-    };
-
-    let (b0, _, p0) = measure(cfg_a, &clip);
-    let (b1, _, p1) = measure(cfg_b, &clip);
-
-    assert_eq!(
-        b0, b1,
-        "MV-cost-aware snap must be inert when enable_rdo=false: {b0} vs {b1}"
-    );
-    assert_eq!(p0.len(), p1.len());
-    for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
-        assert_eq!(a, b, "rdo-off packet {i} differs");
-    }
-}
-
-#[test]
-fn split_mv_real_context_keyframe_decodes_cleanly() {
-    let clip = make_pan_clip(1);
-    let cfg = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_split_mv_rdo_real_context: true,
-        enable_split_mv_rdo_real_context_first_pass: false,
-        enable_subpel_mv_cost_partition: false,
-        ..cfg_baseline()
-    };
-    let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(
-        bytes > 0,
-        "SPLIT_MV real-context keyframe produced zero bytes"
-    );
-    assert!(
-        psnr_y > 5.0,
-        "SPLIT_MV real-context keyframe encode/decode PSNR collapsed: {psnr_y:.2} dB"
-    );
-}
-
-#[test]
-fn split_mv_real_context_pframe_decodes_cleanly() {
-    let clip = make_pan_clip(8);
-    let cfg = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_split_mv_rdo_real_context: true,
-        enable_split_mv_rdo_real_context_first_pass: false,
-        enable_subpel_mv_cost_partition: false,
-        ..cfg_baseline()
-    };
-    let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(
-        bytes > 0,
-        "SPLIT_MV real-context P-frame produced zero bytes"
-    );
-    assert!(
-        psnr_y > 5.0,
-        "SPLIT_MV real-context P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
-    );
-}
-
-/// Real-context second pass refines the rate term but preserves the
-/// distortion model; byte envelope stays within ±10 % of the
-/// neutral-context baseline.
-#[test]
-fn split_mv_real_context_byte_envelope_within_10pct() {
-    let clip = make_pan_clip(8);
-    let baseline = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        ..cfg_baseline()
-    };
-    let with_real = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_split_mv_rdo_real_context: true,
-        enable_split_mv_rdo_real_context_first_pass: false,
-        enable_subpel_mv_cost_partition: false,
-        ..cfg_baseline()
-    };
-
-    let (bytes_g, _, _) = measure(baseline, &clip);
-    let (bytes_r, _, _) = measure(with_real, &clip);
+    let (bytes_r, _, _) = measure(with_first_pass, &clip);
 
     let frac = (bytes_r as f64 - bytes_g as f64).abs() / bytes_g.max(1) as f64;
     assert!(
         frac < 0.10,
-        "real-context second pass swung byte size by {:.1}% (neutral {bytes_g}, real {bytes_r}) — beyond +/-10%",
+        "first-pass real-context swung byte size by {:.1}% (neutral {bytes_g}, real {bytes_r}) — beyond +/-10%",
         frac * 100.0
     );
 }
 
-/// `enable_split_mv_rdo = false` makes the real-context knob inert —
-/// the second pass only fires when the picker actually committed
-/// SPLIT_MV under the round-43 rate weight.
+/// `enable_split_mv_rdo = false` makes the first-pass real-context
+/// knob inert — there is no SPLIT_MV RDO weight to score against, so
+/// the dispatch falls through to the legacy SAD-min path.
 #[test]
-fn split_mv_real_context_requires_split_mv_rdo() {
+fn split_mv_real_context_first_pass_requires_split_mv_rdo() {
     let clip = make_pan_clip(4);
     let cfg_a = Vp8EncoderConfig {
         enable_split_mv_rdo: false,
-        enable_split_mv_rdo_real_context: false,
         enable_split_mv_rdo_real_context_first_pass: false,
-        enable_subpel_mv_cost_partition: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_split_mv_rdo: false,
-        enable_split_mv_rdo_real_context: true,
-        enable_split_mv_rdo_real_context_first_pass: false,
-        enable_subpel_mv_cost_partition: false,
+        enable_split_mv_rdo_real_context_first_pass: true,
         ..cfg_baseline()
     };
 
@@ -413,7 +312,7 @@ fn split_mv_real_context_requires_split_mv_rdo() {
 
     assert_eq!(
         b0, b1,
-        "real-context must be inert when enable_split_mv_rdo=false: {b0} vs {b1}"
+        "first-pass real-context must be inert when enable_split_mv_rdo=false: {b0} vs {b1}"
     );
     assert_eq!(p0.len(), p1.len());
     for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
@@ -421,16 +320,67 @@ fn split_mv_real_context_requires_split_mv_rdo() {
     }
 }
 
-/// Combined round-45 + round-44 + round-43: turn everything on at once
-/// and confirm a clean round-trip with reasonable PSNR.
 #[test]
-fn round45_combined_decodes_cleanly() {
+fn subpel_mv_cost_partition_pframe_decodes_cleanly() {
+    let clip = make_pan_clip(8);
+    let cfg = Vp8EncoderConfig {
+        enable_subpel_mv_cost: true,
+        enable_subpel_mv_cost_partition: true,
+        ..cfg_baseline()
+    };
+    let (bytes, psnr_y, _) = measure(cfg, &clip);
+    assert!(
+        bytes > 0,
+        "sub-pel MV-cost partition refine P-frame produced zero bytes"
+    );
+    assert!(
+        psnr_y > 5.0,
+        "sub-pel MV-cost partition refine P-frame PSNR collapsed: {psnr_y:.2} dB"
+    );
+}
+
+/// `enable_subpel_mv_cost = false` makes the partition refine knob
+/// inert (the refinement uses the per-ref `subpel_mv_cost_lambda`
+/// only when its parent flag is on; we mirror the same gate inside
+/// the call site, so the picker collapses to SAD-only).
+#[test]
+fn subpel_mv_cost_partition_requires_subpel_mv_cost() {
+    let clip = make_pan_clip(4);
+    let cfg_a = Vp8EncoderConfig {
+        enable_subpel_mv_cost: false,
+        enable_subpel_mv_cost_partition: false,
+        ..cfg_baseline()
+    };
+    let cfg_b = Vp8EncoderConfig {
+        enable_subpel_mv_cost: false,
+        enable_subpel_mv_cost_partition: true,
+        ..cfg_baseline()
+    };
+
+    let (b0, _, p0) = measure(cfg_a, &clip);
+    let (b1, _, p1) = measure(cfg_b, &clip);
+
+    assert_eq!(
+        b0, b1,
+        "partition refine must be inert when enable_subpel_mv_cost=false: {b0} vs {b1}"
+    );
+    assert_eq!(p0.len(), p1.len());
+    for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
+        assert_eq!(a, b, "subpel-mv-cost-off packet {i} differs");
+    }
+}
+
+/// Combined round-46 on top of round-45 + round-43: turn everything on
+/// at once and confirm a clean round-trip with reasonable PSNR.
+#[test]
+fn round46_combined_decodes_cleanly() {
     let clip = make_pan_clip(8);
     let cfg = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
         enable_split_mv_rdo_real_context: true,
-        enable_split_mv_rdo_real_context_first_pass: false,
-        enable_subpel_mv_cost_partition: false,
+        enable_split_mv_rdo_real_context_first_pass: true,
+        enable_subpel_mv_cost: true,
+        enable_subpel_mv_cost_partition: true,
         enable_mv_cost_aware_snap: true,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,
@@ -442,9 +392,9 @@ fn round45_combined_decodes_cleanly() {
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "combined round-45 produced zero bytes");
+    assert!(bytes > 0, "combined round-46 produced zero bytes");
     assert!(
         psnr_y > 5.0,
-        "combined round-45 PSNR collapsed: {psnr_y:.2} dB"
+        "combined round-46 PSNR collapsed: {psnr_y:.2} dB"
     );
 }

@@ -191,6 +191,8 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_trellis_context_rate: false,
         enable_mv_cost_aware_snap: false,
         enable_split_mv_rdo_real_context: false,
+        enable_split_mv_rdo_real_context_first_pass: false,
+        enable_subpel_mv_cost_partition: false,
     }
 }
 
@@ -240,6 +242,8 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_trellis_context_rate: false,
         enable_mv_cost_aware_snap: false,
         enable_split_mv_rdo_real_context: false,
+        enable_split_mv_rdo_real_context_first_pass: false,
+        enable_subpel_mv_cost_partition: false,
     }
 }
 
@@ -300,6 +304,8 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         enable_trellis_context_rate: false,
         enable_mv_cost_aware_snap: false,
         enable_split_mv_rdo_real_context: false,
+        enable_split_mv_rdo_real_context_first_pass: false,
+        enable_subpel_mv_cost_partition: false,
     }
 }
 
@@ -408,6 +414,8 @@ fn frame_headers_carry_segment_lf_deltas() {
         enable_trellis_context_rate: false,
         enable_mv_cost_aware_snap: false,
         enable_split_mv_rdo_real_context: false,
+        enable_split_mv_rdo_real_context_first_pass: false,
+        enable_subpel_mv_cost_partition: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

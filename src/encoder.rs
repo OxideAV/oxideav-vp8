@@ -859,6 +859,32 @@ pub struct Vp8EncoderConfig {
     /// so existing SPLIT_MV bitstreams stay byte-identical when this
     /// flag is disabled.
     pub enable_split_mv_rdo_real_context: bool,
+    /// Enable round-46 first-pass real-context SPLIT_MV scoring. When
+    /// `true` (and `enable_split_mv_rdo = true`, `enable_rdo = true`),
+    /// the per-ref picker scores SPLIT_MV with the actual neighbour
+    /// `SUB_MV_REF_PROBS` rows and per-leaf path costs (the same model
+    /// the round-45 second pass uses) right inside `choose_pmb_decision`,
+    /// so the SPLIT-vs-NEW competition under `D + λ·R` sees the bitstream
+    /// rate from the start. Subsumes (and is preferred over) the
+    /// round-45 second-pass swap (`enable_split_mv_rdo_real_context`):
+    /// when both are on, the second pass becomes a no-op because the
+    /// first-pass picker already picks the real-context-optimal split.
+    /// Off-by-default so existing SPLIT_MV bitstreams stay byte-identical
+    /// when this flag is disabled. Requires `enable_split_mv_rdo = true`
+    /// and `enable_rdo = true`.
+    pub enable_split_mv_rdo_real_context_first_pass: bool,
+    /// Enable round-46 MV-cost-aware sub-pel partition refinement.
+    /// When `true` (and `enable_subpel_mv_cost = true`, `enable_rdo = true`),
+    /// `subpel_refine_partition` (used inside `search_split_mv` and
+    /// `search_split_mv_with_real_context`) tilts the 3×3 quarter-pel
+    /// hill-climb with the same `mv_cost_lambda` rate term used in
+    /// `subpel_refine_luma`, so SPLIT_MV partitions land on rate-cheaper
+    /// MVs (smaller delta to `best_for_newmv` proxy = `Mv::ZERO`, same
+    /// proxy `split_mv_total_rate_x256` uses for the absolute-MV cost).
+    /// Off-by-default so existing SPLIT_MV bitstreams stay byte-identical
+    /// when this flag is disabled. Requires `enable_subpel_mv_cost = true`
+    /// and `enable_rdo = true`.
+    pub enable_subpel_mv_cost_partition: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -908,6 +934,8 @@ impl Default for Vp8EncoderConfig {
             enable_trellis_context_rate: false,
             enable_mv_cost_aware_snap: false,
             enable_split_mv_rdo_real_context: false,
+            enable_split_mv_rdo_real_context_first_pass: false,
+            enable_subpel_mv_cost_partition: false,
         }
     }
 }
@@ -2452,6 +2480,26 @@ fn encode_pframe_and_reconstruct(
                     mb_w,
                     ref_frame,
                 );
+                let split_real_ctx = if config.enable_split_mv_rdo_real_context_first_pass
+                    && config.enable_split_mv_rdo
+                    && config.enable_rdo
+                {
+                    Some(SplitMvRealCtx {
+                        mb_sub_mvs: &mb_sub_mvs,
+                        mb_decisions: &mb_decisions,
+                        best_for_newmv,
+                    })
+                } else {
+                    None
+                };
+                let subpel_partition_mv_cost_lambda: u64 = if config.enable_subpel_mv_cost_partition
+                    && config.enable_subpel_mv_cost
+                    && config.enable_rdo
+                {
+                    lambda as u64
+                } else {
+                    0
+                };
                 let dec = choose_pmb_decision_with(
                     &src_y,
                     &ref_plane.y,
@@ -2475,6 +2523,13 @@ fn encode_pframe_and_reconstruct(
                         0
                     },
                     split_mv_rdo_lambda_x256,
+                    if config.enable_mv_cost_aware_snap && config.enable_rdo {
+                        lambda as u64
+                    } else {
+                        0
+                    },
+                    split_real_ctx,
+                    subpel_partition_mv_cost_lambda,
                 );
                 // Per-ref lambda tilt. LAST is the closest reference and
                 // its drift is bounded by exactly one frame; GOLDEN /
@@ -2610,6 +2665,15 @@ fn encode_pframe_and_reconstruct(
                         width: y_stride,
                         height: y_buf_h,
                     };
+                    let subpel_partition_mv_cost_lambda_2p: u64 = if config
+                        .enable_subpel_mv_cost_partition
+                        && config.enable_subpel_mv_cost
+                        && config.enable_rdo
+                    {
+                        lambda as u64
+                    } else {
+                        0
+                    };
                     if let Some((new_split, _)) = search_split_mv_with_real_context(
                         &src_y,
                         &ref_plane,
@@ -2628,6 +2692,7 @@ fn encode_pframe_and_reconstruct(
                         mb_y,
                         mb_w,
                         best_for_newmv,
+                        subpel_partition_mv_cost_lambda_2p,
                     ) {
                         PMbDecision::SplitMv(new_split)
                     } else {
@@ -4373,9 +4438,28 @@ fn choose_pmb_decision(
         near,
         rec_y,
         DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
-        0, // subpel_mv_cost_lambda: disabled (tests use legacy SAD-only path)
-        0, // split_mv_rdo_lambda: disabled (tests use legacy SAD-only path)
+        0,    // subpel_mv_cost_lambda: disabled (tests use legacy SAD-only path)
+        0,    // split_mv_rdo_lambda: disabled (tests use legacy SAD-only path)
+        0,    // mv_cost_aware_snap_lambda: disabled (tests use legacy fixed-tolerance path)
+        None, // split_real_ctx: disabled (tests use legacy neutral-context path)
+        0,    // subpel_partition_mv_cost_lambda: disabled
     )
+}
+
+/// Round-46 first-pass real-context inputs for SPLIT_MV scoring inside
+/// `choose_pmb_decision_with`. When `Some`, `search_split_mv` (called
+/// from the per-ref picker) uses the real-context rate model
+/// (`split_mv_real_context_rate_x256`) instead of the neutral-context
+/// upper bound (`split_mv_total_rate_x256`), so the SPLIT-vs-NEW
+/// `D + λ·R` comparison sees the actual bitstream rate from the start.
+/// `best_for_newmv` is the per-ref NEW-MV root the bitstream emits as
+/// the MV-delta base — same value the per-ref `try_ref` closure gets
+/// from `find_near_mvs_enc`.
+#[derive(Copy, Clone)]
+struct SplitMvRealCtx<'a> {
+    mb_sub_mvs: &'a [[Mv; 16]],
+    mb_decisions: &'a [PMbDecision],
+    best_for_newmv: Mv,
 }
 
 /// Same as `choose_pmb_decision` but with a caller-supplied SPLIT_MV
@@ -4394,6 +4478,37 @@ fn choose_pmb_decision(
 /// for the `MBSPLIT_PROBS` tree path + per-partition `SUB_MV_REF_PROBS`
 /// leaf cost + per-partition MV-delta bits. Setting to 0 restores the
 /// legacy SAD-only `search_split_mv` behaviour bit-for-bit.
+///
+/// `mv_cost_aware_snap_lambda`: round-45 MV-cost-aware NEAREST/NEAR
+/// snap. When non-zero (and the picker just chose NEW_MV) we replace
+/// the fixed L∞ tolerance test with a Lagrangian one: snap to a
+/// non-zero NEAREST / NEAR candidate when the SAD penalty
+/// `(snap_sad − refined_sad)` is less than `λ × Δbits / 256`, where
+/// `Δbits` is the bool-coder cost difference between coding NEW_MV
+/// (mv-tree path "1110" + MV-delta literal under
+/// `DEFAULT_MV_CONTEXT`) and the cheaper neighbour mode (NEAREST:
+/// "10", NEAR: "110"). Setting to 0 keeps the legacy fixed-tolerance
+/// snap (`NEIGHBOUR_MV_SNAP_TOLERANCE`) bit-for-bit.
+///
+/// `split_real_ctx`: round-46 first-pass real-context SPLIT_MV inputs.
+/// When `Some` (and `split_mv_rdo_lambda > 0`), the per-ref SPLIT_MV
+/// search scores each split-mode candidate with the *real* per-leaf
+/// `SUB_MV_REF_PROBS` context derived from the already-committed
+/// left/above neighbour sub-MVs (same model the round-45 second-pass
+/// `search_split_mv_with_real_context` uses), so the SPLIT-vs-NEW
+/// competition under `D + λ·R` sees the bitstream rate from the
+/// start. When `None`, the legacy neutral-context upper bound
+/// (`split_mv_total_rate_x256`) is used. Setting `split_mv_rdo_lambda
+/// = 0` collapses both paths to SAD-min selection bit-for-bit.
+///
+/// `subpel_partition_mv_cost_lambda`: round-46 MV-cost-aware sub-pel
+/// partition refinement. When non-zero (and `split_mv_rdo_lambda > 0`),
+/// the 3×3 quarter-pel `subpel_refine_partition` hill-climb compares
+/// `D + λ·R` rather than SAD-only; `R` is the sum of MV-component
+/// costs under `DEFAULT_MV_CONTEXT` (same proxy
+/// `split_mv_total_rate_x256` uses for the per-partition MV-delta
+/// term). Setting to 0 keeps the legacy SAD-only refinement
+/// bit-for-bit.
 #[allow(clippy::too_many_arguments)]
 fn choose_pmb_decision_with(
     src_y: &[u8],
@@ -4410,6 +4525,9 @@ fn choose_pmb_decision_with(
     split_mv_joint_refine_passes: u32,
     subpel_mv_cost_lambda: u64,
     split_mv_rdo_lambda: u64,
+    mv_cost_aware_snap_lambda: u64,
+    split_real_ctx: Option<SplitMvRealCtx<'_>>,
+    subpel_partition_mv_cost_lambda: u64,
 ) -> PMbDecision {
     let mb_xp = mb_x * 16;
     let mb_yp = mb_y * 16;
@@ -4532,17 +4650,66 @@ fn choose_pmb_decision_with(
     //      without paying the MV-delta bits. Keeps the neighbour-chain
     //      coherent across rows of MBs that all share the same motion
     //      and naturally find it via the per-MB integer search (#373).
+    //
+    //      Round-45: when `mv_cost_aware_snap_lambda > 0`, the snap test
+    //      is augmented with a Lagrangian comparison — even when the MV
+    //      magnitude exceeds `NEIGHBOUR_MV_SNAP_TOLERANCE`, we may still
+    //      snap to a candidate whose `(snap_sad − refined_sad)` distortion
+    //      penalty is amortised by the rate savings of dropping the
+    //      MV-delta literal (NEW_MV pays mv-tree path "1110" + literal;
+    //      NEAREST pays "10"; NEAR pays "110"). Setting the lambda to 0
+    //      preserves the fixed-tolerance behaviour bit-for-bit.
     if let PMbDecision::NewMv(mv) = best_decision {
-        if nearest != Mv::ZERO && mv_within_tolerance(mv, nearest, NEIGHBOUR_MV_SNAP_TOLERANCE) {
+        // Cost (bits × 256) for the inter-mode tree path of each option.
+        // mv-tree probs are all 128 (uniform — see `estimate_mode_rate_x256`).
+        let new_path_cost = (bool_cost_x256(128, true) as u64) * 3 // "111"
+            + (bool_cost_x256(128, false) as u64); // "0" trailing
+        let nearest_path_cost =
+            bool_cost_x256(128, true) as u64 + bool_cost_x256(128, false) as u64;
+        let near_path_cost =
+            (bool_cost_x256(128, true) as u64) * 2 + bool_cost_x256(128, false) as u64;
+        // MV-delta literal cost for the NEW_MV the picker chose. The
+        // NEW path's `best_for_newmv` is unknown to this function (the
+        // per-ref picker fills it later); use the absolute MV as the
+        // delta proxy (same convention as `split_mv_total_rate_x256`).
+        let new_literal_cost = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32) as u64
+            + mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32) as u64;
+
+        let try_snap =
+            |target: Mv, target_sad: Option<u32>, target_path_cost: u64| -> Option<u32> {
+                if target == Mv::ZERO {
+                    return None;
+                }
+                let s = target_sad?;
+                // Fixed-tolerance fast path (legacy behaviour).
+                let fixed_ok = mv_within_tolerance(mv, target, NEIGHBOUR_MV_SNAP_TOLERANCE);
+                if fixed_ok {
+                    return Some(s);
+                }
+                if mv_cost_aware_snap_lambda == 0 {
+                    return None;
+                }
+                // Lagrangian check: snap when the SAD penalty is smaller than
+                // λ × (rate saving) / 256. Rate saving = NEW path + literal −
+                // target path. Saturating subtractions guard against the
+                // (very unlikely) case where target_path_cost > new_path_cost.
+                let rate_saved_x256 =
+                    (new_path_cost + new_literal_cost).saturating_sub(target_path_cost);
+                let sad_penalty = (s as u64).saturating_sub(refined_sad as u64);
+                let rate_credit = mv_cost_aware_snap_lambda.saturating_mul(rate_saved_x256) / 256;
+                if sad_penalty <= rate_credit {
+                    Some(s)
+                } else {
+                    None
+                }
+            };
+
+        if let Some(s) = try_snap(nearest, nearest_sad, nearest_path_cost) {
             best_decision = PMbDecision::NearestMv(nearest);
-            if let Some(s) = nearest_sad {
-                best_sad = s;
-            }
-        } else if near != Mv::ZERO && mv_within_tolerance(mv, near, NEIGHBOUR_MV_SNAP_TOLERANCE) {
+            best_sad = s;
+        } else if let Some(s) = try_snap(near, near_sad, near_path_cost) {
             best_decision = PMbDecision::NearMv(near);
-            if let Some(s) = near_sad {
-                best_sad = s;
-            }
+            best_sad = s;
         }
     }
 
@@ -4553,15 +4720,58 @@ fn choose_pmb_decision_with(
     //      the current best decision by at least
     //      `n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION`.
     if best_sad > SPLITMV_CONSIDER_SAD_PER_PIXEL * (16 * 16) {
-        if let Some((split, split_sad)) = search_split_mv(
-            src_y,
-            &ref_plane,
-            y_stride,
-            mb_xp,
-            mb_yp,
-            split_mv_joint_refine_passes,
-            split_mv_rdo_lambda,
-        ) {
+        // Round-46: dispatch to the real-context search when the caller
+        // supplied real-neighbour inputs AND the SPLIT_MV RDO weight is
+        // active. With `split_real_ctx == None` we fall through to the
+        // legacy neutral-context `search_split_mv`, preserving every
+        // prior bitstream and test fixture bit-for-bit.
+        let split_result = if let Some(ctx) = split_real_ctx {
+            if split_mv_rdo_lambda > 0 {
+                search_split_mv_with_real_context(
+                    src_y,
+                    &ref_plane,
+                    y_stride,
+                    mb_xp,
+                    mb_yp,
+                    split_mv_joint_refine_passes,
+                    split_mv_rdo_lambda,
+                    ctx.mb_sub_mvs,
+                    ctx.mb_decisions,
+                    mb_x,
+                    mb_y,
+                    mb_w,
+                    ctx.best_for_newmv,
+                    subpel_partition_mv_cost_lambda,
+                )
+            } else {
+                // Fall back to the legacy SAD-min path when the SPLIT_MV
+                // RDO lambda is 0 — the real-context rate model would
+                // collapse to 0 anyway, so neutral-context is exactly
+                // bit-equivalent and cheaper.
+                search_split_mv(
+                    src_y,
+                    &ref_plane,
+                    y_stride,
+                    mb_xp,
+                    mb_yp,
+                    split_mv_joint_refine_passes,
+                    split_mv_rdo_lambda,
+                    subpel_partition_mv_cost_lambda,
+                )
+            }
+        } else {
+            search_split_mv(
+                src_y,
+                &ref_plane,
+                y_stride,
+                mb_xp,
+                mb_yp,
+                split_mv_joint_refine_passes,
+                split_mv_rdo_lambda,
+                subpel_partition_mv_cost_lambda,
+            )
+        };
+        if let Some((split, split_sad)) = split_result {
             let n_parts = MB_SPLIT_COUNT[split.split_mode as usize] as u32;
             let split_margin = n_parts * SPLITMV_SAD_MARGIN_PER_PARTITION;
             if split_sad + split_margin < best_sad {
@@ -8389,6 +8599,7 @@ fn emit_bmodes_keyframe(
 /// Lagrangian `D + λ·R` (round-43 SPLIT_MV RDO). `D` is the total SAD
 /// the partition search returns; `R` is built from
 /// [`split_mv_total_rate_x256`].
+#[allow(clippy::too_many_arguments)]
 fn search_split_mv(
     src_y: &[u8],
     ref_plane: &RefPlane<'_>,
@@ -8397,6 +8608,7 @@ fn search_split_mv(
     mb_yp: usize,
     joint_refine_passes: u32,
     rdo_lambda_x256: u64,
+    subpel_partition_mv_cost_lambda: u64,
 ) -> Option<(SplitMv, u32)> {
     let mut best: Option<(SplitMv, u32)> = None;
     let mut best_cost: u64 = u64::MAX;
@@ -8409,6 +8621,7 @@ fn search_split_mv(
             mb_xp,
             mb_yp,
             joint_refine_passes,
+            subpel_partition_mv_cost_lambda,
         );
         let split = SplitMv {
             split_mode,
@@ -8662,6 +8875,7 @@ fn search_split_mv_with_real_context(
     mb_y: usize,
     mb_w: usize,
     best_for_newmv: Mv,
+    subpel_partition_mv_cost_lambda: u64,
 ) -> Option<(SplitMv, u32)> {
     let mut best: Option<(SplitMv, u32)> = None;
     let mut best_cost: u64 = u64::MAX;
@@ -8674,6 +8888,7 @@ fn search_split_mv_with_real_context(
             mb_xp,
             mb_yp,
             joint_refine_passes,
+            subpel_partition_mv_cost_lambda,
         );
         let split = SplitMv {
             split_mode,
@@ -8718,6 +8933,7 @@ fn search_split_mv_with_real_context(
 /// hill-climbing each MV in a 3×3 quarter-pel neighbourhood — catches
 /// boundary cases where the independent-partition search lands one
 /// quarter-pel off the joint optimum.
+#[allow(clippy::too_many_arguments)]
 fn search_split_partitions(
     split_mode: u8,
     src_y: &[u8],
@@ -8726,6 +8942,7 @@ fn search_split_partitions(
     mb_xp: usize,
     mb_yp: usize,
     joint_refine_passes: u32,
+    subpel_partition_mv_cost_lambda: u64,
 ) -> ([Mv; 16], u32) {
     let partition = &MB_SPLITS[split_mode as usize];
     let n = MB_SPLIT_COUNT[split_mode as usize] as usize;
@@ -8776,6 +8993,7 @@ fn search_split_partitions(
             &indices,
             int_mv,
             best_int_sad,
+            subpel_partition_mv_cost_lambda,
         );
         part_mvs[p] = refined_mv;
         part_indices.push(indices);
@@ -8806,6 +9024,7 @@ fn search_split_partitions(
                     &part_indices[p],
                     cur_mv,
                     part_sads[p],
+                    subpel_partition_mv_cost_lambda,
                 );
                 if refined_sad < part_sads[p] {
                     total_sad = total_sad - part_sads[p] + refined_sad;
@@ -8884,6 +9103,7 @@ fn partition_sad_at_int(
 }
 
 /// Sub-pel refinement for a partition using the sixtap filter path.
+#[allow(clippy::too_many_arguments)]
 fn subpel_refine_partition(
     src_y: &[u8],
     ref_plane: &RefPlane<'_>,
@@ -8893,9 +9113,25 @@ fn subpel_refine_partition(
     indices: &[usize],
     int_mv: Mv,
     int_sad: u32,
+    mv_cost_lambda: u64,
 ) -> (Mv, u32) {
+    // Round-46: when `mv_cost_lambda > 0`, mirror `subpel_refine_luma`'s
+    // Lagrangian comparison `D + λ·R / 256` (R = sum of MV-component
+    // costs under `DEFAULT_MV_CONTEXT`, the same proxy
+    // `split_mv_total_rate_x256` charges per partition for the absolute
+    // MV). With `mv_cost_lambda == 0` the rate term collapses to 0 and
+    // we recover the pre-r46 SAD-only behaviour bit-for-bit.
+    let mv_rate_cost = |mv: Mv| -> u64 {
+        if mv_cost_lambda == 0 {
+            return 0;
+        }
+        let row_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32);
+        let col_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32);
+        mv_cost_lambda * (row_bits + col_bits) as u64 / 256
+    };
     let mut best_mv = int_mv;
     let mut best_sad = int_sad;
+    let mut best_cost = int_sad as u64 + mv_rate_cost(int_mv);
     let step = SUBPEL_REFINE_STEP;
     for dy in -1..=1 {
         for dx in -1..=1 {
@@ -8904,7 +9140,9 @@ fn subpel_refine_partition(
             }
             let mv = Mv::new(int_mv.row as i32 + dy * step, int_mv.col as i32 + dx * step);
             let sad = subpel_partition_sad(src_y, ref_plane, y_stride, mb_xp, mb_yp, indices, mv);
-            if sad < best_sad {
+            let cost = sad as u64 + mv_rate_cost(mv);
+            if cost < best_cost {
+                best_cost = cost;
                 best_sad = sad;
                 best_mv = mv;
             }
@@ -10409,8 +10647,8 @@ mod tests {
             width: stride,
             height: 32,
         };
-        let (_mvs0, sad0) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 0);
-        let (_mvs2, sad2) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 2);
+        let (_mvs0, sad0) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 0, 0);
+        let (_mvs2, sad2) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 2, 0);
         assert!(
             sad2 <= sad0,
             "joint refinement must not increase SAD: 0-pass={sad0}, 2-pass={sad2}"
@@ -10437,8 +10675,9 @@ mod tests {
             0,
             0,
             SPLIT_MV_JOINT_REFINE_PASSES_MAX,
+            0,
         );
-        let (_b, sad_huge) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 10_000);
+        let (_b, sad_huge) = search_split_partitions(0, &src, &ref_plane, stride, 0, 0, 10_000, 0);
         assert_eq!(
             sad_max, sad_huge,
             "joint-refine pass count above MAX must clip, not loop forever"

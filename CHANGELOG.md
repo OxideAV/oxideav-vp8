@@ -9,6 +9,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Chroma-aware per-MB median picker + k-means convergence
+  early-exit & iter-count telemetry (round-53). Two complementary
+  forward steps composing the existing round-49 / round-50 / round-51 /
+  round-52 LF-delta + spatial-segment picker tiers, both gated behind
+  opt-in flags (default off / default-1 in the case of the convergence
+  threshold). `Vp8EncoderConfig::enable_chroma_aware_per_mb_median`
+  (default `false`) extends the round-49 per-MB segment LF-delta median
+  picker (`enable_per_mb_lf_deltas`) to compute each MB's "optimal LF
+  delta" from a luma+chroma weighted SSE blend `(luma_w_x256 *
+  mb_sse_y + chroma_w_x256 * mb_sse_uv) / 256` (the same blend the
+  round-52 chroma-aware spatial picker uses), instead of luma SSE alone.
+  Sources chroma SSE from the round-51 `mb_sse_uv_cache` (single-line
+  plumbing — the cache gating widens to populate the chroma cache when
+  this flag is on alongside the per-MB median path). Default weights
+  reuse the existing `chroma_aware_spatial_luma_weight_x256 = 256`
+  (= `1.0`) and `chroma_aware_spatial_chroma_weight_x256 = 128`
+  (= `0.5`), matching the 4:2:0 sub-sampling ratio. Off-by-default;
+  the round-49 luma-only median picker is preserved bit-for-bit when
+  the flag is off. Requires `enable_segments = true` and
+  `enable_per_mb_lf_deltas = true` — inert otherwise; mutually inert
+  with `enable_spatial_lf_deltas` (the spatial picker wins when both
+  per-MB flags are on, so the median picker becomes a no-op).
+  `Vp8EncoderConfig::kmeans_convergence_threshold` (default
+  [`DEFAULT_KMEANS_CONVERGENCE_THRESHOLD`] = `1`) adds a
+  centroid-movement-based early-exit to the round-50 / round-51
+  4-means spatial-segment picker. After each Lloyd's iteration the
+  picker computes `max_delta = max(|new_centroid_i -
+  prev_centroid_i|)` over the `(delta, pos_x, pos_y)` axes; when
+  `max_delta < threshold` the loop exits early. Default `1` typically
+  exits in 2-4 iterations on the encoder's test fixtures vs the
+  round-50 hard cap of `KMEANS_SPATIAL_MAX_ITERS = 16` (the cap is
+  preserved as a safety upper bound). `0` collapses to the round-50 /
+  round-51 termination ("exit only when no region changes assignment")
+  bit-for-bit. Telemetry: the actual iteration count is reported in a
+  new `Vp8EncoderStats` struct with field `last_kmeans_iters:
+  Option<u32>`, accessed via the new `make_encoder_typed_with_config`
+  factory + `Vp8Encoder::last_stats` method (the existing
+  `make_encoder_with_config` factory returns `Box<dyn Encoder>` and
+  hides the concrete type, so the typed factory is the channel for
+  callers that want introspection). Keyframes reset
+  `last_kmeans_iters` to `None` because the spatial picker only runs
+  on P-frames. Implemented via the new
+  `compute_spatial_segment_lf_deltas_kmeans_with_telemetry` function
+  (returning `(Vec<u8>, [i32; 4], u32)`), with the existing
+  `compute_spatial_segment_lf_deltas_kmeans` wrapper preserved for the
+  unit-test corpus. Both flags off-by-default so the round-52
+  default-config behaviour is preserved bit-for-bit and the
+  15-fixture corpus stays bit-exact. Ten integration tests in
+  `tests/encoder_round_53.rs` plus seven unit tests in `src/encoder.rs`
+  pin: defaults at the documented defaults, chroma-aware off
+  byte-identical, chroma-aware-dependency gating, chroma-aware shifts
+  segment_id distribution on a chroma-textured / luma-flat clip,
+  kmeans iter-count telemetry sanity (≥ 1, ≤ `KMEANS_SPATIAL_MAX_ITERS`),
+  kmeans default-threshold ≤ 6 iters on simple fixtures,
+  kmeans threshold-zero deterministic re-run, keyframe resets stats,
+  composed knobs decode cleanly, full-pipeline reproducible re-runs,
+  helper edge cases (zero-threshold matches wrapper, early-exit under
+  default threshold, hard iter-cap respected, degenerate inputs return
+  iter `0`, large threshold exits in ≤ 2 iters).
+
+  [`DEFAULT_KMEANS_CONVERGENCE_THRESHOLD`]: https://docs.rs/oxideav-vp8/latest/oxideav_vp8/encoder/constant.DEFAULT_KMEANS_CONVERGENCE_THRESHOLD.html
+
 - *(encoder)* Joint round-44/48 + round-49 picker + chroma-aware
   spatial picker (round-52). Two complementary opt-in knobs compose
   the existing round-44/48 (mode/ref deltas) and round-49 / round-50 /

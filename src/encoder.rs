@@ -419,6 +419,21 @@ pub const DEFAULT_KMEANS_SPATIAL_ALPHA_X256: u32 = 256;
 /// near-equivalent partitions.
 pub const KMEANS_SPATIAL_MAX_ITERS: usize = 16;
 
+/// Round-53 (#3): default centroid-movement convergence threshold for the
+/// k-means spatial-segment picker's early-exit check. After each Lloyd's
+/// iteration the picker computes `max_delta = max(|new_centroid_i -
+/// prev_centroid_i|)` over the `(delta, pos_x, pos_y)` coordinates of
+/// every centroid; when `max_delta < threshold` the iteration exits
+/// early. `1` (in mixed delta + pos units) corresponds to "every
+/// centroid moved by less than one unit on every axis", which on the
+/// encoder's test fixtures is reached in 2–4 iterations against the
+/// previous hard cap of [`KMEANS_SPATIAL_MAX_ITERS`] = `16`. The cap is
+/// preserved as a safety upper bound for degenerate distributions where
+/// the centroids oscillate just above the threshold. `0` collapses to
+/// the previous "exit only when no region changed assignment" behaviour
+/// (the original round-50 / round-51 termination condition).
+pub const DEFAULT_KMEANS_CONVERGENCE_THRESHOLD: u32 = 1;
+
 /// Default for [`Vp8EncoderConfig::joint_r44r49_picker_max_iters`]. The
 /// round-52 (#2) joint two-pass picker iterates the round-44/48 mode/ref
 /// estimator + the round-49 spatial-segment picker, each iteration
@@ -1318,6 +1333,51 @@ pub struct Vp8EncoderConfig {
     /// [`enable_chroma_aware_spatial`]: Vp8EncoderConfig::enable_chroma_aware_spatial
     /// [`DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256`]: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256
     pub chroma_aware_spatial_chroma_weight_x256: u32,
+    /// Round-53 (#4): chroma-aware variant of the round-49 per-MB segment
+    /// LF-delta median picker. Today the per-MB median picker
+    /// (`enable_per_mb_lf_deltas`) computes each MB's "optimal LF delta"
+    /// from the per-MB luma SSE only — a per-MB region whose luma is
+    /// uniformly smooth but whose chroma carries substantial residual
+    /// error never contributes a non-zero delta. With this flag on, each
+    /// MB's optimal LF delta is computed from a per-MB combined SSE
+    /// `(luma_w_x256 * mb_sse_y + chroma_w_x256 * mb_sse_uv) / 256`,
+    /// reusing the same blend the round-52 chroma-aware spatial picker
+    /// uses (with the same
+    /// [`chroma_aware_spatial_luma_weight_x256`] /
+    /// [`chroma_aware_spatial_chroma_weight_x256`] weights). Default
+    /// weights (`luma=256` = `1.0`, `chroma=128` = `0.5`) match the
+    /// 4:2:0 sub-sampling ratio. The aggregation step (per-segment
+    /// median over per-MB optimal deltas) is unchanged — only the SSE
+    /// driving the per-MB optimal delta differs.
+    ///
+    /// Off-by-default so the round-49 per-MB median picker is preserved
+    /// bit-for-bit when this flag is disabled. Requires
+    /// `enable_segments = true` and `enable_per_mb_lf_deltas = true`
+    /// (the round-49 per-MB median picker) — inert otherwise. Mutually
+    /// inert with `enable_spatial_lf_deltas` (the spatial picker wins
+    /// when both per-MB flags are on; the median picker becomes a no-op
+    /// on that path).
+    ///
+    /// [`chroma_aware_spatial_luma_weight_x256`]: Vp8EncoderConfig::chroma_aware_spatial_luma_weight_x256
+    /// [`chroma_aware_spatial_chroma_weight_x256`]: Vp8EncoderConfig::chroma_aware_spatial_chroma_weight_x256
+    pub enable_chroma_aware_per_mb_median: bool,
+    /// Round-53 (#3): centroid-movement convergence threshold for the
+    /// k-means spatial-segment picker's early-exit check. After each
+    /// Lloyd's iteration the picker computes `max_delta = max(|new -
+    /// prev|)` over the `(delta, pos_x, pos_y)` coordinates of every
+    /// centroid; when `max_delta < threshold` the iteration exits early.
+    /// Default [`DEFAULT_KMEANS_CONVERGENCE_THRESHOLD`] = `1`. `0`
+    /// collapses to the round-50 / round-51 termination ("exit only
+    /// when no region changes assignment"); large values exit sooner
+    /// at the cost of a less-converged partition. The hard cap
+    /// [`KMEANS_SPATIAL_MAX_ITERS`] (= `16`) is always respected.
+    /// Active only when [`enable_kmeans_spatial_segmentation`] is
+    /// `true`.
+    ///
+    /// [`enable_kmeans_spatial_segmentation`]: Vp8EncoderConfig::enable_kmeans_spatial_segmentation
+    /// [`DEFAULT_KMEANS_CONVERGENCE_THRESHOLD`]: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD
+    /// [`KMEANS_SPATIAL_MAX_ITERS`]: KMEANS_SPATIAL_MAX_ITERS
+    pub kmeans_convergence_threshold: u32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -1385,6 +1445,8 @@ impl Default for Vp8EncoderConfig {
             chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
             chroma_aware_spatial_chroma_weight_x256:
                 DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+            enable_chroma_aware_per_mb_median: false,
+            kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         }
     }
 }
@@ -1493,6 +1555,7 @@ pub fn make_encoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn En
         pframe_count: 0,
         scene_cut: SceneCutState::new(),
         lookahead: VecDeque::new(),
+        last_stats: Vp8EncoderStats::default(),
     }))
 }
 
@@ -1556,6 +1619,7 @@ pub fn make_encoder_with_qindex(
         pframe_count: 0,
         scene_cut: SceneCutState::new(),
         lookahead: VecDeque::new(),
+        last_stats: Vp8EncoderStats::default(),
     }))
 }
 
@@ -1604,7 +1668,60 @@ pub fn make_encoder_with_config(
         pframe_count: 0,
         scene_cut: SceneCutState::new(),
         lookahead: VecDeque::new(),
+        last_stats: Vp8EncoderStats::default(),
     }))
+}
+
+/// Round-53 (#3): typed-encoder factory that returns the concrete
+/// [`Vp8Encoder`] (rather than `Box<dyn Encoder>`) so callers can read
+/// per-frame telemetry from [`Vp8Encoder::last_stats`] between
+/// `send_frame` calls. The configuration semantics are identical to
+/// [`make_encoder_with_config`]; the only difference is the return type.
+#[cfg(feature = "registry")]
+pub fn make_encoder_typed_with_config(
+    params: &CodecParameters,
+    config: Vp8EncoderConfig,
+) -> oxideav_core::Result<Vp8Encoder> {
+    let width = params
+        .width
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing width"))?;
+    let height = params
+        .height
+        .ok_or_else(|| oxideav_core::Error::invalid("vp8 encoder: missing height"))?;
+    let pix = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+    if pix != PixelFormat::Yuv420P {
+        return Err(oxideav_core::Error::unsupported(format!(
+            "vp8 encoder: only Yuv420P supported (got {:?})",
+            pix
+        )));
+    }
+    let frame_rate = params.frame_rate.unwrap_or(Rational::new(30, 1));
+    let mut output_params = params.clone();
+    output_params.media_type = MediaType::Video;
+    output_params.codec_id = CodecId::new(super::CODEC_ID_STR);
+    output_params.width = Some(width);
+    output_params.height = Some(height);
+    output_params.pixel_format = Some(PixelFormat::Yuv420P);
+    output_params.frame_rate = Some(frame_rate);
+    let time_base = TimeBase::new(frame_rate.den, frame_rate.num);
+    let mut cfg = config;
+    cfg.qindex = cfg.qindex.min(127);
+    Ok(Vp8Encoder {
+        output_params,
+        width,
+        height,
+        config: cfg,
+        time_base,
+        pending: VecDeque::new(),
+        eof: false,
+        last_frame: None,
+        golden_frame: None,
+        alt_ref_frame: None,
+        pframe_count: 0,
+        scene_cut: SceneCutState::new(),
+        lookahead: VecDeque::new(),
+        last_stats: Vp8EncoderStats::default(),
+    })
 }
 
 /// Reconstructed reference frame (post-quant reconstruction, matching what
@@ -1621,8 +1738,34 @@ struct ReferenceFrame {
     uv_h: usize,
 }
 
+/// Round-53 (#3): per-frame telemetry surfaced by [`Vp8Encoder`] for
+/// callers that want to introspect how the encoder's adaptive picker
+/// loops behaved on the most recent frame. Today the only field is
+/// `last_kmeans_iters` (the round-50 / round-51 4-means spatial-segment
+/// picker's iteration count); future rounds may extend this struct
+/// (e.g. joint-picker convergence-history per round-53 candidate #5).
+///
+/// Use [`Vp8Encoder::last_stats`] to read the most recent value;
+/// keyframes reset the slot to `Default` because the spatial picker
+/// only runs on P-frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vp8EncoderStats {
+    /// Number of Lloyd's-algorithm iterations the round-50 / round-51
+    /// 4-means spatial-segment picker actually ran on the most recent
+    /// frame, before either the centroid-movement convergence test
+    /// (round-53 #3) or the assignment-stability convergence test
+    /// (round-50) terminated the loop. `None` when the kmeans path
+    /// didn't run on this frame: kmeans flag off, segment / spatial
+    /// flag off, or the most-recent encode was a keyframe (which
+    /// doesn't run the spatial picker). Capped at
+    /// [`KMEANS_SPATIAL_MAX_ITERS`] (= `16`).
+    ///
+    /// [`KMEANS_SPATIAL_MAX_ITERS`]: KMEANS_SPATIAL_MAX_ITERS
+    pub last_kmeans_iters: Option<u32>,
+}
+
 #[cfg(feature = "registry")]
-struct Vp8Encoder {
+pub struct Vp8Encoder {
     output_params: CodecParameters,
     width: u32,
     height: u32,
@@ -1646,6 +1789,21 @@ struct Vp8Encoder {
     /// otherwise frames bypass this buffer entirely and the legacy
     /// 1-in / 1-out send/receive cadence is preserved exactly.
     lookahead: VecDeque<VideoFrame>,
+    /// Round-53 (#3): per-frame telemetry stash. Updated at the end of
+    /// each `send_frame` call (P-frames) or reset to `Default` on
+    /// keyframes (the spatial picker doesn't run on keyframes). Read
+    /// via [`Vp8Encoder::last_stats`].
+    last_stats: Vp8EncoderStats,
+}
+
+#[cfg(feature = "registry")]
+impl Vp8Encoder {
+    /// Round-53 (#3): read the per-frame telemetry stash. Returns the
+    /// stats from the most recent `send_frame` call; `Default` (all
+    /// fields `None`) before the first frame or after a keyframe.
+    pub fn last_stats(&self) -> Vp8EncoderStats {
+        self.last_stats
+    }
 }
 
 /// Per-frame state for the scene-cut detector. Holds the previous source
@@ -2071,6 +2229,11 @@ impl Encoder for Vp8Encoder {
                 use_golden: false,
                 use_alt: false,
             };
+            // Round-53 (#3): keyframes don't run the kmeans spatial
+            // picker (segments + spatial-LF deltas only have effect on
+            // P-frames); reset the telemetry slot so a stale P-frame
+            // iter count doesn't outlive a forced cut.
+            self.last_stats = Vp8EncoderStats::default();
             (bitstream, rec, plan)
         } else {
             self.pframe_count += 1;
@@ -2085,7 +2248,7 @@ impl Encoder for Vp8Encoder {
             let last_ref = self.last_frame.as_ref().unwrap();
             let golden_ref = self.golden_frame.as_ref().filter(|_| plan.use_golden);
             let alt_ref = self.alt_ref_frame.as_ref().filter(|_| plan.use_alt);
-            let (bitstream, rec) = encode_pframe_and_reconstruct(
+            let (bitstream, rec, stats) = encode_pframe_and_reconstruct(
                 self.width,
                 self.height,
                 frame_config,
@@ -2095,6 +2258,11 @@ impl Encoder for Vp8Encoder {
                 alt_ref,
                 plan,
             )?;
+            // Round-53 (#3): latch the per-frame encoder stats so a
+            // caller using the typed `Vp8Encoder` factory can read them
+            // between `send_frame` calls. `Vp8EncoderStats` is `Copy`
+            // (just an `Option<u32>` today) so this is a cheap stash.
+            self.last_stats = stats;
             (bitstream, rec, plan)
         };
         // Refresh references per the plan. `LAST` is always refreshed on
@@ -2736,7 +2904,7 @@ fn encode_pframe_and_reconstruct(
     golden_ref: Option<&ReferenceFrame>,
     alt_ref: Option<&ReferenceFrame>,
     plan: RefPlan,
-) -> Result<(Vec<u8>, ReferenceFrame)> {
+) -> Result<(Vec<u8>, ReferenceFrame, Vp8EncoderStats)> {
     let mb_w = ((width + 15) / 16) as usize;
     let mb_h = ((height + 15) / 16) as usize;
     let y_stride = mb_w * 16;
@@ -3471,7 +3639,15 @@ fn encode_pframe_and_reconstruct(
         && config.enable_adaptive_uv_lf_deltas)
         || (segments.enabled
             && config.enable_spatial_lf_deltas
-            && config.enable_chroma_aware_spatial);
+            && config.enable_chroma_aware_spatial)
+        // Round-53 (#4): the chroma-aware per-MB median picker reads
+        // the same `mb_sse_uv_cache` as the round-52 spatial picker —
+        // populate it whenever the per-MB median picker is gated on
+        // alongside the chroma-aware variant.
+        || (segments.enabled
+            && config.enable_per_mb_lf_deltas
+            && !config.enable_spatial_lf_deltas
+            && config.enable_chroma_aware_per_mb_median);
     let mb_sse_uv_cache: Option<Vec<u64>> = if need_mb_sse_uv {
         Some(compute_per_mb_chroma_sse(
             &src_u, &src_v, &rec_u, &rec_v, uv_stride, uv_buf_h, mb_w, mb_h,
@@ -3542,6 +3718,12 @@ fn encode_pframe_and_reconstruct(
 
     let mut lf_deltas: Option<LfDeltas> =
         compute_lf_deltas(mb_sse_y_cache.as_deref().unwrap_or(&[][..]));
+    // Round-53 (#3): k-means spatial-segment iteration telemetry. `None`
+    // when the kmeans path didn't run on this frame (kmeans flag off, or
+    // segment / spatial flag off); `Some(iters)` after the kmeans loop
+    // returns. Plumbed back through `encode_pframe_and_reconstruct` so
+    // the encoder can stash it in `Vp8EncoderStats::last_kmeans_iters`.
+    let mut last_kmeans_iters: Option<u32> = None;
 
     // Round-49 per-MB / spatial segment LF-delta paths. Both override the
     // 4-entry segment_lf_deltas array (and the spatial path also rewrites
@@ -3672,7 +3854,14 @@ fn encode_pframe_and_reconstruct(
                     _ => spatial_sse,
                 };
                 let (new_ids, new_lf) = if config.enable_kmeans_spatial_segmentation {
-                    compute_spatial_segment_lf_deltas_kmeans(
+                    // Round-53 (#3): use the telemetry-returning kmeans
+                    // entrypoint so the per-frame iteration count is
+                    // captured for `Vp8EncoderStats::last_kmeans_iters`.
+                    // The convergence-threshold knob defaults to `1`,
+                    // letting the loop exit before
+                    // `KMEANS_SPATIAL_MAX_ITERS` once the centroids have
+                    // settled.
+                    let (ids, lf, iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
                         spatial_input,
                         mb_w,
                         mb_h,
@@ -3681,7 +3870,14 @@ fn encode_pframe_and_reconstruct(
                         delta_cap_spatial,
                         config.kmeans_spatial_alpha_x256,
                         config.enable_kmeans_pp_seeding,
-                    )
+                        config.kmeans_convergence_threshold,
+                    );
+                    // Latch the most recent iter count — joint picker
+                    // may run kmeans multiple times in this frame; the
+                    // last one wins (the value reported in the stats is
+                    // the iteration count of the last invocation).
+                    last_kmeans_iters = Some(iters);
+                    (ids, lf)
                 } else {
                     compute_spatial_segment_lf_deltas(
                         spatial_input,
@@ -3726,7 +3922,26 @@ fn encode_pframe_and_reconstruct(
             }
             segment_tree_probs = segment_tree_probs_from_counts(&seg_counts);
         } else if config.enable_per_mb_lf_deltas {
-            let per_mb = compute_per_mb_optimal_lf_delta(mb_sse_y, delta_cap_initial);
+            // Round-53 (#4): chroma-aware variant. When the flag is on
+            // and the chroma cache is populated, score each MB on the
+            // luma+chroma weighted SSE blend (same helper the round-52
+            // spatial picker uses) instead of luma SSE alone. With the
+            // flag off, this branch is identical to the round-49 path
+            // bit-for-bit (the closure unwraps to `mb_sse_y`).
+            let per_mb_storage: Option<Vec<u64>> = if config.enable_chroma_aware_per_mb_median {
+                mb_sse_uv_cache.as_deref().map(|uv| {
+                    combined_sse_for_chroma_aware_spatial(
+                        mb_sse_y,
+                        uv,
+                        config.chroma_aware_spatial_luma_weight_x256,
+                        config.chroma_aware_spatial_chroma_weight_x256,
+                    )
+                })
+            } else {
+                None
+            };
+            let per_mb_input: &[u64] = per_mb_storage.as_deref().unwrap_or(mb_sse_y);
+            let per_mb = compute_per_mb_optimal_lf_delta(per_mb_input, delta_cap_initial);
             let new_lf =
                 pick_per_mb_segment_lf_deltas(&per_mb, &mb_segment_ids, config.segment_lf_deltas);
             segments.set_lf_deltas(new_lf);
@@ -4050,7 +4265,8 @@ fn encode_pframe_and_reconstruct(
         y_h: y_buf_h,
         uv_h: uv_buf_h,
     };
-    Ok((out, reference_out))
+    let stats = Vp8EncoderStats { last_kmeans_iters };
+    Ok((out, reference_out, stats))
 }
 
 // ---------------------------------------------------------------------------
@@ -4558,7 +4774,12 @@ fn encode_hidden_altref_pframe(
     // hidden-frame growth stays well below the per-frame savings on a
     // motion-rich noisy fixture.
     hcfg.qindex = (cfg.qindex as i32 - HIDDEN_ALTREF_QINDEX_DELTA).clamp(0, 127) as u8;
-    let (mut bitstream, rec) =
+    // Round-53 (#3): the hidden alt-ref encode also returns
+    // `Vp8EncoderStats`; we ignore them here because the visible-frame
+    // encode that follows will overwrite the encoder's `last_stats`
+    // slot, and a hidden frame's iter count isn't a useful telemetry
+    // signal in isolation (callers want the per-visible-frame value).
+    let (mut bitstream, rec, _hidden_stats) =
         encode_pframe_and_reconstruct(width, height, hcfg, &synth_src, last_ref, None, None, plan)?;
     // Patch the frame tag to set `show_frame = 0`. The tag is the first
     // 3 bytes; bit 4 of byte 0 is the show_frame flag.
@@ -5174,6 +5395,10 @@ pub(crate) fn compute_spatial_segment_lf_deltas(
 /// each centroid in a distinct neighbourhood so the iterations
 /// converge to a tighter partition. Off-by-default; the round-50
 /// top-|delta| seeding is preserved bit-for-bit when this flag is off.
+#[allow(dead_code)] // round-53 (#3): production callers use the
+                    // `_with_telemetry` variant; this thin wrapper is kept as the
+                    // public-by-name entrypoint for unit-test code that doesn't care
+                    // about the per-frame iteration count.
 pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
     mb_sse: &[u64],
     mb_w: usize,
@@ -5184,11 +5409,59 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
     alpha_x256: u32,
     pp_seeding: bool,
 ) -> (Vec<u8>, [i32; 4]) {
+    let (ids, lf, _iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+        mb_sse,
+        mb_w,
+        mb_h,
+        n_row_bands,
+        n_col_bands,
+        delta_cap,
+        alpha_x256,
+        pp_seeding,
+        // Convergence threshold of `0` collapses to "exit only when no
+        // region changes assignment" — preserves the round-50 / round-51
+        // termination bit-for-bit when callers don't opt into the
+        // round-53 (#3) early-exit. Existing behaviour is unchanged.
+        0,
+    );
+    (ids, lf)
+}
+
+/// Round-53 (#3): variant of [`compute_spatial_segment_lf_deltas_kmeans`]
+/// that returns the iteration count alongside the partition + per-segment
+/// deltas, and supports a centroid-movement-based early-exit threshold
+/// that lets the loop terminate before [`KMEANS_SPATIAL_MAX_ITERS`] when
+/// the centroids have effectively settled.
+///
+/// `convergence_threshold` (in mixed `delta + position` units): after
+/// each Lloyd's iteration, the picker computes `max_delta = max(|new -
+/// prev|)` over the `(delta, pos_x, pos_y)` coordinates of every
+/// populated centroid. When `max_delta < convergence_threshold` and
+/// `iter > 0`, the loop exits early. `0` collapses to the round-50 /
+/// round-51 termination ("exit only when no region changed assignment").
+///
+/// Iteration counting: `iters` reports the number of full Lloyd's
+/// iterations actually executed before termination (1-based); on early
+/// degenerate paths (`mb_sse` mismatch, no populated regions) `iters` is
+/// `0`. Callers can stash this in `Vp8EncoderStats::last_kmeans_iters`
+/// for telemetry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+    mb_sse: &[u64],
+    mb_w: usize,
+    mb_h: usize,
+    n_row_bands: u8,
+    n_col_bands: u8,
+    delta_cap: i32,
+    alpha_x256: u32,
+    pp_seeding: bool,
+    convergence_threshold: u32,
+) -> (Vec<u8>, [i32; 4], u32) {
     let n = mb_w * mb_h;
     let mut ids = vec![0u8; n];
     let lf = [0i32; 4];
     if n == 0 || mb_sse.len() != n {
-        return (ids, lf);
+        return (ids, lf, 0);
     }
     let delta_cap = delta_cap.clamp(1, 31);
     let nrb = (n_row_bands as usize).max(1).min(mb_h);
@@ -5213,7 +5486,7 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
     let total_sum: u128 = region_sum.iter().sum();
     let total_cnt: u32 = region_cnt.iter().sum();
     if total_cnt == 0 {
-        return (ids, lf);
+        return (ids, lf, 0);
     }
     let frame_mean = (total_sum / total_cnt as u128).max(1) as i64;
 
@@ -5247,7 +5520,7 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
         });
     }
     if points.is_empty() {
-        return (ids, lf);
+        return (ids, lf, 0);
     }
 
     // k = min(4, n_populated_regions). Two seed strategies:
@@ -5345,7 +5618,19 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
     }
 
     let mut assign = vec![0u8; points.len()];
+    // Round-53 (#3): track iter count + previous centroid coordinates so
+    // the loop can exit early when the centroids effectively settle.
+    // `iters_run` is bumped at the top of each iteration so it counts
+    // every full Lloyd's pass (assignment + update), matching what
+    // `Vp8EncoderStats::last_kmeans_iters` documents as "iterations
+    // executed before termination".
+    let mut iters_run: u32 = 0;
+    let conv_thresh = convergence_threshold as i64;
+    let mut prev_centroid_delta: [i64; 4] = centroid_delta;
+    let mut prev_centroid_px: [i64; 4] = centroid_px;
+    let mut prev_centroid_py: [i64; 4] = centroid_py;
     for _iter in 0..KMEANS_SPATIAL_MAX_ITERS {
+        iters_run = iters_run.saturating_add(1);
         // Assignment step: each region → nearest centroid (ties broken
         // by lowest cluster index for determinism).
         let mut changed = false;
@@ -5399,6 +5684,41 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
                 centroid_py[c] = sum_py[c] / cnt[c];
             }
         }
+
+        // Round-53 (#3): centroid-movement early-exit. After at least
+        // one assignment+update cycle, compute the max axis-wise
+        // movement of any centroid versus the prior iteration. When the
+        // movement falls below `convergence_threshold` (caller-supplied,
+        // default `DEFAULT_KMEANS_CONVERGENCE_THRESHOLD = 1`) the loop
+        // terminates early — the "no region changed assignment" check
+        // above is the strict convergence test, but on real fixtures
+        // the centroid coordinates settle to within 1 unit several
+        // iterations before the assignment becomes fully stable. With
+        // `convergence_threshold = 0` this branch is inert and the
+        // loop runs to the prior round-50 / round-51 termination.
+        if conv_thresh > 0 && _iter > 0 {
+            let mut max_movement: i64 = 0;
+            for c in 0..k {
+                let dd = (centroid_delta[c] - prev_centroid_delta[c]).abs();
+                let dx = (centroid_px[c] - prev_centroid_px[c]).abs();
+                let dy = (centroid_py[c] - prev_centroid_py[c]).abs();
+                if dd > max_movement {
+                    max_movement = dd;
+                }
+                if dx > max_movement {
+                    max_movement = dx;
+                }
+                if dy > max_movement {
+                    max_movement = dy;
+                }
+            }
+            if max_movement < conv_thresh {
+                break;
+            }
+        }
+        prev_centroid_delta = centroid_delta;
+        prev_centroid_px = centroid_px;
+        prev_centroid_py = centroid_py;
     }
 
     // Build region → cluster lookup + per-cluster LF delta (= integer
@@ -5428,7 +5748,7 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
     for i in 0..n {
         ids[i] = region_to_seg[per_mb_region[i]];
     }
-    (ids, seg_lf)
+    (ids, seg_lf, iters_run)
 }
 
 /// Round-52 (#3): build a per-MB combined SSE vector from per-MB luma
@@ -12964,6 +13284,184 @@ mod tests {
         let ids = vec![0u8, 1, 2, 3, 0, 2];
         let out = per_mb_segment_implied_delta(&ids, &segs);
         assert_eq!(out, vec![10, 20, 30, 40, 10, 30]);
+    }
+
+    /// Round-53 (#3): `compute_spatial_segment_lf_deltas_kmeans_with_telemetry`
+    /// returns the same `(ids, lf)` pair as the existing wrapper when
+    /// the convergence threshold is `0` (the wrapper's behaviour). Only
+    /// the third tuple element (the iter count) is new.
+    #[test]
+    fn round53_kmeans_telemetry_zero_threshold_matches_wrapper() {
+        // Synthesise a 4×4 MB frame with two distinct intensity bands.
+        let mb_w = 4usize;
+        let mb_h = 4usize;
+        let mut mb_sse = vec![0u64; mb_w * mb_h];
+        for r in 0..mb_h {
+            for c in 0..mb_w {
+                mb_sse[r * mb_w + c] = if r < mb_h / 2 { 100 } else { 10_000 };
+            }
+        }
+        // Wrapper output (round-50 / round-51 termination).
+        let (wrap_ids, wrap_lf) =
+            compute_spatial_segment_lf_deltas_kmeans(&mb_sse, mb_w, mb_h, 4, 4, 6, 256, false);
+        // Telemetry output with `convergence_threshold = 0`.
+        let (tel_ids, tel_lf, tel_iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+            &mb_sse, mb_w, mb_h, 4, 4, 6, 256, false, 0,
+        );
+        assert_eq!(wrap_ids, tel_ids);
+        assert_eq!(wrap_lf, tel_lf);
+        // Loop must have actually executed at least one full iteration.
+        assert!(
+            tel_iters >= 1,
+            "kmeans must run ≥ 1 iter on a populated input (got {tel_iters})"
+        );
+        assert!(
+            tel_iters as usize <= KMEANS_SPATIAL_MAX_ITERS,
+            "iter count {tel_iters} exceeds KMEANS_SPATIAL_MAX_ITERS"
+        );
+    }
+
+    /// Round-53 (#3): the centroid-movement convergence threshold lets
+    /// the loop exit early. With `threshold = 1` (the default) the
+    /// iteration count on a quickly-settling fixture should be smaller
+    /// than the round-50 hard cap of `KMEANS_SPATIAL_MAX_ITERS = 16`.
+    #[test]
+    fn round53_kmeans_early_exit_under_default_threshold() {
+        // 6×6 frame with a clean two-band split — Lloyd's converges fast.
+        let mb_w = 6usize;
+        let mb_h = 6usize;
+        let mut mb_sse = vec![0u64; mb_w * mb_h];
+        for r in 0..mb_h {
+            for c in 0..mb_w {
+                mb_sse[r * mb_w + c] = if c < mb_w / 2 { 50 } else { 5_000 };
+            }
+        }
+        let (_ids, _lf, iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+            &mb_sse,
+            mb_w,
+            mb_h,
+            4,
+            4,
+            6,
+            256,
+            false,
+            DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        );
+        // On a clean two-band split with k=4 centroids, the partition
+        // settles within a few iterations. A typical run completes in
+        // 2-4 iterations; ≤6 is the documented "typical" upper bound
+        // per the round-53 dispatch prompt.
+        assert!(
+            iters <= 6,
+            "kmeans on quickly-settling fixture should exit within 6 iters under default \
+             convergence threshold (got {iters})"
+        );
+    }
+
+    /// Round-53 (#3): the iteration cap (`KMEANS_SPATIAL_MAX_ITERS`)
+    /// is always respected even when the convergence threshold is `0`
+    /// (effectively disabling the early-exit). The loop must terminate
+    /// at or before the cap regardless of the input distribution.
+    #[test]
+    fn round53_kmeans_respects_hard_iter_cap() {
+        let mb_w = 8usize;
+        let mb_h = 8usize;
+        // A noisy distribution that resists clean convergence.
+        let mb_sse: Vec<u64> = (0..mb_w * mb_h)
+            .map(|i| ((i * 37) % 64) as u64 * 100)
+            .collect();
+        let (_ids, _lf, iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+            &mb_sse, mb_w, mb_h, 4, 4, 6, 256, false, 0,
+        );
+        assert!(
+            iters as usize <= KMEANS_SPATIAL_MAX_ITERS,
+            "iter count {iters} exceeds KMEANS_SPATIAL_MAX_ITERS = {}",
+            KMEANS_SPATIAL_MAX_ITERS
+        );
+    }
+
+    /// Round-53 (#3): degenerate inputs (empty SSE, length mismatch)
+    /// return iter-count `0` so callers can distinguish "loop didn't
+    /// run" from "loop ran once".
+    #[test]
+    fn round53_kmeans_degenerate_inputs_zero_iters() {
+        let (ids, lf, iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+            &[],
+            0,
+            0,
+            4,
+            4,
+            6,
+            256,
+            false,
+            DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        );
+        assert_eq!(iters, 0);
+        assert!(ids.is_empty());
+        assert_eq!(lf, [0; 4]);
+        // Length mismatch between mb_sse and mb_w * mb_h.
+        let (_, _, iters_mismatch) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+            &[1u64; 3],
+            4,
+            4,
+            4,
+            4,
+            6,
+            256,
+            false,
+            DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        );
+        assert_eq!(iters_mismatch, 0);
+    }
+
+    /// Round-53 (#3): higher convergence thresholds exit sooner. With
+    /// a very large threshold (e.g. `1000`) the loop should exit on
+    /// the second iteration regardless of the input.
+    #[test]
+    fn round53_kmeans_large_threshold_exits_immediately() {
+        let mb_w = 8usize;
+        let mb_h = 8usize;
+        let mb_sse: Vec<u64> = (0..mb_w * mb_h)
+            .map(|i| ((i * 37) % 64) as u64 * 100)
+            .collect();
+        let (_, _, iters) = compute_spatial_segment_lf_deltas_kmeans_with_telemetry(
+            &mb_sse, mb_w, mb_h, 4, 4, 6, 256, false, 1000,
+        );
+        // With a permissive threshold the loop exits after the second
+        // iteration (the threshold check requires `_iter > 0`).
+        assert!(
+            iters <= 2,
+            "kmeans should exit ≤ 2 iters under permissive threshold (got {iters})"
+        );
+    }
+
+    /// Round-53 (#4): the chroma-aware per-MB median picker is
+    /// off-by-default in the encoder config.
+    #[test]
+    fn round53_chroma_aware_per_mb_median_default_off() {
+        let cfg = Vp8EncoderConfig::default();
+        assert!(!cfg.enable_chroma_aware_per_mb_median);
+    }
+
+    /// Round-53 (#3): the convergence threshold default matches the
+    /// public constant.
+    #[test]
+    fn round53_kmeans_convergence_threshold_default_matches_constant() {
+        let cfg = Vp8EncoderConfig::default();
+        assert_eq!(
+            cfg.kmeans_convergence_threshold,
+            DEFAULT_KMEANS_CONVERGENCE_THRESHOLD
+        );
+        assert_eq!(DEFAULT_KMEANS_CONVERGENCE_THRESHOLD, 1);
+    }
+
+    /// Round-53 (#3): `Vp8EncoderStats` defaults to `None` for every
+    /// field — a freshly-constructed encoder reports no telemetry until
+    /// the first frame has been encoded.
+    #[test]
+    fn round53_encoder_stats_default_is_none() {
+        let s = Vp8EncoderStats::default();
+        assert_eq!(s.last_kmeans_iters, None);
     }
 }
 

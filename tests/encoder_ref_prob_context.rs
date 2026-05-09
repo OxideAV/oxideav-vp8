@@ -26,8 +26,9 @@ use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
     DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256, DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
-    DEFAULT_GOLDEN_INTERVAL, DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_NLM_H2,
-    DEFAULT_PSY_RD_STRENGTH, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+    DEFAULT_KMEANS_CONVERGENCE_THRESHOLD, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
+    DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 use oxideav_vp8::frame_header::{parse_inter_header, PersistentProbs};
 use oxideav_vp8::{parse_header, FrameType};
@@ -154,6 +155,8 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
     };
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);

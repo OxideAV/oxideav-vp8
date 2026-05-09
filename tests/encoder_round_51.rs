@@ -52,9 +52,10 @@ use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
     DEFAULT_AQ_QINDEX_RANGE, DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
     DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_KMEANS_SPATIAL_ALPHA_X256, DEFAULT_NLM_H2,
-    DEFAULT_PSY_RD_STRENGTH, DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS,
-    DEFAULT_SIMPLE_LF_MAX_LEVEL, DEFAULT_SPATIAL_LF_N_COL_BANDS, DEFAULT_SPATIAL_LF_N_ROW_BANDS,
+    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+    DEFAULT_KMEANS_SPATIAL_ALPHA_X256, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
+    DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_SPATIAL_LF_N_COL_BANDS, DEFAULT_SPATIAL_LF_N_ROW_BANDS,
 };
 
 const W: u32 = 64;
@@ -265,6 +266,8 @@ fn cfg_baseline_segments_high_qp() -> Vp8EncoderConfig {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
     }
 }
 
@@ -291,6 +294,8 @@ fn kmeans_pp_seeding_requires_kmeans_spatial() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline_segments_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -302,6 +307,8 @@ fn kmeans_pp_seeding_requires_kmeans_spatial() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline_segments_high_qp()
     };
     let (b0, _, p0) = measure(cfg_a, &clip);
@@ -330,6 +337,8 @@ fn kmeans_pp_off_path_byte_identical_to_round50_kmeans() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline_segments_high_qp()
     };
     let (b0, _, p0) = measure(cfg_round50, &clip);
@@ -358,6 +367,8 @@ fn kmeans_pp_pframe_decodes_cleanly() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline_segments_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -384,6 +395,8 @@ fn kmeans_pp_byte_envelope_within_35pct() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline_segments_high_qp()
     };
     let with_pp = Vp8EncoderConfig {
@@ -395,6 +408,8 @@ fn kmeans_pp_byte_envelope_within_35pct() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline_segments_high_qp()
     };
     let (bytes_t, _, _) = measure(baseline_round50, &clip);
@@ -435,6 +450,8 @@ fn round51_combined_decodes_cleanly() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         enable_joint_lf_rdo: true,
         ..cfg_baseline_segments_high_qp()
     };
@@ -511,6 +528,8 @@ fn round51_full_pipeline_deterministic() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         enable_adaptive_uv_lf_deltas: true,
         ..cfg_baseline_segments_high_qp()
     };

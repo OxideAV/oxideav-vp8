@@ -39,8 +39,8 @@ use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
     DEFAULT_AQ_QINDEX_RANGE, DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
     DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
-    DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_KMEANS_CONVERGENCE_THRESHOLD, DEFAULT_NLM_H2,
+    DEFAULT_PSY_RD_STRENGTH, DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 
 const W: u32 = 32;
@@ -215,6 +215,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
     }
 }
 
@@ -358,6 +360,8 @@ fn subpel_mv_cost_partition_pframe_decodes_cleanly() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -396,6 +400,8 @@ fn subpel_mv_cost_partition_requires_subpel_mv_cost() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -416,6 +422,8 @@ fn subpel_mv_cost_partition_requires_subpel_mv_cost() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         ..cfg_baseline()
     };
 
@@ -458,6 +466,8 @@ fn round46_combined_decodes_cleanly() {
         enable_chroma_aware_spatial: false,
         chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        enable_chroma_aware_per_mb_median: false,
+        kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
         enable_mv_cost_aware_snap: true,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,

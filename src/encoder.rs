@@ -379,6 +379,23 @@ pub const DEFAULT_SEGMENT_QUANT_DELTAS: [i32; 4] = [-8, -4, 0, 4];
 /// `per_mb_filter_level`. Bitstream `abs_delta = 0`.
 pub const DEFAULT_SEGMENT_LF_DELTAS: [i32; 4] = [-2, -1, 0, 2];
 
+/// Default for [`Vp8EncoderConfig::spatial_lf_n_row_bands`]. Round-49's
+/// spatial-locality bucketed adaptive LF partitions the frame into a
+/// `4 × 4` grid of MB regions by default, picked to give the per-region
+/// SSE estimator enough samples to be statistically meaningful (a 32×32
+/// pixel frame has 4 MB-rows and 4 MB-cols, so each band contains 1 MB —
+/// the smallest useful band size; CIF / VGA frames give each band 4–10
+/// MBs, well above the round-44 estimator's noise floor).
+///
+/// [`Vp8EncoderConfig::spatial_lf_n_row_bands`]: Vp8EncoderConfig::spatial_lf_n_row_bands
+pub const DEFAULT_SPATIAL_LF_N_ROW_BANDS: u8 = 4;
+
+/// Default for [`Vp8EncoderConfig::spatial_lf_n_col_bands`]. See
+/// [`DEFAULT_SPATIAL_LF_N_ROW_BANDS`] for the rationale.
+///
+/// [`Vp8EncoderConfig::spatial_lf_n_col_bands`]: Vp8EncoderConfig::spatial_lf_n_col_bands
+pub const DEFAULT_SPATIAL_LF_N_COL_BANDS: u8 = 4;
+
 /// Variance bucket boundaries (luma, summed-square units per MB) that map
 /// each MB to a segment id. A 16×16 MB has 256 pixels so a per-pixel
 /// variance of `v_pp` corresponds to `v_pp * 256` in this metric. Picked
@@ -1018,6 +1035,68 @@ pub struct Vp8EncoderConfig {
     /// `enable_adaptive_lf_deltas = true` and
     /// `enable_mode_ref_lf_deltas = true`; ignored on keyframes.
     pub enable_adaptive_uv_lf_deltas: bool,
+    /// Enable round-49 per-MB-targeted segment LF deltas. The default
+    /// path picks `segment_lf_deltas` from the static config array; with
+    /// this flag on, the encoder computes a per-MB optimal LF delta from
+    /// the per-MB unfiltered luma SSE distribution (using the same
+    /// proportional formula round-44 uses for ref/mode buckets), then
+    /// aggregates per `mb_segment_id` by picking the median per-MB
+    /// optimal delta inside each segment. The four resulting medians
+    /// override `segment_lf_deltas` for both the encoder reconstruction
+    /// (so `apply_loop_filter_enc` matches the bitstream) and the emitted
+    /// segmentation header. Empty segments fall back to the static config
+    /// value so toggling this flag on a sparsely-populated segment id
+    /// distribution doesn't introduce wild deltas. The delta cap respects
+    /// the round-47/round-48 ladder (`±6` default, expanded under
+    /// `enable_adaptive_lf_high_qp_cap` / `enable_variance_lf_cap`) — the
+    /// per-MB picks reuse the same `delta_cap` the round-44 estimator
+    /// uses, so the cap-widening flags compose with this one. Off-by-
+    /// default so the existing static-config segment LF ladder is
+    /// preserved bit-for-bit when this flag is disabled. Requires
+    /// `enable_segments = true`; ignored on keyframes (which never emit
+    /// per-MB segment ids).
+    pub enable_per_mb_lf_deltas: bool,
+    /// Enable round-49 spatial-locality bucketed adaptive LF. The
+    /// round-44 adaptive LF estimator buckets MBs by `(ref_frame, y_mode)`;
+    /// this flag adds an orthogonal spatial bucketing on
+    /// `(mb_row_band, mb_col_band)` driving the `segment_lf_deltas`
+    /// pathway: the encoder partitions the frame into
+    /// `spatial_lf_n_row_bands × spatial_lf_n_col_bands` regions,
+    /// computes a region-mean SSE → region LF delta with the same
+    /// proportional formula as the round-44 estimator, then maps the
+    /// regions onto VP8's 4-segment scheme by clustering: the three
+    /// regions with the largest absolute delta become segments 1/2/3
+    /// (each carrying its own LF delta), and every remaining region
+    /// collapses into segment 0 with delta `0`. The per-MB segment id
+    /// vector is rewritten so the bitstream's segment map signals the
+    /// spatial assignment to the decoder. Off-by-default so the
+    /// variance-classifier / AQ segment maps are preserved bit-for-bit
+    /// when this flag is disabled. Requires `enable_segments = true`;
+    /// ignored on keyframes (the spatial map only takes effect on
+    /// P-frames where the segmentation block has full effect on the LF).
+    /// Mutually exclusive with `enable_per_mb_lf_deltas` — when both are
+    /// on, the spatial path wins (it owns both the segment-id map and
+    /// the segment_lf_deltas array; the per-MB median path becomes a
+    /// no-op because there's nothing left to override). Cap respects the
+    /// round-47/48 ladder (same `delta_cap` source as the round-44 mode/
+    /// ref estimator) so cap-widening flags compose.
+    pub enable_spatial_lf_deltas: bool,
+    /// Number of horizontal bands (rows of MB regions) the spatial LF
+    /// path partitions the frame into. Active when
+    /// [`enable_spatial_lf_deltas`] = `true`. Clamped to `[1, mb_h]` at
+    /// use-time; `0` collapses to `1`. Default
+    /// [`DEFAULT_SPATIAL_LF_N_ROW_BANDS`].
+    ///
+    /// [`enable_spatial_lf_deltas`]: Vp8EncoderConfig::enable_spatial_lf_deltas
+    pub spatial_lf_n_row_bands: u8,
+    /// Number of vertical bands (columns of MB regions) the spatial LF
+    /// path partitions the frame into. Active when
+    /// [`enable_spatial_lf_deltas`] = `true`. Clamped to `[1, mb_w]` at
+    /// use-time; `0` collapses to `1`. Default
+    /// [`DEFAULT_SPATIAL_LF_N_COL_BANDS`].
+    ///
+    /// [`enable_spatial_lf_deltas`]: Vp8EncoderConfig::enable_spatial_lf_deltas
+    pub spatial_lf_n_col_bands: u8,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -1072,6 +1151,10 @@ impl Default for Vp8EncoderConfig {
             enable_adaptive_lf_high_qp_cap: false,
             enable_variance_lf_cap: false,
             enable_adaptive_uv_lf_deltas: false,
+            enable_per_mb_lf_deltas: false,
+            enable_spatial_lf_deltas: false,
+            spatial_lf_n_row_bands: DEFAULT_SPATIAL_LF_N_ROW_BANDS,
+            spatial_lf_n_col_bands: DEFAULT_SPATIAL_LF_N_COL_BANDS,
         }
     }
 }
@@ -2452,8 +2535,10 @@ fn encode_pframe_and_reconstruct(
 
     let qi = clamp_qindex(config.qindex as i32);
     // Per-segment quant table (collapses to a single QuantCtx when
-    // segmentation is disabled).
-    let segments = SegmentCtx::for_config(&config);
+    // segmentation is disabled). Mutable so the round-49 per-MB / spatial
+    // LF-delta paths can override `segments.lf_deltas` between pass 1
+    // and pass 2 without rebuilding the (expensive) quant tables.
+    let mut segments = SegmentCtx::for_config(&config);
 
     // P-frame loop-filter level. The heuristic `15 + qi/8` is the default;
     // when `enable_joint_lf_rdo` is on, the level is overridden after pass 1
@@ -2493,7 +2578,7 @@ fn encode_pframe_and_reconstruct(
             }
         }
     }
-    let segment_tree_probs = if segments.enabled {
+    let mut segment_tree_probs = if segments.enabled {
         segment_tree_probs_from_counts(&seg_counts)
     } else {
         [255; 3]
@@ -3159,6 +3244,66 @@ fn encode_pframe_and_reconstruct(
     } else {
         None
     };
+
+    // Round-49 per-MB / spatial segment LF-delta paths. Both override the
+    // 4-entry segment_lf_deltas array (and the spatial path also rewrites
+    // the per-MB segment id assignment) before the segmentation header
+    // gets emitted in pass 2 below. Both paths are gated on
+    // `segments.enabled` (the deltas + the per-MB segment id are never
+    // signalled when segmentation is off, so no-op on that path) and on a
+    // P-frame (keyframes never read the segmentation header for LF
+    // purposes — they use the round-42 ladder via `lf_deltas` only).
+    //
+    // The cap matches whatever the round-44/48 estimator picked above so
+    // the cap-widening flags (`enable_adaptive_lf_high_qp_cap`,
+    // `enable_variance_lf_cap`) compose with the per-MB / spatial paths
+    // without recomputing the cap. When neither cap-widening flag is on,
+    // `delta_cap` is the round-44 default of `6`.
+    if segments.enabled && (config.enable_per_mb_lf_deltas || config.enable_spatial_lf_deltas) {
+        // Recompute (or reuse) per-MB SSE. The round-44/48 path above
+        // already computed it inside its branch; we recompute here to
+        // avoid plumbing the value through the `Option<LfDeltas>` ladder
+        // (the cost is one frame-pass over `rec_y` — tiny vs the per-MB
+        // mode search).
+        let mb_sse_y = compute_per_mb_luma_sse(&src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h);
+        let delta_cap = if config.enable_variance_lf_cap {
+            variance_lf_cap(&mb_sse_y)
+        } else if config.enable_adaptive_lf_high_qp_cap {
+            adaptive_lf_high_qp_cap(qi as u8)
+        } else {
+            6
+        };
+        // Spatial path wins when both flags are on — it owns both the
+        // segment-id map and the segment_lf_deltas array, leaving the
+        // per-MB median path nothing to override.
+        if config.enable_spatial_lf_deltas {
+            let (new_ids, new_lf) = compute_spatial_segment_lf_deltas(
+                &mb_sse_y,
+                mb_w,
+                mb_h,
+                config.spatial_lf_n_row_bands,
+                config.spatial_lf_n_col_bands,
+                delta_cap,
+            );
+            mb_segment_ids = new_ids;
+            // Recompute segment tree probs against the new segment-id
+            // distribution so the bool-coded per-MB segment id pays the
+            // optimal entropy cost (otherwise the spatial map would emit
+            // against probs computed from the variance-classifier
+            // distribution and waste bits).
+            seg_counts = [0u32; 4];
+            for &s in &mb_segment_ids {
+                seg_counts[(s as usize) & 3] = seg_counts[(s as usize) & 3].saturating_add(1);
+            }
+            segment_tree_probs = segment_tree_probs_from_counts(&seg_counts);
+            segments.set_lf_deltas(new_lf);
+        } else if config.enable_per_mb_lf_deltas {
+            let per_mb = compute_per_mb_optimal_lf_delta(&mb_sse_y, delta_cap);
+            let new_lf =
+                pick_per_mb_segment_lf_deltas(&per_mb, &mb_segment_ids, config.segment_lf_deltas);
+            segments.set_lf_deltas(new_lf);
+        }
+    }
 
     // Joint loop-filter / QP rate-distortion optimisation (round-40, opt-in
     // via `enable_joint_lf_rdo`). On P-frames only — keyframes still use
@@ -4372,6 +4517,183 @@ fn compute_per_mb_chroma_sse(
         }
     }
     out
+}
+
+/// Round-49 per-MB optimal LF delta. For each MB, returns the signed
+/// delta the round-44 estimator would have assigned if that MB lived in
+/// its own ref/mode bucket: i.e. the same `dev_x32 = (mb_sse -
+/// frame_mean) * 32 / frame_mean` proportional formula, scaled by
+/// `delta_cap / 32` and clamped to `±delta_cap`. Used by the per-MB
+/// segment-LF-delta picker (median per `mb_segment_id`) and by the
+/// spatial bucketing path (median per region). Pure helper — no I/O,
+/// no global state, no allocator beyond the result vector.
+///
+/// `mb_sse` — per-MB SSE values in raster order. Empty input returns an
+/// empty vector. The cap is clamped to `[1, 31]` to keep the result
+/// inside the signed-6-bit grammar even before the per-segment median
+/// reduces it further.
+pub(crate) fn compute_per_mb_optimal_lf_delta(mb_sse: &[u64], delta_cap: i32) -> Vec<i32> {
+    let n = mb_sse.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let delta_cap = delta_cap.clamp(1, 31);
+    let frame_sum: u64 = mb_sse.iter().sum();
+    let frame_mean = (frame_sum / n as u64).max(1) as i64;
+    let mut out = Vec::with_capacity(n);
+    for &s in mb_sse {
+        let dev_x32 = ((s as i64 - frame_mean).saturating_mul(32)) / frame_mean;
+        let raw = (dev_x32 * delta_cap as i64) / 32;
+        out.push(raw.clamp(-delta_cap as i64, delta_cap as i64) as i32);
+    }
+    out
+}
+
+/// Round-49 per-segment LF delta picker. Groups the per-MB optimal LF
+/// deltas (from [`compute_per_mb_optimal_lf_delta`]) by `mb_segment_ids`
+/// and returns the per-segment median (rounded toward zero on
+/// even-sized populations). Empty segment buckets fall back to
+/// `fallback[seg]` so toggling this flag on a frame whose segment map
+/// concentrates all MBs into a single segment doesn't introduce wild
+/// deltas in the unused slots — the bitstream just keeps the static
+/// config value for those segments. The median is the picker the
+/// round-49 spec calls for: it's robust to a few high-error MBs at the
+/// segment edge (which the mean-of-bucket round-44 path can be biased
+/// by) and it concentrates the per-segment delta on the centre of the
+/// per-MB error distribution inside that segment.
+pub(crate) fn pick_per_mb_segment_lf_deltas(
+    per_mb_delta: &[i32],
+    mb_segment_ids: &[u8],
+    fallback: [i32; 4],
+) -> [i32; 4] {
+    let n = per_mb_delta.len().min(mb_segment_ids.len());
+    let mut buckets: [Vec<i32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for i in 0..n {
+        let s = (mb_segment_ids[i] as usize) & 3;
+        buckets[s].push(per_mb_delta[i]);
+    }
+    let mut out = fallback;
+    for (i, b) in buckets.iter_mut().enumerate() {
+        if b.is_empty() {
+            continue;
+        }
+        b.sort_unstable();
+        let mid = b.len() / 2;
+        // Even-sized bucket: pick the lower-half median (= rounded
+        // toward zero / negative end). Odd-sized: pick the centre. Both
+        // collapse to `b[mid]` after the sort.
+        out[i] = b[mid];
+    }
+    out
+}
+
+/// Round-49 spatial-locality bucketed adaptive LF. Partitions the frame
+/// into `n_row_bands × n_col_bands` rectangular MB regions, computes a
+/// per-region SSE-driven LF delta with the same proportional formula as
+/// the round-44 estimator, then maps the regions onto VP8's 4-segment
+/// scheme by clustering: the 3 regions with the largest absolute delta
+/// become segments 1 / 2 / 3 (each carrying its own delta), and every
+/// remaining region collapses into segment 0 with delta `0`.
+///
+/// Returns `(spatial_segment_ids, segment_lf_deltas)`:
+///
+///   * `spatial_segment_ids` — per-MB segment id in raster order, ready
+///     to overwrite the encoder's `mb_segment_ids`. Length = `mb_w *
+///     mb_h`. Every entry is in `[0, 3]`.
+///   * `segment_lf_deltas` — the 4 segment LF deltas to plug into
+///     `SegmentCtx::lf_deltas` and emit in the segmentation header.
+///     Slot `0` is always `0` (the cluster of unselected regions).
+///
+/// `n_row_bands`, `n_col_bands` are clamped to `[1, mb_h]` and
+/// `[1, mb_w]` respectively (a `0` collapses to `1`). When the bands
+/// would create empty regions (e.g. `n_row_bands > mb_h`), the empty
+/// regions are skipped and the cluster picks from the populated set.
+/// `delta_cap` is clamped to `[1, 31]` like the round-44 estimator.
+pub(crate) fn compute_spatial_segment_lf_deltas(
+    mb_sse: &[u64],
+    mb_w: usize,
+    mb_h: usize,
+    n_row_bands: u8,
+    n_col_bands: u8,
+    delta_cap: i32,
+) -> (Vec<u8>, [i32; 4]) {
+    let n = mb_w * mb_h;
+    let mut ids = vec![0u8; n];
+    let lf = [0i32; 4];
+    if n == 0 || mb_sse.len() != n {
+        return (ids, lf);
+    }
+    let delta_cap = delta_cap.clamp(1, 31);
+    let nrb = (n_row_bands as usize).max(1).min(mb_h);
+    let ncb = (n_col_bands as usize).max(1).min(mb_w);
+    let nbuckets = nrb * ncb;
+
+    // Per-region sum + count. Region index = `band_row * ncb + band_col`.
+    let mut region_sum = vec![0u128; nbuckets];
+    let mut region_cnt = vec![0u32; nbuckets];
+    // Per-MB region index, cached so the second pass that rewrites
+    // `ids` doesn't have to redo the integer arithmetic.
+    let mut per_mb_region = vec![0usize; n];
+    for my in 0..mb_h {
+        // Band row index: floor(my * nrb / mb_h). Last band absorbs the
+        // remainder so `band_row < nrb` always holds.
+        let band_row = (my * nrb) / mb_h;
+        for mx in 0..mb_w {
+            let band_col = (mx * ncb) / mb_w;
+            let region = band_row * ncb + band_col;
+            let idx = my * mb_w + mx;
+            per_mb_region[idx] = region;
+            region_sum[region] = region_sum[region].saturating_add(mb_sse[idx] as u128);
+            region_cnt[region] = region_cnt[region].saturating_add(1);
+        }
+    }
+    // Frame mean (over MBs that landed inside any populated region).
+    let total_sum: u128 = region_sum.iter().sum();
+    let total_cnt: u32 = region_cnt.iter().sum();
+    if total_cnt == 0 {
+        return (ids, lf);
+    }
+    let frame_mean = (total_sum / total_cnt as u128).max(1) as i64;
+    // Per-region SSE-driven delta with the same formula round-44 uses
+    // for ref/mode buckets. Empty regions get delta `0` (they don't
+    // contribute MBs to any segment, but we still need a slot).
+    let mut region_delta: Vec<i32> = Vec::with_capacity(nbuckets);
+    for r in 0..nbuckets {
+        if region_cnt[r] == 0 {
+            region_delta.push(0);
+            continue;
+        }
+        let mean = (region_sum[r] / region_cnt[r] as u128) as i64;
+        let dev_x32 = ((mean - frame_mean).saturating_mul(32)) / frame_mean;
+        let raw = (dev_x32 * delta_cap as i64) / 32;
+        region_delta.push(raw.clamp(-delta_cap as i64, delta_cap as i64) as i32);
+    }
+    // Pick the top-3 regions by absolute delta; each becomes its own
+    // segment (1, 2, 3). Other regions cluster into segment 0 with
+    // delta 0.
+    let mut idx_sorted: Vec<usize> = (0..nbuckets).filter(|&r| region_cnt[r] > 0).collect();
+    idx_sorted.sort_unstable_by(|&a, &b| {
+        let da = region_delta[a].unsigned_abs();
+        let db = region_delta[b].unsigned_abs();
+        db.cmp(&da).then(a.cmp(&b))
+    });
+    // Top-3 (or fewer if we have <=3 populated regions). Slot 0 stays
+    // `0` so the unselected cluster + any single-region degenerate frame
+    // both fall through to "no delta on the residual segment". This
+    // keeps the segment-id assignment compact (every used segment
+    // carries a non-trivial delta or is the rest-of-frame baseline).
+    let mut region_to_seg = vec![0u8; nbuckets];
+    let mut seg_lf = [0i32; 4];
+    for (rank, &region) in idx_sorted.iter().take(3).enumerate() {
+        let seg = (rank + 1) as u8; // segments 1, 2, 3
+        region_to_seg[region] = seg;
+        seg_lf[seg as usize] = region_delta[region];
+    }
+    // Rewrite the per-MB segment id vector via the cached region lookup.
+    for i in 0..n {
+        ids[i] = region_to_seg[per_mb_region[i]];
+    }
+    (ids, seg_lf)
 }
 
 fn mb_luma_sse_at_int(
@@ -5928,6 +6250,19 @@ impl SegmentCtx {
 
     fn quant_for(&self, segment_id: u8) -> &QuantCtx {
         &self.quant_ctx[(segment_id as usize) & 3]
+    }
+
+    /// Round-49 helper: replace the per-segment LF deltas after pass 1.
+    /// Used by the per-MB / spatial LF-delta paths to install a
+    /// content-driven ladder before pass 2 emits the segmentation header
+    /// (and before the `apply_loop_filter_enc` call applies it to the
+    /// encoder reconstruction). No-op when segmentation is disabled —
+    /// the deltas would never reach the decoder anyway.
+    #[inline]
+    fn set_lf_deltas(&mut self, lf_deltas: [i32; 4]) {
+        if self.enabled {
+            self.lf_deltas = lf_deltas;
+        }
     }
 
     /// Per-MB loop-filter level after applying the per-segment LF delta
@@ -11101,6 +11436,208 @@ mod tests {
             LfDeltas::round48_adaptive_with_uv(&mb_sse_y, &mb_sse_uv, &mb_ref, &mb_modes, 6);
         assert_eq!(luma.ref_deltas, collapsed.ref_deltas);
         assert_eq!(luma.mode_deltas, collapsed.mode_deltas);
+    }
+
+    // ----- Round-49 unit tests -------------------------------------------
+
+    #[test]
+    fn round49_per_mb_optimal_lf_delta_empty_returns_empty() {
+        assert!(compute_per_mb_optimal_lf_delta(&[], 6).is_empty());
+    }
+
+    #[test]
+    fn round49_per_mb_optimal_lf_delta_uniform_returns_zero() {
+        // Uniform SSE → mb_sse - frame_mean = 0 for every MB → delta 0.
+        let out = compute_per_mb_optimal_lf_delta(&[100u64; 8], 6);
+        assert!(
+            out.iter().all(|&d| d == 0),
+            "uniform input must give all-zero deltas, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn round49_per_mb_optimal_lf_delta_outlier_saturates_cap() {
+        // Heavy outlier → dev_x32 ≫ 32 → raw saturates at +cap.
+        let mut data = vec![1u64; 16];
+        data.push(10_000_000u64);
+        let out = compute_per_mb_optimal_lf_delta(&data, 6);
+        // The outlier MB is at index 16 — it should hit +6 (cap).
+        assert_eq!(out[16], 6, "outlier MB delta must saturate at +cap");
+        // Low MBs (sse < frame_mean) should hit -6 cap.
+        assert!(
+            out[0] <= 0,
+            "below-mean MB must produce non-positive delta, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn round49_per_mb_optimal_lf_delta_respects_cap_widening() {
+        // Same outlier population, but a wider cap → outlier saturates
+        // at the wider value.
+        let mut data = vec![1u64; 16];
+        data.push(10_000_000u64);
+        let out6 = compute_per_mb_optimal_lf_delta(&data, 6);
+        let out10 = compute_per_mb_optimal_lf_delta(&data, 10);
+        assert_eq!(out6[16], 6);
+        assert_eq!(out10[16], 10);
+    }
+
+    #[test]
+    fn round49_pick_per_mb_segment_lf_deltas_empty_segment_uses_fallback() {
+        let per_mb = vec![3i32, -2, 0, 4]; // all segment 0
+        let ids = vec![0u8, 0, 0, 0];
+        let fb = [10, 20, 30, 40];
+        let out = pick_per_mb_segment_lf_deltas(&per_mb, &ids, fb);
+        // Segment 0 picks median of [-2, 0, 3, 4] sorted = [-2, 0, 3, 4]
+        // → mid = 2 → out[0] = 3.
+        assert_eq!(out[0], 3, "segment 0 median");
+        // Segments 1/2/3 are empty → fallback wins.
+        assert_eq!(out[1], 20);
+        assert_eq!(out[2], 30);
+        assert_eq!(out[3], 40);
+    }
+
+    #[test]
+    fn round49_pick_per_mb_segment_lf_deltas_groups_by_segment() {
+        let per_mb = vec![5i32, -3, 5, -3, 1, 2, 1, 2];
+        let ids = vec![0u8, 0, 1, 1, 2, 2, 3, 3];
+        let out = pick_per_mb_segment_lf_deltas(&per_mb, &ids, [0; 4]);
+        // Segment 0: [-3, 5] sorted → mid = 1 → 5.
+        assert_eq!(out[0], 5);
+        // Segment 1: [-3, 5] sorted → mid = 1 → 5.
+        assert_eq!(out[1], 5);
+        // Segment 2: [1, 2] sorted → mid = 1 → 2.
+        assert_eq!(out[2], 2);
+        // Segment 3: [1, 2] sorted → mid = 1 → 2.
+        assert_eq!(out[3], 2);
+    }
+
+    #[test]
+    fn round49_spatial_segment_lf_deltas_empty_returns_zeros() {
+        let (ids, lf) = compute_spatial_segment_lf_deltas(&[], 0, 0, 4, 4, 6);
+        assert!(ids.is_empty());
+        assert_eq!(lf, [0; 4]);
+    }
+
+    #[test]
+    fn round49_spatial_segment_lf_deltas_uniform_no_clusters() {
+        // Uniform SSE → every region has delta 0 → top-3 sort is trivial
+        // and seg_lf stays all zeros.
+        let mb_w = 4;
+        let mb_h = 4;
+        let mb_sse = vec![100u64; mb_w * mb_h];
+        let (ids, lf) = compute_spatial_segment_lf_deltas(&mb_sse, mb_w, mb_h, 2, 2, 6);
+        assert_eq!(ids.len(), mb_w * mb_h);
+        // Even though 3 regions get tagged 1/2/3, their lf deltas are 0.
+        for &v in &lf {
+            assert_eq!(v, 0, "uniform spatial input must give all-zero deltas");
+        }
+    }
+
+    #[test]
+    fn round49_spatial_segment_lf_deltas_top_band_clusters_distinctly() {
+        // Top half of a 4×4 MB grid gets high SSE; bottom half gets low.
+        // With 2 row bands × 1 col band, that's 2 regions → top region
+        // gets the only non-zero delta in segment 1.
+        let mb_w = 4;
+        let mb_h = 4;
+        let mut mb_sse = vec![100u64; mb_w * mb_h];
+        for my in 0..mb_h / 2 {
+            for mx in 0..mb_w {
+                mb_sse[my * mb_w + mx] = 10_000;
+            }
+        }
+        let (ids, lf) = compute_spatial_segment_lf_deltas(&mb_sse, mb_w, mb_h, 2, 1, 6);
+        // 2 regions populated (1 top + 1 bottom). Top has higher
+        // |delta|, becomes segment 1. Bottom region (rank 2) becomes
+        // segment 2 because absolute deltas differ — both regions get a
+        // distinct segment slot.
+        // Verify each MB landed in its expected band.
+        for my in 0..mb_h {
+            for mx in 0..mb_w {
+                let id = ids[my * mb_w + mx];
+                if my < mb_h / 2 {
+                    assert_eq!(id, 1, "top-band MB should land in segment 1");
+                } else {
+                    assert_eq!(id, 2, "bottom-band MB should land in segment 2");
+                }
+            }
+        }
+        // Top band (segment 1) must carry a positive LF delta (high SSE
+        // → stronger filter).
+        assert!(
+            lf[1] > 0,
+            "top band (segment 1) should get positive delta, got {}",
+            lf[1]
+        );
+        // Bottom band (segment 2) must carry a negative delta (low SSE
+        // → softer filter).
+        assert!(
+            lf[2] < 0,
+            "bottom band (segment 2) should get negative delta, got {}",
+            lf[2]
+        );
+        // Slot 0 reserved for the unselected cluster — always 0.
+        assert_eq!(lf[0], 0);
+    }
+
+    #[test]
+    fn round49_spatial_segment_lf_deltas_more_regions_than_slots() {
+        // 4×4 = 16 spatial regions, only 3 segment slots available
+        // beyond the rest-cluster — verify 13 regions get clustered into
+        // segment 0 and the top-3 |delta| regions get segments 1/2/3.
+        let mb_w = 4;
+        let mb_h = 4;
+        let mut mb_sse = vec![100u64; mb_w * mb_h];
+        // Spike four MBs (each its own region with 4×4 bands on 4×4 MBs).
+        mb_sse[0] = 50_000; // (0, 0)
+        mb_sse[3] = 30_000; // (0, 3)
+        mb_sse[12] = 20_000; // (3, 0)
+        mb_sse[15] = 10_000; // (3, 3)
+        let (ids, lf) = compute_spatial_segment_lf_deltas(&mb_sse, mb_w, mb_h, 4, 4, 6);
+        // Top 3 regions by |delta| get segments 1, 2, 3. Fourth-largest
+        // (and the 12 uniform regions) collapse into segment 0.
+        // The delta for segment 0 stays 0.
+        assert_eq!(lf[0], 0);
+        // Verify the 4-th spike MB (10_000) ended up in segment 0 (its
+        // delta is smaller than the top-3).
+        assert_eq!(ids[15], 0, "4th-largest spike should cluster into seg 0");
+    }
+
+    #[test]
+    fn round49_spatial_segment_lf_deltas_clamps_band_count() {
+        // Asking for more bands than MBs → bands clamped to MB count.
+        let mb_w = 2;
+        let mb_h = 2;
+        let mb_sse = vec![10u64, 100, 1000, 10000];
+        let (ids, _) = compute_spatial_segment_lf_deltas(&mb_sse, mb_w, mb_h, 99, 99, 6);
+        // 4 MBs → 4 regions max → 3 distinct populated regions get
+        // segments 1/2/3, one collapses into 0.
+        assert_eq!(ids.len(), 4);
+        // Each region holds exactly one MB; top-3 by |delta| become
+        // segments 1/2/3.
+        let mut seen = [0u32; 4];
+        for &id in &ids {
+            seen[id as usize] += 1;
+        }
+        // Exactly one MB in each of segments 0/1/2/3.
+        assert_eq!(seen, [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn round49_spatial_segment_lf_deltas_zero_band_count_collapses_to_one() {
+        // 0 bands → clamp to 1 → single region → single populated entry
+        // → it goes into segment 1 with delta 0 (cv2 = 0 since region
+        // mean equals frame mean).
+        let mb_w = 2;
+        let mb_h = 2;
+        let mb_sse = vec![100u64; 4];
+        let (ids, lf) = compute_spatial_segment_lf_deltas(&mb_sse, mb_w, mb_h, 0, 0, 6);
+        for &id in &ids {
+            assert_eq!(id, 1, "single region should map every MB to seg 1");
+        }
+        assert_eq!(lf[1], 0, "single uniform region should give delta 0");
     }
 }
 

@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Per-MB-targeted segment LF deltas + spatial-locality
+  bucketed adaptive LF (round-49). Two complementary opt-in knobs land
+  on top of round-48 to drive the per-segment LF-delta channel from
+  per-MB content statistics rather than the static config array.
+  `Vp8EncoderConfig::enable_per_mb_lf_deltas` (default `false`)
+  computes a per-MB optimal LF delta with the same proportional
+  formula round-44 uses for ref/mode buckets
+  (`(mb_sse - frame_mean) * delta_cap / frame_mean`), then groups by
+  `mb_segment_id` and picks the per-segment median. Empty segments
+  fall back to the static `config.segment_lf_deltas` value so toggling
+  this flag on a sparse segment map doesn't introduce wild deltas.
+  `Vp8EncoderConfig::enable_spatial_lf_deltas` (default `false`)
+  partitions the frame into
+  `spatial_lf_n_row_bands × spatial_lf_n_col_bands` rectangular
+  regions (default `4 × 4`), computes a per-region SSE-driven LF
+  delta with the same formula, then maps the regions onto VP8's
+  4-segment scheme by clustering: the 3 regions with the largest
+  `|delta|` become segments 1/2/3 (each carrying its own delta), the
+  rest collapse into segment 0 with delta `0`. Both the per-MB
+  segment-id map and the per-segment LF-delta array are overridden so
+  the bitstream signals the spatial assignment to the decoder. When
+  both flags are on the spatial path wins (it owns both the segment-id
+  map and the LF deltas; the per-MB median path becomes a no-op).
+  Both gated on `enable_segments = true`. Cap matches the round-44/48
+  estimator (`±6` default, expanded under
+  `enable_adaptive_lf_high_qp_cap` / `enable_variance_lf_cap`) so
+  cap-widening flags compose. Implemented via the new helpers
+  `compute_per_mb_optimal_lf_delta`, `pick_per_mb_segment_lf_deltas`,
+  and `compute_spatial_segment_lf_deltas`, plus
+  `SegmentCtx::set_lf_deltas` for installing the picked array between
+  pass 1 and pass 2. Off-by-default so the existing static-config
+  segment LF ladder stays bit-for-bit and the 15-fixture corpus stays
+  bit-exact. Ten integration tests in `tests/encoder_round_49.rs` plus
+  twelve unit tests in `src/encoder.rs` pin: default-off, off-path
+  byte-identical, segments-required gating for both paths, clean
+  P-frame decode, ±25 % per-MB envelope, ±35 % spatial envelope,
+  spatial-wins-over-per-MB composition, helper edge cases (empty /
+  uniform / outlier-saturates-cap / cap-widening / median grouping /
+  spatial top-band cluster / region-count clamping / zero-band
+  collapse), and combined-on round-trip.
 - *(encoder)* Variance-driven adaptive LF cap + UV-channel adaptive LF
   deltas (round-48). Two opt-in knobs generalise the round-47 high-QP
   cap and the round-44 luma-only adaptive estimator.

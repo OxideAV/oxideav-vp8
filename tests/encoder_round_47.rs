@@ -206,6 +206,10 @@ fn cfg_baseline_high_qp() -> Vp8EncoderConfig {
         enable_adaptive_lf_high_qp_cap: false,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
     }
 }
 
@@ -249,6 +253,10 @@ fn high_qp_cap_pframe_decodes_cleanly() {
         enable_adaptive_lf_high_qp_cap: true,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
         ..cfg_baseline_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -271,6 +279,10 @@ fn high_qp_cap_byte_envelope_within_20pct() {
         enable_adaptive_lf_high_qp_cap: true,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
         ..cfg_baseline_high_qp()
     };
 
@@ -296,6 +308,10 @@ fn high_qp_cap_inert_at_low_qp() {
         enable_adaptive_lf_high_qp_cap: true,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
         ..cfg_baseline_low_qp()
     };
 
@@ -323,6 +339,10 @@ fn high_qp_cap_requires_adaptive_lf_deltas() {
         enable_adaptive_lf_high_qp_cap: false,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
         ..cfg_baseline_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -330,6 +350,10 @@ fn high_qp_cap_requires_adaptive_lf_deltas() {
         enable_adaptive_lf_high_qp_cap: true,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
         ..cfg_baseline_high_qp()
     };
 
@@ -390,6 +414,10 @@ fn round47_combined_decodes_cleanly() {
         enable_adaptive_lf_high_qp_cap: true,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
         enable_joint_lf_rdo: true,
         ..cfg_baseline_high_qp()
     };

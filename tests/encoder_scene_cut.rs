@@ -219,6 +219,10 @@ fn cfg_no_cut() -> Vp8EncoderConfig {
         enable_adaptive_lf_high_qp_cap: false,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
     }
 }
 
@@ -273,6 +277,10 @@ fn cfg_with_cut() -> Vp8EncoderConfig {
         enable_adaptive_lf_high_qp_cap: false,
         enable_variance_lf_cap: false,
         enable_adaptive_uv_lf_deltas: false,
+        enable_per_mb_lf_deltas: false,
+        enable_spatial_lf_deltas: false,
+        spatial_lf_n_row_bands: 4,
+        spatial_lf_n_col_bands: 4,
     }
 }
 

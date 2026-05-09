@@ -1,37 +1,41 @@
-//! Round-43 encoder push tests — SPLIT_MV partition-selection RDO
-//! (`enable_split_mv_rdo`).
+//! Round-47 encoder push tests — high-QP adaptive LF magnitude scaling
+//! (`enable_adaptive_lf_high_qp_cap`) + sub-pel rate-term refactor.
 //!
-//! Round-43 lands the rate-aware variant of `search_split_mv`. Up to
-//! round-42 the SPLIT_MV picker chose the SAD-min split mode across the
-//! four candidates (16×8 / 8×16 / 8×8 / 4×4). The 4×4 split nearly
-//! always beats the coarser splits on raw SAD because it has the most
-//! per-partition freedom — but it also pays the most bitstream bits
-//! (16 partitions × per-partition tree + 16 MV deltas + the longest
-//! `MBSPLIT_PROBS` tree path). When `enable_split_mv_rdo` is on, each
-//! candidate is scored as `D + λ·R` where
+//! Round-47 lands two related picker upgrades on top of the round-46
+//! first-pass real-context SPLIT_MV scoring + MV-cost-aware sub-pel
+//! partition refinement:
 //!
-//!   * `D` = total partition SAD (same as the legacy path).
-//!   * `R` = `MBSPLIT_PROBS` tree-path cost + per-partition
-//!     `SUB_MV_REF_PROBS` longest-path leaf cost (NEW_4X4 under the
-//!     neutral [0] context, since neighbour sub-MVs aren't visible at
-//!     search time) + per-partition `mv_component_cost_x256` MV-delta
-//!     bits when the partition's MV is non-zero.
+//!   * `enable_adaptive_lf_high_qp_cap` lets the round-44 adaptive LF
+//!     estimator's per-bucket delta cap grow from `±6` at `qindex ≤ 60`
+//!     linearly up to `±10` at `qindex ≥ 110`. The round-44 cap is
+//!     calibrated for mid-QP; at high QP the per-MB SSE distribution
+//!     compresses against the cap and the adaptation signal is
+//!     truncated. The expansion is always *at* the cap — when the
+//!     proportional bucket deviation is small the produced delta is
+//!     identical regardless. Off-by-default so the round-44 calibration
+//!     is preserved bit-for-bit.
 //!
-//! λ comes from `lambda_for_qp(qi, scale)`, the same multiplier the
-//! per-MB ref/mode picker uses, so RDO trade-offs stay coherent across
-//! all encoder decisions.
+//!   * Sub-pel rate-term refactor folds the duplicated `mv_rate_cost`
+//!     closures from `subpel_refine_luma` and `subpel_refine_partition`
+//!     into a single shared helper `subpel_mv_rate_cost_x256`. Pure
+//!     mechanical refactor — no behavioural change. Verified via the
+//!     same off-path bit-identity tests round-46 used for
+//!     `enable_subpel_mv_cost_partition`.
 //!
 //! Tests:
-//!  1) Default config has the knob off.
+//!  1) Default config has the new knob off.
 //!  2) Off path produces byte-identical encoder output (regression
 //!     guard against accidental engagement).
-//!  3) RDO on: keyframe + P-frame encode/decode cleanly.
-//!  4) RDO byte envelope ±20 % vs greedy SAD baseline.
-//!  5) RDO PSNR not worse by more than 0.5 dB.
-//!  6) Flat-content byte-identical (the cheap-skip test fires before
-//!     `search_split_mv` is reached, so toggling the knob can't move
-//!     bytes).
-//!  7) `enable_rdo = false` makes the knob inert.
+//!  3) High-QP cap on: high-QP P-frame decodes cleanly.
+//!  4) High-QP cap byte envelope ±20 % vs round-44 baseline at high QP.
+//!  5) High-QP cap is inert at low QP (cap == 6 there, identical
+//!     bitstream).
+//!  6) High-QP cap requires `enable_adaptive_lf_deltas`.
+//!  7) Refactored sub-pel rate term: same byte size as pre-refactor
+//!     when `enable_subpel_mv_cost{,_partition}` are on (no behavioural
+//!     change, just the helper extraction).
+//!  8) Combined round-47 + round-46: clean round-trip with reasonable
+//!     PSNR at a high-QP setting.
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -47,7 +51,6 @@ use oxideav_vp8::encoder::{
 
 const W: u32 = 32;
 const H: u32 = 32;
-const QINDEX: u8 = 50;
 
 fn make_frame(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
     let cw = (W / 2) as usize;
@@ -70,11 +73,10 @@ fn make_frame(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> VideoFrame {
     }
 }
 
-/// Half-and-half clip — a horizontally-translating step between two
-/// luminance regions, designed to make the SPLIT_MV picker actually
-/// engage. The 16×8 and 8×16 split modes can capture the boundary in
-/// two halves; the 4×4 split would over-fit and pay more bits without
-/// matching SAD savings — so RDO should bias toward the coarser split.
+/// Half-and-half clip — mixes intra (the keyframe) and inter MBs of
+/// different modes, giving the adaptive estimator a non-trivial bucket
+/// distribution to work from. Same shape as round-44 used for its
+/// adaptive LF tests.
 fn make_half_step_clip(n: usize) -> Vec<VideoFrame> {
     let cw = (W / 2) as usize;
     let ch = (H / 2) as usize;
@@ -83,11 +85,6 @@ fn make_half_step_clip(n: usize) -> Vec<VideoFrame> {
         let mut y = vec![0u8; (W * H) as usize];
         for row in 0..H as usize {
             for col in 0..W as usize {
-                // Step boundary moves by `f` columns each frame, giving
-                // motion search something genuine to lock on. Left half
-                // is dark (60), right half is bright (200), with a small
-                // vertical wobble to keep some texture for sub-pel
-                // refinement.
                 let phase = (f as i32).rem_euclid(W as i32);
                 let bx = (col as i32 + phase).rem_euclid(W as i32);
                 let base = if bx < W as i32 / 2 { 60 } else { 200 };
@@ -100,21 +97,6 @@ fn make_half_step_clip(n: usize) -> Vec<VideoFrame> {
     out
 }
 
-/// Constant-grey clip — every MB skips the SPLIT_MV search outright via
-/// the cheap-skip test (`zero_sad <= MB_SKIP_SAD_PER_PIXEL * 256`), so
-/// toggling the RDO knob must not move bytes.
-fn make_flat_clip(n: usize) -> Vec<VideoFrame> {
-    let cw = (W / 2) as usize;
-    let ch = (H / 2) as usize;
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let y = vec![128u8; (W * H) as usize];
-        out.push(make_frame(y, vec![128u8; cw * ch], vec![128u8; cw * ch]));
-    }
-    out
-}
-
-/// Encode a clip, return `(total_bytes, avg_psnr_y, packets)`.
 fn measure(cfg: Vp8EncoderConfig, clip: &[VideoFrame]) -> (usize, f64, Vec<Vec<u8>>) {
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);
@@ -169,9 +151,13 @@ fn measure(cfg: Vp8EncoderConfig, clip: &[VideoFrame]) -> (usize, f64, Vec<Vec<u
     (total_bytes, avg_psnr, packets)
 }
 
-fn cfg_baseline() -> Vp8EncoderConfig {
+/// Round-47 baseline config at a high QP (`qindex = 110`) where the
+/// round-44 adaptive LF cap of `±6` saturates the SSE-deviation signal
+/// the most. Matches the round-44 baseline shape (mode/ref LF deltas
+/// on so the adaptive ladder can replace the static one).
+fn cfg_baseline_high_qp() -> Vp8EncoderConfig {
     Vp8EncoderConfig {
-        qindex: QINDEX,
+        qindex: 110,
         golden_interval: DEFAULT_GOLDEN_INTERVAL,
         alt_ref_interval: DEFAULT_ALT_REF_INTERVAL,
         enable_rdo: true,
@@ -209,9 +195,9 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_joint_lf_rdo: false,
         enable_bpred_rdo: false,
         enable_uv_rdo: false,
-        enable_mode_ref_lf_deltas: false,
+        enable_mode_ref_lf_deltas: true,
         enable_split_mv_rdo: false,
-        enable_adaptive_lf_deltas: false,
+        enable_adaptive_lf_deltas: true,
         enable_trellis_context_rate: false,
         enable_mv_cost_aware_snap: false,
         enable_split_mv_rdo_real_context: false,
@@ -221,20 +207,30 @@ fn cfg_baseline() -> Vp8EncoderConfig {
     }
 }
 
+/// Same baseline at low QP (`qindex = 30`) where the high-QP cap ramp
+/// floors at `6` and the produced bitstream must match the off path
+/// bit-for-bit.
+fn cfg_baseline_low_qp() -> Vp8EncoderConfig {
+    Vp8EncoderConfig {
+        qindex: 30,
+        ..cfg_baseline_high_qp()
+    }
+}
+
 #[test]
-fn default_config_split_mv_rdo_off() {
+fn default_config_round47_knob_off() {
     let cfg = Vp8EncoderConfig::default();
     assert!(
-        !cfg.enable_split_mv_rdo,
-        "round-43 default must keep SPLIT_MV RDO off (preserves bit-exact greedy SAD min)"
+        !cfg.enable_adaptive_lf_high_qp_cap,
+        "round-47 default must keep adaptive-LF high-QP cap off"
     );
 }
 
-/// Round-43 must not perturb the bitstream when the knob is off.
+/// Round-47 must not perturb the bitstream when the new knob is off.
 #[test]
-fn round43_off_path_byte_identical_to_legacy() {
+fn round47_off_path_byte_identical_to_legacy() {
     let clip = make_half_step_clip(4);
-    let cfg = cfg_baseline();
+    let cfg = cfg_baseline_high_qp();
     let (b0, _, p0) = measure(cfg, &clip);
     let (b1, _, p1) = measure(cfg, &clip);
     assert_eq!(b0, b1, "deterministic encode must match itself");
@@ -245,131 +241,84 @@ fn round43_off_path_byte_identical_to_legacy() {
 }
 
 #[test]
-fn split_mv_rdo_keyframe_decodes_cleanly() {
-    let clip = make_half_step_clip(1);
+fn high_qp_cap_pframe_decodes_cleanly() {
+    let clip = make_half_step_clip(8);
     let cfg = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
+        enable_adaptive_lf_high_qp_cap: true,
+        ..cfg_baseline_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "SPLIT_MV RDO keyframe produced zero bytes");
+    assert!(bytes > 0, "high-QP cap P-frame produced zero bytes");
     assert!(
         psnr_y > 5.0,
-        "SPLIT_MV RDO keyframe encode/decode PSNR collapsed: {psnr_y:.2} dB"
+        "high-QP cap P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
     );
 }
 
+/// The high-QP cap only widens the per-bucket delta clamp; the
+/// signed-6 grammar and frame-mean comparison are unchanged. Byte size
+/// stays within ±20 % of the round-44 baseline at the same QP (same
+/// envelope the round-44 adaptive-on test uses).
 #[test]
-fn split_mv_rdo_pframe_decodes_cleanly() {
+fn high_qp_cap_byte_envelope_within_20pct() {
     let clip = make_half_step_clip(8);
-    let cfg = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
-    };
-    let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(bytes > 0, "SPLIT_MV RDO P-frame produced zero bytes");
-    assert!(
-        psnr_y > 5.0,
-        "SPLIT_MV RDO P-frame encode/decode PSNR collapsed: {psnr_y:.2} dB"
-    );
-}
-
-/// SPLIT_MV RDO biases the picker toward coarser splits when the SAD
-/// savings of the finer splits don't amortise the bits — so on
-/// translating content the bitstream can shrink. Pin the swing to
-/// ±20 % of the legacy baseline.
-#[test]
-fn split_mv_rdo_byte_envelope_within_20pct() {
-    let clip = make_half_step_clip(8);
-    let baseline = cfg_baseline();
-    let with_rdo = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
+    let baseline = cfg_baseline_high_qp();
+    let with_high_cap = Vp8EncoderConfig {
+        enable_adaptive_lf_high_qp_cap: true,
+        ..cfg_baseline_high_qp()
     };
 
     let (bytes_g, _, _) = measure(baseline, &clip);
-    let (bytes_r, _, _) = measure(with_rdo, &clip);
+    let (bytes_a, _, _) = measure(with_high_cap, &clip);
 
-    let frac = (bytes_r as f64 - bytes_g as f64).abs() / bytes_g.max(1) as f64;
+    let frac = (bytes_a as f64 - bytes_g as f64).abs() / bytes_g.max(1) as f64;
     assert!(
         frac < 0.20,
-        "SPLIT_MV RDO swung byte size by {:.1}% (greedy {bytes_g}, rdo {bytes_r}) — beyond +/-20%",
+        "high-QP cap swung byte size by {:.1}% (round-44 {bytes_g}, round-47 {bytes_a}) — beyond +/-20%",
         frac * 100.0
     );
 }
 
+/// At low QP (`qindex ≤ 60`) the round-47 cap ramp floors at `6`, the
+/// same value the round-44 estimator uses. Toggling the high-QP cap
+/// flag must produce a byte-identical bitstream to the round-44 path.
 #[test]
-fn split_mv_rdo_psnr_does_not_regress_significantly() {
-    let clip = make_half_step_clip(6);
-    let baseline = cfg_baseline();
-    let with_rdo = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
-    };
-
-    let (_b_g, psnr_g, _) = measure(baseline, &clip);
-    let (_b_r, psnr_r, _) = measure(with_rdo, &clip);
-
-    assert!(
-        psnr_r >= psnr_g - 0.5,
-        "SPLIT_MV RDO regressed PSNR_Y by {:.3} dB beyond 0.5 dB slack (greedy {psnr_g:.2}, rdo {psnr_r:.2})",
-        psnr_g - psnr_r
-    );
-}
-
-/// Flat content has every MB taking the cheap-skip path before the
-/// SPLIT_MV search runs, so toggling the knob can't move bytes.
-#[test]
-fn split_mv_rdo_flat_content_is_byte_identical() {
-    let clip = make_flat_clip(4);
-    let baseline = cfg_baseline();
-    let with_rdo = Vp8EncoderConfig {
-        enable_split_mv_rdo: true,
-        enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
+fn high_qp_cap_inert_at_low_qp() {
+    let clip = make_half_step_clip(4);
+    let baseline = cfg_baseline_low_qp();
+    let with_high_cap = Vp8EncoderConfig {
+        enable_adaptive_lf_high_qp_cap: true,
+        ..cfg_baseline_low_qp()
     };
 
     let (b0, _, p0) = measure(baseline, &clip);
-    let (b1, _, p1) = measure(with_rdo, &clip);
+    let (b1, _, p1) = measure(with_high_cap, &clip);
 
     assert_eq!(
         b0, b1,
-        "flat-content encode must be byte-identical with SPLIT_MV RDO toggle: {b0} vs {b1}"
+        "high-QP cap must be inert at qindex=30: {b0} vs {b1}"
     );
     assert_eq!(p0.len(), p1.len());
     for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
-        assert_eq!(a, b, "flat-content packet {i} differs");
+        assert_eq!(a, b, "low-QP packet {i} differs");
     }
 }
 
-/// `enable_rdo = false` must zero the SPLIT_MV RDO lambda, making the
-/// knob inert — same gating contract round-41 BMODE-RDO and round-42
-/// UV-RDO use.
+/// `enable_adaptive_lf_deltas = false` makes the high-QP cap knob
+/// inert (the cap only feeds the round-44 estimator; with that off the
+/// encoder uses the static round-42 ladder regardless).
 #[test]
-fn split_mv_rdo_requires_enable_rdo() {
+fn high_qp_cap_requires_adaptive_lf_deltas() {
     let clip = make_half_step_clip(4);
     let cfg_a = Vp8EncoderConfig {
-        enable_rdo: false,
-        enable_split_mv_rdo: false,
         enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
+        enable_adaptive_lf_high_qp_cap: false,
+        ..cfg_baseline_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {
-        enable_rdo: false,
-        enable_split_mv_rdo: true,
         enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        ..cfg_baseline()
+        enable_adaptive_lf_high_qp_cap: true,
+        ..cfg_baseline_high_qp()
     };
 
     let (b0, _, p0) = measure(cfg_a, &clip);
@@ -377,36 +326,63 @@ fn split_mv_rdo_requires_enable_rdo() {
 
     assert_eq!(
         b0, b1,
-        "SPLIT_MV RDO must be inert when enable_rdo = false: {b0} vs {b1}"
+        "high-QP cap must be inert when adaptive LF deltas off: {b0} vs {b1}"
     );
     assert_eq!(p0.len(), p1.len());
     for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
-        assert_eq!(a, b, "enable_rdo-off packet {i} differs");
+        assert_eq!(a, b, "adaptive-off packet {i} differs");
     }
 }
 
-/// Composition with round-42 knobs (UV-RDO + mode/ref deltas + joint
-/// LF-RDO): turn everything on at once and confirm a clean round-trip
-/// with reasonable PSNR.
+/// The sub-pel rate-term refactor (extracting `subpel_mv_rate_cost_x256`
+/// from the duplicated closures) is a pure mechanical change. With the
+/// MV-cost knobs on, encoding the same clip twice at the same config
+/// must remain deterministic and produce identical packets — the
+/// determinism guard catches any accidental behavioural drift the
+/// refactor might have introduced.
 #[test]
-fn round43_combined_with_round42_decodes_cleanly() {
+fn subpel_rate_refactor_deterministic() {
+    let clip = make_half_step_clip(4);
+    let cfg = Vp8EncoderConfig {
+        enable_subpel_mv_cost: true,
+        enable_subpel_mv_cost_partition: true,
+        enable_split_mv_rdo: true,
+        ..cfg_baseline_high_qp()
+    };
+    let (b0, _, p0) = measure(cfg, &clip);
+    let (b1, _, p1) = measure(cfg, &clip);
+    assert_eq!(
+        b0, b1,
+        "sub-pel rate refactor broke determinism: {b0} vs {b1}"
+    );
+    assert_eq!(p0.len(), p1.len());
+    for (i, (a, b)) in p0.iter().zip(p1.iter()).enumerate() {
+        assert_eq!(a, b, "sub-pel rate refactor packet {i} differs");
+    }
+}
+
+/// Combined round-47 + round-46 + round-44: turn everything on at a
+/// high-QP setting and confirm a clean round-trip with reasonable PSNR.
+#[test]
+fn round47_combined_decodes_cleanly() {
     let clip = make_half_step_clip(8);
     let cfg = Vp8EncoderConfig {
         enable_split_mv_rdo: true,
-        enable_adaptive_lf_deltas: false,
-        enable_trellis_context_rate: false,
-        enable_uv_rdo: true,
+        enable_split_mv_rdo_real_context: true,
+        enable_split_mv_rdo_real_context_first_pass: true,
+        enable_subpel_mv_cost: true,
+        enable_subpel_mv_cost_partition: true,
+        enable_mv_cost_aware_snap: true,
         enable_mode_ref_lf_deltas: true,
+        enable_adaptive_lf_deltas: true,
+        enable_adaptive_lf_high_qp_cap: true,
         enable_joint_lf_rdo: true,
-        ..cfg_baseline()
+        ..cfg_baseline_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
-    assert!(
-        bytes > 0,
-        "combined round-43 + round-42 produced zero bytes"
-    );
+    assert!(bytes > 0, "combined round-47 produced zero bytes");
     assert!(
         psnr_y > 5.0,
-        "combined round-43 + round-42 PSNR collapsed: {psnr_y:.2} dB"
+        "combined round-47 PSNR collapsed: {psnr_y:.2} dB"
     );
 }

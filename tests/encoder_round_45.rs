@@ -204,6 +204,7 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context: false,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
     }
 }
 
@@ -324,6 +325,7 @@ fn split_mv_real_context_keyframe_decodes_cleanly() {
         enable_split_mv_rdo_real_context: true,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -345,6 +347,7 @@ fn split_mv_real_context_pframe_decodes_cleanly() {
         enable_split_mv_rdo_real_context: true,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -373,6 +376,7 @@ fn split_mv_real_context_byte_envelope_within_10pct() {
         enable_split_mv_rdo_real_context: true,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
         ..cfg_baseline()
     };
 
@@ -398,6 +402,7 @@ fn split_mv_real_context_requires_split_mv_rdo() {
         enable_split_mv_rdo_real_context: false,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -405,6 +410,7 @@ fn split_mv_real_context_requires_split_mv_rdo() {
         enable_split_mv_rdo_real_context: true,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
         ..cfg_baseline()
     };
 
@@ -431,6 +437,7 @@ fn round45_combined_decodes_cleanly() {
         enable_split_mv_rdo_real_context: true,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
         enable_mv_cost_aware_snap: true,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,

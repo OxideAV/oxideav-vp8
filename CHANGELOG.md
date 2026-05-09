@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* High-QP adaptive LF magnitude scaling + sub-pel rate-term
+  refactor (round-47). New opt-in
+  `Vp8EncoderConfig::enable_adaptive_lf_high_qp_cap` (default `false`)
+  lets the round-44 adaptive LF estimator's per-bucket delta cap grow
+  from `±6` at `qindex ≤ 60` linearly up to `±10` at `qindex ≥ 110`
+  (clamped either side). The round-44 cap is calibrated for mid-QP; at
+  high QP the per-MB SSE distribution carries a wider absolute spread
+  (the baseline reconstruction error is larger) and the bucket-vs-frame
+  deviations more often saturate against `±6`, truncating the
+  adaptation signal. The expansion is always *at* the cap — when the
+  proportional deviation is small the produced delta is identical to
+  the round-44 path. Implemented via
+  `LfDeltas::round44_adaptive_with_cap` and the new
+  `adaptive_lf_high_qp_cap` ramp helper. Off-by-default so the
+  round-44 calibration is preserved bit-for-bit. Requires
+  `enable_adaptive_lf_deltas = true` and
+  `enable_mode_ref_lf_deltas = true`; ignored on keyframes. The
+  round-47 commit also folds the duplicated `mv_rate_cost` closures
+  from `subpel_refine_luma` and `subpel_refine_partition` into a
+  single shared helper `subpel_mv_rate_cost_x256` — pure mechanical
+  refactor, no behavioural change. Eight integration tests in
+  `tests/encoder_round_47.rs` pin: default-off, off-path byte-identical
+  at high QP, high-QP cap clean decode, byte-envelope ±20 % vs
+  round-44 baseline, low-QP inert (cap floor == 6), `enable_adaptive_lf_deltas`-required
+  gating, sub-pel rate-refactor determinism, and combined-on round-trip.
 - *(encoder)* Adaptive loop-filter mode/ref deltas + Trellis
   rate-from-context (round-44). Two complementary picker upgrades land
   together. `Vp8EncoderConfig::enable_adaptive_lf_deltas` (default

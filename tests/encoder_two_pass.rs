@@ -160,6 +160,7 @@ fn default_enc_cfg(qindex: u8) -> Vp8EncoderConfig {
         enable_split_mv_rdo_real_context: false,
         enable_split_mv_rdo_real_context_first_pass: false,
         enable_subpel_mv_cost_partition: false,
+        enable_adaptive_lf_high_qp_cap: false,
     }
 }
 

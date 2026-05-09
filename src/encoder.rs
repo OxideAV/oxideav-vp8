@@ -212,6 +212,29 @@ fn loop_filter_level_for_qindex(qi: u8) -> u8 {
     l.clamp(1, 63) as u8
 }
 
+/// Round-47 high-QP-aware cap for the adaptive LF delta estimator.
+/// Returns the per-bucket clamp magnitude (in signed-6 grammar units)
+/// the round-44 estimator should use. Scales linearly from `6` at
+/// `qindex ≤ 60` to `10` at `qindex ≥ 110`, with the floor and ceiling
+/// each held flat outside that band. The expansion is always at the
+/// cap — when the proportional bucket-vs-frame deviation is small the
+/// produced delta is identical to the round-44 calibration; the cap
+/// only matters for buckets whose deviation already saturated `±6`,
+/// which happens disproportionately at high QP where the SSE
+/// distribution carries a wider absolute spread.
+#[inline]
+fn adaptive_lf_high_qp_cap(qi: u8) -> i32 {
+    // Linear ramp: cap(qi) = 6 + (qi - 60) * 4 / 50, clamped to [6, 10].
+    let q = qi as i32;
+    if q <= 60 {
+        6
+    } else if q >= 110 {
+        10
+    } else {
+        6 + (q - 60) * 4 / 50
+    }
+}
+
 /// Pick the bitstream `filter_type` (0 = normal, 1 = simple) for a
 /// given config + frame-level filter level. The simple-mode filter
 /// (RFC 6386 §15.2) is luma-only and only touches the four pixels
@@ -885,6 +908,25 @@ pub struct Vp8EncoderConfig {
     /// when this flag is disabled. Requires `enable_subpel_mv_cost = true`
     /// and `enable_rdo = true`.
     pub enable_subpel_mv_cost_partition: bool,
+    /// Enable round-47 high-QP adaptive LF magnitude scaling. The
+    /// round-44 adaptive LF estimator caps each ref/mode delta at `±6`
+    /// (which keeps the post-delta level inside one segment-tier of the
+    /// bare frame level — the same range the static round-42 ladder
+    /// uses, calibrated for mid-QP). At high QP the per-MB SSE
+    /// distribution carries a wider absolute spread (the baseline
+    /// reconstruction error is larger), so the bucket-vs-frame
+    /// deviations more often saturate against `±6` and the adaptation
+    /// signal is truncated. With this flag on, the cap scales linearly
+    /// from `±6` at `qindex ≤ 60` to `±10` at `qindex ≥ 110` (clamped
+    /// either side), giving the high-QP estimator headroom to track
+    /// genuinely larger inter-bucket differences. The expansion is
+    /// always at the *cap* — when the proportional deviation is small
+    /// the cap is unused and the produced delta is identical to the
+    /// pre-round-47 path. Off-by-default so the round-44 calibration is
+    /// preserved bit-for-bit when this flag is disabled. Requires
+    /// `enable_adaptive_lf_deltas = true` and
+    /// `enable_mode_ref_lf_deltas = true`; ignored on keyframes.
+    pub enable_adaptive_lf_high_qp_cap: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -936,6 +978,7 @@ impl Default for Vp8EncoderConfig {
             enable_split_mv_rdo_real_context: false,
             enable_split_mv_rdo_real_context_first_pass: false,
             enable_subpel_mv_cost_partition: false,
+            enable_adaptive_lf_high_qp_cap: false,
         }
     }
 }
@@ -2982,10 +3025,22 @@ fn encode_pframe_and_reconstruct(
     let lf_deltas: Option<LfDeltas> = if config.enable_mode_ref_lf_deltas {
         if config.enable_adaptive_lf_deltas {
             let mb_sse_y = compute_per_mb_luma_sse(&src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h);
-            Some(LfDeltas::round44_adaptive(
+            // Round-47: when the high-QP cap knob is on, scale the
+            // per-bucket delta cap from `±6` at `qindex ≤ 60` linearly
+            // up to `±10` at `qindex ≥ 110`. The default (knob off) cap
+            // of `6` reproduces round-44 bit-for-bit. The expansion is
+            // always *at* the cap — when the proportional deviation is
+            // small the produced delta is identical regardless.
+            let delta_cap = if config.enable_adaptive_lf_high_qp_cap {
+                adaptive_lf_high_qp_cap(qi as u8)
+            } else {
+                6
+            };
+            Some(LfDeltas::round44_adaptive_with_cap(
                 &mb_sse_y,
                 &mb_ref_frames,
                 &mb_ymodes,
+                delta_cap,
             ))
         } else {
             Some(LfDeltas::round42_default())
@@ -3899,15 +3954,27 @@ impl LfDeltas {
     /// `mb_ref_frames` — per-MB ENC_REF_* (INTRA=0, LAST=1, GOLDEN=2,
     /// ALT=3).
     /// `mb_ymodes` — per-MB y_mode (DC_PRED..=SPLIT_MV).
-    pub(crate) fn round44_adaptive(
+    ///
+    /// Round-47 cap-parameterised variant. The `delta_cap` parameter is
+    /// the per-bucket clamp magnitude (in 6-bit signed grammar units);
+    /// `6` reproduces the round-44 path bit-for-bit. Higher caps allow
+    /// the high-QP path to track wider bucket-vs-frame SSE deviations
+    /// without saturating the cap. The caller is expected to clamp
+    /// `delta_cap` to a sensible range (round-47 uses `[6..=10]`, the
+    /// latter still well inside the signed-6 grammar's `[-63..=63]`
+    /// budget).
+    pub(crate) fn round44_adaptive_with_cap(
         mb_sse_y: &[u64],
         mb_ref_frames: &[u8],
         mb_ymodes: &[i32],
+        delta_cap: i32,
     ) -> Self {
         // Cap magnitude so the post-delta level stays inside one
         // segment-tier of the bare frame level (matches the static
         // round-42 ladder values, which max at +4 and min at -2).
-        const DELTA_CAP: i32 = 6;
+        // Round-47 lets the cap grow at high QP where the SSE
+        // distribution's spread compresses ±6 saturated.
+        let delta_cap = delta_cap.clamp(1, 31);
         // Frame-mean SSE; the bucket means are compared against this.
         // Empty frame collapses to the static ladder.
         let n = mb_sse_y.len();
@@ -3957,7 +4024,7 @@ impl LfDeltas {
         }
 
         // Convert mean deviation into a signed delta.
-        // delta = clamp((bucket_mean - frame_mean) / frame_mean * DELTA_CAP, -DELTA_CAP, DELTA_CAP)
+        // delta = clamp((bucket_mean - frame_mean) / frame_mean * delta_cap, -delta_cap, delta_cap)
         // The static ladder is the fallback when a bucket has no
         // observations (common on flat content where every MB picks
         // ZERO_MV under LAST).
@@ -3968,11 +4035,11 @@ impl LfDeltas {
             }
             let mean = (sum / cnt as u64) as i64;
             // Proportional deviation in 1/32 units: (mean - frame_mean) * 32 / frame_mean.
-            // Scaled by DELTA_CAP / 32 to stay in [-DELTA_CAP, +DELTA_CAP].
+            // Scaled by delta_cap / 32 to stay in [-delta_cap, +delta_cap].
             let dev_x32 = ((mean - frame_mean).saturating_mul(32)) / frame_mean;
-            // Map dev_x32 ∈ approximately [-32, +32] to ±DELTA_CAP.
-            let raw = (dev_x32 * DELTA_CAP as i64) / 32;
-            raw.clamp(-DELTA_CAP as i64, DELTA_CAP as i64) as i32
+            // Map dev_x32 ∈ approximately [-32, +32] to ±delta_cap.
+            let raw = (dev_x32 * delta_cap as i64) / 32;
+            raw.clamp(-delta_cap as i64, delta_cap as i64) as i32
         };
 
         let ref_deltas = [
@@ -4991,6 +5058,29 @@ fn subpel_luma_sad_at(
     sad
 }
 
+/// Lagrangian rate term for a sub-pel hill-climb candidate (round-47).
+/// Shared by [`subpel_refine_luma`] and [`subpel_refine_partition`] —
+/// both bias their 3×3 quarter-pel walks toward MVs the entropy coder
+/// will spend fewer bits on, using the same `DEFAULT_MV_CONTEXT` table
+/// the per-MB rate model charges. Returning `0` when `lambda == 0`
+/// recovers the pre-rate behaviour bit-for-bit.
+///
+/// Units: `mv_component_cost_x256` returns bit cost in 1/256-bit units
+/// per axis; we sum row + col, multiply by `lambda` (which is itself in
+/// `lambda_for_qp` units, also 1/256-bit-aligned through the
+/// scale/256 factor in [`lambda_for_qp`]) and divide by 256 to put the
+/// result back into the same integer-SSE-magnitude units the SAD term
+/// is expressed in.
+#[inline]
+fn subpel_mv_rate_cost_x256(mv: Mv, lambda: u64) -> u64 {
+    if lambda == 0 {
+        return 0;
+    }
+    let row_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32);
+    let col_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32);
+    lambda * (row_bits + col_bits) as u64 / 256
+}
+
 /// Quarter-pel refinement: 8-neighbour hill-climb at `SUBPEL_REFINE_STEP`
 /// (1/8-pel units). Starts from `int_mv` with its known `int_sad`, scans
 /// the 3×3 neighbourhood once, and returns the best (mv, sad). One pass
@@ -5012,18 +5102,9 @@ fn subpel_refine_luma(
     int_sad: u32,
     mv_cost_lambda: u64,
 ) -> (Mv, u32) {
-    // Compute the rate cost for the integer-pel MV (the baseline).
-    let mv_rate_cost = |mv: Mv| -> u64 {
-        if mv_cost_lambda == 0 {
-            return 0;
-        }
-        let row_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32);
-        let col_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32);
-        mv_cost_lambda * (row_bits + col_bits) as u64 / 256
-    };
     let mut best_mv = int_mv;
     let mut best_sad = int_sad;
-    let mut best_cost = int_sad as u64 + mv_rate_cost(int_mv);
+    let mut best_cost = int_sad as u64 + subpel_mv_rate_cost_x256(int_mv, mv_cost_lambda);
     let step = SUBPEL_REFINE_STEP;
     for dy in -1..=1 {
         for dx in -1..=1 {
@@ -5032,7 +5113,7 @@ fn subpel_refine_luma(
             }
             let mv = Mv::new(int_mv.row as i32 + dy * step, int_mv.col as i32 + dx * step);
             let sad = subpel_luma_sad_at(src_y, ref_plane, src_stride, mb_xp, mb_yp, mv);
-            let cost = sad as u64 + mv_rate_cost(mv);
+            let cost = sad as u64 + subpel_mv_rate_cost_x256(mv, mv_cost_lambda);
             if cost < best_cost {
                 best_cost = cost;
                 best_sad = sad;
@@ -9115,23 +9196,16 @@ fn subpel_refine_partition(
     int_sad: u32,
     mv_cost_lambda: u64,
 ) -> (Mv, u32) {
-    // Round-46: when `mv_cost_lambda > 0`, mirror `subpel_refine_luma`'s
-    // Lagrangian comparison `D + λ·R / 256` (R = sum of MV-component
-    // costs under `DEFAULT_MV_CONTEXT`, the same proxy
-    // `split_mv_total_rate_x256` charges per partition for the absolute
-    // MV). With `mv_cost_lambda == 0` the rate term collapses to 0 and
-    // we recover the pre-r46 SAD-only behaviour bit-for-bit.
-    let mv_rate_cost = |mv: Mv| -> u64 {
-        if mv_cost_lambda == 0 {
-            return 0;
-        }
-        let row_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[0], mv.row as i32);
-        let col_bits = mv_component_cost_x256(&DEFAULT_MV_CONTEXT[1], mv.col as i32);
-        mv_cost_lambda * (row_bits + col_bits) as u64 / 256
-    };
+    // Round-47: shares the rate-term helper with `subpel_refine_luma`
+    // (`subpel_mv_rate_cost_x256`) — both 3×3 hill-climbs use the same
+    // `D + λ·R / 256` Lagrangian (R = sum of MV-component costs under
+    // `DEFAULT_MV_CONTEXT`, the same proxy `split_mv_total_rate_x256`
+    // charges per partition for the absolute MV). With `mv_cost_lambda
+    // == 0` the rate term collapses to 0 and we recover the pre-r46
+    // SAD-only behaviour bit-for-bit.
     let mut best_mv = int_mv;
     let mut best_sad = int_sad;
-    let mut best_cost = int_sad as u64 + mv_rate_cost(int_mv);
+    let mut best_cost = int_sad as u64 + subpel_mv_rate_cost_x256(int_mv, mv_cost_lambda);
     let step = SUBPEL_REFINE_STEP;
     for dy in -1..=1 {
         for dx in -1..=1 {
@@ -9140,7 +9214,7 @@ fn subpel_refine_partition(
             }
             let mv = Mv::new(int_mv.row as i32 + dy * step, int_mv.col as i32 + dx * step);
             let sad = subpel_partition_sad(src_y, ref_plane, y_stride, mb_xp, mb_yp, indices, mv);
-            let cost = sad as u64 + mv_rate_cost(mv);
+            let cost = sad as u64 + subpel_mv_rate_cost_x256(mv, mv_cost_lambda);
             if cost < best_cost {
                 best_cost = cost;
                 best_sad = sad;

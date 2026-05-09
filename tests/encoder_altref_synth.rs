@@ -210,6 +210,8 @@ fn baseline_cfg(alt_ref_interval: u32) -> Vp8EncoderConfig {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     }
 }
 

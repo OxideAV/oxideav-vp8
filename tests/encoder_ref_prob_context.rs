@@ -144,6 +144,8 @@ fn encode_clip(clip: &[VideoFrame]) -> Vec<Vec<u8>> {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     };
     let mut params = CodecParameters::video(CodecId::new("vp8"));
     params.width = Some(W);

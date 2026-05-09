@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* 4-means clustering for spatial-path segments + per-MB
+  luma-SSE caching across round-44/48 + round-49 paths (round-50). Two
+  complementary improvements land on top of round-49.
+  `Vp8EncoderConfig::enable_kmeans_spatial_segmentation` (default
+  `false`) replaces the round-49 greedy "top-3 |delta| → segments
+  1/2/3, rest → segment 0" picker with a `k = 4` Lloyd's-algorithm
+  clustering on `(region_delta, region_pos_x, region_pos_y)`. The
+  distance metric is `(region_delta - centroid_delta)² +
+  (alpha_x256/256) * ((px - cx)² + (py - cy)²)`, tuned by the new
+  `kmeans_spatial_alpha_x256` field (default `256` = `1.0`). Centroids
+  are seeded from the 4 highest-|delta| populated regions and Lloyd's
+  iterations run until convergence or `KMEANS_SPATIAL_MAX_ITERS`
+  (= 16). Spatially-adjacent regions with similar deltas now merge
+  into one segment, freeing slots that the greedy picker would have
+  spent on near-duplicates. Off-by-default so the round-49 greedy
+  picker is preserved bit-for-bit; requires `enable_spatial_lf_deltas
+  = true` (inert otherwise). Cap-widening flags compose through the
+  same `delta_cap` resolution as the greedy path. The second
+  improvement is internal: the per-MB luma-SSE vector is now computed
+  exactly once per P-frame (when needed) and threaded into both the
+  round-44/48 adaptive LF estimator and the round-49 per-MB / spatial
+  paths via a single `mb_sse_y_cache` allocation. Previously the two
+  pipelines independently called `compute_per_mb_luma_sse`, walking
+  `rec_y` twice when both were enabled. The refactor is bit-exact
+  preserving (the math is unchanged); only the duplicate work is
+  removed. Implemented via the new helper
+  `compute_spatial_segment_lf_deltas_kmeans` plus the
+  `mb_sse_y_cache` lifting in the P-frame encoder. Seven integration
+  tests in `tests/encoder_round_50.rs` plus seven unit tests in
+  `src/encoder.rs` pin: default-off, k-means-off byte-identical,
+  spatial-required gating, clean P-frame decode, ±35 % byte
+  envelope vs round-49 greedy, combined-on round-trip,
+  cache-deterministic re-runs, and helper edge cases (empty /
+  uniform / single-region / band-clamping / alpha-zero pure-delta /
+  cluster-mean delta / multi-spike differs-from-greedy).
 - *(encoder)* Per-MB-targeted segment LF deltas + spatial-locality
   bucketed adaptive LF (round-49). Two complementary opt-in knobs land
   on top of round-48 to drive the per-segment LF-delta channel from

@@ -200,6 +200,8 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     }
 }
 
@@ -258,6 +260,8 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     }
 }
 
@@ -327,6 +331,8 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     }
 }
 
@@ -444,6 +450,8 @@ fn frame_headers_carry_segment_lf_deltas() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

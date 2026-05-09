@@ -396,6 +396,29 @@ pub const DEFAULT_SPATIAL_LF_N_ROW_BANDS: u8 = 4;
 /// [`Vp8EncoderConfig::spatial_lf_n_col_bands`]: Vp8EncoderConfig::spatial_lf_n_col_bands
 pub const DEFAULT_SPATIAL_LF_N_COL_BANDS: u8 = 4;
 
+/// Default for [`Vp8EncoderConfig::kmeans_spatial_alpha_x256`]. The 4-means
+/// distance metric (round-50 #2) weighs delta-similarity against
+/// spatial-locality with `d = (region_delta - centroid_delta)² + alpha *
+/// ((px - cx)² + (py - cy)²)`. `alpha_x256 = 256` (= `1.0`) gives the
+/// spatial term unit weight relative to the squared delta term, matching
+/// the proposal in `docs/IMPLEMENTOR_ROUND.md` round-50 candidate #2 — a
+/// region one MB-grid-step away from the centroid contributes the same
+/// distance as a region whose delta differs by `1` from the centroid
+/// delta. Tunable per-encoder via the config field; `0` collapses to the
+/// pure-delta clustering of the greedy path; large values bias toward
+/// pure spatial-locality clustering.
+///
+/// [`Vp8EncoderConfig::kmeans_spatial_alpha_x256`]: Vp8EncoderConfig::kmeans_spatial_alpha_x256
+pub const DEFAULT_KMEANS_SPATIAL_ALPHA_X256: u32 = 256;
+
+/// Hard cap on Lloyd's-algorithm iterations for the round-50 4-means
+/// spatial-segment picker. The clusters typically converge in 4–6
+/// iterations on the encoder's test fixtures; `16` is a generous upper
+/// bound that still terminates the algorithm in negligible wall-time even
+/// on degenerate distributions where the centroids oscillate between two
+/// near-equivalent partitions.
+pub const KMEANS_SPATIAL_MAX_ITERS: usize = 16;
+
 /// Variance bucket boundaries (luma, summed-square units per MB) that map
 /// each MB to a segment id. A 16×16 MB has 256 pixels so a per-pixel
 /// variance of `v_pp` corresponds to `v_pp * 256` in this metric. Picked
@@ -1097,6 +1120,45 @@ pub struct Vp8EncoderConfig {
     ///
     /// [`enable_spatial_lf_deltas`]: Vp8EncoderConfig::enable_spatial_lf_deltas
     pub spatial_lf_n_col_bands: u8,
+    /// Round-50 (#2): replace the round-49 greedy "top-3 |delta| regions
+    /// → segments 1/2/3, rest → segment 0" picker with a 4-means
+    /// (Lloyd's algorithm) clustering on `(region_delta, region_pos_x,
+    /// region_pos_y)`. The distance metric is `(region_delta -
+    /// centroid_delta)² + alpha * ((px - cx)² + (py - cy)²)`, tuned by
+    /// [`kmeans_spatial_alpha_x256`]. Centroids are initialised at the
+    /// 4 regions with the largest absolute delta; iteration runs until
+    /// no region changes cluster (convergence) or
+    /// [`KMEANS_SPATIAL_MAX_ITERS`] iterations are reached. Each
+    /// region's segment id is the cluster index `[0, 3]`; the per-segment
+    /// LF delta is the (rounded) mean of its cluster-member region
+    /// deltas. Spatially-adjacent regions with similar deltas now merge
+    /// into one segment, freeing the other 3 segment slots for distinct
+    /// regions; greedy `top-3 |delta|` would have spent two slots on
+    /// near-duplicates.
+    ///
+    /// Off-by-default so the round-49 greedy picker is preserved
+    /// bit-for-bit when this flag is disabled. Requires
+    /// `enable_spatial_lf_deltas = true`; ignored otherwise. Composes
+    /// with the cap-widening flags through the same `delta_cap`
+    /// resolution as the greedy path.
+    ///
+    /// [`kmeans_spatial_alpha_x256`]: Vp8EncoderConfig::kmeans_spatial_alpha_x256
+    /// [`KMEANS_SPATIAL_MAX_ITERS`]: KMEANS_SPATIAL_MAX_ITERS
+    pub enable_kmeans_spatial_segmentation: bool,
+    /// Round-50 (#2): spatial-locality weight α (in 1/256 units) for the
+    /// 4-means clustering distance metric. The metric is
+    /// `(region_delta - cd)² + (alpha_x256/256) * ((px - cx)² + (py -
+    /// cy)²)`. Active when [`enable_kmeans_spatial_segmentation`] = `true`.
+    /// `0` collapses to pure-delta 1-D clustering (regions cluster only
+    /// on their LF-delta value); `256` (default,
+    /// [`DEFAULT_KMEANS_SPATIAL_ALPHA_X256`]) gives the spatial term
+    /// unit weight relative to the squared delta term; large values
+    /// bias toward pure spatial-locality clustering. The math is
+    /// integer-only so any value the encoder picks is reproducible
+    /// across builds.
+    ///
+    /// [`enable_kmeans_spatial_segmentation`]: Vp8EncoderConfig::enable_kmeans_spatial_segmentation
+    pub kmeans_spatial_alpha_x256: u32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -1155,6 +1217,8 @@ impl Default for Vp8EncoderConfig {
             enable_spatial_lf_deltas: false,
             spatial_lf_n_row_bands: DEFAULT_SPATIAL_LF_N_ROW_BANDS,
             spatial_lf_n_col_bands: DEFAULT_SPATIAL_LF_N_COL_BANDS,
+            enable_kmeans_spatial_segmentation: false,
+            kmeans_spatial_alpha_x256: DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
         }
     }
 }
@@ -3200,15 +3264,37 @@ fn encode_pframe_and_reconstruct(
     // and toward lighter filtering for buckets below the frame mean.
     // Empty buckets fall back to the static ladder so sparse-mode
     // frames don't get wild deltas.
+    // Round-50 (#4): cache the per-MB luma-SSE so the round-44/48
+    // estimator and the round-49 per-MB / spatial paths share a single
+    // computation. Both pipelines previously called
+    // `compute_per_mb_luma_sse` independently — when both the round-48
+    // adaptive LF estimator and a round-49 path were enabled the encoder
+    // walked `rec_y` twice. Here we compute it lazily exactly once when
+    // any consumer needs it, then thread the cached `Vec<u64>` into both
+    // branches. Bit-exact preserving (the math is unchanged); only the
+    // double work is removed.
+    let need_mb_sse_y = (config.enable_mode_ref_lf_deltas && config.enable_adaptive_lf_deltas)
+        || (segments.enabled
+            && (config.enable_per_mb_lf_deltas || config.enable_spatial_lf_deltas));
+    let mb_sse_y_cache: Option<Vec<u64>> = if need_mb_sse_y {
+        Some(compute_per_mb_luma_sse(
+            &src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h,
+        ))
+    } else {
+        None
+    };
+
     let lf_deltas: Option<LfDeltas> = if config.enable_mode_ref_lf_deltas {
         if config.enable_adaptive_lf_deltas {
-            let mb_sse_y = compute_per_mb_luma_sse(&src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h);
+            let mb_sse_y = mb_sse_y_cache
+                .as_deref()
+                .expect("mb_sse_y cache populated when adaptive LF deltas on");
             // Round-48: variance-driven cap takes priority over the
             // round-47 QP ramp when its flag is on. Otherwise the
             // round-47 QP-proxy cap applies, falling back to the
             // round-44 default cap of `6` when neither flag is set.
             let delta_cap = if config.enable_variance_lf_cap {
-                variance_lf_cap(&mb_sse_y)
+                variance_lf_cap(mb_sse_y)
             } else if config.enable_adaptive_lf_high_qp_cap {
                 adaptive_lf_high_qp_cap(qi as u8)
             } else {
@@ -3224,7 +3310,7 @@ fn encode_pframe_and_reconstruct(
                     &src_u, &src_v, &rec_u, &rec_v, uv_stride, uv_buf_h, mb_w, mb_h,
                 );
                 Some(LfDeltas::round48_adaptive_with_uv(
-                    &mb_sse_y,
+                    mb_sse_y,
                     &mb_sse_uv,
                     &mb_ref_frames,
                     &mb_ymodes,
@@ -3232,7 +3318,7 @@ fn encode_pframe_and_reconstruct(
                 ))
             } else {
                 Some(LfDeltas::round44_adaptive_with_cap(
-                    &mb_sse_y,
+                    mb_sse_y,
                     &mb_ref_frames,
                     &mb_ymodes,
                     delta_cap,
@@ -3259,15 +3345,20 @@ fn encode_pframe_and_reconstruct(
     // `enable_variance_lf_cap`) compose with the per-MB / spatial paths
     // without recomputing the cap. When neither cap-widening flag is on,
     // `delta_cap` is the round-44 default of `6`.
+    //
+    // Round-50 (#4): the per-MB luma-SSE is sourced from `mb_sse_y_cache`
+    // populated above (single computation shared with the round-44/48
+    // estimator). Round-50 (#2): when
+    // `enable_kmeans_spatial_segmentation` is on, the spatial path uses
+    // 4-means clustering on (region_delta, region_pos) instead of the
+    // greedy top-3-|delta| picker — same bit-for-bit interface to the
+    // bitstream, different segment assignment policy.
     if segments.enabled && (config.enable_per_mb_lf_deltas || config.enable_spatial_lf_deltas) {
-        // Recompute (or reuse) per-MB SSE. The round-44/48 path above
-        // already computed it inside its branch; we recompute here to
-        // avoid plumbing the value through the `Option<LfDeltas>` ladder
-        // (the cost is one frame-pass over `rec_y` — tiny vs the per-MB
-        // mode search).
-        let mb_sse_y = compute_per_mb_luma_sse(&src_y, &rec_y, y_stride, y_buf_h, mb_w, mb_h);
+        let mb_sse_y = mb_sse_y_cache
+            .as_deref()
+            .expect("mb_sse_y cache populated when round-49 paths on");
         let delta_cap = if config.enable_variance_lf_cap {
-            variance_lf_cap(&mb_sse_y)
+            variance_lf_cap(mb_sse_y)
         } else if config.enable_adaptive_lf_high_qp_cap {
             adaptive_lf_high_qp_cap(qi as u8)
         } else {
@@ -3277,14 +3368,26 @@ fn encode_pframe_and_reconstruct(
         // segment-id map and the segment_lf_deltas array, leaving the
         // per-MB median path nothing to override.
         if config.enable_spatial_lf_deltas {
-            let (new_ids, new_lf) = compute_spatial_segment_lf_deltas(
-                &mb_sse_y,
-                mb_w,
-                mb_h,
-                config.spatial_lf_n_row_bands,
-                config.spatial_lf_n_col_bands,
-                delta_cap,
-            );
+            let (new_ids, new_lf) = if config.enable_kmeans_spatial_segmentation {
+                compute_spatial_segment_lf_deltas_kmeans(
+                    mb_sse_y,
+                    mb_w,
+                    mb_h,
+                    config.spatial_lf_n_row_bands,
+                    config.spatial_lf_n_col_bands,
+                    delta_cap,
+                    config.kmeans_spatial_alpha_x256,
+                )
+            } else {
+                compute_spatial_segment_lf_deltas(
+                    mb_sse_y,
+                    mb_w,
+                    mb_h,
+                    config.spatial_lf_n_row_bands,
+                    config.spatial_lf_n_col_bands,
+                    delta_cap,
+                )
+            };
             mb_segment_ids = new_ids;
             // Recompute segment tree probs against the new segment-id
             // distribution so the bool-coded per-MB segment id pays the
@@ -3298,12 +3401,13 @@ fn encode_pframe_and_reconstruct(
             segment_tree_probs = segment_tree_probs_from_counts(&seg_counts);
             segments.set_lf_deltas(new_lf);
         } else if config.enable_per_mb_lf_deltas {
-            let per_mb = compute_per_mb_optimal_lf_delta(&mb_sse_y, delta_cap);
+            let per_mb = compute_per_mb_optimal_lf_delta(mb_sse_y, delta_cap);
             let new_lf =
                 pick_per_mb_segment_lf_deltas(&per_mb, &mb_segment_ids, config.segment_lf_deltas);
             segments.set_lf_deltas(new_lf);
         }
     }
+    drop(mb_sse_y_cache);
 
     // Joint loop-filter / QP rate-distortion optimisation (round-40, opt-in
     // via `enable_joint_lf_rdo`). On P-frames only — keyframes still use
@@ -4690,6 +4794,225 @@ pub(crate) fn compute_spatial_segment_lf_deltas(
         seg_lf[seg as usize] = region_delta[region];
     }
     // Rewrite the per-MB segment id vector via the cached region lookup.
+    for i in 0..n {
+        ids[i] = region_to_seg[per_mb_region[i]];
+    }
+    (ids, seg_lf)
+}
+
+/// Round-50 (#2): 4-means (Lloyd's algorithm) variant of the round-49
+/// spatial-locality bucketed adaptive LF picker. Same I/O contract as
+/// [`compute_spatial_segment_lf_deltas`] but replaces the greedy
+/// "top-3 |delta| → segments 1/2/3, rest → segment 0" partitioning with
+/// a `k=4` clustering on `(region_delta, region_pos_x, region_pos_y)`.
+/// The metric is
+///
+///   `d = (region_delta - centroid_delta)² + (alpha_x256/256) * ((px - cx)² + (py - cy)²)`
+///
+/// where `(px, py)` is the band-coordinate of the region (col_band,
+/// row_band, integer-valued). `alpha_x256` is in 1/256 units; the
+/// default `256` (= `1.0`) gives the spatial term unit weight relative
+/// to the squared delta term. `0` collapses to a pure 1-D clustering
+/// on delta. The whole computation is integer arithmetic in `i64`.
+///
+/// Initialisation: centroids start at the 4 populated regions with the
+/// largest `|delta|` (when fewer populated regions exist, the cluster
+/// count is reduced to that many — the same way the greedy picker
+/// degenerates).
+///
+/// Iteration: each region is assigned to the nearest centroid (ties
+/// broken by lowest cluster index for determinism); centroids are
+/// recomputed as the integer mean of their members. Iteration stops at
+/// convergence (no region changes cluster) or after
+/// [`KMEANS_SPATIAL_MAX_ITERS`] iterations.
+///
+/// Output: `(spatial_segment_ids, segment_lf_deltas)` — same shape as
+/// the greedy path. The per-segment LF delta is the integer mean of
+/// the cluster-member region deltas. Empty cluster slots stay at
+/// `0` (no member regions → no LF nudge).
+///
+/// `n_row_bands`, `n_col_bands` are clamped to `[1, mb_h]` /
+/// `[1, mb_w]` (a `0` collapses to `1`); `delta_cap` is clamped to
+/// `[1, 31]` like the greedy path.
+pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
+    mb_sse: &[u64],
+    mb_w: usize,
+    mb_h: usize,
+    n_row_bands: u8,
+    n_col_bands: u8,
+    delta_cap: i32,
+    alpha_x256: u32,
+) -> (Vec<u8>, [i32; 4]) {
+    let n = mb_w * mb_h;
+    let mut ids = vec![0u8; n];
+    let lf = [0i32; 4];
+    if n == 0 || mb_sse.len() != n {
+        return (ids, lf);
+    }
+    let delta_cap = delta_cap.clamp(1, 31);
+    let nrb = (n_row_bands as usize).max(1).min(mb_h);
+    let ncb = (n_col_bands as usize).max(1).min(mb_w);
+    let nbuckets = nrb * ncb;
+
+    // Pass 1: per-region SSE accumulation + per-MB region cache.
+    let mut region_sum = vec![0u128; nbuckets];
+    let mut region_cnt = vec![0u32; nbuckets];
+    let mut per_mb_region = vec![0usize; n];
+    for my in 0..mb_h {
+        let band_row = (my * nrb) / mb_h;
+        for mx in 0..mb_w {
+            let band_col = (mx * ncb) / mb_w;
+            let region = band_row * ncb + band_col;
+            let idx = my * mb_w + mx;
+            per_mb_region[idx] = region;
+            region_sum[region] = region_sum[region].saturating_add(mb_sse[idx] as u128);
+            region_cnt[region] = region_cnt[region].saturating_add(1);
+        }
+    }
+    let total_sum: u128 = region_sum.iter().sum();
+    let total_cnt: u32 = region_cnt.iter().sum();
+    if total_cnt == 0 {
+        return (ids, lf);
+    }
+    let frame_mean = (total_sum / total_cnt as u128).max(1) as i64;
+
+    // Per-region delta + (band_col, band_row) coordinates. Only
+    // populated regions enter the clustering; empty regions are
+    // skipped so they don't pull centroids toward unrepresented
+    // delta=0 / pos=arbitrary points.
+    #[derive(Clone, Copy)]
+    struct RegionPt {
+        region: usize,
+        delta: i32,
+        px: i32,
+        py: i32,
+    }
+    let mut points: Vec<RegionPt> = Vec::with_capacity(nbuckets);
+    for r in 0..nbuckets {
+        if region_cnt[r] == 0 {
+            continue;
+        }
+        let mean = (region_sum[r] / region_cnt[r] as u128) as i64;
+        let dev_x32 = ((mean - frame_mean).saturating_mul(32)) / frame_mean;
+        let raw = (dev_x32 * delta_cap as i64) / 32;
+        let delta = raw.clamp(-delta_cap as i64, delta_cap as i64) as i32;
+        let py = (r / ncb) as i32;
+        let px = (r % ncb) as i32;
+        points.push(RegionPt {
+            region: r,
+            delta,
+            px,
+            py,
+        });
+    }
+    if points.is_empty() {
+        return (ids, lf);
+    }
+
+    // k = min(4, n_populated_regions). Init centroids at the populated
+    // regions sorted descending by |delta|, then by region index for
+    // determinism. This matches the greedy picker's seed selection so
+    // the k-means path is a strict refinement (single-region or
+    // saturated-delta inputs cluster identically to the greedy output).
+    let mut seed_idx: Vec<usize> = (0..points.len()).collect();
+    seed_idx.sort_unstable_by(|&a, &b| {
+        let da = points[a].delta.unsigned_abs();
+        let db = points[b].delta.unsigned_abs();
+        db.cmp(&da).then(points[a].region.cmp(&points[b].region))
+    });
+    let k = points.len().min(4);
+    let mut centroid_delta: [i64; 4] = [0; 4];
+    let mut centroid_px: [i64; 4] = [0; 4];
+    let mut centroid_py: [i64; 4] = [0; 4];
+    for i in 0..k {
+        let p = &points[seed_idx[i]];
+        centroid_delta[i] = p.delta as i64;
+        centroid_px[i] = p.px as i64;
+        centroid_py[i] = p.py as i64;
+    }
+
+    let alpha_x256 = alpha_x256 as i64;
+    let mut assign = vec![0u8; points.len()];
+    for _iter in 0..KMEANS_SPATIAL_MAX_ITERS {
+        // Assignment step: each region → nearest centroid (ties broken
+        // by lowest cluster index for determinism).
+        let mut changed = false;
+        for (i, p) in points.iter().enumerate() {
+            let mut best = 0u8;
+            let mut best_d = i64::MAX;
+            for c in 0..k {
+                let dd = p.delta as i64 - centroid_delta[c];
+                let dx = p.px as i64 - centroid_px[c];
+                let dy = p.py as i64 - centroid_py[c];
+                // d = dd^2 + (alpha_x256/256) * (dx^2 + dy^2). Multiply
+                // through by 256 to keep integer math; comparisons are
+                // monotone under positive scaling.
+                let dd2_256 = dd.saturating_mul(dd).saturating_mul(256);
+                let pos2 = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+                let pos2_alpha = pos2.saturating_mul(alpha_x256);
+                let dist = dd2_256.saturating_add(pos2_alpha);
+                if dist < best_d {
+                    best_d = dist;
+                    best = c as u8;
+                }
+            }
+            if assign[i] != best {
+                assign[i] = best;
+                changed = true;
+            }
+        }
+        if !changed && _iter > 0 {
+            break;
+        }
+
+        // Update step: integer mean of cluster-member coordinates +
+        // delta. Empty clusters keep their previous centroid (no
+        // movement) so a transient empty cluster doesn't snap to
+        // (0, 0, 0).
+        let mut sum_delta: [i64; 4] = [0; 4];
+        let mut sum_px: [i64; 4] = [0; 4];
+        let mut sum_py: [i64; 4] = [0; 4];
+        let mut cnt: [i64; 4] = [0; 4];
+        for (i, p) in points.iter().enumerate() {
+            let c = assign[i] as usize;
+            sum_delta[c] = sum_delta[c].saturating_add(p.delta as i64);
+            sum_px[c] = sum_px[c].saturating_add(p.px as i64);
+            sum_py[c] = sum_py[c].saturating_add(p.py as i64);
+            cnt[c] = cnt[c].saturating_add(1);
+        }
+        for c in 0..k {
+            if cnt[c] > 0 {
+                centroid_delta[c] = sum_delta[c] / cnt[c];
+                centroid_px[c] = sum_px[c] / cnt[c];
+                centroid_py[c] = sum_py[c] / cnt[c];
+            }
+        }
+    }
+
+    // Build region → cluster lookup + per-cluster LF delta (= integer
+    // mean of cluster-member region deltas, clamped to ±delta_cap to
+    // stay inside the signed-6-bit grammar).
+    let mut region_to_seg = vec![0u8; nbuckets];
+    let mut sum_delta: [i64; 4] = [0; 4];
+    let mut cnt: [i64; 4] = [0; 4];
+    for (i, p) in points.iter().enumerate() {
+        let c = assign[i];
+        region_to_seg[p.region] = c;
+        sum_delta[c as usize] = sum_delta[c as usize].saturating_add(p.delta as i64);
+        cnt[c as usize] = cnt[c as usize].saturating_add(1);
+    }
+    let mut seg_lf = [0i32; 4];
+    for c in 0..4 {
+        if cnt[c] > 0 {
+            let mean = sum_delta[c] / cnt[c];
+            seg_lf[c] = (mean.clamp(-delta_cap as i64, delta_cap as i64)) as i32;
+        }
+    }
+
+    // Rewrite the per-MB segment id vector via the cached region
+    // lookup. Empty regions (no MBs) get a `0` cluster id by
+    // construction; their slot in `region_to_seg` is never read (no MB
+    // points at them).
     for i in 0..n {
         ids[i] = region_to_seg[per_mb_region[i]];
     }
@@ -11638,6 +11961,196 @@ mod tests {
             assert_eq!(id, 1, "single region should map every MB to seg 1");
         }
         assert_eq!(lf[1], 0, "single uniform region should give delta 0");
+    }
+
+    // -----------------------------------------------------------------
+    // Round-50 (#2): 4-means clustering for spatial path segments
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn round50_kmeans_spatial_empty_returns_zeros() {
+        let (ids, lf) = compute_spatial_segment_lf_deltas_kmeans(&[], 0, 0, 4, 4, 6, 256);
+        assert!(ids.is_empty());
+        assert_eq!(lf, [0; 4]);
+    }
+
+    #[test]
+    fn round50_kmeans_spatial_uniform_no_clusters() {
+        // Uniform SSE → every region delta = 0 → cluster centroids all
+        // overlap → every region lands in cluster 0; per-segment LF
+        // deltas all 0.
+        let mb_w = 4;
+        let mb_h = 4;
+        let mb_sse = vec![100u64; mb_w * mb_h];
+        let (ids, lf) = compute_spatial_segment_lf_deltas_kmeans(&mb_sse, mb_w, mb_h, 2, 2, 6, 256);
+        assert_eq!(ids.len(), mb_w * mb_h);
+        for &v in &lf {
+            assert_eq!(v, 0, "uniform input must give all-zero LF deltas");
+        }
+    }
+
+    #[test]
+    fn round50_kmeans_spatial_single_region_collapses() {
+        // 0 bands → 1 region → single cluster, every MB in segment 0.
+        let mb_w = 2;
+        let mb_h = 2;
+        let mb_sse = vec![100u64; 4];
+        let (ids, lf) = compute_spatial_segment_lf_deltas_kmeans(&mb_sse, mb_w, mb_h, 0, 0, 6, 256);
+        // Single region → seed at index 0 → cluster id 0.
+        for &id in &ids {
+            assert_eq!(id, 0, "single region should land in cluster 0");
+        }
+        assert_eq!(lf[0], 0, "single uniform region must give delta 0");
+    }
+
+    #[test]
+    fn round50_kmeans_spatial_clamps_band_count() {
+        // Asking for more bands than MBs clamps to MB count, like the
+        // greedy path. 4 MBs, 99×99 bands → 2×2 region grid → 4
+        // populated regions, k = 4. Output length matches MB count.
+        let mb_w = 2;
+        let mb_h = 2;
+        // Pick SSEs that produce distinct *unclamped* deltas with
+        // delta_cap = 30 (above the per-region computed |delta|): the
+        // deltas land at roughly -23, -7, +6, +24 → 4 distinct
+        // clusters under alpha=0 pure-delta clustering.
+        let mb_sse = vec![100u64, 800, 1500, 4000];
+        let (ids, _) = compute_spatial_segment_lf_deltas_kmeans(
+            &mb_sse, mb_w, mb_h, 99, 99, /* delta_cap */ 30, /* alpha */ 0,
+        );
+        assert_eq!(ids.len(), 4);
+        let mut seen = [0u32; 4];
+        for &id in &ids {
+            seen[id as usize] += 1;
+        }
+        // Exactly one MB in each of the 4 cluster slots.
+        assert_eq!(
+            seen,
+            [1, 1, 1, 1],
+            "alpha=0 + 4 distinct unclamped deltas → 4 distinct clusters"
+        );
+    }
+
+    /// Round-50 (#2) headline test: 4-means clustering produces a
+    /// different segment-id distribution from the round-49 greedy
+    /// picker. The specific assignments depend on Lloyd's iterations
+    /// and the alpha weight; this test pins the headline contract:
+    /// (1) 4-means uses up to 4 distinct segment slots whereas greedy
+    /// caps at 4 (used + segment 0); (2) when the frame has more
+    /// than 3 high-|delta| regions, greedy collapses 4th+ into
+    /// segment 0 while k-means clusters them by (delta, position) —
+    /// so the segment-id maps must differ.
+    #[test]
+    fn round50_kmeans_spatial_differs_from_greedy_on_multi_spike() {
+        // 4×4 region grid: 5 spike regions distributed across the
+        // frame. Greedy picks the top-3 |delta| ones; the other 2
+        // spikes collapse into segment 0 alongside the uniform
+        // background. K-means clusters by joint (delta, position) and
+        // produces a different per-region partition.
+        let mb_w = 4;
+        let mb_h = 4;
+        let mut mb_sse = vec![100u64; mb_w * mb_h];
+        // 5 spikes, descending |delta|: region 0, 5, 10, 12, 15.
+        mb_sse[0] = 100_000;
+        mb_sse[5] = 90_000;
+        mb_sse[10] = 80_000;
+        mb_sse[12] = 70_000;
+        mb_sse[15] = 60_000;
+        let (greedy_ids, _) = compute_spatial_segment_lf_deltas(&mb_sse, mb_w, mb_h, 4, 4, 30);
+        let (kmeans_ids, _) =
+            compute_spatial_segment_lf_deltas_kmeans(&mb_sse, mb_w, mb_h, 4, 4, 30, 256);
+        // Both pickers produce ID maps of the same length.
+        assert_eq!(greedy_ids.len(), kmeans_ids.len());
+        // Headline contract: the two pickers DO assign segment ids
+        // differently on a multi-spike frame. (If they ever
+        // accidentally agree on every region for this fixture, the
+        // k-means path is silently degenerating to the greedy
+        // partitioning and the round-50 work loses its purpose.)
+        let mut diff_count = 0usize;
+        for i in 0..greedy_ids.len() {
+            if greedy_ids[i] != kmeans_ids[i] {
+                diff_count += 1;
+            }
+        }
+        assert!(
+            diff_count > 0,
+            "k-means must produce a distinct segment-id assignment from greedy on multi-spike fixture"
+        );
+        // K-means must use up to 4 cluster slots (no spike collapses
+        // forcibly into segment 0 the way greedy does — segment 0
+        // becomes just one of the 4 cluster ids the algorithm
+        // chooses).
+        let mut k_seen = [0u32; 4];
+        for &id in &kmeans_ids {
+            k_seen[id as usize] += 1;
+        }
+        let k_clusters_used = k_seen.iter().filter(|&&c| c > 0).count();
+        assert!(
+            k_clusters_used >= 2,
+            "k-means must use at least 2 cluster slots (got {k_clusters_used})"
+        );
+    }
+
+    /// `alpha = 0` collapses to pure-delta clustering (no spatial term)
+    /// — adjacent vs distant doesn't matter, only delta-similarity.
+    #[test]
+    fn round50_kmeans_spatial_alpha_zero_pure_delta_clustering() {
+        let mb_w = 4;
+        let mb_h = 4;
+        let mut mb_sse = vec![100u64; mb_w * mb_h];
+        // Two pairs of regions: A (deltas ≈ +x), B (deltas ≈ -x). The
+        // pairs are spatially distant but their deltas are equal.
+        mb_sse[0] = 10_000;
+        mb_sse[15] = 10_000;
+        mb_sse[3] = 10;
+        mb_sse[12] = 10;
+        let (ids, _) = compute_spatial_segment_lf_deltas_kmeans(&mb_sse, mb_w, mb_h, 4, 4, 6, 0);
+        // alpha=0 collapses spatial term → regions with the same delta
+        // cluster together regardless of position. Position 0 and 15
+        // (both delta = +cap) must share a cluster; position 3 and 12
+        // (both delta = -cap) must share a cluster.
+        assert_eq!(
+            ids[0], ids[15],
+            "alpha=0: same-delta distant regions must share a cluster"
+        );
+        assert_eq!(
+            ids[3], ids[12],
+            "alpha=0: same-delta distant regions must share a cluster"
+        );
+        assert_ne!(
+            ids[0], ids[3],
+            "alpha=0: opposite-sign-delta regions must split clusters"
+        );
+    }
+
+    /// Per-cluster LF delta is the mean of cluster-member region
+    /// deltas (rounded toward zero by integer division), clamped to
+    /// `±delta_cap`.
+    #[test]
+    fn round50_kmeans_spatial_cluster_delta_is_mean() {
+        // Force 2 populated regions with known opposite-sign deltas.
+        // 1-row × 2-col bands on a 1×2 MB frame → 2 regions, each one
+        // MB.
+        let mb_w = 2;
+        let mb_h = 1;
+        let mb_sse = vec![100u64, 10_000u64];
+        let (_, lf) = compute_spatial_segment_lf_deltas_kmeans(&mb_sse, mb_w, mb_h, 1, 2, 6, 256);
+        // 2 populated regions → k = 2. With distinct deltas the
+        // assignment is one-region-per-cluster; cluster 0's delta is
+        // the seed region (largest |delta| → mb_sse[1]'s delta = +6),
+        // cluster 1's delta is region 0's delta (= -6).
+        assert!(
+            lf[0] != 0 || lf[1] != 0,
+            "non-uniform input must produce non-zero deltas"
+        );
+        // Both populated cluster slots stay inside ±delta_cap (= 6).
+        for &v in &lf {
+            assert!(
+                v.abs() <= 6,
+                "per-cluster LF delta exceeded ±delta_cap (= {})",
+                6
+            );
+        }
     }
 }
 

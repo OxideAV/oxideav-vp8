@@ -58,9 +58,10 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_GOLDEN_INTERVAL, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
-    DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
-    DEFAULT_SPATIAL_LF_N_COL_BANDS, DEFAULT_SPATIAL_LF_N_ROW_BANDS,
+    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_GOLDEN_INTERVAL, DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
+    DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SEGMENT_LF_DELTAS,
+    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL, DEFAULT_SPATIAL_LF_N_COL_BANDS,
+    DEFAULT_SPATIAL_LF_N_ROW_BANDS,
 };
 
 const W: u32 = 64;
@@ -288,6 +289,8 @@ fn cfg_baseline_segments_high_qp() -> Vp8EncoderConfig {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: DEFAULT_SPATIAL_LF_N_ROW_BANDS,
         spatial_lf_n_col_bands: DEFAULT_SPATIAL_LF_N_COL_BANDS,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
     }
 }
 

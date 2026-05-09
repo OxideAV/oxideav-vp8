@@ -211,6 +211,8 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
     }
 }
 
@@ -338,6 +340,8 @@ fn split_mv_real_context_keyframe_decodes_cleanly() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -366,6 +370,8 @@ fn split_mv_real_context_pframe_decodes_cleanly() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
         ..cfg_baseline()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -401,6 +407,8 @@ fn split_mv_real_context_byte_envelope_within_10pct() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
         ..cfg_baseline()
     };
 
@@ -433,6 +441,8 @@ fn split_mv_real_context_requires_split_mv_rdo() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
         ..cfg_baseline()
     };
     let cfg_b = Vp8EncoderConfig {
@@ -447,6 +457,8 @@ fn split_mv_real_context_requires_split_mv_rdo() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
         ..cfg_baseline()
     };
 
@@ -480,6 +492,8 @@ fn round45_combined_decodes_cleanly() {
         enable_spatial_lf_deltas: false,
         spatial_lf_n_row_bands: 4,
         spatial_lf_n_col_bands: 4,
+        enable_kmeans_spatial_segmentation: false,
+        kmeans_spatial_alpha_x256: 256,
         enable_mv_cost_aware_snap: true,
         enable_uv_rdo: true,
         enable_mode_ref_lf_deltas: true,

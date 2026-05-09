@@ -345,6 +345,41 @@ longest split-tree path). λ comes from `lambda_for_qp(qi, scale)`,
 the same multiplier the per-MB ref/mode picker uses. Opt-in;
 default `false`. Requires `enable_rdo = true`.
 
+**Joint round-44/48 + round-49 picker (round-52, #2)** — when
+`enable_joint_r44r49_picker = true`, the round-44/48 mode/ref delta
+estimator and the round-49 spatial-segment LF picker iterate jointly
+instead of running independently from the same per-MB luma-SSE
+distribution. Each iteration recomputes the round-44/48 estimator on
+a per-MB residual SSE that subtracts the part of the per-MB ideal
+delta the spatial tier has already addressed, and recomputes the
+spatial picker on a per-MB residual SSE that subtracts the part the
+mode/ref tier has already addressed. The residual is
+`mb_sse * max(0, 32 - |implied_delta|) / 32` so an MB whose implied
+delta saturates the proportional-formula scale (`±32`) contributes
+zero to the next picker's frame mean / per-bucket sums (already
+"addressed" by the previous tier). Convergence: stop when both the
+8 mode/ref deltas + the segment_id vector + the 4 segment_lf_deltas
+match the previous iteration, capped at
+`joint_r44r49_picker_max_iters` (default 3 — converges in 1–2 on the
+test fixtures). Off-by-default; the round-49 / round-50 / round-51
+single-pass behaviour is preserved bit-for-bit when the flag is off.
+
+**Chroma-aware spatial picker (round-52, #3)** — when
+`enable_chroma_aware_spatial = true`, the round-49 / round-50
+spatial-segment picker scores regions on a luma+chroma weighted SSE
+blend (`combined = (luma_w * mb_sse_y + chroma_w * mb_sse_uv) / 256`)
+sourced from the round-51 `mb_sse_uv_cache`, instead of luma SSE
+alone. Defaults: `chroma_aware_spatial_luma_weight_x256 = 256` (=
+`1.0`, native luma weight), `chroma_aware_spatial_chroma_weight_x256
+= 128` (= `0.5`, the 4:2:0 sub-sampling ratio). Lifts a region whose
+luma is uniformly smooth but whose chroma carries substantial
+residual error (e.g. a saturated colour patch on a flat-luma
+background) into a non-zero segment — the luma-only picker would
+have collapsed it into segment 0. Both the greedy and k-means
+spatial paths consume the combined SSE; the picker logic is
+unchanged. Off-by-default; the luma-only picker is preserved
+bit-for-bit when the flag is off.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,

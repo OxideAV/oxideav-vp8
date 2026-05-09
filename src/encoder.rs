@@ -419,6 +419,48 @@ pub const DEFAULT_KMEANS_SPATIAL_ALPHA_X256: u32 = 256;
 /// near-equivalent partitions.
 pub const KMEANS_SPATIAL_MAX_ITERS: usize = 16;
 
+/// Default for [`Vp8EncoderConfig::joint_r44r49_picker_max_iters`]. The
+/// round-52 (#2) joint two-pass picker iterates the round-44/48 mode/ref
+/// estimator + the round-49 spatial-segment picker, each iteration
+/// telling the other what it just chose by subtracting an "implied
+/// per-MB delta" from the per-MB ideal delta the picker aggregates over.
+/// On the test fixtures the joint sequence converges (no change in
+/// either output) in 1-2 iterations; `3` is a generous upper bound that
+/// keeps wall-time negligible even when the two pickers oscillate
+/// between two near-equivalent partitions.
+///
+/// [`Vp8EncoderConfig::joint_r44r49_picker_max_iters`]: Vp8EncoderConfig::joint_r44r49_picker_max_iters
+pub const DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS: u8 = 3;
+
+/// Hard cap on [`Vp8EncoderConfig::joint_r44r49_picker_max_iters`]. The
+/// joint picker is integer-only and fast, but the iteration count is
+/// pure overhead; `8` covers any realistic oscillating distribution
+/// without ballooning the per-frame wall-time.
+pub const JOINT_R44R49_PICKER_MAX_ITERS_MAX: u8 = 8;
+
+/// Default for [`Vp8EncoderConfig::chroma_aware_spatial_luma_weight_x256`].
+/// In the round-52 (#3) chroma-aware spatial picker, each region's
+/// "combined SSE" is `(luma_w_x256 * region_luma_sse + chroma_w_x256 *
+/// region_chroma_sse) / 256`. `256` (= `1.0`) keeps the luma plane at
+/// its native weight (the greedy / k-means pickers already use luma SSE
+/// directly), so the default chroma weight of `128` (= `0.5`) folds the
+/// chroma plane into the picker at half the luma's contribution —
+/// matching the 4:2:0 chroma sub-sampling ratio (luma has 4× the
+/// pixels of chroma per MB).
+///
+/// [`Vp8EncoderConfig::chroma_aware_spatial_luma_weight_x256`]: Vp8EncoderConfig::chroma_aware_spatial_luma_weight_x256
+pub const DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256: u32 = 256;
+
+/// Default for [`Vp8EncoderConfig::chroma_aware_spatial_chroma_weight_x256`].
+/// `128` (= `0.5`) folds the chroma plane into the round-52 (#3) spatial
+/// picker at half the luma's contribution — matches the 4:2:0
+/// sub-sampling ratio (chroma has 1/4 of the pixels per MB so its SSE
+/// is naturally smaller; weighting by 0.5 lets a chroma-textured MB
+/// land in a high-delta region even when its luma is flat).
+///
+/// [`Vp8EncoderConfig::chroma_aware_spatial_chroma_weight_x256`]: Vp8EncoderConfig::chroma_aware_spatial_chroma_weight_x256
+pub const DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256: u32 = 128;
+
 /// Variance bucket boundaries (luma, summed-square units per MB) that map
 /// each MB to a segment id. A 16×16 MB has 256 pixels so a per-pixel
 /// variance of `v_pp` corresponds to `v_pp * 256` in this metric. Picked
@@ -1182,6 +1224,100 @@ pub struct Vp8EncoderConfig {
     ///
     /// [`compute_spatial_segment_lf_deltas_kmeans`]: compute_spatial_segment_lf_deltas_kmeans
     pub enable_kmeans_pp_seeding: bool,
+    /// Round-52 (#2): compose the round-49 spatial-segment LF picker with
+    /// the round-44/48 mode/ref delta estimator into a joint two-pass
+    /// converger. Today the two pickers are computed independently from
+    /// the same per-MB luma-SSE — first round-44/48 picks 4 ref + 4 mode
+    /// deltas using the per-MB SSE distribution, then round-49 (and the
+    /// k-means variant) rewrites `mb_segment_ids` and the per-segment LF
+    /// deltas using the same SSE distribution. The combined per-MB
+    /// filter level adds all three arms (`base + ref_delta + mode_delta +
+    /// segment_lf_delta`), so when both pickers independently push the
+    /// same direction the combined effect can saturate the cap or
+    /// over-correct; conversely when they push opposite directions they
+    /// can cancel each other out.
+    ///
+    /// The joint picker iterates: each iteration recomputes the round-44/48
+    /// estimator using a per-MB residual SSE that subtracts the implied
+    /// LF-delta contribution of the current spatial segment (so the
+    /// mode/ref picker sees only the deviation that the segment-tier
+    /// hasn't yet addressed), and recomputes the spatial picker using a
+    /// per-MB residual SSE that subtracts the implied LF-delta
+    /// contribution of the current ref/mode bucket (so the spatial
+    /// picker sees only the deviation that the ref/mode tier hasn't yet
+    /// addressed). Convergence: stop when both outputs (the 8 lf_deltas +
+    /// the segment_id vector + the 4 segment_lf_deltas) match the
+    /// previous iteration, capped at
+    /// [`joint_r44r49_picker_max_iters`] iterations (default
+    /// [`DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS`] = `3`; on the test
+    /// fixtures the sequence converges in 1-2 iterations).
+    ///
+    /// Off-by-default so the round-49 / round-50 / round-51 single-pass
+    /// behaviour is preserved bit-for-bit when this flag is disabled.
+    /// Requires `enable_mode_ref_lf_deltas = true` and
+    /// `enable_adaptive_lf_deltas = true` (the round-44/48 pass) plus
+    /// `enable_segments = true` and `enable_spatial_lf_deltas = true`
+    /// (the round-49 spatial pass) — inert otherwise.
+    /// Composes with the cap-widening flags
+    /// (`enable_adaptive_lf_high_qp_cap`, `enable_variance_lf_cap`)
+    /// through the same `delta_cap` resolution as the single-pass
+    /// pickers.
+    ///
+    /// [`joint_r44r49_picker_max_iters`]: Vp8EncoderConfig::joint_r44r49_picker_max_iters
+    /// [`DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS`]: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS
+    pub enable_joint_r44r49_picker: bool,
+    /// Round-52 (#2): cap on the joint picker's iteration count. Default
+    /// [`DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS`] (= `3`); clamped to
+    /// `[1, JOINT_R44R49_PICKER_MAX_ITERS_MAX]` at use-time. Active only
+    /// when [`enable_joint_r44r49_picker`] is `true`. Setting to `1`
+    /// recovers the single-pass pickers (the joint picker's first
+    /// iteration is the standard pipeline; the residual-SSE feedback
+    /// kicks in at iteration 2).
+    ///
+    /// [`enable_joint_r44r49_picker`]: Vp8EncoderConfig::enable_joint_r44r49_picker
+    /// [`DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS`]: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS
+    pub joint_r44r49_picker_max_iters: u8,
+    /// Round-52 (#3): chroma-aware variant of the round-49 / round-50
+    /// spatial-segment LF picker. Today the spatial picker bins regions
+    /// by their per-MB luma SSE only (`compute_per_mb_luma_sse`); a
+    /// region whose luma is uniformly smooth but whose chroma carries
+    /// substantial residual error (e.g. a saturated colour patch on a
+    /// flat-luma background) lands in segment 0 and gets no LF nudge.
+    /// With this flag on, the spatial picker's per-region SSE becomes
+    /// `(luma_w_x256 * region_luma_sse + chroma_w_x256 *
+    /// region_chroma_sse) / 256` where the per-MB chroma SSE is sourced
+    /// from the round-51 `mb_sse_uv_cache`. Defaults: `luma_w_x256 =
+    /// 256` (= `1.0`, native weight), `chroma_w_x256 = 128` (= `0.5`).
+    /// The greedy and k-means spatial paths both consume the combined
+    /// SSE; the picker logic is unchanged — only the SSE the regions are
+    /// scored on differs.
+    ///
+    /// Off-by-default so the round-49 / round-50 luma-only picker is
+    /// preserved bit-for-bit when this flag is disabled. Requires
+    /// `enable_segments = true` and `enable_spatial_lf_deltas = true`
+    /// (the round-49 spatial pass) — inert otherwise.
+    pub enable_chroma_aware_spatial: bool,
+    /// Round-52 (#3): luma weight (in 1/256 units) for the chroma-aware
+    /// spatial-segment SSE blend. Active when
+    /// [`enable_chroma_aware_spatial`] is `true`. Default
+    /// [`DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256`] (= `256` =
+    /// `1.0`). Setting to `0` collapses the picker to chroma-only SSE
+    /// (the inverse of the off-flag default behaviour).
+    ///
+    /// [`enable_chroma_aware_spatial`]: Vp8EncoderConfig::enable_chroma_aware_spatial
+    /// [`DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256`]: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256
+    pub chroma_aware_spatial_luma_weight_x256: u32,
+    /// Round-52 (#3): chroma weight (in 1/256 units) for the chroma-aware
+    /// spatial-segment SSE blend. Active when
+    /// [`enable_chroma_aware_spatial`] is `true`. Default
+    /// [`DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256`] (= `128` =
+    /// `0.5`). `0` recovers luma-only behaviour even with the flag on;
+    /// large values (e.g. `512`) bias the picker toward chroma-textured
+    /// regions.
+    ///
+    /// [`enable_chroma_aware_spatial`]: Vp8EncoderConfig::enable_chroma_aware_spatial
+    /// [`DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256`]: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256
+    pub chroma_aware_spatial_chroma_weight_x256: u32,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -1243,6 +1379,12 @@ impl Default for Vp8EncoderConfig {
             enable_kmeans_spatial_segmentation: false,
             kmeans_spatial_alpha_x256: DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
             enable_kmeans_pp_seeding: false,
+            enable_joint_r44r49_picker: false,
+            joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+            enable_chroma_aware_spatial: false,
+            chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+            chroma_aware_spatial_chroma_weight_x256:
+                DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         }
     }
 }
@@ -3318,9 +3460,18 @@ fn encode_pframe_and_reconstruct(
     // here is when both adaptive UV deltas + a future chroma consumer
     // are on, the encoder walks `rec_u` / `rec_v` once instead of
     // twice. With only the round-48 path on, behaviour is identical.
-    let need_mb_sse_uv = config.enable_mode_ref_lf_deltas
+    //
+    // Round-52 (#3): the chroma-aware spatial picker
+    // (`enable_chroma_aware_spatial`) is the second consumer the
+    // round-51 cache was hoisted for — when it's on (and the
+    // spatial-LF-delta path is on), the cache is populated so the
+    // spatial picker can blend luma + chroma SSE per region.
+    let need_mb_sse_uv = (config.enable_mode_ref_lf_deltas
         && config.enable_adaptive_lf_deltas
-        && config.enable_adaptive_uv_lf_deltas;
+        && config.enable_adaptive_uv_lf_deltas)
+        || (segments.enabled
+            && config.enable_spatial_lf_deltas
+            && config.enable_chroma_aware_spatial);
     let mb_sse_uv_cache: Option<Vec<u64>> = if need_mb_sse_uv {
         Some(compute_per_mb_chroma_sse(
             &src_u, &src_v, &rec_u, &rec_v, uv_stride, uv_buf_h, mb_w, mb_h,
@@ -3329,56 +3480,68 @@ fn encode_pframe_and_reconstruct(
         None
     };
 
-    let lf_deltas: Option<LfDeltas> = if config.enable_mode_ref_lf_deltas {
-        if config.enable_adaptive_lf_deltas {
-            let mb_sse_y = mb_sse_y_cache
-                .as_deref()
-                .expect("mb_sse_y cache populated when adaptive LF deltas on");
-            // Round-48: variance-driven cap takes priority over the
-            // round-47 QP ramp when its flag is on. Otherwise the
-            // round-47 QP-proxy cap applies, falling back to the
-            // round-44 default cap of `6` when neither flag is set.
-            let delta_cap = if config.enable_variance_lf_cap {
-                variance_lf_cap(mb_sse_y)
-            } else if config.enable_adaptive_lf_high_qp_cap {
-                adaptive_lf_high_qp_cap(qi as u8)
-            } else {
-                6
-            };
-            // Round-48: when the UV-channel knob is on, also feed the
-            // per-MB chroma SSE so the per-bucket delta is the average
-            // of the luma-only and chroma-only adaptive deltas. With
-            // the knob off, the round-44 luma-only path is preserved
-            // bit-for-bit.
-            if config.enable_adaptive_uv_lf_deltas {
-                // Round-51 (#4): chroma SSE comes from the lazy
-                // `mb_sse_uv_cache` populated above. The cache is
-                // initialised with the same gating predicate this
-                // branch checks, so the unwrap is infallible.
-                let mb_sse_uv = mb_sse_uv_cache
-                    .as_deref()
-                    .expect("mb_sse_uv cache populated when adaptive UV LF deltas on");
-                Some(LfDeltas::round48_adaptive_with_uv(
-                    mb_sse_y,
-                    mb_sse_uv,
-                    &mb_ref_frames,
-                    &mb_ymodes,
-                    delta_cap,
-                ))
-            } else {
-                Some(LfDeltas::round44_adaptive_with_cap(
-                    mb_sse_y,
-                    &mb_ref_frames,
-                    &mb_ymodes,
-                    delta_cap,
-                ))
-            }
-        } else {
-            Some(LfDeltas::round42_default())
+    // Compute the round-44/48 mode/ref delta estimator. Factored into a
+    // closure so the round-52 (#2) joint picker can re-invoke it on each
+    // iteration with a residual SSE that subtracts the part of the
+    // per-MB ideal delta the spatial picker has already addressed.
+    //
+    // `mb_sse_y_input` is the luma-SSE vector the closure aggregates
+    // over; it's `mb_sse_y_cache` directly on iteration 1 (matching the
+    // round-44/48 single-pass behaviour), then the residual after
+    // subtracting the spatial picker's per-MB implied delta on later
+    // iterations. Same gating predicates apply as the round-44/48
+    // single-pass code path: `enable_mode_ref_lf_deltas` gates the
+    // delta tier; `enable_adaptive_lf_deltas` enables the adaptive
+    // estimator (otherwise the round-42 default ladder applies). The
+    // cap is recomputed each iteration (the joint picker may shrink the
+    // SSE distribution enough that `variance_lf_cap` returns a
+    // different value).
+    let compute_lf_deltas = |mb_sse_y_input: &[u64]| -> Option<LfDeltas> {
+        if !config.enable_mode_ref_lf_deltas {
+            return None;
         }
-    } else {
-        None
+        if !config.enable_adaptive_lf_deltas {
+            return Some(LfDeltas::round42_default());
+        }
+        let delta_cap = if config.enable_variance_lf_cap {
+            variance_lf_cap(mb_sse_y_input)
+        } else if config.enable_adaptive_lf_high_qp_cap {
+            adaptive_lf_high_qp_cap(qi as u8)
+        } else {
+            6
+        };
+        // Round-48: when the UV-channel knob is on, also feed the
+        // per-MB chroma SSE so the per-bucket delta is the average
+        // of the luma-only and chroma-only adaptive deltas. With
+        // the knob off, the round-44 luma-only path is preserved
+        // bit-for-bit.
+        if config.enable_adaptive_uv_lf_deltas {
+            // Round-51 (#4): chroma SSE comes from the lazy
+            // `mb_sse_uv_cache` populated above. The cache is
+            // initialised with the same gating predicate this
+            // branch checks, so the unwrap is infallible.
+            let mb_sse_uv = mb_sse_uv_cache
+                .as_deref()
+                .expect("mb_sse_uv cache populated when adaptive UV LF deltas on");
+            Some(LfDeltas::round48_adaptive_with_uv(
+                mb_sse_y_input,
+                mb_sse_uv,
+                &mb_ref_frames,
+                &mb_ymodes,
+                delta_cap,
+            ))
+        } else {
+            Some(LfDeltas::round44_adaptive_with_cap(
+                mb_sse_y_input,
+                &mb_ref_frames,
+                &mb_ymodes,
+                delta_cap,
+            ))
+        }
     };
+
+    let mut lf_deltas: Option<LfDeltas> =
+        compute_lf_deltas(mb_sse_y_cache.as_deref().unwrap_or(&[][..]));
 
     // Round-49 per-MB / spatial segment LF-delta paths. Both override the
     // 4-entry segment_lf_deltas array (and the spatial path also rewrites
@@ -3402,56 +3565,168 @@ fn encode_pframe_and_reconstruct(
     // 4-means clustering on (region_delta, region_pos) instead of the
     // greedy top-3-|delta| picker — same bit-for-bit interface to the
     // bitstream, different segment assignment policy.
+    //
+    // Round-52 (#3): when `enable_chroma_aware_spatial` is on the spatial
+    // picker scores regions on a luma+chroma weighted SSE built from
+    // `mb_sse_y_cache` + `mb_sse_uv_cache` (the round-51 cache is
+    // populated for this reason — see the UV cache gating above).
+    //
+    // Round-52 (#2): when `enable_joint_r44r49_picker` is on, the
+    // round-49 spatial picker + the round-44/48 mode/ref picker iterate
+    // jointly: each iteration feeds the other a residual SSE that
+    // subtracts the part of the per-MB ideal delta the previous tier
+    // has already addressed, until both outputs converge or the
+    // iteration cap is reached.
     if segments.enabled && (config.enable_per_mb_lf_deltas || config.enable_spatial_lf_deltas) {
         let mb_sse_y = mb_sse_y_cache
             .as_deref()
             .expect("mb_sse_y cache populated when round-49 paths on");
-        let delta_cap = if config.enable_variance_lf_cap {
+        let delta_cap_initial = if config.enable_variance_lf_cap {
             variance_lf_cap(mb_sse_y)
         } else if config.enable_adaptive_lf_high_qp_cap {
             adaptive_lf_high_qp_cap(qi as u8)
         } else {
             6
         };
+        // Round-52 (#3): build the SSE the spatial picker scores on.
+        // Without the chroma-aware flag this is just `mb_sse_y` (luma
+        // only — the round-49 / round-50 default). With the flag on
+        // it's a per-MB blend of luma + chroma SSE.
+        let spatial_sse_storage: Option<Vec<u64>> =
+            if config.enable_chroma_aware_spatial && config.enable_spatial_lf_deltas {
+                let mb_sse_uv = mb_sse_uv_cache
+                    .as_deref()
+                    .expect("mb_sse_uv cache populated when chroma-aware spatial on");
+                Some(combined_sse_for_chroma_aware_spatial(
+                    mb_sse_y,
+                    mb_sse_uv,
+                    config.chroma_aware_spatial_luma_weight_x256,
+                    config.chroma_aware_spatial_chroma_weight_x256,
+                ))
+            } else {
+                None
+            };
+        let spatial_sse: &[u64] = spatial_sse_storage.as_deref().unwrap_or(mb_sse_y);
+        let delta_cap_spatial = if config.enable_variance_lf_cap {
+            variance_lf_cap(spatial_sse)
+        } else {
+            delta_cap_initial
+        };
         // Spatial path wins when both flags are on — it owns both the
         // segment-id map and the segment_lf_deltas array, leaving the
         // per-MB median path nothing to override.
         if config.enable_spatial_lf_deltas {
-            let (new_ids, new_lf) = if config.enable_kmeans_spatial_segmentation {
-                compute_spatial_segment_lf_deltas_kmeans(
-                    mb_sse_y,
-                    mb_w,
-                    mb_h,
-                    config.spatial_lf_n_row_bands,
-                    config.spatial_lf_n_col_bands,
-                    delta_cap,
-                    config.kmeans_spatial_alpha_x256,
-                    config.enable_kmeans_pp_seeding,
-                )
+            // Round-52 (#2): joint picker. Iteration 1 runs the
+            // standard pipeline (no residual feedback yet). On
+            // subsequent iterations each picker is fed a residual SSE
+            // that scales each MB's contribution down by `(32 -
+            // |implied_delta|) / 32`, where the implied delta is the
+            // other tier's combined per-MB nudge from the previous
+            // iteration. Convergence: stop when neither output
+            // changed, capped at `joint_r44r49_picker_max_iters`. With
+            // the joint flag off the loop runs exactly once with no
+            // residual feedback, recovering the single-pass behaviour
+            // bit-for-bit.
+            let max_iters = if config.enable_joint_r44r49_picker {
+                config
+                    .joint_r44r49_picker_max_iters
+                    .clamp(1, JOINT_R44R49_PICKER_MAX_ITERS_MAX) as usize
             } else {
-                compute_spatial_segment_lf_deltas(
-                    mb_sse_y,
-                    mb_w,
-                    mb_h,
-                    config.spatial_lf_n_row_bands,
-                    config.spatial_lf_n_col_bands,
-                    delta_cap,
-                )
+                1
             };
-            mb_segment_ids = new_ids;
-            // Recompute segment tree probs against the new segment-id
-            // distribution so the bool-coded per-MB segment id pays the
-            // optimal entropy cost (otherwise the spatial map would emit
-            // against probs computed from the variance-classifier
-            // distribution and waste bits).
+            let mut prev_lf_deltas: Option<LfDeltas> = None;
+            let mut prev_seg_ids: Vec<u8> = Vec::new();
+            let mut prev_seg_lf: [i32; 4] = [0; 4];
+            for iter_idx in 0..max_iters {
+                // Build the spatial picker's SSE input + (on later
+                // iterations only) the lf-delta picker's SSE input.
+                // On iteration 0 the inputs are the raw caches
+                // (matches single-pass behaviour bit-for-bit). On
+                // subsequent iterations of the joint picker we apply
+                // the residual offset from the previous iteration's
+                // outputs.
+                if iter_idx > 0 && config.enable_joint_r44r49_picker {
+                    // Re-run the round-44/48 picker on a residual SSE
+                    // that subtracts the spatial tier's implied per-MB
+                    // delta (so the mode/ref picker sees only the part
+                    // the spatial tier hasn't already addressed).
+                    let lf_offset = per_mb_segment_implied_delta(&mb_segment_ids, &prev_seg_lf);
+                    let lf_residual = apply_residual_offset_to_mb_sse(mb_sse_y, &lf_offset);
+                    lf_deltas = compute_lf_deltas(&lf_residual);
+                }
+                // Spatial picker input: chroma-aware combined SSE on
+                // iteration 0; residual on later iterations of the
+                // joint picker (subtracting the mode/ref tier's
+                // implied per-MB delta).
+                let spatial_residual_storage: Option<Vec<u64>>;
+                let spatial_input: &[u64] = match prev_lf_deltas {
+                    Some(ref deltas) if iter_idx > 0 && config.enable_joint_r44r49_picker => {
+                        let spatial_offset =
+                            per_mb_ref_mode_implied_delta(deltas, &mb_ref_frames, &mb_ymodes);
+                        spatial_residual_storage = Some(apply_residual_offset_to_mb_sse(
+                            spatial_sse,
+                            &spatial_offset,
+                        ));
+                        spatial_residual_storage.as_deref().unwrap()
+                    }
+                    _ => spatial_sse,
+                };
+                let (new_ids, new_lf) = if config.enable_kmeans_spatial_segmentation {
+                    compute_spatial_segment_lf_deltas_kmeans(
+                        spatial_input,
+                        mb_w,
+                        mb_h,
+                        config.spatial_lf_n_row_bands,
+                        config.spatial_lf_n_col_bands,
+                        delta_cap_spatial,
+                        config.kmeans_spatial_alpha_x256,
+                        config.enable_kmeans_pp_seeding,
+                    )
+                } else {
+                    compute_spatial_segment_lf_deltas(
+                        spatial_input,
+                        mb_w,
+                        mb_h,
+                        config.spatial_lf_n_row_bands,
+                        config.spatial_lf_n_col_bands,
+                        delta_cap_spatial,
+                    )
+                };
+                mb_segment_ids = new_ids;
+                segments.set_lf_deltas(new_lf);
+                // Convergence check (joint picker only — single-pass
+                // doesn't iterate). Stops when both the lf_deltas and
+                // the spatial outputs are identical to the previous
+                // iteration's.
+                if config.enable_joint_r44r49_picker && iter_idx > 0 {
+                    let lf_match = match (&lf_deltas, &prev_lf_deltas) {
+                        (Some(a), Some(b)) => {
+                            a.ref_deltas == b.ref_deltas && a.mode_deltas == b.mode_deltas
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    let spatial_match = mb_segment_ids == prev_seg_ids && new_lf == prev_seg_lf;
+                    if lf_match && spatial_match {
+                        break;
+                    }
+                }
+                prev_lf_deltas = lf_deltas;
+                prev_seg_ids = mb_segment_ids.clone();
+                prev_seg_lf = new_lf;
+            }
+            // Recompute segment tree probs against the converged
+            // segment-id distribution so the bool-coded per-MB segment
+            // id pays the optimal entropy cost (otherwise the spatial
+            // map would emit against probs computed from the
+            // variance-classifier distribution and waste bits).
             seg_counts = [0u32; 4];
             for &s in &mb_segment_ids {
                 seg_counts[(s as usize) & 3] = seg_counts[(s as usize) & 3].saturating_add(1);
             }
             segment_tree_probs = segment_tree_probs_from_counts(&seg_counts);
-            segments.set_lf_deltas(new_lf);
         } else if config.enable_per_mb_lf_deltas {
-            let per_mb = compute_per_mb_optimal_lf_delta(mb_sse_y, delta_cap);
+            let per_mb = compute_per_mb_optimal_lf_delta(mb_sse_y, delta_cap_initial);
             let new_lf =
                 pick_per_mb_segment_lf_deltas(&per_mb, &mb_segment_ids, config.segment_lf_deltas);
             segments.set_lf_deltas(new_lf);
@@ -5154,6 +5429,135 @@ pub(crate) fn compute_spatial_segment_lf_deltas_kmeans(
         ids[i] = region_to_seg[per_mb_region[i]];
     }
     (ids, seg_lf)
+}
+
+/// Round-52 (#3): build a per-MB combined SSE vector from per-MB luma
+/// and per-MB chroma SSE under the chroma-aware spatial picker. The
+/// result is `(luma_w_x256 * mb_sse_y[i] + chroma_w_x256 * mb_sse_uv[i])
+/// `>>` `8` (saturating in `u128` to handle very-high-QP frames where the
+/// per-MB SSE can approach `2^32`). Lengths must match; mismatched
+/// inputs collapse to a clone of `mb_sse_y` (defensive — the caller
+/// gates on lengths agreeing).
+///
+/// `luma_weight_x256 = 256` (= `1.0`) + `chroma_weight_x256 = 0` (= `0`)
+/// reproduces `mb_sse_y` exactly. `luma_weight_x256 = 0` +
+/// `chroma_weight_x256 = 256` reproduces `mb_sse_uv` exactly. The
+/// default round-52 (#3) blend (`luma = 256`, `chroma = 128`) folds the
+/// chroma plane in at half the luma weight, matching the 4:2:0
+/// sub-sampling ratio (chroma has 1/4 of the pixels per MB so its raw
+/// SSE is naturally smaller; weighting by `0.5` lets a chroma-textured
+/// MB still register as high-error).
+pub(crate) fn combined_sse_for_chroma_aware_spatial(
+    mb_sse_y: &[u64],
+    mb_sse_uv: &[u64],
+    luma_weight_x256: u32,
+    chroma_weight_x256: u32,
+) -> Vec<u64> {
+    let n = mb_sse_y.len();
+    if mb_sse_uv.len() != n {
+        return mb_sse_y.to_vec();
+    }
+    let mut out = Vec::with_capacity(n);
+    let lw = luma_weight_x256 as u128;
+    let cw = chroma_weight_x256 as u128;
+    for i in 0..n {
+        let y = mb_sse_y[i] as u128;
+        let u = mb_sse_uv[i] as u128;
+        let combined = (y.saturating_mul(lw).saturating_add(u.saturating_mul(cw))) >> 8;
+        out.push(combined.min(u64::MAX as u128) as u64);
+    }
+    out
+}
+
+/// Round-52 (#2): per-MB ref/mode-implied LF delta vector. Builds, for
+/// each MB in raster order, the value `lf_deltas.ref_deltas[ref] +
+/// lf_deltas.mode_deltas[mode_bucket]` mirroring
+/// `per_mb_filter_level_enc`'s aggregation (so the joint picker's
+/// "implied delta" matches what the loop-filter actually applies). The
+/// result is the per-MB nudge (in signed-6-bit grammar units) that the
+/// round-44/48 mode/ref tier has already committed to before the
+/// spatial tier picks its segment_lf_deltas.
+///
+/// Used by the joint picker to compute a "residual SSE" for the
+/// spatial picker that subtracts the part of the per-MB ideal delta
+/// that the mode/ref tier has already addressed.
+pub(crate) fn per_mb_ref_mode_implied_delta(
+    lf_deltas: &LfDeltas,
+    mb_ref_frames: &[u8],
+    mb_ymodes: &[i32],
+) -> Vec<i32> {
+    let n = mb_ref_frames.len().min(mb_ymodes.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let r = (mb_ref_frames[i] as usize) & 3;
+        let mut d = lf_deltas.ref_deltas[r];
+        if mb_ref_frames[i] == ENC_REF_INTRA {
+            if mb_ymodes[i] == B_PRED {
+                d += lf_deltas.mode_deltas[0];
+            }
+        } else {
+            let bucket = match mb_ymodes[i] {
+                ZERO_MV => 1,
+                SPLIT_MV => 3,
+                _ => 2,
+            };
+            d += lf_deltas.mode_deltas[bucket];
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// Round-52 (#2): apply a per-MB "implied delta" subtraction to the
+/// per-MB SSE vector before another picker aggregates over it. The
+/// subtraction is proportional: each MB's SSE is scaled by
+/// `max(0, 32 - |implied_delta|) / 32` (in fixed-point), so an MB whose
+/// implied delta saturates the cap (= `delta_cap`) contributes a
+/// fraction `max(0, 32 - delta_cap) / 32` of its raw SSE to the next
+/// picker's frame mean / per-bucket sums. The 32 base matches the
+/// `(mean - frame_mean) * 32 / frame_mean` proportional formula the
+/// pickers themselves use, so an implied delta of `+32` (= the full
+/// `dev_x32` the picker would have produced for an SSE
+/// `2 * frame_mean`) zeroes the residual contribution — the MB has
+/// already been "addressed" by the previous tier.
+///
+/// `delta_cap` clamping isn't applied here (the caller already clamps
+/// `lf_deltas` and `seg_lf_deltas` to the cap), but the saturation at
+/// `0` prevents a runaway negative residual from a delta exceeding
+/// `±32` (which can happen if the joint picker oscillates between two
+/// near-equivalent partitions on a degenerate distribution).
+pub(crate) fn apply_residual_offset_to_mb_sse(mb_sse: &[u64], per_mb_offset: &[i32]) -> Vec<u64> {
+    let n = mb_sse.len().min(per_mb_offset.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mag = per_mb_offset[i].unsigned_abs() as u64;
+        let scale = 32u64.saturating_sub(mag.min(32));
+        // Round-toward-zero integer multiply-then-divide. Using u128
+        // intermediate to avoid overflow when mb_sse approaches u64::MAX
+        // / 32 on degenerate frames.
+        let raw = (mb_sse[i] as u128).saturating_mul(scale as u128) / 32u128;
+        out.push(raw.min(u64::MAX as u128) as u64);
+    }
+    out
+}
+
+/// Round-52 (#2): per-MB segment-implied LF delta vector. Walks
+/// `mb_segment_ids` and produces the per-MB `seg_lf_deltas[seg]` value.
+/// Mirrors what the loop-filter applies via
+/// `SegmentCtx::filter_level_for`. Used by the joint picker so the
+/// mode/ref tier sees a residual SSE that subtracts the part of the
+/// per-MB ideal delta that the spatial tier has already committed to.
+pub(crate) fn per_mb_segment_implied_delta(
+    mb_segment_ids: &[u8],
+    seg_lf_deltas: &[i32; 4],
+) -> Vec<i32> {
+    let n = mb_segment_ids.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let s = (mb_segment_ids[i] as usize) & 3;
+        out.push(seg_lf_deltas[s]);
+    }
+    out
 }
 
 fn mb_luma_sse_at_int(
@@ -12444,6 +12848,122 @@ mod tests {
                 "per-cluster LF delta exceeded ±delta_cap (= 12): {v}"
             );
         }
+    }
+
+    /// Round-52 (#3): with `chroma_weight_x256 = 0` the combined SSE
+    /// helper reproduces the input luma SSE exactly (after the
+    /// `luma_w_x256 / 256` scaling which at `luma_w = 256` is
+    /// identity).
+    #[test]
+    fn round52_combined_sse_chroma_zero_reproduces_luma() {
+        let luma = vec![100u64, 200u64, 300u64, 400u64];
+        let chroma = vec![999u64; 4];
+        let combined = combined_sse_for_chroma_aware_spatial(&luma, &chroma, 256, 0);
+        assert_eq!(combined, luma, "chroma_w=0 must collapse to luma");
+    }
+
+    /// Round-52 (#3): with the default round-52 weights (`luma=256`,
+    /// `chroma=128`), the combined SSE is `luma + chroma/2`.
+    #[test]
+    fn round52_combined_sse_default_weights() {
+        let luma = vec![100u64, 200u64, 300u64];
+        let chroma = vec![400u64, 200u64, 100u64];
+        let combined = combined_sse_for_chroma_aware_spatial(&luma, &chroma, 256, 128);
+        // (256*100 + 128*400)/256 = 100 + 200 = 300
+        // (256*200 + 128*200)/256 = 200 + 100 = 300
+        // (256*300 + 128*100)/256 = 300 + 50  = 350
+        assert_eq!(combined, vec![300u64, 300u64, 350u64]);
+    }
+
+    /// Round-52 (#3): mismatched luma / chroma lengths fall back to a
+    /// clone of luma (defensive).
+    #[test]
+    fn round52_combined_sse_length_mismatch_collapses_to_luma() {
+        let luma = vec![100u64, 200u64, 300u64];
+        let chroma = vec![400u64, 200u64];
+        let combined = combined_sse_for_chroma_aware_spatial(&luma, &chroma, 256, 128);
+        assert_eq!(combined, luma);
+    }
+
+    /// Round-52 (#3): `chroma_w` can crank chroma above luma so a
+    /// luma-flat / chroma-textured input produces a non-trivial
+    /// combined SSE.
+    #[test]
+    fn round52_combined_sse_chroma_dominates_under_high_chroma_weight() {
+        let luma = vec![10u64; 4];
+        let chroma = vec![1000u64, 0u64, 1000u64, 0u64];
+        let combined = combined_sse_for_chroma_aware_spatial(&luma, &chroma, 256, 1024);
+        // (256*10 + 1024*1000)/256 = 10 + 4000 = 4010
+        // (256*10 + 1024*0)/256    = 10 +    0 = 10
+        assert_eq!(combined, vec![4010u64, 10u64, 4010u64, 10u64]);
+    }
+
+    /// Round-52 (#2): `apply_residual_offset_to_mb_sse` scales each
+    /// MB's SSE by `(32 - |offset|) / 32` (saturating at 0).
+    #[test]
+    fn round52_apply_residual_offset_basic() {
+        let sse = vec![320u64, 320u64, 320u64, 320u64];
+        let offset = vec![0i32, 8, 16, 32];
+        let out = apply_residual_offset_to_mb_sse(&sse, &offset);
+        // 320 * (32-0)/32 = 320
+        // 320 * (32-8)/32 = 240
+        // 320 * (32-16)/32 = 160
+        // 320 * (32-32)/32 = 0
+        assert_eq!(out, vec![320u64, 240u64, 160u64, 0u64]);
+    }
+
+    /// Round-52 (#2): residual-offset saturates at 0 for offsets
+    /// exceeding ±32 (defensive against runaway joint-picker
+    /// oscillation).
+    #[test]
+    fn round52_apply_residual_offset_saturates_at_zero() {
+        let sse = vec![1000u64; 3];
+        let offset = vec![64i32, -64, 100];
+        let out = apply_residual_offset_to_mb_sse(&sse, &offset);
+        assert_eq!(out, vec![0u64; 3]);
+    }
+
+    /// Round-52 (#2): `per_mb_ref_mode_implied_delta` mirrors the
+    /// loop-filter's per-MB delta aggregation (intra + B_PRED →
+    /// mode_deltas[0]; inter ZERO/NEAREST/NEW/SPLIT → mode_deltas[1
+    /// /2/3]).
+    #[test]
+    fn round52_per_mb_ref_mode_implied_delta_buckets() {
+        let lf = LfDeltas {
+            ref_deltas: [1, 2, 3, 4],
+            mode_deltas: [10, 20, 30, 40],
+        };
+        // 5 MBs: intra+B_PRED, intra+DC_PRED (no mode_delta), inter+
+        // ZERO_MV, inter+NEAREST_MV (bucket 2), inter+SPLIT_MV.
+        let refs = vec![
+            ENC_REF_INTRA,
+            ENC_REF_INTRA,
+            ENC_REF_LAST,
+            ENC_REF_LAST,
+            ENC_REF_LAST,
+        ];
+        // Use raw constants — NEAREST_MV (10) lands in bucket 2 (the
+        // NEAREST/NEAR/NEW group); the trees module also exposes
+        // ZERO_MV / SPLIT_MV / B_PRED / DC_PRED in our existing import.
+        let nearest_mv: i32 = 10;
+        let modes = vec![B_PRED, DC_PRED, ZERO_MV, nearest_mv, SPLIT_MV];
+        let out = per_mb_ref_mode_implied_delta(&lf, &refs, &modes);
+        // intra+B_PRED      = ref[0] + mode[0] = 1 + 10 = 11
+        // intra+DC_PRED     = ref[0] + 0 (no mode delta for non-B_PRED intra) = 1
+        // inter+ZERO_MV     = ref[1] + mode[1] = 2 + 20 = 22
+        // inter+NEAREST_MV  = ref[1] + mode[2] = 2 + 30 = 32
+        // inter+SPLIT_MV    = ref[1] + mode[3] = 2 + 40 = 42
+        assert_eq!(out, vec![11, 1, 22, 32, 42]);
+    }
+
+    /// Round-52 (#2): `per_mb_segment_implied_delta` reads
+    /// `seg_lf_deltas[mb_segment_ids[i]]` straight through.
+    #[test]
+    fn round52_per_mb_segment_implied_delta_indexing() {
+        let segs = [10i32, 20, 30, 40];
+        let ids = vec![0u8, 1, 2, 3, 0, 2];
+        let out = per_mb_segment_implied_delta(&ids, &segs);
+        assert_eq!(out, vec![10, 20, 30, 40, 10, 30]);
     }
 }
 

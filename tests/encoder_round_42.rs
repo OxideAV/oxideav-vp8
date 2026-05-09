@@ -49,7 +49,9 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_GOLDEN_INTERVAL, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
+    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+    DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256, DEFAULT_GOLDEN_INTERVAL,
+    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH,
     DEFAULT_SIMPLE_LF_MAX_LEVEL,
 };
 
@@ -240,6 +242,11 @@ fn cfg_baseline() -> Vp8EncoderConfig {
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
         enable_kmeans_pp_seeding: false,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
     }
 }
 

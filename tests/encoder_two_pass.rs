@@ -17,10 +17,12 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     first_pass_analyze, make_encoder_with_config, two_pass_qindices, LoopFilterMode,
-    Vp8EncoderConfig, Vp8TwoPassConfig, DEFAULT_ALT_REF_INTERVAL, DEFAULT_GOLDEN_INTERVAL,
-    DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SCENE_CUT_BOOST_FRAMES,
-    DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SEGMENT_LF_DELTAS,
-    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL, QP_SENSITIVITY_X8,
+    Vp8EncoderConfig, Vp8TwoPassConfig, DEFAULT_ALT_REF_INTERVAL,
+    DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256, DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_NLM_H2,
+    DEFAULT_PSY_RD_STRENGTH, DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST,
+    DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS,
+    DEFAULT_SIMPLE_LF_MAX_LEVEL, QP_SENSITIVITY_X8,
 };
 
 const W: u32 = 128;
@@ -170,6 +172,11 @@ fn default_enc_cfg(qindex: u8) -> Vp8EncoderConfig {
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: 256,
         enable_kmeans_pp_seeding: false,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
     }
 }
 

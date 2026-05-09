@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(encoder)* Joint round-44/48 + round-49 picker + chroma-aware
+  spatial picker (round-52). Two complementary opt-in knobs compose
+  the existing round-44/48 (mode/ref deltas) and round-49 / round-50 /
+  round-51 (spatial-segment LF deltas) tiers.
+  `Vp8EncoderConfig::enable_joint_r44r49_picker` (default `false`)
+  makes the two tiers iterate jointly: each iteration recomputes the
+  round-44/48 estimator using a per-MB residual SSE that subtracts
+  the part of the per-MB ideal delta the spatial tier has already
+  addressed, and recomputes the spatial picker using a per-MB
+  residual SSE that subtracts the part the mode/ref tier has already
+  addressed. The residual is `mb_sse * max(0, 32 - |implied_delta|)
+  / 32` so an MB whose implied delta saturates the proportional-
+  formula scale (`±32`) contributes zero to the next picker's frame
+  mean / per-bucket sums (already "addressed" by the previous tier).
+  Convergence: stop when both the 8 mode/ref deltas + the segment_id
+  vector + the 4 segment_lf_deltas match the previous iteration,
+  capped at `joint_r44r49_picker_max_iters` (new field, default
+  `DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS = 3` — converges in 1–2 on
+  the test fixtures; clamped to `[1, JOINT_R44R49_PICKER_MAX_ITERS_MAX
+  = 8]`). Requires `enable_mode_ref_lf_deltas = true` AND
+  `enable_spatial_lf_deltas = true` — inert with either off. Composes
+  with the cap-widening flags through the same `delta_cap` resolution.
+  `Vp8EncoderConfig::enable_chroma_aware_spatial` (default `false`)
+  extends the round-49 / round-50 / round-51 spatial picker to score
+  regions on a luma+chroma weighted SSE blend (`combined = (luma_w *
+  mb_sse_y + chroma_w * mb_sse_uv) >> 8`) sourced from the round-51
+  `mb_sse_uv_cache`, instead of luma SSE alone. Default weights
+  `chroma_aware_spatial_luma_weight_x256 = 256` (= `1.0`),
+  `chroma_aware_spatial_chroma_weight_x256 = 128` (= `0.5` — matches
+  the 4:2:0 sub-sampling ratio). Both the greedy and k-means spatial
+  paths consume the combined SSE; the picker logic is unchanged.
+  Requires `enable_segments = true` AND `enable_spatial_lf_deltas =
+  true` — inert otherwise. The round-51 chroma cache gating widens to
+  populate `mb_sse_uv_cache` when this flag is on, so the chroma-aware
+  path lands as one extra blend allocation rather than a duplicate
+  `compute_per_mb_chroma_sse` walk. Implemented via the new helpers
+  `combined_sse_for_chroma_aware_spatial`,
+  `per_mb_ref_mode_implied_delta`, `per_mb_segment_implied_delta`, and
+  `apply_residual_offset_to_mb_sse`, plus the joint-picker iteration
+  loop wrapping `compute_spatial_segment_lf_deltas[_kmeans]` and a
+  refactored `compute_lf_deltas` closure for the round-44/48 tier.
+  Both flags off-by-default so the round-51 default-config behaviour
+  is preserved bit-for-bit and the 15-fixture corpus stays bit-exact.
+  Nine integration tests in `tests/encoder_round_52.rs` plus seven
+  unit tests in `src/encoder.rs` pin: defaults off, joint-off
+  byte-identical, joint-dependency gating, joint iter-cap respected,
+  chroma-off byte-identical, chroma-dependency gating, chroma-aware
+  shifts segment_id distribution on a chroma-textured / luma-flat
+  clip, joint+chroma composed decode, full-pipeline reproducible
+  re-runs, and helper edge cases (chroma_w=0, default-weight blend,
+  length-mismatch fallback, chroma-dominant blend, residual-offset
+  basic, residual-offset saturation, ref/mode bucket aggregation,
+  segment-id direct lookup).
 - *(encoder)* 4-means clustering for spatial-path segments + per-MB
   luma-SSE caching across round-44/48 + round-49 paths (round-50). Two
   complementary improvements land on top of round-49.

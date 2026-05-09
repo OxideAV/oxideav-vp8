@@ -50,10 +50,11 @@ use oxideav_core::{
 use oxideav_vp8::decoder::Vp8Decoder;
 use oxideav_vp8::encoder::{
     make_encoder_with_config, LoopFilterMode, Vp8EncoderConfig, DEFAULT_ALT_REF_INTERVAL,
-    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_GOLDEN_INTERVAL, DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
-    DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_SEGMENT_LF_DELTAS,
-    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL, DEFAULT_SPATIAL_LF_N_COL_BANDS,
-    DEFAULT_SPATIAL_LF_N_ROW_BANDS,
+    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+    DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256, DEFAULT_GOLDEN_INTERVAL,
+    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_KMEANS_SPATIAL_ALPHA_X256, DEFAULT_NLM_H2,
+    DEFAULT_PSY_RD_STRENGTH, DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS,
+    DEFAULT_SIMPLE_LF_MAX_LEVEL, DEFAULT_SPATIAL_LF_N_COL_BANDS, DEFAULT_SPATIAL_LF_N_ROW_BANDS,
 };
 
 const W: u32 = 64;
@@ -259,6 +260,11 @@ fn cfg_baseline_segments_high_qp() -> Vp8EncoderConfig {
         enable_kmeans_spatial_segmentation: false,
         kmeans_spatial_alpha_x256: DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
         enable_kmeans_pp_seeding: false,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
     }
 }
 
@@ -280,12 +286,22 @@ fn kmeans_pp_seeding_requires_kmeans_spatial() {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: false,
         enable_kmeans_pp_seeding: false,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         ..cfg_baseline_segments_high_qp()
     };
     let cfg_b = Vp8EncoderConfig {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: false,
         enable_kmeans_pp_seeding: true,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         ..cfg_baseline_segments_high_qp()
     };
     let (b0, _, p0) = measure(cfg_a, &clip);
@@ -309,6 +325,11 @@ fn kmeans_pp_off_path_byte_identical_to_round50_kmeans() {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: true,
         enable_kmeans_pp_seeding: false,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         ..cfg_baseline_segments_high_qp()
     };
     let (b0, _, p0) = measure(cfg_round50, &clip);
@@ -332,6 +353,11 @@ fn kmeans_pp_pframe_decodes_cleanly() {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: true,
         enable_kmeans_pp_seeding: true,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         ..cfg_baseline_segments_high_qp()
     };
     let (bytes, psnr_y, _) = measure(cfg, &clip);
@@ -353,12 +379,22 @@ fn kmeans_pp_byte_envelope_within_35pct() {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: true,
         enable_kmeans_pp_seeding: false,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         ..cfg_baseline_segments_high_qp()
     };
     let with_pp = Vp8EncoderConfig {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: true,
         enable_kmeans_pp_seeding: true,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         ..cfg_baseline_segments_high_qp()
     };
     let (bytes_t, _, _) = measure(baseline_round50, &clip);
@@ -394,6 +430,11 @@ fn round51_combined_decodes_cleanly() {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: true,
         enable_kmeans_pp_seeding: true,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_joint_lf_rdo: true,
         ..cfg_baseline_segments_high_qp()
     };
@@ -465,6 +506,11 @@ fn round51_full_pipeline_deterministic() {
         enable_spatial_lf_deltas: true,
         enable_kmeans_spatial_segmentation: true,
         enable_kmeans_pp_seeding: true,
+        enable_joint_r44r49_picker: false,
+        joint_r44r49_picker_max_iters: DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+        enable_chroma_aware_spatial: false,
+        chroma_aware_spatial_luma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+        chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_adaptive_uv_lf_deltas: true,
         ..cfg_baseline_segments_high_qp()
     };

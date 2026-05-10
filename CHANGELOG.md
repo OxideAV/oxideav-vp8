@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.12...v0.1.13) - 2026-05-09
+
+### Other
+
+- chroma-aware per-MB median picker + k-means convergence early-exit/telemetry (round-53)
+- joint round-44/48 + round-49 picker + chroma-aware spatial picker (round-52)
+- k-means++ centroid seeding + per-MB chroma-SSE cache (round-51)
+- 4-means spatial-segment clustering + per-MB SSE caching (round-50)
+- per-MB segment LF deltas + spatial-locality bucketed adaptive LF (round-49)
+- variance-driven LF cap + UV-channel adaptive deltas (round-48)
+- high-QP adaptive LF cap + sub-pel rate refactor (round-47)
+- first-pass real-context SPLIT_MV + sub-pel partition MV-cost (round-46)
+- MV-cost-aware NEAREST/NEAR snap + SPLIT_MV real-context (round-45)
+- adaptive LF deltas + Trellis rate-from-context (round-44)
+- SPLIT_MV partition-selection RDO (round-43)
+- UV-mode RDO + mode/ref loop-filter deltas (round-42)
+
 ### Added
 
 - *(encoder)* Chroma-aware per-MB median picker + k-means convergence

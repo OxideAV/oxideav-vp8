@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.13...v0.1.14) - 2026-05-19
+
+### Other
+
+- chroma-aware variance LF cap (round-77)
+
 ### Added
 
 - *(encoder)* Chroma-aware variance LF cap (round-77). Opt-in

@@ -1378,6 +1378,48 @@ pub struct Vp8EncoderConfig {
     /// [`DEFAULT_KMEANS_CONVERGENCE_THRESHOLD`]: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD
     /// [`KMEANS_SPATIAL_MAX_ITERS`]: KMEANS_SPATIAL_MAX_ITERS
     pub kmeans_convergence_threshold: u32,
+    /// Round-77: chroma-aware variant of the round-48 variance-driven
+    /// adaptive LF cap. The round-48 cap (`enable_variance_lf_cap`)
+    /// computes its coefficient-of-variation² (`cv²`) over the per-MB
+    /// **luma** SSE distribution only: a frame whose luma is uniformly
+    /// smooth but whose chroma carries a heterogeneous reconstruction
+    /// error (e.g. a saturated colour patch on a flat-luma background)
+    /// gets `cv²` ≈ 0 → cap stays at the round-44 default `±6` → the
+    /// per-bucket delta picker has no headroom on the channel that
+    /// actually carries the per-MB spread.
+    ///
+    /// With this flag on, the variance-cap input switches from the
+    /// luma-only `mb_sse_y_cache` to a per-MB combined luma+chroma SSE
+    /// built via the same blend the round-52 chroma-aware spatial
+    /// picker uses (`combined = (luma_w_x256 * mb_sse_y + chroma_w_x256
+    /// * mb_sse_uv) >> 8`). Defaults reuse the round-52 / round-53
+    /// chroma weights (`luma=256` = `1.0`, `chroma=128` = `0.5`), so the
+    /// 4:2:0 sub-sampling ratio is honoured without extra configuration
+    /// — a chroma-textured MB with smooth luma now lifts the `cv²` of
+    /// the combined distribution and the cap widens past `±6`
+    /// proportionally with the heterogeneity, exactly as the luma-only
+    /// path does on luma-textured frames. The luma-only path is
+    /// recovered bit-for-bit when this flag is off (`mb_sse_y_cache`
+    /// fed directly into `variance_lf_cap`).
+    ///
+    /// Composes with every existing cap-widening / picker flag through
+    /// the same `delta_cap` resolution as the luma path: the round-49
+    /// per-MB / spatial / joint pickers share the same cap-computation
+    /// site, so the chroma-aware reading also widens their headroom
+    /// when their flags are on. Off-by-default so the round-48
+    /// luma-only cap calibration is preserved bit-for-bit when this
+    /// flag is disabled. Requires `enable_variance_lf_cap = true`
+    /// (otherwise the cap is computed by `adaptive_lf_high_qp_cap`
+    /// instead, and the chroma blend is never read) — inert otherwise.
+    /// Also needs at least one consumer of the cap to be on: the
+    /// round-44/48 estimator (`enable_mode_ref_lf_deltas` +
+    /// `enable_adaptive_lf_deltas`) and/or the round-49 per-MB /
+    /// spatial pickers (`enable_per_mb_lf_deltas` /
+    /// `enable_spatial_lf_deltas` under `enable_segments`). Reuses the
+    /// round-51 `mb_sse_uv_cache` (cache gating widens to populate the
+    /// chroma SSE when this flag is on alongside any cap-consumer
+    /// path).
+    pub enable_chroma_aware_variance_lf_cap: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -1447,6 +1489,7 @@ impl Default for Vp8EncoderConfig {
                 DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
             enable_chroma_aware_per_mb_median: false,
             kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+            enable_chroma_aware_variance_lf_cap: false,
         }
     }
 }
@@ -3647,7 +3690,20 @@ fn encode_pframe_and_reconstruct(
         || (segments.enabled
             && config.enable_per_mb_lf_deltas
             && !config.enable_spatial_lf_deltas
-            && config.enable_chroma_aware_per_mb_median);
+            && config.enable_chroma_aware_per_mb_median)
+        // Round-77: the chroma-aware variance LF cap needs the same
+        // per-MB chroma SSE the round-52 spatial picker uses (the
+        // combined-blend helper consumes the cache verbatim). Populate
+        // it whenever any cap-consumer is on alongside the
+        // variance-cap + chroma-aware-variance-cap pair of flags
+        // (the round-44 estimator on the mode/ref path OR the round-49
+        // per-MB / spatial pickers under segmentation).
+        || (config.enable_variance_lf_cap
+            && config.enable_chroma_aware_variance_lf_cap
+            && ((config.enable_mode_ref_lf_deltas && config.enable_adaptive_lf_deltas)
+                || (segments.enabled
+                    && (config.enable_per_mb_lf_deltas
+                        || config.enable_spatial_lf_deltas))));
     let mb_sse_uv_cache: Option<Vec<u64>> = if need_mb_sse_uv {
         Some(compute_per_mb_chroma_sse(
             &src_u, &src_v, &rec_u, &rec_v, uv_stride, uv_buf_h, mb_w, mb_h,
@@ -3679,8 +3735,34 @@ fn encode_pframe_and_reconstruct(
         if !config.enable_adaptive_lf_deltas {
             return Some(LfDeltas::round42_default());
         }
+        // Round-77: chroma-aware variance LF cap. When on, the
+        // variance-cap input switches from luma-only `mb_sse_y_input`
+        // to a per-MB combined luma+chroma blend (same helper the
+        // round-52 chroma-aware spatial picker uses). The blend
+        // storage is held in a local `Vec<u64>` for the duration of
+        // the cap computation; the round-44/48 estimator itself
+        // continues to read `mb_sse_y_input` unchanged so the
+        // per-bucket aggregation stays luma-only when
+        // `enable_adaptive_uv_lf_deltas = false` (round-48's UV
+        // knob is the gate for chroma in the bucket aggregation).
+        let chroma_aware_variance_storage: Option<Vec<u64>> =
+            if config.enable_variance_lf_cap && config.enable_chroma_aware_variance_lf_cap {
+                mb_sse_uv_cache.as_deref().map(|mb_sse_uv| {
+                    combined_sse_for_chroma_aware_spatial(
+                        mb_sse_y_input,
+                        mb_sse_uv,
+                        config.chroma_aware_spatial_luma_weight_x256,
+                        config.chroma_aware_spatial_chroma_weight_x256,
+                    )
+                })
+            } else {
+                None
+            };
+        let variance_cap_input: &[u64] = chroma_aware_variance_storage
+            .as_deref()
+            .unwrap_or(mb_sse_y_input);
         let delta_cap = if config.enable_variance_lf_cap {
-            variance_lf_cap(mb_sse_y_input)
+            variance_lf_cap(variance_cap_input)
         } else if config.enable_adaptive_lf_high_qp_cap {
             adaptive_lf_high_qp_cap(qi as u8)
         } else {
@@ -3763,8 +3845,29 @@ fn encode_pframe_and_reconstruct(
         let mb_sse_y = mb_sse_y_cache
             .as_deref()
             .expect("mb_sse_y cache populated when round-49 paths on");
+        // Round-77: chroma-aware variance LF cap shares the same blend
+        // helper as `compute_lf_deltas` so the per-MB / spatial pickers
+        // see the same widened cap when the chroma-aware flag is on.
+        // Stays luma-only when the flag is off (the storage is `None`
+        // and `variance_cap_input` falls back to `mb_sse_y`).
+        let chroma_aware_variance_initial_storage: Option<Vec<u64>> =
+            if config.enable_variance_lf_cap && config.enable_chroma_aware_variance_lf_cap {
+                mb_sse_uv_cache.as_deref().map(|mb_sse_uv| {
+                    combined_sse_for_chroma_aware_spatial(
+                        mb_sse_y,
+                        mb_sse_uv,
+                        config.chroma_aware_spatial_luma_weight_x256,
+                        config.chroma_aware_spatial_chroma_weight_x256,
+                    )
+                })
+            } else {
+                None
+            };
+        let variance_cap_initial_input: &[u64] = chroma_aware_variance_initial_storage
+            .as_deref()
+            .unwrap_or(mb_sse_y);
         let delta_cap_initial = if config.enable_variance_lf_cap {
-            variance_lf_cap(mb_sse_y)
+            variance_lf_cap(variance_cap_initial_input)
         } else if config.enable_adaptive_lf_high_qp_cap {
             adaptive_lf_high_qp_cap(qi as u8)
         } else {
@@ -3789,8 +3892,20 @@ fn encode_pframe_and_reconstruct(
                 None
             };
         let spatial_sse: &[u64] = spatial_sse_storage.as_deref().unwrap_or(mb_sse_y);
+        // Round-77: when the chroma-aware variance LF cap is on but the
+        // round-52 chroma-aware spatial picker is off, the spatial
+        // picker still scores regions on luma-only but the cap input
+        // should still incorporate the chroma blend (so the spatial
+        // picker sees the same widened headroom the round-44 estimator
+        // does). When round-52 chroma-aware is also on, `spatial_sse`
+        // already carries the chroma blend, so reading the cap off it
+        // is the same chroma-aware result.
         let delta_cap_spatial = if config.enable_variance_lf_cap {
-            variance_lf_cap(spatial_sse)
+            if config.enable_chroma_aware_variance_lf_cap && !config.enable_chroma_aware_spatial {
+                variance_lf_cap(variance_cap_initial_input)
+            } else {
+                variance_lf_cap(spatial_sse)
+            }
         } else {
             delta_cap_initial
         };
@@ -12575,6 +12690,87 @@ mod tests {
             (8..=10).contains(&cap),
             "expected cap in [8, 10] for cv2 ≈ 3, got {cap}"
         );
+    }
+
+    /// Round-77: chroma-aware variance cap pipeline. With smooth luma
+    /// (uniform SSE → cv² ≈ 0 → cap = 6) and heterogeneous chroma SSE
+    /// (cv² ≥ 1 → cap = 10), the combined blend (default luma_w=256 /
+    /// chroma_w=128) must produce a cap above the luma-only floor — the
+    /// chroma component lifts the variance signal.
+    #[test]
+    fn round77_chroma_blend_lifts_cap_on_chroma_textured_signal() {
+        // Luma: uniform 1_000 across 64 MBs → mean = 1_000, var = 0,
+        // cv² = 0, luma-only cap = 6.
+        let mb_sse_y = vec![1_000u64; 64];
+        // Chroma: 75% zero + 25% large → cv² ≈ 3 → chroma-only cap saturates at 10.
+        let mut mb_sse_uv = vec![0u64; 48];
+        mb_sse_uv.extend_from_slice(&[10_000u64; 16]);
+
+        let luma_only_cap = variance_lf_cap(&mb_sse_y);
+        assert_eq!(
+            luma_only_cap, 6,
+            "luma-only smooth signal stays at default cap"
+        );
+
+        // Default blend: luma_w = 256 (1.0), chroma_w = 128 (0.5).
+        let combined = combined_sse_for_chroma_aware_spatial(
+            &mb_sse_y,
+            &mb_sse_uv,
+            DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+            DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        );
+        let combined_cap = variance_lf_cap(&combined);
+        // Combined per-MB: (y*256 + uv*128) >> 8 = y + uv/2.
+        // First 48 MBs: 1000 + 0 = 1000; last 16 MBs: 1000 + 5_000 = 6_000.
+        // Mean = (48*1000 + 16*6000) / 64 = (48000 + 96000) / 64 = 2250.
+        // Deviations: ±1250 for zero half, ±3750 for large half.
+        // Var ≈ (48 * 1250² + 16 * 3750²) / 64 = (75M + 225M) / 64 ≈ 4_687_500.
+        // cv² = 4_687_500 / 5_062_500 ≈ 0.926 → cap = 6 + (cv² - 0.5) * 8 ≈ 9.4 → 9.
+        assert!(
+            combined_cap > luma_only_cap,
+            "round-77 blend must lift the cap above the luma-only floor (luma={luma_only_cap}, blend={combined_cap})"
+        );
+        assert!(
+            (8..=10).contains(&combined_cap),
+            "expected blend cap in [8, 10], got {combined_cap}"
+        );
+    }
+
+    /// Round-77: with chroma weight = 0 (degenerate), the blend
+    /// collapses to luma-only and the cap stays at the luma-only value.
+    /// Guards against accidentally always-on behaviour.
+    #[test]
+    fn round77_chroma_weight_zero_recovers_luma_only_cap() {
+        let mb_sse_y = vec![1_000u64; 64];
+        let mut mb_sse_uv = vec![0u64; 48];
+        mb_sse_uv.extend_from_slice(&[10_000u64; 16]);
+
+        let luma_only_cap = variance_lf_cap(&mb_sse_y);
+        let combined = combined_sse_for_chroma_aware_spatial(&mb_sse_y, &mb_sse_uv, 256, 0);
+        let cap = variance_lf_cap(&combined);
+        assert_eq!(
+            cap, luma_only_cap,
+            "chroma weight 0 must recover the luma-only cap exactly"
+        );
+    }
+
+    /// Round-77: length-mismatched chroma cache must fall back to
+    /// luma-only (the blend helper's own contract).
+    #[test]
+    fn round77_chroma_blend_length_mismatch_falls_back_to_luma() {
+        let mb_sse_y = vec![1_000u64; 64];
+        let mb_sse_uv = vec![10_000u64; 32]; // wrong length
+        let combined = combined_sse_for_chroma_aware_spatial(
+            &mb_sse_y,
+            &mb_sse_uv,
+            DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+            DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+        );
+        // Helper falls back to a copy of luma on length mismatch.
+        assert_eq!(combined, mb_sse_y, "length mismatch must fall back to luma");
+        let cap = variance_lf_cap(&combined);
+        let luma_cap = variance_lf_cap(&mb_sse_y);
+        assert_eq!(cap, luma_cap, "fallback cap must match luma-only cap");
     }
 
     #[test]

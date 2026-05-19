@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(encoder)* Chroma-aware variance LF cap (round-77). Opt-in
+  `Vp8EncoderConfig::enable_chroma_aware_variance_lf_cap` (default
+  `false`) extends the round-48 variance-driven adaptive LF cap
+  (`enable_variance_lf_cap`) with a luma+chroma blend on the
+  coefficient-of-variation² input. The round-48 cap classifies a
+  frame's content heterogeneity by the `cv²` of the per-MB **luma**
+  SSE distribution only — a frame whose luma is uniformly smooth but
+  whose chroma carries a heterogeneous reconstruction error gets
+  `cv² ≈ 0` → cap stays at the round-44 default `±6` regardless of
+  what the chroma channel actually wants. With this flag on the
+  variance-cap input switches from the luma-only `mb_sse_y_cache`
+  to a per-MB combined SSE built via the same
+  `combined_sse_for_chroma_aware_spatial` helper the round-52
+  chroma-aware spatial picker uses, reusing the existing
+  `chroma_aware_spatial_luma_weight_x256` / `chroma_aware_spatial_chroma_weight_x256`
+  weights (defaults `luma=256` = `1.0`, `chroma=128` = `0.5`, matching
+  the 4:2:0 sub-sampling ratio). A chroma-textured MB with smooth
+  luma now lifts the `cv²` of the combined distribution and the cap
+  widens past `±6` proportionally with the heterogeneity — exactly as
+  the luma-only path does on luma-textured frames. Composes with
+  every existing cap-widening / picker flag through the same
+  `delta_cap` resolution: the round-44/48 estimator's
+  `compute_lf_deltas` closure AND the round-49 per-MB / spatial /
+  joint pickers share one cap-computation site each, so the
+  chroma-aware reading widens their headroom symmetrically when their
+  flags are on. The round-51 `mb_sse_uv_cache` gating widens to
+  populate chroma SSE whenever this flag is on alongside any
+  cap-consumer (round-44 estimator OR round-49 spatial / per-MB
+  pickers) — the cache stays unpopulated when no consumer is on so
+  the flag is genuinely inert. Off-by-default so the round-48
+  luma-only cap calibration is preserved bit-for-bit when this flag
+  is disabled. Three unit tests in `src/encoder.rs` plus eight
+  integration tests in `tests/encoder_round_77.rs` pin: default-off,
+  chroma blend lifts cap when chroma textured / luma smooth,
+  chroma-weight-zero recovers luma-only cap, length-mismatch fallback
+  to luma, off-path byte-identical, gating on `enable_variance_lf_cap`,
+  inert when no cap-consumer is on, determinism, clean P-frame decode
+  on chroma-textured clip, byte-envelope vs the luma-only path within
+  ±60 %, and combined with the round-49 spatial picker decodes
+  cleanly.
+
 ## [0.1.13](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.12...v0.1.13) - 2026-05-09
 
 ### Other

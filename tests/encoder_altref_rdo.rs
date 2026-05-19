@@ -209,6 +209,7 @@ fn refresh_flags_follow_plan() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0], "first frame must be a keyframe");
@@ -318,6 +319,7 @@ fn multi_ref_off_keeps_legacy_refresh_flags() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (packets, keyflags) = encode_clip(cfg, &clip);
     assert!(keyflags[0]);
@@ -415,6 +417,7 @@ fn multi_ref_rdo_pipeline_roundtrips_high_psnr() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (packets, _kf) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);
@@ -520,6 +523,7 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (off_packets, _) = encode_clip(off, &clip);
     let off_psnrs = decode_clip_psnr(&off_packets, &clip);
@@ -595,6 +599,7 @@ fn alt_ref_vs_off_bd_rate_comparison() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (on_packets, _) = encode_clip(on, &clip);
     let on_psnrs = decode_clip_psnr(&on_packets, &clip);
@@ -755,6 +760,7 @@ fn ffmpeg_cross_decode_accepts_alt_ref_stream() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let ivf = ivf_bytes_for_packets(&packets, W, H, 30);
@@ -863,6 +869,7 @@ fn legacy_single_ref_path_still_works() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let (packets, _) = encode_clip(cfg, &clip);
     let psnrs = decode_clip_psnr(&packets, &clip);

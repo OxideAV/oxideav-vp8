@@ -268,6 +268,7 @@ fn cfg_baseline_segments_high_qp() -> Vp8EncoderConfig {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     }
 }
 

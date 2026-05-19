@@ -212,6 +212,7 @@ fn cfg_no_segments() -> Vp8EncoderConfig {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     }
 }
 
@@ -280,6 +281,7 @@ fn cfg_with_segments() -> Vp8EncoderConfig {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     }
 }
 
@@ -359,6 +361,7 @@ fn cfg_with_save_segments() -> Vp8EncoderConfig {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     }
 }
 
@@ -486,6 +489,7 @@ fn frame_headers_carry_segment_lf_deltas() {
         chroma_aware_spatial_chroma_weight_x256: DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
         enable_chroma_aware_per_mb_median: false,
         kmeans_convergence_threshold: DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+        enable_chroma_aware_variance_lf_cap: false,
     };
     let packets = encode_clip(cfg, &clip);
     let probs = PersistentProbs::defaults();

@@ -380,6 +380,27 @@ spatial paths consume the combined SSE; the picker logic is
 unchanged. Off-by-default; the luma-only picker is preserved
 bit-for-bit when the flag is off.
 
+**Chroma-aware variance LF cap (round-77)** — when
+`enable_chroma_aware_variance_lf_cap = true`, the round-48
+variance-driven adaptive LF cap (`enable_variance_lf_cap`) reads its
+coefficient-of-variation² from a per-MB combined luma+chroma SSE
+distribution instead of luma-only. Uses the same blend helper +
+weights as the round-52 chroma-aware spatial picker
+(`chroma_aware_spatial_luma_weight_x256` / `chroma_aware_spatial_chroma_weight_x256`,
+defaults `1.0` / `0.5`). A frame whose luma is uniformly smooth but
+whose chroma carries a heterogeneous residual now lifts `cv²` past
+the round-48 `0.5` threshold and the cap widens past `±6`
+proportionally — the luma-only path would have collapsed to cap 6
+regardless. Composes with every cap-widening / picker flag through
+the same cap-computation site as the luma-only variance cap (the
+round-44/48 estimator AND the round-49 per-MB / spatial / joint
+pickers). Requires `enable_variance_lf_cap = true` plus at least one
+cap-consumer (round-44 estimator or round-49 spatial / per-MB
+pickers); inert otherwise. The round-51 `mb_sse_uv_cache` gating
+widens to populate chroma SSE whenever this flag is on alongside a
+cap consumer. Off-by-default; the round-48 luma-only cap is
+preserved bit-for-bit when the flag is off.
+
 Pass a custom `Vp8EncoderConfig` to `make_encoder_with_config` for
 fine-grained control over `qindex`, `golden_interval`,
 `alt_ref_interval`, `lambda_scale`, `enable_rdo`, `enable_multi_ref`,

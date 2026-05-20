@@ -1,0 +1,34 @@
+name: CI
+
+# Thin shim around the OxideAV org-level reusable workflow. See
+# https://github.com/OxideAV/.github for the actual job definitions and
+# the input surface. Miri runs by default per the org-wide policy.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  ci:
+    uses: OxideAV/.github/.github/workflows/crate-ci.yml@master
+    secrets: inherit
+
+  # Standalone (no-`registry`) build verification. Image-library
+  # consumers depend on the crate with `default-features = false` to
+  # skip the `oxideav-core` dep tree entirely; this job ensures the
+  # gated paths stay compiling on every change. Tests/benches stay on
+  # the default-feature path (they exercise trait integration), so
+  # this is `cargo build --lib` rather than `cargo test`.
+  standalone:
+    name: Build (no registry)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: standalone
+      - name: cargo build --lib --no-default-features
+        run: cargo build --lib --no-default-features --verbose

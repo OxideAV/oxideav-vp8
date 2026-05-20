@@ -1,15 +1,25 @@
 //! # oxideav-vp8
 //!
-//! **Status:** orphan-rebuild scaffold (post 2026-05-20 audit).
+//! **Status:** clean-room rebuild in progress (post 2026-05-20 audit).
 //!
 //! The prior implementation was retired under the workspace clean-room
-//! policy. The crate will be re-implemented from scratch against
-//! RFC 6386 in a future clean-room round, using only material under
-//! `docs/` and black-box validator binaries.
+//! policy and the crate is being re-implemented from scratch against
+//! RFC 6386, using only material under `docs/` and black-box
+//! validator binaries.
 //!
-//! Every public API currently returns [`Error::NotImplemented`].
+//! Currently landed: VP8 boolean (range) entropy decoder, the
+//! foundational primitive every higher-level decode step is built on
+//! (RFC 6386 §7). See [`bool_decoder`].
+//!
+//! Frame header, macroblock decode, loop filter, and the encoder are
+//! all still scaffolded — the top-level `decode_vp8` / `encode_vp8_*`
+//! entry points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
+
+pub mod bool_decoder;
+
+pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;

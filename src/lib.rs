@@ -15,12 +15,15 @@
 //! * VP8 uncompressed frame header (frame tag + key-frame start code +
 //!   width / height / scale codes) per RFC 6386 §9.1; see
 //!   [`frame_header`].
-//! * VP8 boolean-coded frame header prefix — through `prob_skip_false`
-//!   inclusive (RFC 6386 §19.2); see [`coded_header`]. Covers
-//!   segmentation, loop-filter knobs, MB loop-filter adjustments,
-//!   DCT partition count, quantiser indices, entropy-probability
-//!   refresh, inter-frame reference refresh/copy/sign-bias bits and
-//!   the per-MB skip flag.
+//! * VP8 boolean-coded frame header — the complete §19.2 table per
+//!   RFC 6386; see [`coded_header`]. Covers segmentation, loop-filter
+//!   knobs, MB loop-filter adjustments, DCT partition count, quantiser
+//!   indices, the `token_prob_update()` sweep, entropy-probability
+//!   refresh, the inter-frame reference refresh / copy / sign-bias
+//!   ladder, the per-MB skip flag, the §9.10 tail of `prob_intra` /
+//!   `prob_last` / `prob_gf`, the gated Y and UV intra-mode
+//!   probability replacements, and the `mv_prob_update()` sub-block
+//!   of §17.2 (two 19-position MV_CONTEXTs, each `F? P(7)`).
 //!
 //! Macroblock decode, loop filter, and the encoder are all still
 //! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
@@ -34,7 +37,8 @@ pub mod frame_header;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
-    CodedHeaderError, MbLfAdjustments, QuantIndices, UpdateSegmentation, Vp8CodedHeader,
+    CodedHeaderError, MbLfAdjustments, MvProbUpdates, QuantIndices, TokenProbUpdates,
+    UpdateSegmentation, Vp8CodedHeader, DEFAULT_MV_CONTEXT, MV_PROB_COUNT,
 };
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,

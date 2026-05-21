@@ -12,10 +12,16 @@
 //!
 //! # Scope of this round
 //!
-//! Round 3 covers the table from the top of §19.2 through
-//! `mb_no_skip_coeff` / `prob_skip_false` — every field whose presence
-//! in the stream is determined by the frame's key/inter flag alone and
-//! one or two enable bits along the way. Specifically:
+//! Round 4 closes out §19.2 by adding the inter-frame-only remainder
+//! that follows `prob_skip_false`: the three L(8) reference-selection
+//! probabilities (`prob_intra` / `prob_last` / `prob_gf`), the two
+//! gated intra-mode probability blocks (Y: F then 4 × L(8); UV: F then
+//! 3 × L(8)), and the `mv_prob_update()` sub-block of §17.2 (two
+//! 19-position MV_CONTEXTs, each position is `F? P(7)`). Round 3
+//! covered the table from the top of §19.2 through `mb_no_skip_coeff`
+//! / `prob_skip_false` (every field whose presence in the stream is
+//! determined by the frame's key/inter flag alone and one or two
+//! enable bits along the way). Specifically:
 //!
 //! 1. If `key_frame`: `color_space` (L1) and `clamping_type` (L1).
 //! 2. `segmentation_enabled` (L1). When set, the
@@ -47,16 +53,31 @@
 //!    `mb_no_skip_coeff` bit that follows it, so it is decoded here
 //!    even though the resulting probabilities are not yet used.
 //! 10. `mb_no_skip_coeff` (L1) and, when set, `prob_skip_false` (L8).
+//! 11. Inter frames only: `prob_intra` (L8), `prob_last` (L8),
+//!     `prob_gf` (L8) per §9.10.
+//! 12. Inter frames only: a single F flag gating four `L(8)` Y intra-
+//!     mode probability replacements (§9.10 / §16.1) — if the F is
+//!     false the four values are absent and the in-tree defaults
+//!     `{112, 86, 140, 37}` remain in force.
+//! 13. Inter frames only: a single F flag gating three `L(8)` UV
+//!     intra-mode probability replacements (§9.10 / §16.1) — if the
+//!     F is false the three values are absent and the defaults
+//!     `{162, 101, 204}` remain in force.
+//! 14. Inter frames only: `mv_prob_update()` (§17.2) — for each of
+//!     the two MV_CONTEXTs (row then column) 19 optional updates
+//!     read as `F? P(7)`, where each F is gated by the corresponding
+//!     entry in the constant `MV_UPDATE_PROBS` table. The L(7) value
+//!     `x` reconstructs to `x << 1` when non-zero and to `1` when
+//!     zero, per the §17.2 procedure.
 //!
 //! What this round deliberately does **not** decode:
 //!
-//! * `prob_intra` / `prob_last` / `prob_gf` and the intra-mode /
-//!   intra-chroma probability updates (inter-frame only).
-//! * `mv_prob_update()` — motion-vector context probability updates
-//!   (inter-frame only).
-//!
-//! Those land in later rounds together with the macroblock-decode work
-//! that consumes them.
+//! Nothing remains in §19.2 itself. Subsequent rounds wire up
+//! macroblock-level prediction records (§11 / §16), DCT-coefficient
+//! decoding (§13), the loop filter (§15), and motion-vector decoding
+//! against the resulting probability tables (§17). The decoded
+//! probability triples / mode-prob arrays / 19-position MV contexts
+//! surfaced here are the input to that work.
 //!
 //! # Reference
 //!
@@ -169,6 +190,19 @@ pub struct QuantIndices {
 /// "inherit the default".
 pub type TokenProbUpdates = [[[[Option<u8>; 11]; 3]; 8]; 4];
 
+/// Number of probabilities in a single MV_CONTEXT — RFC 6386 §17
+/// `MVPcount = MVPbits + 10`, with `MVPbits = MVPshort + 7` and
+/// `MVPshort = 2`, giving 19 positions total per row / column
+/// component.
+pub const MV_PROB_COUNT: usize = 19;
+
+/// `mv_prob_update()` block (§17.2). Two 19-position contexts (row
+/// then column); each entry is `Some(prob)` when the encoder
+/// transmitted a new probability and `None` when the corresponding
+/// update flag was 0 (the in-tree default for that position remains
+/// in force).
+pub type MvProbUpdates = [[Option<u8>; MV_PROB_COUNT]; 2];
+
 /// Decoded prefix of the boolean-coded frame header — every field up
 /// to and including `prob_skip_false`.
 ///
@@ -252,6 +286,41 @@ pub struct Vp8CodedHeader {
     /// `false` (in which case `mb_skip_coeff` is forced to 0 for all
     /// MBs per §9.10/§9.11).
     pub prob_skip_false: Option<u8>,
+    /// `prob_intra` (inter only). L(8) — probability that a
+    /// macroblock is intra-predicted vs inter-predicted (§9.10 /
+    /// §16). `None` on key frames.
+    pub prob_intra: Option<u8>,
+    /// `prob_last` (inter only). L(8) — for an inter-predicted
+    /// macroblock, the probability of selecting `last_frame` over
+    /// `golden_frame` / `altref_frame` (§9.10 / §16.2). `None` on
+    /// key frames.
+    pub prob_last: Option<u8>,
+    /// `prob_gf` (inter only). L(8) — for a non-last inter-predicted
+    /// macroblock, the probability of selecting `golden_frame` over
+    /// `altref_frame` (§9.10 / §16.2). `None` on key frames.
+    pub prob_gf: Option<u8>,
+    /// `intra_y_mode_prob_update` (inter only). The §9.10 "F" gate
+    /// controls whether four replacement Y intra-mode probabilities
+    /// are read. When the F is `true`, all four entries carry the
+    /// transmitted `L(8)` values (in the order corresponding to the
+    /// even positions of `ymode_tree`, §16.1). When the F is
+    /// `false`, every entry is `None` and the §16.1 defaults
+    /// `{112, 86, 140, 37}` remain in force. `None`-of-array on key
+    /// frames.
+    pub intra_y_mode_prob_update: Option<[u8; 4]>,
+    /// `intra_uv_mode_prob_update` (inter only). Same F-gate
+    /// structure as `intra_y_mode_prob_update`, three entries
+    /// instead of four (even positions of `uv_mode_tree`). Defaults
+    /// are `{162, 101, 204}`. `None`-of-array on key frames.
+    pub intra_uv_mode_prob_update: Option<[u8; 3]>,
+    /// `mv_prob_update()` (inter only). Two 19-position MV_CONTEXTs
+    /// (row, then column) — each position is `F? P(7)` (§17.2).
+    /// `None` on key frames; otherwise `Some([[Option<u8>; 19]; 2])`
+    /// where each `Option<u8>` is the reconstructed replacement
+    /// probability (the §17.2 procedure: `x << 1` if non-zero, else
+    /// `1`) when the corresponding F was `true`, and `None` when the
+    /// F was `false`.
+    pub mv_prob_update: Option<MvProbUpdates>,
 }
 
 impl Vp8CodedHeader {
@@ -366,6 +435,60 @@ impl Vp8CodedHeader {
             None
         };
 
+        // §9.10 inter-only tail: prob_intra / prob_last / prob_gf,
+        // gated Y / UV intra-mode probability updates, and the
+        // mv_prob_update() sub-block from §17.2. Key frames do not
+        // carry any of these fields per the §9.11 table.
+        let (
+            prob_intra,
+            prob_last,
+            prob_gf,
+            intra_y_mode_prob_update,
+            intra_uv_mode_prob_update,
+            mv_prob_update,
+        ) = if key_frame {
+            (None, None, None, None, None, None)
+        } else {
+            let prob_intra = dec.read_literal(8)? as u8;
+            let prob_last = dec.read_literal(8)? as u8;
+            let prob_gf = dec.read_literal(8)? as u8;
+
+            // F? L(8) × 4 — §9.10 row 7. The single F gate
+            // controls all four entries together.
+            let intra_y_mode_prob_update = if dec.read_bool(128)? {
+                let mut buf = [0u8; 4];
+                for slot in &mut buf {
+                    *slot = dec.read_literal(8)? as u8;
+                }
+                Some(buf)
+            } else {
+                None
+            };
+
+            // F? L(8) × 3 — §9.10 row 8.
+            let intra_uv_mode_prob_update = if dec.read_bool(128)? {
+                let mut buf = [0u8; 3];
+                for slot in &mut buf {
+                    *slot = dec.read_literal(8)? as u8;
+                }
+                Some(buf)
+            } else {
+                None
+            };
+
+            // mv_prob_update() — §17.2.
+            let mv_prob_update = Some(parse_mv_prob_update(&mut dec)?);
+
+            (
+                Some(prob_intra),
+                Some(prob_last),
+                Some(prob_gf),
+                intra_y_mode_prob_update,
+                intra_uv_mode_prob_update,
+                mv_prob_update,
+            )
+        };
+
         Ok(Vp8CodedHeader {
             color_space,
             clamping_type,
@@ -389,6 +512,12 @@ impl Vp8CodedHeader {
             token_prob_updates,
             mb_no_skip_coeff,
             prob_skip_false,
+            prob_intra,
+            prob_last,
+            prob_gf,
+            intra_y_mode_prob_update,
+            intra_uv_mode_prob_update,
+            mv_prob_update,
         })
     }
 }
@@ -570,6 +699,63 @@ const COEFF_UPDATE_PROBS: [[[[u8; 11]; 3]; 8]; 4] = [
         ],
     ],
 ];
+
+/// `MV_UPDATE_PROBS[component][position]` — the never-changing table
+/// of update probabilities each `F` flag in `mv_prob_update()` is read
+/// against. Transcribed verbatim from RFC 6386 §17.2
+/// (`vp8_mv_update_probs[2]`). Row component first (index 0), then
+/// column (index 1). Each row carries 19 entries laid out in the
+/// `MV_CONTEXT` order:
+///
+/// * `[0]` — is_short
+/// * `[1]` — sign
+/// * `[2..=8]` — 7-position short tree
+/// * `[9..=18]` — 10 long-value independent bit probabilities
+const MV_UPDATE_PROBS: [[u8; MV_PROB_COUNT]; 2] = [
+    [
+        237, 246, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 250, 250, 252, 254,
+        254,
+    ],
+    [
+        231, 243, 245, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 251, 251, 254, 254,
+        254,
+    ],
+];
+
+/// `DEFAULT_MV_CONTEXT[component][position]` — the in-tree default
+/// MV decoding probabilities, restored on every key frame
+/// (RFC 6386 §17.2 `default_mv_context[2]`). Surfaced as a public
+/// constant so the macroblock-decode round can seed its
+/// `MV_CONTEXT mvc[2]` table from it directly.
+pub const DEFAULT_MV_CONTEXT: [[u8; MV_PROB_COUNT]; 2] = [
+    // row
+    [
+        162, 128, 225, 146, 172, 147, 214, 39, 156, 128, 129, 132, 75, 145, 178, 206, 239, 254, 254,
+    ],
+    // column
+    [
+        164, 128, 204, 170, 119, 235, 140, 230, 228, 128, 130, 130, 74, 148, 180, 203, 236, 254,
+        254,
+    ],
+];
+
+fn parse_mv_prob_update(dec: &mut BoolDecoder<'_>) -> Result<MvProbUpdates, BoolDecoderError> {
+    let mut out: MvProbUpdates = [[None; MV_PROB_COUNT]; 2];
+    for (i, ctx) in out.iter_mut().enumerate() {
+        for (j, slot) in ctx.iter_mut().enumerate() {
+            // F gate, read at the per-position table probability —
+            // NOT a flat 128.
+            if dec.read_bool(MV_UPDATE_PROBS[i][j])? {
+                // P(7) reconstruction (§17.2):
+                //   x = read_literal(d, 7);
+                //   *p = x ? x << 1 : 1;
+                let x = dec.read_literal(7)? as u8;
+                *slot = Some(if x == 0 { 1 } else { x << 1 });
+            }
+        }
+    }
+    Ok(out)
+}
 
 fn parse_token_prob_update(
     dec: &mut BoolDecoder<'_>,
@@ -800,6 +986,18 @@ mod tests {
                             self.write_bool(prob, false);
                         }
                     }
+                }
+            }
+        }
+
+        /// Convenience for the tests: emit an `mv_prob_update()`
+        /// sub-block (§17.2) whose every F flag is 0. Each F is read
+        /// against the per-position `MV_UPDATE_PROBS` entry — most of
+        /// those are 250+, so a `false` flag is nearly free.
+        fn write_empty_mv_prob_update(&mut self) {
+            for ctx in &MV_UPDATE_PROBS {
+                for &prob in ctx {
+                    self.write_bool(prob, false);
                 }
             }
         }
@@ -1092,6 +1290,8 @@ mod tests {
         // sign_bias_golden = 1, sign_bias_alternate = 0
         // refresh_entropy_probs = 0
         // refresh_last = 1
+        // Tail: prob_intra/last/gf = 17/130/240, no intra-mode prob
+        // updates, no MV prob updates.
         let mut enc = TestEncoder::new();
         // Inter frame: no color_space / clamping_type.
         enc.write_bool(128, false); // segmentation_enabled
@@ -1116,6 +1316,12 @@ mod tests {
         enc.write_empty_token_prob_update();
         enc.write_bool(128, true); // mb_no_skip_coeff
         enc.write_literal(200, 8); // prob_skip_false
+        enc.write_literal(17, 8); // prob_intra
+        enc.write_literal(130, 8); // prob_last
+        enc.write_literal(240, 8); // prob_gf
+        enc.write_bool(128, false); // intra_y_mode F = 0
+        enc.write_bool(128, false); // intra_uv_mode F = 0
+        enc.write_empty_mv_prob_update();
         let buf = enc.finish();
 
         let hdr = Vp8CodedHeader::parse(&buf, false).unwrap();
@@ -1134,6 +1340,15 @@ mod tests {
         assert_eq!(hdr.refresh_last, Some(true));
         assert!(hdr.mb_no_skip_coeff);
         assert_eq!(hdr.prob_skip_false, Some(200));
+        // §9.10 tail (this round):
+        assert_eq!(hdr.prob_intra, Some(17));
+        assert_eq!(hdr.prob_last, Some(130));
+        assert_eq!(hdr.prob_gf, Some(240));
+        assert_eq!(hdr.intra_y_mode_prob_update, None);
+        assert_eq!(hdr.intra_uv_mode_prob_update, None);
+        let mv = hdr.mv_prob_update.unwrap();
+        assert!(mv[0].iter().all(|s| s.is_none()));
+        assert!(mv[1].iter().all(|s| s.is_none()));
     }
 
     #[test]
@@ -1208,5 +1423,209 @@ mod tests {
         assert!(hdr.refresh_entropy_probs, "update_probs=1 per trace");
         assert!(hdr.mb_no_skip_coeff, "mbskip_enabled=1 per trace");
         assert_eq!(hdr.prob_skip_false, Some(255), "prob_skip=255 per trace");
+        // Key-frame §9.11 has no §9.10 tail — confirm every inter-only
+        // field collapsed to None.
+        assert_eq!(hdr.prob_intra, None);
+        assert_eq!(hdr.prob_last, None);
+        assert_eq!(hdr.prob_gf, None);
+        assert_eq!(hdr.intra_y_mode_prob_update, None);
+        assert_eq!(hdr.intra_uv_mode_prob_update, None);
+        assert!(hdr.mv_prob_update.is_none());
+    }
+
+    #[test]
+    fn key_frame_omits_section_9_10_tail() {
+        // Round 3's minimal key frame should still parse cleanly with
+        // every §9.10 inter-only tail field absent.
+        let buf = build_minimal_key_frame();
+        let hdr = Vp8CodedHeader::parse(&buf, true).unwrap();
+        assert_eq!(hdr.prob_intra, None);
+        assert_eq!(hdr.prob_last, None);
+        assert_eq!(hdr.prob_gf, None);
+        assert_eq!(hdr.intra_y_mode_prob_update, None);
+        assert_eq!(hdr.intra_uv_mode_prob_update, None);
+        assert!(hdr.mv_prob_update.is_none());
+    }
+
+    /// Build a minimal interframe coded header — no segmentation, no
+    /// LF adjustments, every refresh flag 0, no token-prob updates,
+    /// `mb_no_skip_coeff = 0` so `prob_skip_false` is omitted. Tail
+    /// parameters (prob_intra/last/gf, two F gates, mv block) are
+    /// emitted by the caller as needed.
+    fn write_inter_prefix_through_skip_block(enc: &mut TestEncoder) {
+        enc.write_bool(128, false); // segmentation_enabled
+        enc.write_bool(128, false); // filter_type
+        enc.write_literal(0, 6); // lf_level
+        enc.write_literal(0, 3); // sharpness
+        enc.write_bool(128, false); // lf_adj_enable
+        enc.write_literal(0, 2); // log2_dct_parts
+        enc.write_literal(0, 7); // y_ac_qi
+        for _ in 0..5 {
+            enc.write_bool(128, false); // each delta-present flag = 0
+        }
+        // Inter-frame refresh ladder — every refresh / sign_bias / etc.
+        // flag = 0; copy_buffer_to_* = 0 (no copy).
+        enc.write_bool(128, false); // refresh_golden_frame
+        enc.write_bool(128, false); // refresh_alternate_frame
+        enc.write_literal(0, 2); // copy_buffer_to_golden = 0 (no copy)
+        enc.write_literal(0, 2); // copy_buffer_to_alternate = 0
+        enc.write_bool(128, false); // sign_bias_golden
+        enc.write_bool(128, false); // sign_bias_alternate
+        enc.write_bool(128, false); // refresh_entropy_probs
+        enc.write_bool(128, false); // refresh_last
+        enc.write_empty_token_prob_update();
+        enc.write_bool(128, false); // mb_no_skip_coeff = 0 → prob_skip_false omitted
+    }
+
+    #[test]
+    fn interframe_prob_intra_last_gf_round_trip() {
+        // Exercises the three L(8) reference-selection probabilities
+        // at the head of the new tail. Pick distinct values that span
+        // the L(8) range.
+        let mut enc = TestEncoder::new();
+        write_inter_prefix_through_skip_block(&mut enc);
+        enc.write_literal(0x00, 8); // prob_intra = 0
+        enc.write_literal(0x80, 8); // prob_last = 128
+        enc.write_literal(0xff, 8); // prob_gf = 255
+        enc.write_bool(128, false); // intra_y_mode F = 0
+        enc.write_bool(128, false); // intra_uv_mode F = 0
+        enc.write_empty_mv_prob_update();
+        let buf = enc.finish();
+
+        let hdr = Vp8CodedHeader::parse(&buf, false).unwrap();
+        assert_eq!(hdr.prob_intra, Some(0));
+        assert_eq!(hdr.prob_last, Some(128));
+        assert_eq!(hdr.prob_gf, Some(255));
+    }
+
+    #[test]
+    fn interframe_intra_y_mode_prob_update_full_block() {
+        // F gate = 1 followed by the four §16.1 Y intra-mode probs
+        // overridden from their {112, 86, 140, 37} defaults.
+        let mut enc = TestEncoder::new();
+        write_inter_prefix_through_skip_block(&mut enc);
+        enc.write_literal(0, 8); // prob_intra
+        enc.write_literal(0, 8); // prob_last
+        enc.write_literal(0, 8); // prob_gf
+        enc.write_bool(128, true); // intra_y_mode F = 1
+        for &p in &[200u8, 100, 33, 250] {
+            enc.write_literal(p as u32, 8);
+        }
+        enc.write_bool(128, false); // intra_uv_mode F = 0
+        enc.write_empty_mv_prob_update();
+        let buf = enc.finish();
+
+        let hdr = Vp8CodedHeader::parse(&buf, false).unwrap();
+        assert_eq!(hdr.intra_y_mode_prob_update, Some([200, 100, 33, 250]));
+        assert_eq!(hdr.intra_uv_mode_prob_update, None);
+    }
+
+    #[test]
+    fn interframe_intra_uv_mode_prob_update_full_block() {
+        // F gate = 1 followed by the three §16.1 UV intra-mode probs.
+        // Defaults are {162, 101, 204}; pick three different values.
+        let mut enc = TestEncoder::new();
+        write_inter_prefix_through_skip_block(&mut enc);
+        enc.write_literal(0, 8); // prob_intra
+        enc.write_literal(0, 8); // prob_last
+        enc.write_literal(0, 8); // prob_gf
+        enc.write_bool(128, false); // intra_y_mode F = 0
+        enc.write_bool(128, true); // intra_uv_mode F = 1
+        for &p in &[10u8, 20, 30] {
+            enc.write_literal(p as u32, 8);
+        }
+        enc.write_empty_mv_prob_update();
+        let buf = enc.finish();
+
+        let hdr = Vp8CodedHeader::parse(&buf, false).unwrap();
+        assert_eq!(hdr.intra_y_mode_prob_update, None);
+        assert_eq!(hdr.intra_uv_mode_prob_update, Some([10, 20, 30]));
+    }
+
+    #[test]
+    fn interframe_mv_prob_update_round_trip() {
+        // Exercise the §17.2 per-position F? P(7) reconstruction. Set
+        // a non-zero P(7) on row[0] and a zero P(7) on column[18] to
+        // hit both branches of `x ? x << 1 : 1` — and leave a couple
+        // of positions un-updated to confirm None passthrough.
+        let mut enc = TestEncoder::new();
+        write_inter_prefix_through_skip_block(&mut enc);
+        enc.write_literal(0, 8); // prob_intra
+        enc.write_literal(0, 8); // prob_last
+        enc.write_literal(0, 8); // prob_gf
+        enc.write_bool(128, false); // intra_y_mode F = 0
+        enc.write_bool(128, false); // intra_uv_mode F = 0
+
+        // Row context (i = 0). 19 F? P(7) pairs.
+        for (j, &update_prob) in MV_UPDATE_PROBS[0].iter().enumerate() {
+            if j == 0 {
+                // Non-zero P(7) → reconstructed = 50 << 1 = 100.
+                enc.write_bool(update_prob, true);
+                enc.write_literal(50, 7);
+            } else if j == 5 {
+                // P(7) = 0 → reconstructed = 1 (the spec's
+                // `x ? x<<1 : 1` clause).
+                enc.write_bool(update_prob, true);
+                enc.write_literal(0, 7);
+            } else {
+                enc.write_bool(update_prob, false);
+            }
+        }
+        // Column context (i = 1).
+        for (j, &update_prob) in MV_UPDATE_PROBS[1].iter().enumerate() {
+            if j == MV_PROB_COUNT - 1 {
+                // Non-zero P(7) → 127 << 1 = 254 (max representable
+                // via this encoding).
+                enc.write_bool(update_prob, true);
+                enc.write_literal(127, 7);
+            } else {
+                enc.write_bool(update_prob, false);
+            }
+        }
+        let buf = enc.finish();
+
+        let hdr = Vp8CodedHeader::parse(&buf, false).unwrap();
+        let mv = hdr.mv_prob_update.unwrap();
+        // Row asserts.
+        assert_eq!(mv[0][0], Some(100));
+        assert_eq!(mv[0][1], None);
+        assert_eq!(mv[0][5], Some(1));
+        for (j, &slot) in mv[0].iter().enumerate() {
+            if j != 0 && j != 5 {
+                assert!(slot.is_none(), "row[{j}] should be None");
+            }
+        }
+        // Column asserts.
+        assert_eq!(mv[1][MV_PROB_COUNT - 1], Some(254));
+        for (j, &slot) in mv[1].iter().enumerate().take(MV_PROB_COUNT - 1) {
+            assert!(slot.is_none(), "col[{j}] should be None");
+        }
+    }
+
+    #[test]
+    fn mv_default_context_matches_spec_listing() {
+        // §17.2 default_mv_context[2] — sanity-check the transcribed
+        // table against the spec's listed values so a transcription
+        // typo would surface here rather than as a downstream
+        // mis-decode.
+        // Row component:
+        assert_eq!(DEFAULT_MV_CONTEXT[0][0], 162); // is_short
+        assert_eq!(DEFAULT_MV_CONTEXT[0][1], 128); // sign
+        assert_eq!(DEFAULT_MV_CONTEXT[0][2], 225); // short tree [0]
+        assert_eq!(DEFAULT_MV_CONTEXT[0][8], 156); // short tree [6]
+        assert_eq!(DEFAULT_MV_CONTEXT[0][9], 128); // bit 0
+        assert_eq!(DEFAULT_MV_CONTEXT[0][18], 254); // bit 9
+                                                    // Column component:
+        assert_eq!(DEFAULT_MV_CONTEXT[1][0], 164); // is_short
+        assert_eq!(DEFAULT_MV_CONTEXT[1][1], 128); // sign
+        assert_eq!(DEFAULT_MV_CONTEXT[1][2], 204); // short tree [0]
+        assert_eq!(DEFAULT_MV_CONTEXT[1][8], 228); // short tree [6]
+        assert_eq!(DEFAULT_MV_CONTEXT[1][9], 128); // bit 0
+        assert_eq!(DEFAULT_MV_CONTEXT[1][18], 254); // bit 9
+                                                    // Update-probs table sanity.
+        assert_eq!(MV_UPDATE_PROBS[0][0], 237);
+        assert_eq!(MV_UPDATE_PROBS[0][18], 254);
+        assert_eq!(MV_UPDATE_PROBS[1][0], 231);
+        assert_eq!(MV_UPDATE_PROBS[1][18], 254);
     }
 }

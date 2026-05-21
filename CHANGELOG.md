@@ -6,6 +6,44 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Boolean-coded frame-header §9.10 inter-only tail** completing the
+  §19.2 syntax table. The existing `Vp8CodedHeader::parse` now decodes,
+  after `prob_skip_false`, every remaining field listed for an
+  interframe in §9.10:
+  - `prob_intra` (L8), `prob_last` (L8), `prob_gf` (L8) — the three
+    macroblock reference-selection probabilities;
+  - the `F? L(8) × 4` block of intra-Y mode probability replacements
+    (§9.10 / §16.1) — when the F is 0 the four §16.1 default values
+    `{112, 86, 140, 37}` remain in force and the bitstream omits the
+    four L(8) values;
+  - the `F? L(8) × 3` block of intra-UV mode probability replacements
+    (defaults `{162, 101, 204}`);
+  - `mv_prob_update()` per RFC 6386 §17.2 — two 19-position
+    MV_CONTEXTs (row then column), each position is an `F? P(7)`
+    update read at the per-position `MV_UPDATE_PROBS` probability
+    (transcribed verbatim from the spec's `vp8_mv_update_probs[2]`)
+    with the spec's `x ? x<<1 : 1` P(7) reconstruction. Key frames
+    omit the entire tail (`prob_intra` etc. all collapse to `None`).
+  The MV update-probabilities table and the `default_mv_context[2]`
+  table are both transcribed verbatim from §17.2 and the latter is
+  re-exported as the public `DEFAULT_MV_CONTEXT` constant so the
+  macroblock-decode round can seed its `MV_CONTEXT mvc[2]` table.
+* New public types: `MvProbUpdates` (alias for
+  `[[Option<u8>; 19]; 2]`); plus the `MV_PROB_COUNT = 19` constant
+  matching §17 `MVPcount`. Six new fields on `Vp8CodedHeader`
+  (`prob_intra`, `prob_last`, `prob_gf`, `intra_y_mode_prob_update`,
+  `intra_uv_mode_prob_update`, `mv_prob_update`) — each `Option`-typed
+  to surface key-frame-vs-inter framing at the type level.
+* Six new unit tests covering: the new `key_frame_omits_section_9_10_tail`
+  invariant; an extended `interframe_refresh_block_full_path`
+  asserting on the full-zeroed tail; `prob_intra` / `prob_last` /
+  `prob_gf` round-trip across `0 / 128 / 255`; the gated Y intra-mode
+  block (F = 1, four overrides); the gated UV intra-mode block;
+  `mv_prob_update()` exercising both branches of the §17.2
+  `x ? x<<1 : 1` reconstruction and the per-position `MV_UPDATE_PROBS`
+  read; and a `mv_default_context_matches_spec_listing` sanity check
+  that would surface a transcription typo in the default-MV table.
+
 * **Boolean-coded frame-header prefix** per RFC 6386 §19.2
   (`Vp8CodedHeader::parse` in `src/coded_header.rs`). Reads through
   the `BoolDecoder` over the `first_partition_size`-byte control

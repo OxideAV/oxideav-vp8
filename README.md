@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-21 (round 3)
+## Status — 2026-05-21 (round 4)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -75,32 +75,50 @@ follows the uncompressed header. Decoded fields:
   * `mb_no_skip_coeff` and the conditional `prob_skip_false (L8)`
     (§9.10 / §9.11).
 
-Twenty-seven unit tests across the three modules: the nine bool-coder
-round-trip cases from round 1; the nine frame-header tests from round
-2; plus nine new coded-header tests (minimal-key-frame round trip,
-maxed-out filter / partition / quantiser fields, every cell of the
-`mb_lf_adjustments` sub-block with mixed signs, full
-`update_segmentation()` block with mixed presence flags,
-quant-indices with all five deltas present, the inter-frame
-refresh-ladder full path including `copy_buffer_to_golden` =
-"copy alt to golden", `mb_no_skip_coeff` = 0 omitting
-`prob_skip_false`, short-input rejection through the bool-coder
-`InputTooShort` surface, and an end-to-end parse of the 23-byte
-first partition extracted from
-`docs/video/vp8/fixtures/tiny-i-only-16x16/input.ivf` that
-reproduces every field listed in the fixture's `trace.txt`:
-`filter_simple = 0`, `filter_level = 1`, `filter_sharpness = 0`,
-`lf_delta_enabled = 1`, `num_partitions = 1`, `seg_enabled = 0`,
-`mbskip_enabled = 1`, `prob_skip = 255`, `qi_y_ac = 4`, every
-quantiser delta absent, `update_probs = 1`).
+**Round 4 (2026-05-21).** Closes the §19.2 syntax table by adding the
+remaining inter-frame-only tail — every field that §9.10 lists after
+`prob_skip_false` and the §17.2 motion-vector probability updates:
+
+  * `prob_intra` / `prob_last` / `prob_gf` — three L(8) probabilities
+    governing intra-vs-inter and reference-frame selection at the
+    macroblock level (§9.10 / §16);
+  * a single F gate followed by four `L(8)` overrides for the intra-Y
+    mode probabilities (§16.1; defaults `{112, 86, 140, 37}` apply
+    when the F is 0 and the four L(8)s are absent);
+  * the analogous F-gated block of three `L(8)` intra-UV mode
+    probability overrides (defaults `{162, 101, 204}`);
+  * `mv_prob_update()` from §17.2 — two 19-position MV_CONTEXTs
+    (row then column), each position is `F? P(7)` where the F is
+    read at the per-position `MV_UPDATE_PROBS` value (the spec's
+    `vp8_mv_update_probs[2]`, transcribed verbatim) and the L(7) `x`
+    reconstructs to `x << 1` when non-zero, else `1`. The
+    `default_mv_context[2]` table from §17.2 is also transcribed
+    verbatim and re-exported as the public `DEFAULT_MV_CONTEXT`
+    constant for the macroblock-decode round to seed `mvc[2]` from.
+
+Thirty-three unit tests across the three modules: the eighteen carried
+forward from rounds 1 / 2 (bool coder + frame header), the nine
+coded-header tests from round 3, and six new round-4 tests — the
+`key_frame_omits_section_9_10_tail` invariant; an extended
+`interframe_refresh_block_full_path` asserting on the full tail with
+both intra-mode F gates off and an all-empty MV update block; a
+`prob_intra` / `prob_last` / `prob_gf` round-trip exercising `0 / 128
+/ 255`; the Y intra-mode F-gated four-L(8) override block; the UV
+intra-mode F-gated three-L(8) override block; a `mv_prob_update()`
+round-trip that hits both branches of the §17.2 `x ? x<<1 : 1`
+reconstruction (non-zero P(7) → `100`, zero P(7) → `1`, plus a
+column-context `127 → 254`) and confirms `None`-passthrough on the
+un-updated 36 of 38 positions; and a `mv_default_context_matches_spec_listing`
+transcription-sanity check.
 
 ### Not yet landed
 
-`prob_intra` / `prob_last` / `prob_gf` and intra-mode / intra-chroma
-probability updates (inter frames); `mv_prob_update()` (inter frames);
-macroblock decode; intra / inter prediction; IDCT and inverse-WHT;
-loop filter; and the encoder. All top-level entry points
-(`decode_vp8`, `encode_vp8_keyframe`) still return
+Macroblock-level prediction records (§11 / §16); DCT-coefficient
+decoding (§13) against the probability table populated by
+`token_prob_update()`; motion-vector decoding (§17) against the
+updated `MV_CONTEXT`s; intra / inter prediction (§12 / §18); IDCT and
+inverse-WHT (§14); the loop filter (§15); the encoder. All top-level
+entry points (`decode_vp8`, `encode_vp8_keyframe`) still return
 `Error::NotImplemented`.
 
 ## Clean-room sources

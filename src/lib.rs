@@ -15,6 +15,12 @@
 //! * VP8 uncompressed frame header (frame tag + key-frame start code +
 //!   width / height / scale codes) per RFC 6386 §9.1; see
 //!   [`frame_header`].
+//! * VP8 boolean-coded frame header prefix — through `prob_skip_false`
+//!   inclusive (RFC 6386 §19.2); see [`coded_header`]. Covers
+//!   segmentation, loop-filter knobs, MB loop-filter adjustments,
+//!   DCT partition count, quantiser indices, entropy-probability
+//!   refresh, inter-frame reference refresh/copy/sign-bias bits and
+//!   the per-MB skip flag.
 //!
 //! Macroblock decode, loop filter, and the encoder are all still
 //! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
@@ -23,9 +29,13 @@
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
+pub mod coded_header;
 pub mod frame_header;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
+pub use coded_header::{
+    CodedHeaderError, MbLfAdjustments, QuantIndices, UpdateSegmentation, Vp8CodedHeader,
+};
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
     KEY_FRAME_START_CODE,

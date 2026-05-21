@@ -6,6 +6,45 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Boolean-coded frame-header prefix** per RFC 6386 §19.2
+  (`Vp8CodedHeader::parse` in `src/coded_header.rs`). Reads through
+  the `BoolDecoder` over the `first_partition_size`-byte control
+  partition that follows the uncompressed frame header and decodes
+  every field up to and including `prob_skip_false`:
+  key-frame-only `color_space` / `clamping_type` (§9.2);
+  `segmentation_enabled` and the full `update_segmentation()`
+  sub-block (§9.3); `filter_type`, 6-bit `loop_filter_level`,
+  3-bit `sharpness_level`, and `mb_lf_adjustments()` (§9.4); 2-bit
+  `log2_nbr_of_dct_partitions` (§9.5) plus the convenient
+  `nbr_of_dct_partitions = 1 << log2_nbr_of_dct_partitions`;
+  `quant_indices()` (§9.6); `token_prob_update()` over the
+  `[4][8][3][11]` DCT context table — each `coeff_prob_update_flag`
+  is read against the per-position `coeff_update_probs` table from
+  §13.4 (NOT a flat 128), followed by the optional `L(8)`
+  replacement probability; the inter-frame-only refresh / copy /
+  sign-bias ladder of §9.7 / §9.8 (`refresh_golden_frame`,
+  `refresh_alternate_frame`, conditional `copy_buffer_to_golden` /
+  `copy_buffer_to_alternate`, `sign_bias_golden`, `sign_bias_alternate`,
+  `refresh_last`); `refresh_entropy_probs` (every frame); and
+  `mb_no_skip_coeff` with its conditional 8-bit `prob_skip_false`
+  (§9.10 / §9.11). The `[4][8][3][11]` `COEFF_UPDATE_PROBS` table
+  used to gate `token_prob_update()` reads is transcribed verbatim
+  from RFC 6386 §13.4.
+* Nine new unit tests in `coded_header::tests`, covering: minimal
+  key-frame round trip with every optional block absent; maxed-out
+  filter / partition / quantiser fields; the full
+  `mb_lf_adjustments` sub-block with mixed signs across the eight
+  delta entries; `update_segmentation()` with mixed-presence
+  quantiser deltas, loop-filter deltas, and segment-probability
+  entries; quant_indices with all five deltas present (positive,
+  negative, max-magnitude, zero); the inter-frame refresh ladder
+  including `copy_buffer_to_golden`; `mb_no_skip_coeff = 0`
+  omitting `prob_skip_false`; `InputTooShort` surfaced through the
+  `CodedHeaderError::BoolDecoder` wrapper; and an end-to-end parse
+  of the 23-byte first partition extracted from
+  `docs/video/vp8/fixtures/tiny-i-only-16x16/input.ivf` that
+  matches every field surfaced in the fixture's `trace.txt`.
+
 * **Uncompressed frame header parser** per RFC 6386 §9.1 / §19.1
   (`Vp8FrameHeader::parse` in `src/frame_header.rs`). Splits the
   3-byte little-endian frame tag into `key_frame`, 3-bit `version`,

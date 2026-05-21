@@ -333,8 +333,31 @@ impl Vp8CodedHeader {
     /// and the parsed `first_partition_size`. `key_frame` is the
     /// same field off the uncompressed header.
     pub fn parse(partition: &[u8], key_frame: bool) -> Result<Self, CodedHeaderError> {
-        let mut dec = BoolDecoder::init(partition)?;
+        Self::parse_with_decoder(partition, key_frame).map(|(hdr, _dec)| hdr)
+    }
 
+    /// Same as [`parse`](Self::parse) but additionally returns the
+    /// [`BoolDecoder`] positioned immediately after the §19.2 header,
+    /// ready for the §11 macroblock layer to keep reading from. The
+    /// decoder borrows from `partition` for the lifetime of the
+    /// returned tuple.
+    pub fn parse_with_decoder<'a>(
+        partition: &'a [u8],
+        key_frame: bool,
+    ) -> Result<(Self, BoolDecoder<'a>), CodedHeaderError> {
+        let mut dec = BoolDecoder::init(partition)?;
+        let hdr = Self::parse_from_decoder(&mut dec, key_frame)?;
+        Ok((hdr, dec))
+    }
+
+    /// Internal entry point shared by [`parse`](Self::parse) and
+    /// [`parse_with_decoder`](Self::parse_with_decoder). Reads every
+    /// field from §19.2 (uncompressed-header → `mv_prob_update()`)
+    /// off `dec` in place.
+    fn parse_from_decoder(
+        dec: &mut BoolDecoder<'_>,
+        key_frame: bool,
+    ) -> Result<Self, CodedHeaderError> {
         // §19.2 row 1–2: key-frame-only color_space / clamping_type.
         let (color_space, clamping_type) = if key_frame {
             let cs = dec.read_bool(128)?;
@@ -347,7 +370,7 @@ impl Vp8CodedHeader {
         // §19.2 row 3 + §9.3: segmentation toggle, optional sub-block.
         let segmentation_enabled = dec.read_bool(128)?;
         let update_segmentation = if segmentation_enabled {
-            Some(parse_update_segmentation(&mut dec)?)
+            Some(parse_update_segmentation(dec)?)
         } else {
             None
         };
@@ -358,14 +381,14 @@ impl Vp8CodedHeader {
         let sharpness_level = dec.read_literal(3)? as u8;
 
         // mb_lf_adjustments() sub-block.
-        let mb_lf_adjustments = parse_mb_lf_adjustments(&mut dec)?;
+        let mb_lf_adjustments = parse_mb_lf_adjustments(dec)?;
 
         // §19.2 + §9.5 — DCT partition count.
         let log2_nbr_of_dct_partitions = dec.read_literal(2)? as u8;
         let nbr_of_dct_partitions = 1u8 << log2_nbr_of_dct_partitions;
 
         // quant_indices() sub-block (§9.6).
-        let quant_indices = parse_quant_indices(&mut dec)?;
+        let quant_indices = parse_quant_indices(dec)?;
 
         // §19.2 — refresh / sign-bias bits. Key vs inter is asymmetric:
         // key frames have only refresh_entropy_probs in the stream and
@@ -425,7 +448,7 @@ impl Vp8CodedHeader {
         // token_prob_update() — must be consumed in order to reach
         // mb_no_skip_coeff. The probabilities themselves will be
         // consumed by the macroblock decoder in a later round.
-        let token_prob_updates = parse_token_prob_update(&mut dec)?;
+        let token_prob_updates = parse_token_prob_update(dec)?;
 
         // mb_no_skip_coeff and (conditionally) prob_skip_false.
         let mb_no_skip_coeff = dec.read_bool(128)?;
@@ -477,7 +500,7 @@ impl Vp8CodedHeader {
             };
 
             // mv_prob_update() — §17.2.
-            let mv_prob_update = Some(parse_mv_prob_update(&mut dec)?);
+            let mv_prob_update = Some(parse_mv_prob_update(dec)?);
 
             (
                 Some(prob_intra),

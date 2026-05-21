@@ -24,16 +24,24 @@
 //!   `prob_last` / `prob_gf`, the gated Y and UV intra-mode
 //!   probability replacements, and the `mv_prob_update()` sub-block
 //!   of §17.2 (two 19-position MV_CONTEXTs, each `F? P(7)`).
+//! * VP8 key-frame macroblock mode decoding (RFC 6386 §11) — the
+//!   per-MB segment id, mb_skip_coeff, Y mode (`kf_ymode_tree`),
+//!   sixteen sub-block modes when `B_PRED` is selected
+//!   (`bmode_tree` driven by the §11.3 context predictors and the
+//!   §11.5 `kf_bmode_prob[10][10][9]` table), and the UV mode
+//!   (`uv_mode_tree`). See [`macroblock`].
 //!
-//! Macroblock decode, loop filter, and the encoder are all still
-//! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
-//! points return [`Error::NotImplemented`].
+//! Pixel-level prediction (§12), DCT-coefficient decoding (§13),
+//! motion-vector decoding (§17), the loop filter (§15), and the
+//! encoder are all still scaffolded — the top-level `decode_vp8` /
+//! `encode_vp8_*` entry points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod frame_header;
+pub mod macroblock;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
@@ -43,6 +51,10 @@ pub use coded_header::{
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
     KEY_FRAME_START_CODE,
+};
+pub use macroblock::{
+    parse_key_frame_macroblock_modes, IntraBmode, IntraUvMode, IntraYMode, MacroblockError,
+    MacroblockModes,
 };
 
 #[cfg(feature = "registry")]

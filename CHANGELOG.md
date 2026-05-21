@@ -6,6 +6,57 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Key-frame macroblock mode layer** per RFC 6386 §11
+  (`parse_key_frame_macroblock_modes` in `src/macroblock.rs`).
+  Consumes a `BoolDecoder` positioned immediately after the §19.2
+  header and returns `Vec<MacroblockModes>` for the frame in raster
+  order. Each record carries:
+  - `segment_id` (§10) — `Some(0..=3)` when the frame enabled both
+    `segmentation_enabled` and `update_mb_segmentation_map`; decoded
+    by walking `mb_segment_tree` against the resolved
+    `mb_segment_tree_probs[3]` (defaulting to 255 for entries whose
+    `segment_prob_update_flag` was 0);
+  - `mb_skip_coeff` (§11.1) — read against `prob_skip_false` only
+    when `mb_no_skip_coeff` is set; forced to `false` otherwise;
+  - `y_mode` (§11.2) — `kf_ymode_tree` walk against
+    `KF_YMODE_PROB = {145, 156, 163, 128}` (one of `DC_PRED` /
+    `V_PRED` / `H_PRED` / `TM_PRED` / `B_PRED`);
+  - `subblock_modes` (§11.3 / §11.5) — sixteen `IntraBmode` values
+    in raster j=0..15 order, present iff `y_mode == B_PRED`. Each
+    is decoded against the `KF_BMODE_PROB[above][left][9]` row of
+    the §11.5 `[10][10][9]` table (transcribed verbatim). The
+    "above" / "left" indices are derived per §11.3: top-edge
+    sub-blocks inherit the above macroblock's bottom row,
+    left-edge sub-blocks inherit the left macroblock's right
+    column, frame-edge predictors default to `B_DC_PRED`, and a
+    non-`B_PRED` neighbouring macroblock projects its 16x16 luma
+    mode to a single sub-block context (`DC->B_DC`, `V->B_VE`,
+    `H->B_HE`, `TM->B_TM`);
+  - `uv_mode` (§11.4) — `uv_mode_tree` walk against
+    `KF_UV_MODE_PROB = {142, 114, 183}`.
+* **`Vp8CodedHeader::parse_with_decoder`** — new public entry point
+  that returns both the parsed header and the still-mutable
+  `BoolDecoder`, so the macroblock layer can keep reading from the
+  same partition without replaying §19.2. The existing
+  `Vp8CodedHeader::parse` is now a thin wrapper that drops the
+  decoder.
+* New public types: `IntraYMode`, `IntraUvMode`, `IntraBmode`,
+  `MacroblockModes`, `MacroblockError`.
+* Nine new unit tests covering: exhaustive leaf round-trips for
+  `kf_ymode_tree` (5 leaves), `uv_mode_tree` (4 leaves),
+  `bmode_tree` (10 leaves), and `mb_segment_tree` (4 leaves); an
+  end-to-end 2-macroblock decode exercising a `DC_PRED` MB plus a
+  `B_PRED` MB with sixteen sub-block modes (verifying the cross-MB
+  context buffer wiring); a segmentation + `mb_skip_coeff` path
+  exercising the optional §10 / §11.1 prefix bits; an
+  interframe-header guard test; and `KF_YMODE_PROB` /
+  `KF_UV_MODE_PROB` / `KF_BMODE_PROB` spot-checks that would catch a
+  transcription typo.
+* This round stays structural: no actual pixel prediction (§12),
+  DCT-coefficient decode (§13), motion-vector decode (§17), IDCT
+  (§14) or loop filter (§15) is performed yet. The returned modes
+  are the input to subsequent rounds.
+
 * **Boolean-coded frame-header §9.10 inter-only tail** completing the
   §19.2 syntax table. The existing `Vp8CodedHeader::parse` now decodes,
   after `prob_skip_false`, every remaining field listed for an

@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-21 (round 4)
+## Status — 2026-05-22 (round 5)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -96,30 +96,68 @@ remaining inter-frame-only tail — every field that §9.10 lists after
     verbatim and re-exported as the public `DEFAULT_MV_CONTEXT`
     constant for the macroblock-decode round to seed `mvc[2]` from.
 
-Thirty-three unit tests across the three modules: the eighteen carried
-forward from rounds 1 / 2 (bool coder + frame header), the nine
-coded-header tests from round 3, and six new round-4 tests — the
-`key_frame_omits_section_9_10_tail` invariant; an extended
-`interframe_refresh_block_full_path` asserting on the full tail with
-both intra-mode F gates off and an all-empty MV update block; a
-`prob_intra` / `prob_last` / `prob_gf` round-trip exercising `0 / 128
-/ 255`; the Y intra-mode F-gated four-L(8) override block; the UV
-intra-mode F-gated three-L(8) override block; a `mv_prob_update()`
-round-trip that hits both branches of the §17.2 `x ? x<<1 : 1`
-reconstruction (non-zero P(7) → `100`, zero P(7) → `1`, plus a
-column-context `127 → 254`) and confirms `None`-passthrough on the
-un-updated 36 of 38 positions; and a `mv_default_context_matches_spec_listing`
-transcription-sanity check.
+**Round 5 (2026-05-22).** Adds the key-frame macroblock mode layer
+(RFC 6386 §11): `parse_key_frame_macroblock_modes` consumes a
+[`BoolDecoder`] positioned immediately after the §19.2 header and
+returns one `MacroblockModes` record per macroblock in raster order.
+Each record carries:
+
+  * `segment_id` (`§10`) — `Some(0..=3)` when the frame enabled both
+    `segmentation_enabled` and `update_mb_segmentation_map`; the
+    2-bit code is walked through `mb_segment_tree` against
+    `mb_segment_tree_probs[3]` (defaulting to 255 for entries whose
+    `segment_prob_update_flag` was 0 per §9.3 item 5);
+  * `mb_skip_coeff` (`§11.1`) — read against `prob_skip_false` when
+    `mb_no_skip_coeff` is set; forced to `false` otherwise;
+  * `y_mode` (`§11.2`) — `kf_ymode_tree` walk against the constant
+    `KF_YMODE_PROB = {145, 156, 163, 128}`; one of `DC_PRED` /
+    `V_PRED` / `H_PRED` / `TM_PRED` / `B_PRED`;
+  * `subblock_modes` (`§11.3` / `§11.5`) — `Some([IntraBmode; 16])`
+    iff `y_mode == B_PRED`. Each of the sixteen 4x4 sub-blocks is
+    decoded against `KF_BMODE_PROB[above][left]` (the §11.5
+    `[10][10][9]` table, transcribed verbatim) using the `bmode_tree`
+    from §11.2. Cross-macroblock context tracking handles §11.3
+    items 2/3/4 — top-edge sub-blocks inherit the above-MB's bottom
+    row, left-edge sub-blocks inherit the left-MB's right column,
+    frame-edge predictors default to `B_DC_PRED`, and non-`B_PRED`
+    macroblocks project their 16x16 luma mode to a constant
+    sub-block context (`DC->B_DC`, `V->B_VE`, `H->B_HE`,
+    `TM->B_TM`);
+  * `uv_mode` (`§11.4`) — `uv_mode_tree` walk against the constant
+    `KF_UV_MODE_PROB = {142, 114, 183}`.
+
+The new `Vp8CodedHeader::parse_with_decoder` entry point returns
+both the parsed header and the still-mutable `BoolDecoder` so the
+macroblock layer can keep reading from the same partition without
+replaying §19.2.
+
+This round stays **structural**: no actual pixel prediction (§12),
+DCT-coefficient decode (§13), motion-vector decode (§17), IDCT (§14)
+or loop filter (§15) is performed yet. The returned modes are the
+input to subsequent rounds.
+
+Forty-two unit tests across four modules: the thirty-three carried
+forward from rounds 1 / 2 / 3 / 4 plus nine new round-5 tests —
+exhaustive `kf_ymode_tree` / `uv_mode_tree` / `bmode_tree` /
+`mb_segment_tree` leaf round-trips (5 + 4 + 10 + 4 = 23 paths in 4
+tests); an end-to-end 2-macroblock decode that exercises a `DC_PRED`
+MB plus a `B_PRED` MB with sixteen sub-block modes feeding the
+cross-MB context buffers; a segmentation + `mb_skip_coeff` path
+exercising the optional §10 / §11.1 prefix bits; an interframe-header
+guard test; and two `KF_YMODE_PROB` / `KF_UV_MODE_PROB` /
+`KF_BMODE_PROB` transcription spot-checks.
 
 ### Not yet landed
 
-Macroblock-level prediction records (§11 / §16); DCT-coefficient
-decoding (§13) against the probability table populated by
+Interframe macroblock prediction records (§16) including
+`ymode_tree` / `bmode_prob[9]` decoding and the inter-prediction
+mode tree (mv_nearest / mv_near / zero4x4 / new4x4 / split4x4);
+intra-prediction pixel synthesis (§12); DCT-coefficient decoding
+(§13) against the probability table populated by
 `token_prob_update()`; motion-vector decoding (§17) against the
-updated `MV_CONTEXT`s; intra / inter prediction (§12 / §18); IDCT and
-inverse-WHT (§14); the loop filter (§15); the encoder. All top-level
-entry points (`decode_vp8`, `encode_vp8_keyframe`) still return
-`Error::NotImplemented`.
+updated `MV_CONTEXT`s; IDCT and inverse-WHT (§14); the loop filter
+(§15); the encoder. All top-level entry points (`decode_vp8`,
+`encode_vp8_keyframe`) still return `Error::NotImplemented`.
 
 ## Clean-room sources
 

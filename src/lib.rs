@@ -30,17 +30,23 @@
 //!   (`bmode_tree` driven by the §11.3 context predictors and the
 //!   §11.5 `kf_bmode_prob[10][10][9]` table), and the UV mode
 //!   (`uv_mode_tree`). See [`macroblock`].
+//! * VP8 intra-prediction pixel kernels (RFC 6386 §12) — the four
+//!   16×16 luma modes, the four 8×8 chroma modes, and the ten 4×4
+//!   sub-block modes. Pure pixel-shape kernels operating on small
+//!   neighbour arrays; no entropy decode, no IDCT, no loop filter.
+//!   See [`intra_predict`].
 //!
-//! Pixel-level prediction (§12), DCT-coefficient decoding (§13),
-//! motion-vector decoding (§17), the loop filter (§15), and the
-//! encoder are all still scaffolded — the top-level `decode_vp8` /
-//! `encode_vp8_*` entry points return [`Error::NotImplemented`].
+//! DCT-coefficient decoding (§13), motion-vector decoding (§17), IDCT
+//! and inverse-WHT (§14), the loop filter (§15), and the encoder are
+//! all still scaffolded — the top-level `decode_vp8` / `encode_vp8_*`
+//! entry points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod frame_header;
+pub mod intra_predict;
 pub mod macroblock;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
@@ -51,6 +57,11 @@ pub use coded_header::{
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
     KEY_FRAME_START_CODE,
+};
+pub use intra_predict::{
+    predict_b4x4, predict_uv8x8, predict_uv8x8_dc, predict_uv8x8_h, predict_uv8x8_tm,
+    predict_uv8x8_v, predict_y16x16, predict_y16x16_dc, predict_y16x16_h, predict_y16x16_tm,
+    predict_y16x16_v, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, DEFAULT_TOPLEFT_DC,
 };
 pub use macroblock::{
     parse_key_frame_macroblock_modes, IntraBmode, IntraUvMode, IntraYMode, MacroblockError,

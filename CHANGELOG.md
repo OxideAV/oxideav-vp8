@@ -6,6 +6,81 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Intra-prediction pixel kernels** per RFC 6386 §12 (new module
+  `src/intra_predict.rs`). Pure pixel-shape kernels operating on small
+  neighbour-array inputs — no entropy decoding, no IDCT, no loop
+  filter is performed yet. Surface:
+  - `predict_y16x16_dc` / `_v` / `_h` / `_tm` — the four 16×16 luma
+    modes per §12.3 (which forwards to the §12.2 formulas at the
+    larger block size). `_v` / `_h` / `_tm` take `&[u8; 16]`
+    above / left buffers; `_dc` takes `Option<&[u8; 16]>` so callers
+    can encode "this edge is off-frame" and trigger the §12.2 fallback
+    rules (single-edge average; top-left → constant 128).
+  - `predict_uv8x8_dc` / `_v` / `_h` / `_tm` — the four 8×8 chroma
+    modes per §12.2, same shape as the luma kernels at 8×8.
+  - `predict_b4x4` — the ten 4×4 sub-block modes per §12.3:
+    `B_DC_PRED`, `B_TM_PRED`, `B_VE_PRED`, `B_HE_PRED`, `B_LD_PRED`,
+    `B_RD_PRED`, `B_VR_PRED`, `B_VL_PRED`, `B_HD_PRED`, `B_HU_PRED`.
+    Takes the 8-pixel above row (positions `(-1, 0)..=(-1, 7)` of the
+    sub-block's coordinate frame — the lower four are directly above
+    the sub-block, the upper four are the "extra" pixels the §12.3
+    right-edge fixup defines), the 4-pixel left column, and the
+    single corner pixel `P`. Builds the spec's `E[0..=8]` array
+    internally.
+  - `predict_y16x16` / `predict_uv8x8` dispatchers that route on the
+    decoded `IntraYMode` / `IntraUvMode` enum and apply the §12 page-50
+    out-of-bounds defaults (127 above, 129 left) when an edge is
+    `None`.
+  - Public constants `DEFAULT_ABOVE_PIXEL = 127`,
+    `DEFAULT_LEFT_PIXEL = 129`, `DEFAULT_TOPLEFT_DC = 128` for
+    callers building neighbour buffers from raw frame data.
+* Twenty-seven new unit tests with hand-derived expected pixels:
+  - 16×16 luma: DC full-neighbour rounding, DC top-row-only,
+    DC top-left default 128, V copies above, H copies left, TM
+    matches the spec formula on a non-trivial ramp, TM clamping to
+    0 and 255, dispatch routing all five modes,
+    V dispatch off-frame default, H dispatch off-frame default
+    (11 tests).
+  - 8×8 chroma: DC full-neighbour rounding, DC left-column-only,
+    DC top-left default 128, dispatch V/H/TM (4 tests).
+  - 4×4 sub-block: DC averaging of 8 pixels, TM clamped formula,
+    VE smoothed above row, HE smoothed left column with the
+    `avg3(L[2], L[3], L[3])` bottom-row special case, LD top-left
+    + bottom-right `avg3(A[6], A[7], A[7])` synthetic pixel, RD
+    diagonal propagation through `E[4]`, VR mixing avg2p / avg3p,
+    VL handling the right-extension `above[4..=7]` pixels, HD
+    treating the spec's `svg2p` typo as `avg2p`, HD avg2p / avg3p
+    disambiguator (proves we picked avg2p, since a constant-input
+    test cannot distinguish them), HU bottom-row L[3] fill, HU
+    top-row using the smoothed left column (11 tests).
+  - One cross-cutting "flat input → flat output" sanity check that
+    exercises every one of the ten sub-block modes (catches missing
+    pixel writes in the kernels — found the original bug where my
+    `B_HU_PRED` kernel forgot to set `B[1][2]`, `B[1][3]`, and
+    `B[2][0]`).
+* Updated `lib.rs` to re-export the new module's public API.
+
+### Reference
+
+RFC 6386 §12 in full (pages 50–59). The 16×16 / 8×8 mode shape and
+the out-of-bounds defaults (127 / 129) come from §12.2, the DC
+rounding formula `(sum + (1 << (shf - 1))) >> shf` is in §12.2
+page 52, the TM clamp is in §12.2 page 53, and the 4×4 mode
+listings (including the `E[0..=8]` array layout and the `avg2` /
+`avg3` / `avg2p` / `avg3p` helper definitions) are in §12.3.
+
+### Spec gaps surfaced
+
+* **§12.3 page 58, B_HD_PRED listing.** The raw RFC text reads
+  `svg2p(E + 1)` for the second pixel of row 3. No `svg2p` function
+  is defined anywhere in the spec; the three sibling diagonal modes
+  (B_VR_PRED, B_VL_PRED, B_HU_PRED) all use `avg2p` at the
+  analogous position with no typo. We treat the token as `avg2p`
+  and include `b4x4_hd_avg2p_vs_avg3p_disambiguator` to prove the
+  resulting output discriminates between the two functions (rather
+  than coincidentally agreeing on the test input). Recommend an
+  RFC 6386 erratum.
+
 * **Key-frame macroblock mode layer** per RFC 6386 §11
   (`parse_key_frame_macroblock_modes` in `src/macroblock.rs`).
   Consumes a `BoolDecoder` positioned immediately after the §19.2

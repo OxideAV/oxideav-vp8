@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-22 (round 5)
+## Status — 2026-05-22 (round 6)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -136,24 +136,68 @@ DCT-coefficient decode (§13), motion-vector decode (§17), IDCT (§14)
 or loop filter (§15) is performed yet. The returned modes are the
 input to subsequent rounds.
 
-Forty-two unit tests across four modules: the thirty-three carried
-forward from rounds 1 / 2 / 3 / 4 plus nine new round-5 tests —
-exhaustive `kf_ymode_tree` / `uv_mode_tree` / `bmode_tree` /
-`mb_segment_tree` leaf round-trips (5 + 4 + 10 + 4 = 23 paths in 4
-tests); an end-to-end 2-macroblock decode that exercises a `DC_PRED`
-MB plus a `B_PRED` MB with sixteen sub-block modes feeding the
-cross-MB context buffers; a segmentation + `mb_skip_coeff` path
-exercising the optional §10 / §11.1 prefix bits; an interframe-header
-guard test; and two `KF_YMODE_PROB` / `KF_UV_MODE_PROB` /
-`KF_BMODE_PROB` transcription spot-checks.
+**Round 6 (2026-05-22).** Adds the intra-prediction pixel kernels
+(RFC 6386 §12): a new `src/intra_predict.rs` module implementing
+all four 16×16 luma modes (`DC_PRED` / `V_PRED` / `H_PRED` /
+`TM_PRED`), all four 8×8 chroma modes (the same four modes at 8×8
+per §12.2), and all ten 4×4 sub-block modes (`B_DC_PRED`,
+`B_TM_PRED`, `B_VE_PRED`, `B_HE_PRED`, `B_LD_PRED`, `B_RD_PRED`,
+`B_VR_PRED`, `B_VL_PRED`, `B_HD_PRED`, `B_HU_PRED`). Each kernel is
+a pure pixel-shape primitive operating on small caller-supplied
+neighbour arrays: an `above` row, a `left` column, and a single
+corner pixel `P` (the §12.3 `A[-1] == L[-1]` value). No entropy
+decode, no IDCT, and no loop filter is performed in this round.
+
+  * The 16×16 and 8×8 DC modes accept `Option<&[u8; N]>` for
+    `above` / `left` to encode the §12.2 page-51 fallback rules:
+    when only one edge is on-frame the DC is the rounded average
+    of that one edge's `N` pixels; when both are off-frame the
+    block is filled with the constant 128 (NOT the average of the
+    127 / 129 defaults).
+  * The 16×16 / 8×8 dispatchers apply the §12 page-50 defaults
+    (127 above, 129 left) to `V_PRED` / `H_PRED` / `TM_PRED` when
+    a directly-required edge is off-frame.
+  * `predict_b4x4` takes an 8-pixel `above` row covering positions
+    `(-1, 0) .. (-1, 7)`. The lower four are directly above the
+    sub-block, the upper four are the "extra" pixels the §12.3
+    right-edge fixup defines (for sub-blocks 7 / 11 / 15 these are
+    the same four pixels used by sub-block 3, and at the rightmost
+    macroblock in each row they are clamped to position `(-1, 15)`).
+    Computing the fixup is the caller's responsibility; the kernel
+    just reads the buffer it's handed.
+
+The new module surfaces three public constants — `DEFAULT_ABOVE_PIXEL`
+(127), `DEFAULT_LEFT_PIXEL` (129), `DEFAULT_TOPLEFT_DC` (128) — so
+callers can build neighbour buffers from raw frame data without
+re-deriving the spec constants.
+
+Sixty-nine unit tests across five modules: the forty-two carried
+forward from rounds 1 / 2 / 3 / 4 / 5 plus twenty-seven new round-6
+tests with hand-derived expected pixels for every kernel — DC
+rounding under each of the three edge-availability cases (full /
+single-edge / both-off), V / H copy semantics, TM both as a generic
+formula match and as floor/ceiling clamp probes, the
+mode-dispatch routing including the off-frame default fall-through,
+every one of the ten 4×4 modes individually (including the
+`avg3(L[2], L[3], L[3])` bottom-row special case in B_HE_PRED, the
+`avg3(A[6], A[7], A[7])` synthetic-pixel special case in B_LD_PRED,
+the right-extension `above[4..=7]` consumption in B_VL_PRED, and a
+disambiguating test that proves B_HD_PRED uses `avg2p` rather than
+the spec's typo'd `svg2p`), and a cross-cutting "flat input → flat
+output" check that catches missing pixel-writes in any of the ten
+sub-block kernels.
 
 ### Not yet landed
 
 Interframe macroblock prediction records (§16) including
 `ymode_tree` / `bmode_prob[9]` decoding and the inter-prediction
 mode tree (mv_nearest / mv_near / zero4x4 / new4x4 / split4x4);
-intra-prediction pixel synthesis (§12); DCT-coefficient decoding
-(§13) against the probability table populated by
+the *integration* layer that turns the §12 kernels + decoded
+modes into reconstructed prediction blocks (i.e. walking the
+already-reconstructed frame buffer to assemble the per-block
+neighbour arrays + computing the §12.3 right-edge subblock-7/11/15
+extra-pixel fixup against the rightmost macroblock); DCT-coefficient
+decoding (§13) against the probability table populated by
 `token_prob_update()`; motion-vector decoding (§17) against the
 updated `MV_CONTEXT`s; IDCT and inverse-WHT (§14); the loop filter
 (§15); the encoder. All top-level entry points (`decode_vp8`,

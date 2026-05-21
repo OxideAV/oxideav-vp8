@@ -6,6 +6,18 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Uncompressed frame header parser** per RFC 6386 §9.1 / §19.1
+  (`Vp8FrameHeader::parse` in `src/frame_header.rs`). Splits the
+  3-byte little-endian frame tag into `key_frame`, 3-bit `version`,
+  `show_frame`, and 19-bit `first_partition_size`. Maps `version` to
+  the §9.1 Table 1 `ReconstructionFilter` / `LoopFilterPolicy`
+  enums. On key frames validates the `0x9d 0x01 0x2a` start code and
+  splits each of the two LE 16-bit size words into a 14-bit
+  dimension and a 2-bit `ScaleCode`. Surfaces `header_bytes_consumed`
+  (3 for interframes, 10 for key frames) so callers can advance to
+  the first (control) partition. Nine unit tests, including a
+  sanity-check parse of the actual first 10 bytes of
+  `docs/video/vp8/fixtures/tiny-i-only-16x16/input.ivf`.
 * **Boolean (range) entropy decoder** per RFC 6386 §7
   (`BoolDecoder` in `src/bool_decoder.rs`). This is the foundational
   primitive every higher-level VP8 decode step reads through. Surface:

@@ -7,19 +7,29 @@
 //! RFC 6386, using only material under `docs/` and black-box
 //! validator binaries.
 //!
-//! Currently landed: VP8 boolean (range) entropy decoder, the
-//! foundational primitive every higher-level decode step is built on
-//! (RFC 6386 §7). See [`bool_decoder`].
+//! Currently landed:
 //!
-//! Frame header, macroblock decode, loop filter, and the encoder are
-//! all still scaffolded — the top-level `decode_vp8` / `encode_vp8_*`
-//! entry points return [`Error::NotImplemented`].
+//! * VP8 boolean (range) entropy decoder — the foundational primitive
+//!   every higher-level decode step is built on (RFC 6386 §7); see
+//!   [`bool_decoder`].
+//! * VP8 uncompressed frame header (frame tag + key-frame start code +
+//!   width / height / scale codes) per RFC 6386 §9.1; see
+//!   [`frame_header`].
+//!
+//! Macroblock decode, loop filter, and the encoder are all still
+//! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
+//! points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
+pub mod frame_header;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
+pub use frame_header::{
+    FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
+    KEY_FRAME_START_CODE,
+};
 
 #[cfg(feature = "registry")]
 use oxideav_core::RuntimeContext;

@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-22 (round 6)
+## Status — 2026-05-22 (round 7)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -187,6 +187,70 @@ the spec's typo'd `svg2p`), and a cross-cutting "flat input → flat
 output" check that catches missing pixel-writes in any of the ten
 sub-block kernels.
 
+**Round 7 (2026-05-22).** Adds the DCT-coefficient token-tree decoder
+(RFC 6386 §13). A new `src/dct_tokens.rs` walks the `coeff_tree` of
+§13.2 against the `coeff_probs[4][8][3][11]` table populated by round
+3's `token_prob_update()` and recovers a `[i16; 16]` of quantised
+coefficients per 4×4 sub-block. The full §13.5 default
+probability table is transcribed verbatim (4 × 8 × 3 × 11 = 1056
+probabilities) and exposed as `DEFAULT_COEFF_PROBS`. New surface:
+
+  * `BlockType` — the §13.3 plane discriminator (`YAfterY2` / `Y2`
+    / `UV` / `YNoY2`), with `first_coeff()` returning the §13.3
+    `firstCoeff` value (1 for plane 0, 0 for the other three) and
+    `plane_index()` returning the outermost `coeff_probs` index.
+  * `DctToken` — the twelve-symbol §13.2 token alphabet (`Dct0..Dct4`,
+    `Cat1..Cat6`, `Eob`).
+  * `CoeffProbs` — the resolved `[[[[u8; 11]; 3]; 8]; 4]` table type.
+  * `COEFF_BANDS` — the §13.3 position-to-band lookup.
+  * `merge_default_token_probs` — overlays a `TokenProbUpdates` (from
+    the parsed `Vp8CodedHeader`) onto `DEFAULT_COEFF_PROBS` to
+    produce the resolved table.
+  * `decode_block` — the per-sub-block primitive: walks
+    `coeff_tree` (starting at index 0 when EOB is legal, index 2
+    after a `Dct0` per §13.2's "skip dct_eob branch" rule), reads
+    the §13.2 `DCTextra` extra-bits for the six `Cat*` tokens
+    against the fixed `Pcat1..Pcat6` probability lists, reads the
+    fixed-prob-128 sign bit for non-zero values, and rolls over
+    the §13.3 `ctx3` (`0` / `1` / `2`) for the next coefficient
+    based on the just-decoded absolute value.
+
+The round stays decoder-side and per-block: dequantisation, IDCT,
+the per-macroblock walker, and the §13.3 above/left non-zero-block
+predictor maintenance are all explicitly **not** in scope here —
+they belong to the §14 IDCT and the round-7+ integration layer.
+
+Eighteen new unit tests round-trip a test-side bool encoder + a
+recursive `coeff_tree` walker through `decode_block` and cover:
+default-probs transcription shape + spot-checks on four planes, the
+`coeff_bands[16]` listing, `BlockType::first_coeff()` / `plane_index()`,
+`merge_default_token_probs` identity + overlay behaviour, immediate
+EOB → all-zero block, single-DCT1 round trip, negative round trip,
+each of the cat1..cat6 ranges (13 specific magnitudes including
+range boundaries and 2114 = `categoryBase[5] + 0x7FF`), the
+`YAfterY2` plane skipping coefficient 0, a dense block with mixed
+positive / negative / cat3 / cat4 values, an updates-overlaid round
+trip proving `decode_block` reads from the caller table rather than
+defaults, a `prev_token_skips_eob_branch` test that exercises the
+§13.2 EOB-skip-after-`Dct0` rule, all four `ctx3` seed values from
+(above, left) ∈ {0,1}², a 16-position fully-occupied block that
+emits no EOB, and the cat6 maximum 2114 value with 11-bit
+`DCTextra` exercised.
+
+### Spec gap surfaced
+
+**§13.3 page 67 pseudocode.** The token loop ends with the literal
+statement `prevCoeffWasZero = true;` — i.e. *unconditionally true*.
+That is a transcription error: the field controls whether the next
+iteration's tree-walk starts at index 2 (skipping the dct_eob
+branch) per §13.2's "if the preceding coefficient is a DCT_0,
+decoding will skip the first branch" statement. Unconditionally
+true would mean every coefficient after the first allows
+`eob-after-non-zero`, which contradicts the §13.2 wording. We
+implement `prevCoeffWasZero = (token == DCT_0)`. The
+`prev_token_skips_eob_branch` test proves the round-trip works
+either way the encoder writes it. Recommend an RFC 6386 erratum.
+
 ### Not yet landed
 
 Interframe macroblock prediction records (§16) including
@@ -196,11 +260,14 @@ the *integration* layer that turns the §12 kernels + decoded
 modes into reconstructed prediction blocks (i.e. walking the
 already-reconstructed frame buffer to assemble the per-block
 neighbour arrays + computing the §12.3 right-edge subblock-7/11/15
-extra-pixel fixup against the rightmost macroblock); DCT-coefficient
-decoding (§13) against the probability table populated by
-`token_prob_update()`; motion-vector decoding (§17) against the
-updated `MV_CONTEXT`s; IDCT and inverse-WHT (§14); the loop filter
-(§15); the encoder. All top-level entry points (`decode_vp8`,
+extra-pixel fixup against the rightmost macroblock); the
+per-macroblock §13.3 walker that aggregates 24/25 sub-blocks per
+MB, maintains the above/left non-zero-block predictors across
+raster order, and honours the `mb_skip_coeff` and `B_PRED` /
+`SPLITMV` exemptions on top of the round-7 `decode_block`
+primitive; motion-vector decoding (§17) against the updated
+`MV_CONTEXT`s; IDCT and inverse-WHT (§14); the loop filter (§15);
+the encoder. All top-level entry points (`decode_vp8`,
 `encode_vp8_keyframe`) still return `Error::NotImplemented`.
 
 ## Clean-room sources

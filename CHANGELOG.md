@@ -6,6 +6,66 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **DCT-coefficient token decoding** per RFC 6386 §13 (new module
+  `src/dct_tokens.rs`). Walks the §13.2 `coeff_tree` against the
+  `coeff_probs[4][8][3][11]` table populated by round 3's
+  `token_prob_update()` and recovers a `[i16; 16]` of quantised
+  coefficients per 4×4 sub-block. Surface:
+  - `BlockType` — the §13.3 plane-type discriminator (`YAfterY2` /
+    `Y2` / `UV` / `YNoY2`); `first_coeff()` returns 1 / 0 / 0 / 0;
+    `plane_index()` returns the outermost `coeff_probs` index.
+  - `DctToken` — the twelve §13.2 alphabet symbols (`Dct0..Dct4`,
+    `Cat1..Cat6`, `Eob`).
+  - `CoeffProbs` — the resolved `[[[[u8; 11]; 3]; 8]; 4]` table.
+  - `COEFF_BANDS` — the §13.3 position-to-band lookup
+    `[0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7]`.
+  - `DEFAULT_COEFF_PROBS` — the §13.5 default token-probability
+    table, all 4 × 8 × 3 × 11 = 1056 probabilities transcribed
+    verbatim from RFC 6386.
+  - `merge_default_token_probs` — overlays a `TokenProbUpdates`
+    (from a parsed `Vp8CodedHeader`) onto `DEFAULT_COEFF_PROBS`
+    to produce a resolved table; `None` entries leave defaults in
+    place.
+  - `decode_block` — the per-sub-block primitive. Walks
+    `coeff_tree` from the appropriate start index per §13.2's
+    "skip dct_eob branch when previous coefficient was DCT_0"
+    rule, reads §13.2 `DCTextra` extra-bits against
+    `Pcat1..Pcat6` for each `Cat*` token, reads the fixed-prob-128
+    sign bit for non-zero values, and rolls over the §13.3 `ctx3`
+    (`0` / `1` / `2`) for the next coefficient based on the
+    just-decoded absolute value.
+  - `DctTokenError` — wraps `BoolDecoderError` and surfaces
+    `InvalidTokenIndex` for a corrupt tree-table.
+* Eighteen new unit tests covering: default-probs transcription
+  shape + four-plane spot-checks; `coeff_bands[16]` listing;
+  `BlockType::first_coeff()` / `plane_index()`;
+  `merge_default_token_probs` identity + overlay behaviour;
+  immediate EOB → all-zero block; single-DCT1 round trip at
+  position 0; negative-value round trip; round-trip of one value
+  inside each of cat1..cat6 (thirteen magnitudes including range
+  boundaries 5/6/7/10/11/18/19/34/35/66/67/100/2048);
+  `BlockType::YAfterY2` skipping coefficient 0; a dense block with
+  mixed positive / negative / cat3 / cat4 values across non-adjacent
+  positions; an updates-overlaid round trip proving `decode_block`
+  reads from the caller's resolved table (not defaults);
+  `prev_token_skips_eob_branch` exercising the §13.2 EOB-skip rule
+  through a leading run of zeros; all four `(above, left)`
+  predictor combinations for the first-coefficient `ctx3` seed;
+  a 16-position fully-occupied block that emits no EOB at all; and
+  cat6 maximum value `categoryBase[5] + 0x7FF = 2114` exercising
+  the 11-extra-bit `DCTextra` path.
+
+### Spec gaps surfaced
+
+* **§13.3 page 67 token-loop pseudocode.** The trailing
+  `prevCoeffWasZero = true;` is a transcription error; setting the
+  flag unconditionally true would let EOB follow a non-zero
+  coefficient on every iteration after the first, contradicting
+  §13.2's "if the preceding coefficient is a DCT_0, decoding will
+  skip the first branch" statement. We implement
+  `prevCoeffWasZero = (token == DCT_0)`. Recommend an RFC 6386
+  erratum.
+
 * **Intra-prediction pixel kernels** per RFC 6386 §12 (new module
   `src/intra_predict.rs`). Pure pixel-shape kernels operating on small
   neighbour-array inputs — no entropy decoding, no IDCT, no loop

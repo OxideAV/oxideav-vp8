@@ -1,0 +1,1093 @@
+//! VP8 DCT-coefficient token decoding per RFC 6386 §13.
+//!
+//! This module walks the `coeff_tree` of §13.2 against the
+//! `coeff_probs[4][8][3][11]` probability table to recover the sixteen
+//! quantised DCT coefficients of a single 4×4 sub-block. Encoded
+//! coefficients are written into a caller-supplied `[i16; 16]` in the
+//! spec's "implicit position" order — i.e. positions `firstCoeff ..
+//! firstCoeff + n` of the (already-zig-zagged) sub-block array. After
+//! a `dct_eob` token the remaining positions are left at zero.
+//!
+//! **What is in this module:**
+//!
+//! * The §13.2 token-tree walker (`treed_read_coef`), with the §13.2
+//!   "skip the dct_eob branch when the previous coefficient was a
+//!   DCT_0" optimisation. Implemented as a one-step descent past the
+//!   first internal node rather than a separate tree.
+//! * The §13.2 `DCTextra` extra-bits decoder over the six fixed
+//!   probability tables `Pcat1..Pcat6`.
+//! * The §13.2 sign bit (read at probability 128).
+//! * The §13.3 `coeff_bands[16]` position-to-band mapping that selects
+//!   the second probability-table index.
+//! * The §13.3 "previous-token class" `ctx3` rollover that selects the
+//!   third probability-table index (0 if previous was zero, 1 if its
+//!   absolute value was 1, 2 if its absolute value was > 1).
+//! * The §13.3 plane-type discriminator: 0 = Y after Y2, 1 = Y2,
+//!   2 = U or V, 3 = Y in the absence of Y2.
+//! * The §13.5 default token-probability table (transcribed verbatim).
+//! * A `merge_default_token_probs` helper that overlays a
+//!   `TokenProbUpdates` (from `coded_header::Vp8CodedHeader`) onto the
+//!   default table, producing a complete `coeff_probs[4][8][3][11]`
+//!   ready for `decode_block` calls.
+//!
+//! **What is NOT in this module yet:**
+//!
+//! * Dequantisation — multiplying the recovered `i16` coefficients by
+//!   the §14.1 `dc_qlookup` / `ac_qlookup` table values (round 8).
+//! * The inverse WHT / IDCT (§14.2 / §14.3).
+//! * The per-macroblock walk that aggregates 24/25 blocks per MB,
+//!   maintains the §13.3 above / left non-zero-block predictors, and
+//!   honours the `mb_skip_coeff` and `B_PRED` / `SPLITMV` exemptions
+//!   (this is the round-7+ integration layer — the per-block decode
+//!   primitive lives here as the building block).
+//!
+//! # Spec-pseudocode caveat
+//!
+//! RFC 6386 §13.3 page 67's pseudocode ends each iteration with the
+//! literal statement `prevCoeffWasZero = true;` — i.e. *unconditionally
+//! true*. That is plainly a transcription error: the field is named
+//! `prevCoeffWasZero` and is used at the next iteration's tree entry
+//! to decide whether to skip the `dct_eob` branch (which is illegal
+//! after a zero). Setting it unconditionally true would mean **every
+//! coefficient after the first** allows EOB-after-non-zero, which
+//! contradicts §13.2's "if the preceding coefficient is a DCT_0,
+//! decoding will skip the first branch" statement. We treat the
+//! correct semantics as `prevCoeffWasZero = (token == DCT_0)`. The
+//! `prev_token_skips_eob_branch` test exercises both directions to
+//! prove this branch decision matters.
+
+use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
+use crate::coded_header::TokenProbUpdates;
+
+/// Twelve DCT-token alphabet symbols per RFC 6386 §13.2. Order is
+/// fixed to match the spec; the integer discriminants are also the
+/// `dct_token` enum values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DctToken {
+    /// Coefficient value 0.
+    Dct0 = 0,
+    /// Coefficient value 1.
+    Dct1 = 1,
+    /// Coefficient value 2.
+    Dct2 = 2,
+    /// Coefficient value 3.
+    Dct3 = 3,
+    /// Coefficient value 4.
+    Dct4 = 4,
+    /// Range `5..=6` (size 2; 1 extra bit).
+    Cat1 = 5,
+    /// Range `7..=10` (size 4; 2 extra bits).
+    Cat2 = 6,
+    /// Range `11..=18` (size 8; 3 extra bits).
+    Cat3 = 7,
+    /// Range `19..=34` (size 16; 4 extra bits).
+    Cat4 = 8,
+    /// Range `35..=66` (size 32; 5 extra bits).
+    Cat5 = 9,
+    /// Range `67..=2048` (size 1982; 11 extra bits).
+    Cat6 = 10,
+    /// End of block — the remaining coefficients of this sub-block
+    /// are zero.
+    Eob = 11,
+}
+
+/// The §13.3 "plane type" — the outermost index into
+/// `coeff_probs[4][8][3][11]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockType {
+    /// Y luma block when the macroblock also has a Y2 block — i.e.
+    /// the DC slot is part of Y2 and Y DCT starts at coefficient 1.
+    YAfterY2 = 0,
+    /// The Y2 block itself (one per macroblock, holds the 16 Y DCs).
+    Y2 = 1,
+    /// U or V chroma block.
+    UV = 2,
+    /// Y luma block in a macroblock without Y2 (B_PRED / SPLITMV) —
+    /// Y DCT starts at coefficient 0.
+    YNoY2 = 3,
+}
+
+impl BlockType {
+    /// The §13.3 `firstCoeff` index — the first coefficient position
+    /// the token loop visits. `1` for [`BlockType::YAfterY2`], `0` for
+    /// every other plane.
+    pub const fn first_coeff(self) -> usize {
+        match self {
+            BlockType::YAfterY2 => 1,
+            BlockType::Y2 | BlockType::UV | BlockType::YNoY2 => 0,
+        }
+    }
+
+    /// The numeric `coeff_probs` outermost index per §13.3.
+    pub const fn plane_index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Out-of-band conditions surfaced by [`decode_block`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DctTokenError {
+    /// Underlying bool-decoder ran out of bytes mid-token.
+    BoolDecoder(BoolDecoderError),
+    /// The token tree walked into a leaf index outside `0..=11`. The
+    /// tree-table transcription is constant data, so this only fires
+    /// if `decode_block` is given a tree-table table corrupted by a
+    /// caller — kept as an error rather than `panic!` so all
+    /// failure modes flow through `Result`.
+    InvalidTokenIndex,
+}
+
+impl From<BoolDecoderError> for DctTokenError {
+    fn from(e: BoolDecoderError) -> Self {
+        DctTokenError::BoolDecoder(e)
+    }
+}
+
+impl core::fmt::Display for DctTokenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DctTokenError::BoolDecoder(e) => write!(f, "vp8 dct token: bool decoder: {e}"),
+            DctTokenError::InvalidTokenIndex => {
+                write!(f, "vp8 dct token: token tree leaf index out of range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DctTokenError {}
+
+/// §13.2 `coeff_tree` — the eleven-internal-node, twelve-leaf token
+/// tree. Entry `2*i` is the left child of internal node `i`; entry
+/// `2*i + 1` is the right child. Non-negative entries point to the
+/// next internal node; non-positive entries `-t` denote the leaf
+/// `DctToken::from(t as u8)`.
+///
+/// Encoded verbatim from the §13.2 listing. The leading `-Eob` entry
+/// is at index 0; when the previous coefficient was zero the walker
+/// starts at index 2 (skipping the EOB branch) — see [`decode_block`].
+const COEFF_TREE: [i8; 22] = [
+    -(DctToken::Eob as i8),
+    2, // eob = "0"
+    -(DctToken::Dct0 as i8),
+    4, // 0   = "10"
+    -(DctToken::Dct1 as i8),
+    6, // 1   = "110"
+    8,
+    12,
+    -(DctToken::Dct2 as i8),
+    10, // 2   = "11100"
+    -(DctToken::Dct3 as i8),
+    -(DctToken::Dct4 as i8),
+    14,
+    16,
+    -(DctToken::Cat1 as i8),
+    -(DctToken::Cat2 as i8),
+    18,
+    20,
+    -(DctToken::Cat3 as i8),
+    -(DctToken::Cat4 as i8),
+    -(DctToken::Cat5 as i8),
+    -(DctToken::Cat6 as i8),
+];
+
+/// §13.2 `Pcat1` extra-bits probability list (terminator removed).
+const PCAT1: &[u8] = &[159];
+/// §13.2 `Pcat2`.
+const PCAT2: &[u8] = &[165, 145];
+/// §13.2 `Pcat3`.
+const PCAT3: &[u8] = &[173, 148, 140];
+/// §13.2 `Pcat4`.
+const PCAT4: &[u8] = &[176, 155, 140, 135];
+/// §13.2 `Pcat5`.
+const PCAT5: &[u8] = &[180, 157, 141, 134, 130];
+/// §13.2 `Pcat6` — eleven probabilities for the wide cat6 range.
+const PCAT6: &[u8] = &[254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129];
+
+/// §13.2 base values for cat1..cat6 (`categoryBase[6]`).
+const CAT_BASE: [u16; 6] = [5, 7, 11, 19, 35, 67];
+
+/// §13.3 `coeff_bands[16]` — position-to-band lookup for the second
+/// probability-table dimension.
+pub const COEFF_BANDS: [usize; 16] = [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7];
+
+/// Complete `coeff_probs[plane][band][prev_ctx][position]` table.
+/// The four outer dimensions match RFC 6386 §13.3's `Prob
+/// coeff_probs[4][8][3][num_dct_tokens - 1]` declaration.
+pub type CoeffProbs = [[[[u8; 11]; 3]; 8]; 4];
+
+/// §13.5 default token-probability table (`default_coeff_probs[4][8][3][11]`),
+/// transcribed verbatim from RFC 6386.
+pub const DEFAULT_COEFF_PROBS: CoeffProbs = [
+    // plane 0 — Y after Y2 (DCT starts at coefficient 1)
+    [
+        [
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [253, 136, 254, 255, 228, 219, 128, 128, 128, 128, 128],
+            [189, 129, 242, 255, 227, 213, 255, 219, 128, 128, 128],
+            [106, 126, 227, 252, 214, 209, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 98, 248, 255, 236, 226, 255, 255, 128, 128, 128],
+            [181, 133, 238, 254, 221, 234, 255, 154, 128, 128, 128],
+            [78, 134, 202, 247, 198, 180, 255, 219, 128, 128, 128],
+        ],
+        [
+            [1, 185, 249, 255, 243, 255, 128, 128, 128, 128, 128],
+            [184, 150, 247, 255, 236, 224, 128, 128, 128, 128, 128],
+            [77, 110, 216, 255, 236, 230, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 101, 251, 255, 241, 255, 128, 128, 128, 128, 128],
+            [170, 139, 241, 252, 236, 209, 255, 255, 128, 128, 128],
+            [37, 116, 196, 243, 228, 255, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 204, 254, 255, 245, 255, 128, 128, 128, 128, 128],
+            [207, 160, 250, 255, 238, 128, 128, 128, 128, 128, 128],
+            [102, 103, 231, 255, 211, 171, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 152, 252, 255, 240, 255, 128, 128, 128, 128, 128],
+            [177, 135, 243, 255, 234, 225, 128, 128, 128, 128, 128],
+            [80, 129, 211, 255, 194, 224, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [246, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [255, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+    ],
+    // plane 1 — Y2
+    [
+        [
+            [198, 35, 237, 223, 193, 187, 162, 160, 145, 155, 62],
+            [131, 45, 198, 221, 172, 176, 220, 157, 252, 221, 1],
+            [68, 47, 146, 208, 149, 167, 221, 162, 255, 223, 128],
+        ],
+        [
+            [1, 149, 241, 255, 221, 224, 255, 255, 128, 128, 128],
+            [184, 141, 234, 253, 222, 220, 255, 199, 128, 128, 128],
+            [81, 99, 181, 242, 176, 190, 249, 202, 255, 255, 128],
+        ],
+        [
+            [1, 129, 232, 253, 214, 197, 242, 196, 255, 255, 128],
+            [99, 121, 210, 250, 201, 198, 255, 202, 128, 128, 128],
+            [23, 91, 163, 242, 170, 187, 247, 210, 255, 255, 128],
+        ],
+        [
+            [1, 200, 246, 255, 234, 255, 128, 128, 128, 128, 128],
+            [109, 178, 241, 255, 231, 245, 255, 255, 128, 128, 128],
+            [44, 130, 201, 253, 205, 192, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 132, 239, 251, 219, 209, 255, 165, 128, 128, 128],
+            [94, 136, 225, 251, 218, 190, 255, 255, 128, 128, 128],
+            [22, 100, 174, 245, 186, 161, 255, 199, 128, 128, 128],
+        ],
+        [
+            [1, 182, 249, 255, 232, 235, 128, 128, 128, 128, 128],
+            [124, 143, 241, 255, 227, 234, 128, 128, 128, 128, 128],
+            [35, 77, 181, 251, 193, 211, 255, 205, 128, 128, 128],
+        ],
+        [
+            [1, 157, 247, 255, 236, 231, 255, 255, 128, 128, 128],
+            [121, 141, 235, 255, 225, 227, 255, 255, 128, 128, 128],
+            [45, 99, 188, 251, 195, 217, 255, 224, 128, 128, 128],
+        ],
+        [
+            [1, 1, 251, 255, 213, 255, 128, 128, 128, 128, 128],
+            [203, 1, 248, 255, 255, 128, 128, 128, 128, 128, 128],
+            [137, 1, 177, 255, 224, 255, 128, 128, 128, 128, 128],
+        ],
+    ],
+    // plane 2 — U or V
+    [
+        [
+            [253, 9, 248, 251, 207, 208, 255, 192, 128, 128, 128],
+            [175, 13, 224, 243, 193, 185, 249, 198, 255, 255, 128],
+            [73, 17, 171, 221, 161, 179, 236, 167, 255, 234, 128],
+        ],
+        [
+            [1, 95, 247, 253, 212, 183, 255, 255, 128, 128, 128],
+            [239, 90, 244, 250, 211, 209, 255, 255, 128, 128, 128],
+            [155, 77, 195, 248, 188, 195, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 24, 239, 251, 218, 219, 255, 205, 128, 128, 128],
+            [201, 51, 219, 255, 196, 186, 128, 128, 128, 128, 128],
+            [69, 46, 190, 239, 201, 218, 255, 228, 128, 128, 128],
+        ],
+        [
+            [1, 191, 251, 255, 255, 128, 128, 128, 128, 128, 128],
+            [223, 165, 249, 255, 213, 255, 128, 128, 128, 128, 128],
+            [141, 124, 248, 255, 255, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 16, 248, 255, 255, 128, 128, 128, 128, 128, 128],
+            [190, 36, 230, 255, 236, 255, 128, 128, 128, 128, 128],
+            [149, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 226, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [247, 192, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [240, 128, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [1, 134, 252, 255, 255, 128, 128, 128, 128, 128, 128],
+            [213, 62, 250, 255, 255, 128, 128, 128, 128, 128, 128],
+            [55, 93, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+        [
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+            [128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+    ],
+    // plane 3 — Y in the absence of Y2 (DCT starts at coefficient 0)
+    [
+        [
+            [202, 24, 213, 235, 186, 191, 220, 160, 240, 175, 255],
+            [126, 38, 182, 232, 169, 184, 228, 174, 255, 187, 128],
+            [61, 46, 138, 219, 151, 178, 240, 170, 255, 216, 128],
+        ],
+        [
+            [1, 112, 230, 250, 199, 191, 247, 159, 255, 255, 128],
+            [166, 109, 228, 252, 211, 215, 255, 174, 128, 128, 128],
+            [39, 77, 162, 232, 172, 180, 245, 178, 255, 255, 128],
+        ],
+        [
+            [1, 52, 220, 246, 198, 199, 249, 220, 255, 255, 128],
+            [124, 74, 191, 243, 183, 193, 250, 221, 255, 255, 128],
+            [24, 71, 130, 219, 154, 170, 243, 182, 255, 255, 128],
+        ],
+        [
+            [1, 182, 225, 249, 219, 240, 255, 224, 128, 128, 128],
+            [149, 150, 226, 252, 216, 205, 255, 171, 128, 128, 128],
+            [28, 108, 170, 242, 183, 194, 254, 223, 255, 255, 128],
+        ],
+        [
+            [1, 81, 230, 252, 204, 203, 255, 192, 128, 128, 128],
+            [123, 102, 209, 247, 188, 196, 255, 233, 128, 128, 128],
+            [20, 95, 153, 243, 164, 173, 255, 203, 128, 128, 128],
+        ],
+        [
+            [1, 222, 248, 255, 216, 213, 128, 128, 128, 128, 128],
+            [168, 175, 246, 252, 235, 205, 255, 255, 128, 128, 128],
+            [47, 116, 215, 255, 211, 212, 255, 255, 128, 128, 128],
+        ],
+        [
+            [1, 121, 236, 253, 212, 214, 255, 255, 128, 128, 128],
+            [141, 84, 213, 252, 201, 202, 255, 219, 128, 128, 128],
+            [42, 80, 160, 240, 162, 185, 255, 205, 128, 128, 128],
+        ],
+        [
+            [1, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [244, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+            [238, 1, 255, 128, 128, 128, 128, 128, 128, 128, 128],
+        ],
+    ],
+];
+
+/// Overlay an in-frame `token_prob_update()` block onto the §13.5
+/// default token-probability table. The output is the resolved
+/// `coeff_probs[4][8][3][11]` used by the per-frame DCT decode loop.
+///
+/// Each entry of `updates` that is `Some(p)` replaces the
+/// corresponding default position; `None` leaves the default in
+/// place. The on-the-wire ordering of `updates` matches RFC 6386
+/// §19.2's `token_prob_update()` four-nested-loop sweep, so the
+/// `[plane][band][prev_ctx][pos]` indexing on the type alias is
+/// already aligned.
+pub fn merge_default_token_probs(updates: &TokenProbUpdates) -> CoeffProbs {
+    let mut out = DEFAULT_COEFF_PROBS;
+    for (plane_idx, plane) in updates.iter().enumerate() {
+        for (band_idx, band) in plane.iter().enumerate() {
+            for (prev_idx, ctx) in band.iter().enumerate() {
+                for (pos_idx, slot) in ctx.iter().enumerate() {
+                    if let Some(p) = *slot {
+                        out[plane_idx][band_idx][prev_idx][pos_idx] = p;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Walk the §13.2 coefficient tree starting at `start_index` (0 for
+/// "may decode dct_eob", 2 for "skip dct_eob — previous coefficient
+/// was zero"). The probability for each internal node `i` is
+/// `probs[i >> 1]`, matching RFC 6386 §8.1 `treed_read`.
+fn treed_read_coef(
+    dec: &mut BoolDecoder<'_>,
+    probs: &[u8; 11],
+    start_index: i8,
+) -> Result<DctToken, DctTokenError> {
+    let mut i: i8 = start_index;
+    loop {
+        let prob = probs[(i as usize) >> 1];
+        let bit = dec.read_bool(prob)? as usize;
+        let next = COEFF_TREE[i as usize + bit];
+        if next <= 0 {
+            let leaf = -next as u8;
+            return Ok(match leaf {
+                0 => DctToken::Dct0,
+                1 => DctToken::Dct1,
+                2 => DctToken::Dct2,
+                3 => DctToken::Dct3,
+                4 => DctToken::Dct4,
+                5 => DctToken::Cat1,
+                6 => DctToken::Cat2,
+                7 => DctToken::Cat3,
+                8 => DctToken::Cat4,
+                9 => DctToken::Cat5,
+                10 => DctToken::Cat6,
+                11 => DctToken::Eob,
+                _ => return Err(DctTokenError::InvalidTokenIndex),
+            });
+        }
+        i = next;
+    }
+}
+
+/// Decode the variable-length "extra bits" trailing a `Cat1..Cat6`
+/// token (RFC 6386 §13.2 `DCTextra`). `cat_probs` is the cat's
+/// fixed probability list (`Pcat1..Pcat6`, terminator omitted).
+fn read_extra_bits(dec: &mut BoolDecoder<'_>, cat_probs: &[u8]) -> Result<u16, BoolDecoderError> {
+    let mut v: u16 = 0;
+    for &p in cat_probs {
+        let bit = dec.read_bool(p)? as u16;
+        v = (v << 1) | bit;
+    }
+    Ok(v)
+}
+
+/// Decode one DCT-token sub-block per RFC 6386 §13.3 and return the
+/// number of non-zero coefficients written. The recovered values are
+/// written into `coeffs[firstCoeff..16]` (positions in the
+/// already-zig-zagged sub-block order); positions past the implicit
+/// `dct_eob` are left untouched (caller is expected to pre-zero
+/// `coeffs`).
+///
+/// * `block_type` selects the §13.3 plane index and the
+///   `firstCoeff` value.
+/// * `coeff_probs` is the resolved `coeff_probs[4][8][3][11]`
+///   produced by [`merge_default_token_probs`].
+/// * `above_has_nonzero` / `left_has_nonzero` are the §13.3
+///   "neighbour block has at least one non-zero coefficient"
+///   predictors for the *first* coefficient only. Off-frame
+///   neighbours are passed as `false` per §13.3 page 64.
+/// * Returns `Ok(non_zero_count)` — the number of non-zero
+///   coefficients decoded. `coeffs` is updated in place. A return
+///   value of 0 means the block was all-zero (either an immediate
+///   EOB at `firstCoeff` or a sequence of `DCT_0` tokens followed
+///   by EOB).
+pub fn decode_block(
+    dec: &mut BoolDecoder<'_>,
+    block_type: BlockType,
+    coeff_probs: &CoeffProbs,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &mut [i16; 16],
+) -> Result<usize, DctTokenError> {
+    // §13.3 page 65: the third context-index (`ctx3`) is seeded by
+    // the count of non-zero neighbours for the very first coefficient
+    // only. After the first coefficient the field rolls over to the
+    // class of the last decoded coefficient (see end of loop).
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let plane = block_type.plane_index();
+    let first_coeff = block_type.first_coeff();
+
+    // §13.3 page 67 calls the "skip dct_eob branch" flag
+    // `prevCoeffWasZero`. It is `false` for the first coefficient
+    // because there is no previous coefficient at all (i.e. we DO
+    // permit an immediate dct_eob). After the first iteration the
+    // value is updated to `(token == DCT_0)` — see the trailing
+    // assignment in the loop.
+    let mut prev_was_zero = false;
+
+    let mut non_zero_count = 0usize;
+
+    let mut i = first_coeff;
+    while i < 16 {
+        let band = COEFF_BANDS[i];
+        let probs = &coeff_probs[plane][band][ctx3];
+
+        // §13.2: skip the eob branch if previous coefficient was a DCT_0.
+        // The eob branch is the i=0/i=1 edge of the tree; entering at
+        // index 2 (the DCT_0 branch) bypasses it.
+        let start = if prev_was_zero { 2i8 } else { 0i8 };
+        let token = treed_read_coef(dec, probs, start)?;
+
+        if token == DctToken::Eob {
+            break;
+        }
+
+        let abs_value: u16 = match token {
+            DctToken::Dct0 => 0,
+            DctToken::Dct1 => 1,
+            DctToken::Dct2 => 2,
+            DctToken::Dct3 => 3,
+            DctToken::Dct4 => 4,
+            DctToken::Cat1 => CAT_BASE[0] + read_extra_bits(dec, PCAT1)?,
+            DctToken::Cat2 => CAT_BASE[1] + read_extra_bits(dec, PCAT2)?,
+            DctToken::Cat3 => CAT_BASE[2] + read_extra_bits(dec, PCAT3)?,
+            DctToken::Cat4 => CAT_BASE[3] + read_extra_bits(dec, PCAT4)?,
+            DctToken::Cat5 => CAT_BASE[4] + read_extra_bits(dec, PCAT5)?,
+            DctToken::Cat6 => CAT_BASE[5] + read_extra_bits(dec, PCAT6)?,
+            DctToken::Eob => unreachable!("eob handled above"),
+        };
+
+        if abs_value != 0 {
+            // Non-zero coefficients carry a sign bit at fixed
+            // probability 128 (§13.2 page 62).
+            let sign = dec.read_bool(128)?;
+            // §13.2 cat6 max value is 67 + (2^11 - 1) = 2114, which
+            // still fits in i16 with sign. Cast is safe.
+            let signed = abs_value as i16;
+            coeffs[i] = if sign { -signed } else { signed };
+            non_zero_count += 1;
+        } else {
+            coeffs[i] = 0;
+        }
+
+        // §13.3 page 67: rollover of `ctx3` to the absolute-value
+        // class of the coefficient we just decoded.
+        ctx3 = if abs_value == 0 {
+            0
+        } else if abs_value == 1 {
+            1
+        } else {
+            2
+        };
+
+        // Spec-typo correction (see module-level doc comment): set
+        // `prev_was_zero` to whether the token was DCT_0, NOT the
+        // literal `true` the spec listing types.
+        prev_was_zero = token == DctToken::Dct0;
+
+        i += 1;
+    }
+
+    Ok(non_zero_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test-side bool encoder (mirrors the one inside
+    // `bool_decoder::tests`). Lives only in tests; never exported.
+    struct TestEncoder {
+        out: Vec<u8>,
+        range: u32,
+        bottom: u32,
+        bit_count: i32,
+    }
+
+    impl TestEncoder {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                range: 255,
+                bottom: 0,
+                bit_count: 24,
+            }
+        }
+
+        fn write_bool(&mut self, prob: u8, val: bool) {
+            let split = 1 + (((self.range - 1) * prob as u32) >> 8);
+            if val {
+                self.bottom = self.bottom.wrapping_add(split);
+                self.range -= split;
+            } else {
+                self.range = split;
+            }
+            while self.range < 128 {
+                self.range <<= 1;
+                if (self.bottom >> 31) & 1 == 1 {
+                    let mut i = self.out.len();
+                    while i > 0 {
+                        i -= 1;
+                        if self.out[i] == 255 {
+                            self.out[i] = 0;
+                        } else {
+                            self.out[i] = self.out[i].wrapping_add(1);
+                            break;
+                        }
+                    }
+                }
+                self.bottom <<= 1;
+                self.bit_count -= 1;
+                if self.bit_count == 0 {
+                    let byte = (self.bottom >> 24) as u8;
+                    self.out.push(byte);
+                    self.bottom &= (1 << 24) - 1;
+                    self.bit_count = 8;
+                }
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            let c = self.bit_count;
+            let v = self.bottom;
+            if v & (1u32 << (32 - c)) != 0 {
+                let mut i = self.out.len();
+                while i > 0 {
+                    i -= 1;
+                    if self.out[i] == 255 {
+                        self.out[i] = 0;
+                    } else {
+                        self.out[i] = self.out[i].wrapping_add(1);
+                        break;
+                    }
+                }
+            }
+            let mut v = v;
+            v <<= c & 7;
+            let mut c_shift = c >> 3;
+            while c_shift > 0 {
+                v <<= 8;
+                c_shift -= 1;
+            }
+            for _ in 0..4 {
+                self.out.push((v >> 24) as u8);
+                v <<= 8;
+            }
+            self.out
+        }
+    }
+
+    /// Encode a single DctToken against the given probability vector by
+    /// walking the same tree the decoder will walk. Returns the (start
+    /// internal node, list of (prob_index, bit) pairs to write).
+    ///
+    /// `start_at_index` is `0` if we may emit eob, `2` if not (i.e.
+    /// when the previous coefficient was a DCT_0).
+    fn encode_token(token: DctToken, start_at_index: i8) -> Vec<(usize, bool)> {
+        // We replay the tree-walk and at each step record (i>>1, bit)
+        // that the decoder would have read. We do this by knowing the
+        // tree statically.
+        let target = token as i8;
+        let mut out = Vec::new();
+        // Helper: at internal node `i`, the two children are
+        // COEFF_TREE[i] (left, bit=0) and COEFF_TREE[i+1] (right, bit=1).
+        fn descend(i: i8, target: i8, path: &mut Vec<(usize, bool)>) -> bool {
+            for &bit in &[false, true] {
+                let child = COEFF_TREE[i as usize + bit as usize];
+                if child <= 0 {
+                    if -child == target {
+                        path.push(((i as usize) >> 1, bit));
+                        return true;
+                    }
+                } else {
+                    path.push(((i as usize) >> 1, bit));
+                    if descend(child, target, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+            }
+            false
+        }
+        assert!(descend(start_at_index, target, &mut out));
+        out
+    }
+
+    /// Encode a full block of coefficients against the resolved coeff
+    /// probability table and return the bool-encoder byte stream that
+    /// `decode_block` should consume.
+    fn encode_block(
+        coeffs: &[i16; 16],
+        block_type: BlockType,
+        coeff_probs: &CoeffProbs,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+    ) -> Vec<u8> {
+        let mut enc = TestEncoder::new();
+        let plane = block_type.plane_index();
+        let first_coeff = block_type.first_coeff();
+        let mut ctx3 = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+        let mut prev_was_zero = false;
+
+        // Find the position of the last non-zero coefficient — we will
+        // emit an EOB token immediately after that position (or at
+        // first_coeff if the block is empty).
+        let mut last_non_zero: i32 = -1;
+        for (idx, c) in coeffs.iter().enumerate().take(16) {
+            if idx >= first_coeff && *c != 0 {
+                last_non_zero = idx as i32;
+            }
+        }
+
+        let mut i = first_coeff as i32;
+        while i < 16 {
+            let band = COEFF_BANDS[i as usize];
+            let probs = &coeff_probs[plane][band][ctx3];
+
+            let emit_eob = i > last_non_zero;
+            let abs_value: u16;
+            let sign: bool;
+            let token: DctToken;
+            if emit_eob {
+                token = DctToken::Eob;
+                abs_value = 0;
+                sign = false;
+            } else {
+                let v = coeffs[i as usize];
+                sign = v < 0;
+                abs_value = v.unsigned_abs();
+                token = if abs_value == 0 {
+                    DctToken::Dct0
+                } else if abs_value == 1 {
+                    DctToken::Dct1
+                } else if abs_value == 2 {
+                    DctToken::Dct2
+                } else if abs_value == 3 {
+                    DctToken::Dct3
+                } else if abs_value == 4 {
+                    DctToken::Dct4
+                } else if abs_value <= 6 {
+                    DctToken::Cat1
+                } else if abs_value <= 10 {
+                    DctToken::Cat2
+                } else if abs_value <= 18 {
+                    DctToken::Cat3
+                } else if abs_value <= 34 {
+                    DctToken::Cat4
+                } else if abs_value <= 66 {
+                    DctToken::Cat5
+                } else {
+                    DctToken::Cat6
+                };
+            }
+
+            let start = if prev_was_zero { 2i8 } else { 0i8 };
+            for (i_half, bit) in encode_token(token, start) {
+                enc.write_bool(probs[i_half], bit);
+            }
+            if token == DctToken::Eob {
+                break;
+            }
+
+            if let Some((base, plist)) = match token {
+                DctToken::Cat1 => Some((CAT_BASE[0], PCAT1)),
+                DctToken::Cat2 => Some((CAT_BASE[1], PCAT2)),
+                DctToken::Cat3 => Some((CAT_BASE[2], PCAT3)),
+                DctToken::Cat4 => Some((CAT_BASE[3], PCAT4)),
+                DctToken::Cat5 => Some((CAT_BASE[4], PCAT5)),
+                DctToken::Cat6 => Some((CAT_BASE[5], PCAT6)),
+                _ => None,
+            } {
+                let extra = abs_value - base;
+                let n = plist.len();
+                for (j, &p) in plist.iter().enumerate() {
+                    let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                    enc.write_bool(p, bit);
+                }
+            }
+
+            if abs_value != 0 {
+                enc.write_bool(128, sign);
+            }
+
+            ctx3 = if abs_value == 0 {
+                0
+            } else if abs_value == 1 {
+                1
+            } else {
+                2
+            };
+            prev_was_zero = token == DctToken::Dct0;
+            i += 1;
+        }
+
+        enc.finish()
+    }
+
+    #[test]
+    fn default_probs_table_shape() {
+        // Cheap sanity check on the §13.5 transcription: every entry
+        // is a u8 in the legal range and the table has 4*8*3*11=1056
+        // probabilities.
+        let mut count = 0;
+        for plane in &DEFAULT_COEFF_PROBS {
+            for band in plane {
+                for ctx in band {
+                    for &_p in ctx {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(count, 4 * 8 * 3 * 11);
+    }
+
+    #[test]
+    fn default_probs_first_row_is_uniform_128() {
+        // Plane 0 (Y after Y2) band 0 is all-128 in the RFC listing —
+        // unused since plane 0 starts at coefficient 1, so band 0
+        // never reads. Spot-check the first row.
+        for ctx in &DEFAULT_COEFF_PROBS[0][0] {
+            for &p in ctx {
+                assert_eq!(p, 128);
+            }
+        }
+    }
+
+    #[test]
+    fn default_probs_known_values() {
+        // A handful of specific cells from §13.5 — would catch a
+        // transcription typo on any of the four touched planes.
+        assert_eq!(DEFAULT_COEFF_PROBS[0][1][0][0], 253);
+        assert_eq!(DEFAULT_COEFF_PROBS[1][0][0][10], 62);
+        assert_eq!(DEFAULT_COEFF_PROBS[2][7][2][0], 128); // chroma plane band 7 all-128
+        assert_eq!(DEFAULT_COEFF_PROBS[3][0][0][0], 202);
+        assert_eq!(DEFAULT_COEFF_PROBS[3][7][2][1], 1); // last block: { 238, 1, 255, ... }
+    }
+
+    #[test]
+    fn coeff_bands_is_spec_listing() {
+        assert_eq!(
+            COEFF_BANDS,
+            [0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7]
+        );
+    }
+
+    #[test]
+    fn block_type_first_coeff_and_plane_index() {
+        assert_eq!(BlockType::YAfterY2.first_coeff(), 1);
+        assert_eq!(BlockType::Y2.first_coeff(), 0);
+        assert_eq!(BlockType::UV.first_coeff(), 0);
+        assert_eq!(BlockType::YNoY2.first_coeff(), 0);
+        assert_eq!(BlockType::YAfterY2.plane_index(), 0);
+        assert_eq!(BlockType::Y2.plane_index(), 1);
+        assert_eq!(BlockType::UV.plane_index(), 2);
+        assert_eq!(BlockType::YNoY2.plane_index(), 3);
+    }
+
+    #[test]
+    fn merge_no_updates_is_identity() {
+        let updates: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+        let merged = merge_default_token_probs(&updates);
+        assert_eq!(merged, DEFAULT_COEFF_PROBS);
+    }
+
+    #[test]
+    fn merge_overlays_present_entries() {
+        let mut updates: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+        updates[2][3][1][5] = Some(42);
+        updates[0][0][0][0] = Some(7);
+        let merged = merge_default_token_probs(&updates);
+        assert_eq!(merged[2][3][1][5], 42);
+        assert_eq!(merged[0][0][0][0], 7);
+        // Untouched cells still match defaults.
+        assert_eq!(merged[3][5][2][1], DEFAULT_COEFF_PROBS[3][5][2][1]);
+    }
+
+    #[test]
+    fn decode_immediate_eob_yields_all_zero_block() {
+        // Block: 16 zeros; first token is dct_eob.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let coeffs = [0i16; 16];
+        let buf = encode_block(&coeffs, BlockType::Y2, probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 0);
+        assert_eq!(out, [0i16; 16]);
+    }
+
+    #[test]
+    fn decode_roundtrip_single_dct1_at_position_0() {
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 1;
+        let buf = encode_block(&coeffs, BlockType::Y2, probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 1);
+        assert_eq!(out[0], 1);
+        for &v in out.iter().skip(1) {
+            assert_eq!(v, 0);
+        }
+    }
+
+    #[test]
+    fn decode_roundtrip_negative_value() {
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = -3;
+        coeffs[1] = -2;
+        let buf = encode_block(&coeffs, BlockType::Y2, probs, true, true);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::Y2, probs, true, true, &mut out).unwrap();
+        assert_eq!(nz, 2);
+        assert_eq!(out[0], -3);
+        assert_eq!(out[1], -2);
+    }
+
+    #[test]
+    fn decode_roundtrip_each_cat_range() {
+        // One value from inside each cat1..cat6 range. Verifies the
+        // base + extra-bits arithmetic at the cat boundary, halfway
+        // inside the range, and at the cat ceiling.
+        for &val in &[5i16, 6, 7, 10, 11, 18, 19, 34, 35, 66, 67, 100, 2048] {
+            let probs = &DEFAULT_COEFF_PROBS;
+            let mut coeffs = [0i16; 16];
+            coeffs[0] = val;
+            let buf = encode_block(&coeffs, BlockType::Y2, probs, false, false);
+            let mut dec = BoolDecoder::init(&buf).unwrap();
+            let mut out = [0i16; 16];
+            let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
+            assert_eq!(nz, 1, "val={val}");
+            assert_eq!(out[0], val, "val={val}");
+        }
+    }
+
+    #[test]
+    fn decode_y_after_y2_skips_dc_position() {
+        // Plane 0 (`YAfterY2`) starts at coefficient 1; position 0
+        // must stay zero even if the encoded bits would otherwise
+        // ascribe a token there. Verify by encoding a value at
+        // position 1.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut coeffs = [0i16; 16];
+        coeffs[1] = 7; // cat2
+        let buf = encode_block(&coeffs, BlockType::YAfterY2, probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz =
+            decode_block(&mut dec, BlockType::YAfterY2, probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 1);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 7);
+    }
+
+    #[test]
+    fn decode_dense_block_zigzag_positions() {
+        // A non-trivial block with values at multiple positions
+        // including the rollover from DCT_0 -> non-zero (covering
+        // the §13.3 `prev_was_zero` / `ctx3` rollover).
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 3;
+        coeffs[1] = 0;
+        coeffs[2] = -1;
+        coeffs[3] = 2;
+        coeffs[5] = 15; // cat3
+        coeffs[8] = -25; // cat4
+        let buf = encode_block(&coeffs, BlockType::UV, probs, true, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::UV, probs, true, false, &mut out).unwrap();
+        assert_eq!(nz, 5);
+        assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn decode_under_overlaid_probability_updates() {
+        // Use a TokenProbUpdates that overrides a handful of entries
+        // and verify decode still round-trips. Catches a bug where
+        // `decode_block` accidentally hits `DEFAULT_COEFF_PROBS`
+        // instead of the caller-supplied table.
+        let mut updates: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+        updates[2][1][0][0] = Some(200);
+        updates[2][1][0][1] = Some(50);
+        updates[2][2][1][2] = Some(99);
+        let probs = merge_default_token_probs(&updates);
+
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 4;
+        coeffs[1] = -1;
+        coeffs[3] = 12; // cat3
+        let buf = encode_block(&coeffs, BlockType::UV, &probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::UV, &probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 3);
+        assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn prev_token_skips_eob_branch() {
+        // Encode a block where the second coefficient is reached
+        // through the "previous was zero" path. The decoder must
+        // start the second token's tree-walk at index 2 (skipping
+        // the dct_eob branch). To prove this matters: emit a long
+        // run of zeros that would, under the buggy spec literal
+        // `prev_was_zero = true`, be interpreted as eob.
+        //
+        // We rely on the encode helper applying the same "start at
+        // 2 when prev was zero" rule; if `decode_block` did the
+        // wrong thing, the round-trip would fail.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 0;
+        coeffs[1] = 0;
+        coeffs[2] = 0;
+        coeffs[3] = 5; // cat1
+        let buf = encode_block(&coeffs, BlockType::Y2, probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 1);
+        assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn neighbour_predictor_count_seeds_ctx3() {
+        // The `ctx3` for the very first coefficient is the count
+        // (0/1/2) of non-zero neighbours. Encoding with all four
+        // cases (00, 01, 10, 11) and round-tripping makes sure the
+        // decoder picks the same row.
+        let probs = &DEFAULT_COEFF_PROBS;
+        for (above, left) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut coeffs = [0i16; 16];
+            coeffs[0] = -7; // cat2
+            coeffs[2] = 1;
+            let buf = encode_block(&coeffs, BlockType::UV, probs, above, left);
+            let mut dec = BoolDecoder::init(&buf).unwrap();
+            let mut out = [0i16; 16];
+            let nz = decode_block(&mut dec, BlockType::UV, probs, above, left, &mut out).unwrap();
+            assert_eq!(nz, 2, "above={above} left={left}");
+            assert_eq!(out, coeffs, "above={above} left={left}");
+        }
+    }
+
+    #[test]
+    fn block_full_to_position_15_no_eob_emitted() {
+        // A block that uses all 16 positions emits no EOB at all —
+        // the §13.3 loop runs to completion with i = 16. Verify
+        // the decoder handles that termination correctly.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let coeffs = [1i16; 16];
+        let buf = encode_block(&coeffs, BlockType::Y2, probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 16);
+        assert_eq!(out, coeffs);
+    }
+
+    #[test]
+    fn cat6_high_magnitude_roundtrip() {
+        // cat6 with the largest legal magnitude (67 + 2047 = 2114).
+        // Exercises the 11-extra-bit DCTextra path.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 2114;
+        let buf = encode_block(&coeffs, BlockType::Y2, probs, false, false);
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut out = [0i16; 16];
+        let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
+        assert_eq!(nz, 1);
+        assert_eq!(out[0], 2114);
+    }
+}

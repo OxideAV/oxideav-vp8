@@ -35,16 +35,23 @@
 //!   sub-block modes. Pure pixel-shape kernels operating on small
 //!   neighbour arrays; no entropy decode, no IDCT, no loop filter.
 //!   See [`intra_predict`].
+//! * VP8 DCT-coefficient token decoding (RFC 6386 §13) — the
+//!   `coeff_tree` walker, the `DCTextra` extra-bits decode, the §13.5
+//!   default token-probability table, and a per-sub-block
+//!   `decode_block` primitive that recovers a `[i16; 16]` of
+//!   quantised coefficients. No IDCT, no dequantisation, no
+//!   per-macroblock walker yet. See [`dct_tokens`].
 //!
-//! DCT-coefficient decoding (§13), motion-vector decoding (§17), IDCT
-//! and inverse-WHT (§14), the loop filter (§15), and the encoder are
-//! all still scaffolded — the top-level `decode_vp8` / `encode_vp8_*`
-//! entry points return [`Error::NotImplemented`].
+//! Motion-vector decoding (§17), IDCT and inverse-WHT (§14), the loop
+//! filter (§15), and the encoder are all still scaffolded — the
+//! top-level `decode_vp8` / `encode_vp8_*` entry points return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
 pub mod coded_header;
+pub mod dct_tokens;
 pub mod frame_header;
 pub mod intra_predict;
 pub mod macroblock;
@@ -53,6 +60,10 @@ pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
     CodedHeaderError, MbLfAdjustments, MvProbUpdates, QuantIndices, TokenProbUpdates,
     UpdateSegmentation, Vp8CodedHeader, DEFAULT_MV_CONTEXT, MV_PROB_COUNT,
+};
+pub use dct_tokens::{
+    decode_block, merge_default_token_probs, BlockType, CoeffProbs, DctToken, DctTokenError,
+    COEFF_BANDS, DEFAULT_COEFF_PROBS,
 };
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,

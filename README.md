@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 11)
+## Status — 2026-05-24 (round 13)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -509,26 +509,72 @@ defaulting to 127; a full mixed-mode MB end-to-end (skip-vs-run
 invariance + residue lift); and chroma using the 8×8 mode
 independent of luma. Total: 159 tests across nine modules.
 
+**Round 13 (2026-05-24).** Adds the per-frame keyframe raster
+walker — the layer above the round-11 / round-12 per-MB
+orchestrators (`src/frame.rs`).
+
+* `decode_keyframe(mb_cols, mb_rows, modes, coeffs) ->
+  Result<KeyframePlanes, FrameError>` — iterates a key frame's
+  macroblocks in raster-scan order. For each MB it assembles the
+  `MbNeighbors` strips from the already-reconstructed full-frame
+  plane buffers, selects `decode_keyframe_mb_bpred` (when the luma
+  mode is `B_PRED`) or `decode_keyframe_mb_non_bpred` (the four
+  16×16 modes), and writes the reconstructed 16×16 luma + two 8×8
+  chroma blocks into the I420 `KeyframePlanes`.
+* Neighbour assembly follows §12: the bottom row of the MB above
+  (`y_above`), the rightmost column of the MB to the left
+  (`y_left`), the `(-1,-1)` corner (`*_topleft`), and the chroma
+  analogues. Off-frame edges are reported as `None` — **not** a
+  127 / 129 fill — so the §12.2 `DC_PRED` averaging distinguishes
+  genuinely-visible pixels from the out-of-bounds defaults (the
+  top-row average-of-8-left, the left-column average-of-8-above,
+  and the constant 128 top-left case).
+* §12.3 above-right extension: `y_above_right` is the four
+  `(-1,16)..=(-1,19)` pixels (the bottom row of the
+  already-built MB above-and-to-the-right) for interior MBs; for
+  the **rightmost** MB in a non-top row those four are clamped to
+  the `(-1,15)` value (§12.3 page 55, mirroring §20.14's per-row
+  "extend the last row by four pixels"); on the top MB row the
+  field is `None` so the orchestrator fills 127.
+* New surface: `decode_keyframe`, `KeyframePlanes` (Y / U / V
+  `Vec<u8>` + strides + `mb_cols` / `mb_rows`), `MbCoeffs`
+  (pre-dequantized Y2 / 16 Y / 4 U / 4 V), `FrameError`
+  (`EmptyFrame`, `MacroblockCountMismatch`, indexed `Macroblock`).
+* Caller supplies pre-dequantized `MbCoeffs`: the §13.3 per-MB
+  token walk and the §14.1 Y2/chroma dequant scaling are still
+  documented spec gaps, so this round lands the frame-level raster
+  geometry without depending on them.
+
+Ten new unit tests: a 2×2-MB synthetic key frame round-tripping
+through the walker (output matches an independent hand-gathered
+per-MB run); the rightmost-MB above-right `(-1,15)` clamp (with a
+non-flat above row so the clamp is meaningful) plus a B_PRED MB
+consuming it; the non-rightmost MB taking the genuine `(-1,16..20)`
+pixels; the top-row `None` above-right; cross-MB neighbour
+propagation (a V_PRED MB below copying the residue-lifted
+reconstructed row of the MB above); an all-B_PRED 2×2 frame walk;
+plus the `EmptyFrame`, `MacroblockCountMismatch`, and indexed
+`MissingSubblockModes` error paths. Total: 169 tests across ten
+modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
-walk); the per-frame raster walker on top of
-`decode_keyframe_mb_non_bpred` / `decode_keyframe_mb_bpred` that
-assembles the per-MB neighbour strips from the already-reconstructed
-frame buffer (including the `y_above_right` extraction + the
-rightmost-MB `(-1,15)` clamp the `B_PRED` path consumes); the
-per-macroblock §13.3 token walker that aggregates
+walk); the per-macroblock §13.3 token walker that aggregates
 24/25 sub-blocks per MB, maintains the above/left non-zero-block
 predictors across raster order, and honours the `mb_skip_coeff` and
 `B_PRED` / `SPLITMV` exemptions on top of the round-7 `decode_block`
-primitive; the two §14 spec gaps (zig-zag → raster reordering for
-§13 token output, and the §14.1 Y2/chroma dequant scaling that
-defers to `dixie.c` outside the clean-room policy); motion-vector
-component decoding (§17.1) against the updated `MV_CONTEXT`s; the
-§15.1 loop-filter geometry (raster-order edge walk + the §15.1
-page-86 step-2/4 skip rule + the §9.4 / §10 per-macroblock
+primitive (the missing link that would feed `decode_keyframe`
+straight from the bitstream); the two §14 spec gaps (zig-zag →
+raster reordering for §13 token output, and the §14.1 Y2/chroma
+dequant scaling that defers to `dixie.c` outside the clean-room
+policy) that keep `decode_keyframe`'s `MbCoeffs` caller-supplied for
+now; motion-vector component decoding (§17.1) against the updated
+`MV_CONTEXT`s; the §15.1 loop-filter geometry (raster-order edge
+walk over `decode_keyframe`'s plane output + the §15.1 page-86
+step-2/4 skip rule + the §9.4 / §10 per-macroblock
 `loop_filter_level` derivation) that drives the round-9 §15.2 /
 §15.3 / §15.4 per-segment kernels; the encoder. All top-level entry
 points (`decode_vp8`, `encode_vp8_keyframe`) still return

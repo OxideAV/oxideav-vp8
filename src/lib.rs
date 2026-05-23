@@ -81,15 +81,31 @@
 //!   applies the §12.3 right-edge above-right fixup for sub-blocks
 //!   7 / 11 / 15, omits the Y2 WHT seeding (a `B_PRED` MB has no Y2
 //!   block), and reconstructs the chroma planes with the same 8×8
-//!   §12.2 path. The per-frame raster walker is still pending. See
-//!   [`reconstruct`].
+//!   §12.2 path. See [`reconstruct`].
+//! * VP8 per-frame keyframe raster walker (RFC 6386 §12 / §14.2) —
+//!   [`decode_keyframe`] iterates a key frame's macroblocks in
+//!   raster-scan order, assembling each MB's [`reconstruct::MbNeighbors`]
+//!   strips from the already-reconstructed full-frame plane buffers (the
+//!   bottom row of the MB above, the rightmost column of the MB to the
+//!   left, the corner pixel, and — for `B_PRED` — the four §12.3
+//!   above-and-to-the-right pixels with the rightmost-MB `(-1,15)`
+//!   clamp), selecting the non-`B_PRED` vs `B_PRED` orchestrator per the
+//!   MB's decoded luma mode, and writing reconstructed pixels into the
+//!   [`frame::KeyframePlanes`] I420 buffers. Off-frame edges are reported
+//!   as `None` so the §12.2 `DC_PRED` averaging distinguishes genuine
+//!   pixels from 127 / 129 fills. Consumes caller-supplied
+//!   [`frame::MbCoeffs`] (pre-dequantized) because the §13.3 per-MB token
+//!   walk and §14.1 Y2 / chroma dequant scaling remain documented spec
+//!   gaps. See [`frame`].
 //!
 //! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
 //! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
-//! prediction), the per-frame raster walker (including the §15.1
-//! loop-filter geometry that drives the [`loop_filter`] segment
-//! kernels), and the encoder are all still scaffolded — the top-level
-//! `decode_vp8` / `encode_vp8_*` entry points return
+//! prediction), the §15.1 loop-filter geometry that drives the
+//! [`loop_filter`] segment kernels (a post-reconstruction pass on top of
+//! [`decode_keyframe`]'s plane output), the §13.3 per-MB token walk /
+//! §14.1 dequant scaling that would feed [`decode_keyframe`] straight
+//! from the bitstream, and the encoder are all still scaffolded — the
+//! top-level `decode_vp8` / `encode_vp8_*` entry points return
 //! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
@@ -97,6 +113,7 @@
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;
+pub mod frame;
 pub mod frame_header;
 pub mod intra_predict;
 pub mod inverse_transform;
@@ -113,6 +130,7 @@ pub use dct_tokens::{
     decode_block, merge_default_token_probs, BlockType, CoeffProbs, DctToken, DctTokenError,
     COEFF_BANDS, DEFAULT_COEFF_PROBS,
 };
+pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
     KEY_FRAME_START_CODE,

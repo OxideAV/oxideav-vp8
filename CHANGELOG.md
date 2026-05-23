@@ -6,6 +6,28 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§12 / §14.2 per-frame keyframe raster walker** — new
+  `decode_keyframe(mb_cols, mb_rows, modes, coeffs) ->
+  Result<KeyframePlanes, FrameError>` in `src/frame.rs`, the layer above
+  the per-MB orchestrators. Iterates a key frame's macroblocks in
+  raster-scan order; for each MB it assembles the `MbNeighbors` strips
+  from the already-reconstructed full-frame plane buffers (the bottom row
+  of the MB above, the rightmost column of the MB to the left, the
+  top-left corner pixel, and — for `B_PRED` — the four §12.3
+  above-and-to-the-right pixels), selects `decode_keyframe_mb_bpred` vs
+  `decode_keyframe_mb_non_bpred` per the MB's decoded luma mode, and
+  writes the reconstructed 16×16 luma + two 8×8 chroma blocks into the
+  I420 `KeyframePlanes`. Off-frame edges are reported as `None` (not a
+  127 / 129 fill) so the §12.2 `DC_PRED` averaging distinguishes genuine
+  visible pixels from the out-of-bounds defaults. The §12.3 above-right
+  extension applies the rightmost-macroblock `(-1,15)` clamp (and is left
+  `None` on the top MB row, where the orchestrator fills 127). New
+  surface: `decode_keyframe`, `KeyframePlanes`, `MbCoeffs`, `FrameError`.
+  Consumes caller-supplied pre-dequantized `MbCoeffs` because the §13.3
+  per-MB token walk and §14.1 Y2/chroma dequant scaling remain documented
+  spec gaps. Adds 10 tests (2×2 round-trip through the walker; rightmost-MB
+  above-right clamp; non-rightmost genuine above-right; top-row `None`;
+  cross-MB neighbour propagation; B_PRED frame walk; error paths).
 * **§11.3 / §12.3 `B_PRED` macroblock reconstruction** — new
   `decode_keyframe_mb_bpred(subblock_modes, uv_mode, mb_skip_coeff,
   neighbors, y_coeffs_dequant, u_coeffs_dequant, v_coeffs_dequant)

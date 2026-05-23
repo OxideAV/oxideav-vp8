@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-23 (round 8)
+## Status — 2026-05-24 (round 9)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -316,6 +316,54 @@ implement `prevCoeffWasZero = (token == DCT_0)`. The
 `prev_token_skips_eob_branch` test proves the round-trip works
 either way the encoder writes it. Recommend an RFC 6386 erratum.
 
+**Round 9 (2026-05-24).** Adds the loop-filter per-segment kernels of
+RFC 6386 §15 in a new `src/loop_filter.rs`, all operating on a
+caller-supplied contiguous pixel window (the spec's "segment" — the
+2/4/6/8 pixels symmetrically straddling one edge), so the routines are
+agnostic to horizontal-vs-vertical edge orientation just as the RFC's
+reference routines are:
+
+  * §15.2 helpers — `clamp_s8` (the spec's `c`), `u2s` / `s2u`, and
+    `common_adjust`, the shared core edge adjustment (4-tap with outer
+    taps, or 2-tap without), returning the signed `a` the subblock
+    filter consumes;
+  * §15.2 `simple_segment` — the simple luma-only filter gated by the
+    `abs(p0-q0)*2 + abs(p1-q1)/2 <= edge_limit` metric;
+  * §15.3 normal filter — the `filter_yes` enable test, the `hev`
+    high-edge-variance test, `subblock_filter` (inter-subblock variant,
+    with the low-variance half-magnitude inner-pixel adjustment), and
+    `mb_filter` (the wider inter-macroblock `MBfilter` touching six
+    pixels with 3/7, 2/7, 1/7 decaying magnitude, falling back to
+    `common_adjust` under high variance);
+  * §15.4 `LoopFilterParams::derive` — computes `interior_limit`,
+    `hev_threshold`, `mbedge_limit`, and `sub_bedge_limit` from a
+    resolved per-macroblock `loop_filter_level`, the frame
+    `sharpness_level`, and the key-frame flag (the key-frame vs.
+    interframe `hev_threshold` ladders, the sharpness shift+cap on
+    `interior_limit`, and the two edge-limit formulas).
+
+The round stays per-segment and primitive. The §15.1 macroblock-by-
+macroblock filter *geometry* (the raster-order walk gathering the 16
+luma / 8 chroma segments straddling each of the four edges per MB, the
+ordered four filtering steps, and the §15.1 page-86 skip rule) and the
+§9.4 / §10 derivation of the per-macroblock `loop_filter_level` itself
+(segment override + reference-frame / prediction-mode deltas) are
+explicitly **not** in scope — they belong to the per-macroblock
+reconstruction walk (the integration round), which calls these kernels.
+
+Twenty-three new unit tests: §15.2 clamp saturation, the `u2s` / `s2u`
+round trip over all 256 pixel values + known points + out-of-range
+clamps; §15.4 interior-limit derivation under no / low / high sharpness
+(including the cap and the floor-to-1), both `hev_threshold` ladders at
+every boundary, and the edge-limit formulas (including the max-level
+fit); §15.2 simple-filter skip-vs-adjust plus two hand-derived
+`common_adjust` cases (with and without outer taps, re-deriving the
+spec arithmetic inline); §15.3 subblock / MB filter skip, low-hev
+(inner-pixel adjustment), and high-hev (fall-back) branches, a fully
+hand-derived `mb_filter` low-variance case asserting all eight output
+pixels, and a base-offset test proving the kernels leave the
+surrounding buffer untouched. Total: 127 tests across seven modules.
+
 ### Not yet landed
 
 Interframe macroblock prediction records (§16) including
@@ -335,8 +383,11 @@ primitive; the §14.2 macroblock-level transform orchestration
 per-block transforms into reconstruction, plus the two §14 spec
 gaps (zig-zag → raster reordering, Y2/chroma dequant scaling);
 motion-vector decoding (§17) against the updated `MV_CONTEXT`s;
-the loop filter (§15); the encoder. All top-level entry points
-(`decode_vp8`, `encode_vp8_keyframe`) still return
+the §15.1 loop-filter geometry (raster-order edge walk + the
+§15.1 page-86 step-2/4 skip rule + the §9.4 / §10 per-macroblock
+`loop_filter_level` derivation) that drives the round-9 §15.2 /
+§15.3 / §15.4 per-segment kernels; the encoder. All top-level
+entry points (`decode_vp8`, `encode_vp8_keyframe`) still return
 `Error::NotImplemented`.
 
 ## Clean-room sources

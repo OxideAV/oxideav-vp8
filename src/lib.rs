@@ -49,9 +49,17 @@
 //!   the Y2/chroma dequant scaling and the zig-zag→raster reordering
 //!   are documented spec gaps left to the integration round. See
 //!   [`inverse_transform`].
+//! * VP8 loop filter per-segment primitives (RFC 6386 §15) — the §15.2
+//!   simple filter, the §15.3 normal subblock / macroblock filters, and
+//!   the §15.4 control-parameter derivation
+//!   ([`LoopFilterParams::derive`]). Pure per-edge-segment kernels
+//!   operating on a caller-supplied pixel window; the §15.1
+//!   raster-order edge geometry is the integration round's job. See
+//!   [`loop_filter`].
 //!
-//! Motion-vector decoding (§17), the loop filter (§15), the
-//! per-macroblock reconstruction walk, and the encoder are all still
+//! Motion-vector decoding (§17), the per-macroblock reconstruction walk
+//! (including the §15.1 loop-filter geometry that drives the
+//! [`loop_filter`] segment kernels), and the encoder are all still
 //! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
 //! points return [`Error::NotImplemented`].
 
@@ -63,6 +71,7 @@ pub mod dct_tokens;
 pub mod frame_header;
 pub mod intra_predict;
 pub mod inverse_transform;
+pub mod loop_filter;
 pub mod macroblock;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
@@ -87,6 +96,9 @@ pub use inverse_transform::{
     add_residue, add_residue_4x4, clamp255, clamp_qindex, dequant_block, inverse_dct_4x4,
     inverse_wht_4x4, inverse_wht_4x4_dc_only, Y1DequantFactors, AC_QLOOKUP, DC_QLOOKUP,
     QINDEX_RANGE,
+};
+pub use loop_filter::{
+    clamp_s8, common_adjust, mb_filter, s2u, simple_segment, subblock_filter, u2s, LoopFilterParams,
 };
 pub use macroblock::{
     parse_key_frame_macroblock_modes, IntraBmode, IntraUvMode, IntraYMode, MacroblockError,

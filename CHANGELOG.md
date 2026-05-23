@@ -6,6 +6,46 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Loop-filter per-segment kernels** per RFC 6386 §15 (new module
+  `src/loop_filter.rs`). Each routine operates on a caller-supplied
+  contiguous pixel window (the spec's "segment" symmetrically
+  straddling one edge), so all routines are agnostic to
+  horizontal-vs-vertical edge orientation. Surface:
+  - §15.2 helpers `clamp_s8` (the spec's `c`), `u2s`, `s2u`, and
+    `common_adjust` (the shared core adjustment; 4-tap with outer taps
+    or 2-tap without; returns the signed `a` the subblock filter uses).
+  - §15.2 `simple_segment` — the simple luma-only filter gated by the
+    `abs(p0-q0)*2 + abs(p1-q1)/2 <= edge_limit` metric.
+  - §15.3 `subblock_filter` — the normal inter-subblock filter
+    (`filter_yes` enable test, `hev` high-edge-variance test, and the
+    low-variance half-magnitude inner-pixel adjustment).
+  - §15.3 `mb_filter` — the wider inter-macroblock `MBfilter` (six
+    pixels adjusted with 3/7, 2/7, 1/7 decaying magnitude under low
+    variance; `common_adjust` fall-back under high variance).
+  - §15.4 `LoopFilterParams::derive` — computes `interior_limit`,
+    `hev_threshold`, `mbedge_limit`, and `sub_bedge_limit` from a
+    resolved per-macroblock `loop_filter_level`, the frame
+    `sharpness_level`, and the key-frame flag (both `hev_threshold`
+    ladders, the sharpness shift+cap on `interior_limit`, the two
+    edge-limit formulas).
+* Twenty-three new unit tests covering: §15.2 clamp saturation; `u2s` /
+  `s2u` round trip over all 256 pixel values + known points +
+  out-of-range clamps; §15.4 interior-limit derivation under no / low /
+  high sharpness (cap + floor-to-1), both `hev_threshold` ladders at
+  every boundary, and the edge-limit formulas (including the max-level
+  fit); §15.2 simple-filter skip-vs-adjust plus two hand-derived
+  `common_adjust` cases (with / without outer taps, re-deriving the
+  spec arithmetic inline); §15.3 subblock / MB filter skip, low-hev
+  inner-pixel adjustment, and high-hev fall-back branches; a fully
+  hand-derived `mb_filter` low-variance case asserting all eight output
+  pixels; and a base-offset test proving the kernels leave the
+  surrounding buffer untouched.
+* The §15.1 macroblock-by-macroblock filter geometry (raster-order edge
+  walk + the §15.1 page-86 step-2/4 skip rule) and the §9.4 / §10
+  per-macroblock `loop_filter_level` derivation are out of scope for
+  this round; they belong to the per-macroblock reconstruction walk and
+  call these kernels.
+
 * **Dequantization and inverse transforms** per RFC 6386 §14 (new
   module `src/inverse_transform.rs`). All primitives operate on
   caller-supplied 4×4 arrays in raster (natural) order. Surface:

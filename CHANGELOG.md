@@ -6,6 +6,59 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Interframe intra-predicted macroblock mode decoding** per RFC 6386
+  §16.1 (extends `src/macroblock.rs`). The §16.1 layer is
+  structurally analogous to the §11 key-frame layer but uses different
+  trees and probability tables. New surface:
+  - `IF_YMODE_PROB_DEFAULTS = [112, 86, 140, 37]`,
+    `IF_UV_MODE_PROB_DEFAULTS = [162, 101, 204]` and
+    `IF_BMODE_PROB = [120, 90, 79, 133, 87, 85, 80, 111, 151]` — the
+    three default probability tables (the first two are dynamic and may
+    be overridden per frame; the bmode table is fixed and shared by
+    every sub-block, with **no** above/left context — that's a
+    key-frame-only behaviour).
+  - `InterFrameIntraProbs::for_frame_header(previous, header)` — the
+    resolved per-frame Y/UV probability state. On a key frame, both
+    dynamic tables reset to the §16.1 defaults per the section's last
+    paragraph; on an interframe, the resolved state is the previous
+    state with the §9.10 F-gated `intra_y_mode_prob_update` /
+    `intra_uv_mode_prob_update` overlays applied wholesale (or
+    carried forward unchanged when the override block is absent).
+  - `parse_inter_frame_intra_macroblock_modes(dec, probs, segment_id,
+    mb_skip_coeff)` — decode one §16.1 intra MB: the Y mode
+    (`ymode_tree` against `probs.y_mode_prob`), the sixteen sub-block
+    modes when Y is `B_PRED` (`bmode_tree` against the fixed
+    `IF_BMODE_PROB`), and the UV mode (`uv_mode_tree` against
+    `probs.uv_mode_prob`). The optional `segment_id` and
+    `mb_skip_coeff` precede the intra-vs-inter discriminator on
+    interframes and are read before this entry point; they pass
+    through to the returned `MacroblockModes` unchanged.
+* The internal §16.1 `IF_YMODE_TREE` is the eight-entry
+  `[-DC_PRED, 2, 4, 6, -V_PRED, -H_PRED, -TM_PRED, -B_PRED]` listing.
+  Its first slot disagrees with `KF_YMODE_TREE` — that's the §16.1
+  characterisation: the root left-leaf encodes `DC_PRED` ("0") rather
+  than the key-frame's `B_PRED` ("0"). The leaves at the second level
+  also differ in ordering.
+* Twelve new unit tests covering: spec-listing transcription of the
+  three §16.1 default tables; the `IF_YMODE_TREE` shape (matching the
+  spec literal listing and explicitly distinct from `KF_YMODE_TREE`'s
+  root); round-trip of all five Y modes through `IF_YMODE_TREE`; all
+  four UV modes through the shared `UV_MODE_TREE` with the §16.1
+  defaults; all ten sub-block modes through the shared `BMODE_TREE`
+  with the fixed `IF_BMODE_PROB`; a non-`B_PRED` MB round-trip with
+  the optional pass-through fields elided; a `B_PRED` MB round-trip
+  with a sixteen-entry mixed sub-block pattern that exercises every
+  `IntraBmode` plus the optional `segment_id` / `mb_skip_coeff`
+  pass-through; the key-frame reset rule of
+  `InterFrameIntraProbs::for_frame_header`; the interframe
+  carry-forward when no override block is present; the wholesale
+  Y+UV overlay when both are present; the mixed Y-only overlay; and
+  the `Default` impl matching `defaults()`.
+* The inter-predicted §16.2 / §16.3 / §16.4 branch (`mv_ref` tree,
+  near/nearest/best census, motion-vector clamping, split-prediction
+  sub-block walk) and the §17 motion-vector component decoding remain
+  out of scope for this round.
+
 * **Loop-filter per-segment kernels** per RFC 6386 §15 (new module
   `src/loop_filter.rs`). Each routine operates on a caller-supplied
   contiguous pixel window (the spec's "segment" symmetrically

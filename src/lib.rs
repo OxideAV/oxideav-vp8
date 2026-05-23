@@ -56,12 +56,25 @@
 //!   operating on a caller-supplied pixel window; the §15.1
 //!   raster-order edge geometry is the integration round's job. See
 //!   [`loop_filter`].
+//! * VP8 interframe intra-predicted macroblock mode decoding (RFC 6386
+//!   §16.1) — the dynamic `ymode_prob` / `uv_mode_prob` resolution
+//!   ([`InterFrameIntraProbs::for_frame_header`]) including the §16.1
+//!   last-paragraph reset on key frames and the §9.10 per-frame
+//!   overlay, plus the `ymode_tree` / context-free `bmode_prob` /
+//!   `uv_mode_tree` walks
+//!   ([`parse_inter_frame_intra_macroblock_modes`]). Returns a
+//!   [`MacroblockModes`] for one intra-predicted MB on an interframe;
+//!   the caller forwards the `segment_id` and `mb_skip_coeff` already
+//!   read before the intra-vs-inter discriminator. See
+//!   [`macroblock`].
 //!
-//! Motion-vector decoding (§17), the per-macroblock reconstruction walk
-//! (including the §15.1 loop-filter geometry that drives the
-//! [`loop_filter`] segment kernels), and the encoder are all still
-//! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
-//! points return [`Error::NotImplemented`].
+//! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
+//! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
+//! prediction), the per-macroblock reconstruction walk (including the
+//! §15.1 loop-filter geometry that drives the [`loop_filter`] segment
+//! kernels), and the encoder are all still scaffolded — the top-level
+//! `decode_vp8` / `encode_vp8_*` entry points return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -101,8 +114,9 @@ pub use loop_filter::{
     clamp_s8, common_adjust, mb_filter, s2u, simple_segment, subblock_filter, u2s, LoopFilterParams,
 };
 pub use macroblock::{
-    parse_key_frame_macroblock_modes, IntraBmode, IntraUvMode, IntraYMode, MacroblockError,
-    MacroblockModes,
+    parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
+    InterFrameIntraProbs, IntraBmode, IntraUvMode, IntraYMode, MacroblockError, MacroblockModes,
+    IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
 };
 
 #[cfg(feature = "registry")]

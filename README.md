@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 9)
+## Status — 2026-05-24 (round 10)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -364,12 +364,57 @@ hand-derived `mb_filter` low-variance case asserting all eight output
 pixels, and a base-offset test proving the kernels leave the
 surrounding buffer untouched. Total: 127 tests across seven modules.
 
+**Round 10 (2026-05-24).** Adds the interframe intra-predicted
+macroblock-mode layer of RFC 6386 §16.1 (extending
+`src/macroblock.rs`). The §16.1 layout mirrors §11 structurally but
+uses different trees and probability tables:
+
+  * `IF_YMODE_PROB_DEFAULTS = [112, 86, 140, 37]`,
+    `IF_UV_MODE_PROB_DEFAULTS = [162, 101, 204]`, and the fixed
+    `IF_BMODE_PROB = [120, 90, 79, 133, 87, 85, 80, 111, 151]` (a
+    single nine-tuple — no above/left context, unlike the §11.5
+    `[10][10][9]` key-frame table);
+  * `InterFrameIntraProbs::for_frame_header(previous, header)` — the
+    per-frame Y/UV probability state. On a key frame, both dynamic
+    tables reset to the §16.1 defaults per the section's last
+    paragraph; on an interframe, the resolved state is `previous`
+    with the §9.10 F-gated `intra_y_mode_prob_update` /
+    `intra_uv_mode_prob_update` overlays applied wholesale (or
+    carried forward unchanged when the override block is `None`);
+  * `parse_inter_frame_intra_macroblock_modes(dec, probs, segment_id,
+    mb_skip_coeff)` — decode one §16.1 intra MB. Reads the Y mode
+    (`IF_YMODE_TREE` against `probs.y_mode_prob`; the root left-leaf
+    is `DC_PRED`, not `B_PRED` as on key frames), the sixteen
+    sub-block modes when Y is `B_PRED` (shared `BMODE_TREE` against
+    `IF_BMODE_PROB`, every sub-block reads the same nine-tuple), and
+    the UV mode (shared `UV_MODE_TREE` against `probs.uv_mode_prob`).
+    The optional `segment_id` (§10) and `mb_skip_coeff` (§11.1) bits
+    precede the intra-vs-inter discriminator on interframes and are
+    consumed before this entry point — the caller passes them in and
+    they round-trip into the returned `MacroblockModes`.
+
+Twelve new unit tests: spec-listing transcription of all three §16.1
+default tables; the `IF_YMODE_TREE` shape literal match and an
+explicit `IF_YMODE_TREE[0] != KF_YMODE_TREE[0]` divergence check;
+round-trip of all five Y modes through `IF_YMODE_TREE` with the
+default probabilities; all four UV modes through the shared
+`UV_MODE_TREE` with `IF_UV_MODE_PROB_DEFAULTS`; all ten sub-block
+modes through `BMODE_TREE` with `IF_BMODE_PROB`; a non-`B_PRED` MB
+round-trip with elided optional fields; a `B_PRED` MB round-trip
+with a sixteen-entry mixed sub-block pattern that exercises every
+`IntraBmode` plus `segment_id = Some(2)` and `mb_skip_coeff = true`
+pass-through; key-frame reset of the dynamic state; interframe
+carry-forward when no overlay block is present; wholesale Y+UV
+overlay when both are present; mixed Y-only overlay; and the
+`Default` impl matching `defaults()`. Total: 139 tests across seven
+modules.
+
 ### Not yet landed
 
-Interframe macroblock prediction records (§16) including
-`ymode_tree` / `bmode_prob[9]` decoding and the inter-prediction
-mode tree (mv_nearest / mv_near / zero4x4 / new4x4 / split4x4);
-the *integration* layer that turns the §12 kernels + decoded
+The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
+(`mv_ref` tree, near/nearest/best census + the three-neighbour
+weighted score, motion-vector clamping, split-prediction sub-block
+walk); the *integration* layer that turns the §12 kernels + decoded
 modes into reconstructed prediction blocks (i.e. walking the
 already-reconstructed frame buffer to assemble the per-block
 neighbour arrays + computing the §12.3 right-edge subblock-7/11/15
@@ -382,13 +427,13 @@ primitive; the §14.2 macroblock-level transform orchestration
 (Y2 → 16 Y-DC seeding, the 24/25-block walk) wiring the round-8
 per-block transforms into reconstruction, plus the two §14 spec
 gaps (zig-zag → raster reordering, Y2/chroma dequant scaling);
-motion-vector decoding (§17) against the updated `MV_CONTEXT`s;
-the §15.1 loop-filter geometry (raster-order edge walk + the
-§15.1 page-86 step-2/4 skip rule + the §9.4 / §10 per-macroblock
-`loop_filter_level` derivation) that drives the round-9 §15.2 /
-§15.3 / §15.4 per-segment kernels; the encoder. All top-level
-entry points (`decode_vp8`, `encode_vp8_keyframe`) still return
-`Error::NotImplemented`.
+motion-vector component decoding (§17.1) against the updated
+`MV_CONTEXT`s; the §15.1 loop-filter geometry (raster-order edge
+walk + the §15.1 page-86 step-2/4 skip rule + the §9.4 / §10
+per-macroblock `loop_filter_level` derivation) that drives the
+round-9 §15.2 / §15.3 / §15.4 per-segment kernels; the encoder. All
+top-level entry points (`decode_vp8`, `encode_vp8_keyframe`) still
+return `Error::NotImplemented`.
 
 ## Clean-room sources
 

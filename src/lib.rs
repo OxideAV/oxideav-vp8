@@ -39,13 +39,21 @@
 //!   `coeff_tree` walker, the `DCTextra` extra-bits decode, the §13.5
 //!   default token-probability table, and a per-sub-block
 //!   `decode_block` primitive that recovers a `[i16; 16]` of
-//!   quantised coefficients. No IDCT, no dequantisation, no
-//!   per-macroblock walker yet. See [`dct_tokens`].
+//!   quantised coefficients. No per-macroblock walker yet. See
+//!   [`dct_tokens`].
+//! * VP8 dequantization and inverse transforms (RFC 6386 §14) — the
+//!   §14.1 `dc_qlookup` / `ac_qlookup` tables with Y-plane factor
+//!   computation, the §14.3 inverse WHT (general + single-DC fast
+//!   path), the §14.4 inverse DCT, and the §14.5 predictor+residue
+//!   summation with `clamp255`. Per-block raster-order primitives;
+//!   the Y2/chroma dequant scaling and the zig-zag→raster reordering
+//!   are documented spec gaps left to the integration round. See
+//!   [`inverse_transform`].
 //!
-//! Motion-vector decoding (§17), IDCT and inverse-WHT (§14), the loop
-//! filter (§15), and the encoder are all still scaffolded — the
-//! top-level `decode_vp8` / `encode_vp8_*` entry points return
-//! [`Error::NotImplemented`].
+//! Motion-vector decoding (§17), the loop filter (§15), the
+//! per-macroblock reconstruction walk, and the encoder are all still
+//! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
+//! points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -54,6 +62,7 @@ pub mod coded_header;
 pub mod dct_tokens;
 pub mod frame_header;
 pub mod intra_predict;
+pub mod inverse_transform;
 pub mod macroblock;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
@@ -73,6 +82,11 @@ pub use intra_predict::{
     predict_b4x4, predict_uv8x8, predict_uv8x8_dc, predict_uv8x8_h, predict_uv8x8_tm,
     predict_uv8x8_v, predict_y16x16, predict_y16x16_dc, predict_y16x16_h, predict_y16x16_tm,
     predict_y16x16_v, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, DEFAULT_TOPLEFT_DC,
+};
+pub use inverse_transform::{
+    add_residue, add_residue_4x4, clamp255, clamp_qindex, dequant_block, inverse_dct_4x4,
+    inverse_wht_4x4, inverse_wht_4x4_dc_only, Y1DequantFactors, AC_QLOOKUP, DC_QLOOKUP,
+    QINDEX_RANGE,
 };
 pub use macroblock::{
     parse_key_frame_macroblock_modes, IntraBmode, IntraUvMode, IntraYMode, MacroblockError,

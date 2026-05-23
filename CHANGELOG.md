@@ -6,6 +6,61 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Dequantization and inverse transforms** per RFC 6386 §14 (new
+  module `src/inverse_transform.rs`). All primitives operate on
+  caller-supplied 4×4 arrays in raster (natural) order. Surface:
+  - `DC_QLOOKUP[128]` / `AC_QLOOKUP[128]` — the §14.1 page-77 dequant
+    lookup tables, transcribed verbatim and verified byte-for-byte
+    against the RFC. `QINDEX_RANGE = 128`.
+  - `clamp_qindex` — saturates a delta-adjusted 7-bit quantiser index
+    into the `0..=127` table domain.
+  - `Y1DequantFactors::from_indices(yac_qi, ydc_delta)` — the Y1-plane
+    DC/AC factor computation per §14.1 (*"Lookup values ... are
+    directly used in the DC and AC coefficients in Y1"*): DC from
+    `dc_qlookup[clamp(yac_qi + ydc_delta)]`, AC from
+    `ac_qlookup[clamp(yac_qi)]`.
+  - `dequant_block` — multiplies a `[i16; 16]` (DC × dc_factor,
+    AC × ac_factor) in `i32`, stored back as `i16` per §14.1.
+  - `inverse_wht_4x4` — faithful port of §14.3's
+    `vp8_short_inv_walsh4x4_c` (two passes, `(x + 3) >> 3` rounding);
+    `inverse_wht_4x4_dc_only` — the single-non-zero-DC fast path
+    `vp8_short_inv_walsh4x4_1_c`.
+  - `inverse_dct_4x4` — faithful port of §14.4's `short_idct4x4llm_c`
+    with the fixed-point constants `cospi8sqrt2minus1 = 20091` and
+    `sinpi8sqrt2 = 35468`, two passes, `(x + 4) >> 3` rounding.
+  - `add_residue_4x4` / `add_residue` / `clamp255` — the §14.5
+    predictor + residue summation with 32-bit-precision sums saturated
+    to 8-bit via the §14.5 `clamp255`.
+* Eighteen new unit tests covering: dequant-table shape + spec-value
+  spot-checks (verified against the RFC); qindex clamping at both ends;
+  Y1 DC/AC lookup selection including delta over/underflow clamping;
+  per-block DC-vs-AC scaling; `clamp255` boundary behaviour; WHT
+  general-vs-fast-path equivalence over a value sweep; a hand-derived
+  two-value WHT input traced through both passes; DCT zero-input,
+  DC-only flat-block, and DC-rounding cases; a single-AC-coefficient
+  DCT case re-deriving the spec arithmetic inline (proving the cosine
+  constants land in the right lanes and produce a gradient); a full
+  mixed-block DCT re-derivation guarding against a row/column
+  transpose; and §14.5 summation saturation at both clamp ends, the
+  slice-vs-4×4 form agreement, and the zero-residue identity.
+
+### Spec gaps surfaced
+
+* **§14.1 page 77 Y2 / chroma dequant scaling.** The RFC gives the raw
+  `dc_qlookup` / `ac_qlookup` tables and says Y1 uses them directly,
+  but the Y2-DC, Y2-AC, chroma-DC, and chroma-AC factors *"undergo
+  either scaling or clamping before the multiplies. Details ... can be
+  found in related lookup functions in dixie.c (Section 20.4)."* Those
+  rules are not in the RFC body and `dixie.c` is off-limits reference
+  source, so the four non-Y1 factors are not computed in this round.
+  Recommend a clean-room note giving the Y2/chroma scaling/clamping.
+* **§13 page 60 zig-zag scan order.** §13 names the coefficient
+  ordering "zig-zag" but the 16-entry scan-to-raster permutation
+  appears only in the reference `idct_add.c` (Section 20.8). The §14
+  transforms here operate in raster order; the integration round must
+  supply the reordering. Recommend a clean-room note with the
+  permutation array.
+
 * **DCT-coefficient token decoding** per RFC 6386 §13 (new module
   `src/dct_tokens.rs`). Walks the §13.2 `coeff_tree` against the
   `coeff_probs[4][8][3][11]` table populated by round 3's

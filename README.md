@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-22 (round 7)
+## Status — 2026-05-23 (round 8)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -237,6 +237,71 @@ defaults, a `prev_token_skips_eob_branch` test that exercises the
 emits no EOB, and the cat6 maximum 2114 value with 11-bit
 `DCTextra` exercised.
 
+**Round 8 (2026-05-23).** Adds the dequantization tables and the
+inverse transforms of RFC 6386 §14 in a new
+`src/inverse_transform.rs`, all operating on caller-supplied 4×4
+arrays in raster (natural) order:
+
+  * `DC_QLOOKUP[128]` / `AC_QLOOKUP[128]` — the two §14.1 page-77
+    dequant lookup tables, transcribed verbatim (verified
+    byte-for-byte against the RFC). `QINDEX_RANGE = 128` and
+    `clamp_qindex` saturate a delta-adjusted 7-bit index into the
+    table domain.
+  * `Y1DequantFactors::from_indices(yac_qi, ydc_delta)` — the Y1-plane
+    factor computation per §14.1's *"Lookup values from the above two
+    tables are directly used in the DC and AC coefficients in Y1"*:
+    DC = `dc_qlookup[clamp(yac_qi + ydc_delta)]`, AC =
+    `ac_qlookup[clamp(yac_qi)]`. `dequant_block` multiplies a 4×4 of
+    coefficients (DC × dc_factor, AC × ac_factor) in `i32` and stores
+    back as `i16`.
+  * `inverse_wht_4x4` — a faithful port of §14.3's
+    `vp8_short_inv_walsh4x4_c` (two passes, `(x + 3) >> 3` rounding),
+    plus `inverse_wht_4x4_dc_only` for the single-non-zero-DC fast
+    path `vp8_short_inv_walsh4x4_1_c`.
+  * `inverse_dct_4x4` — a faithful port of §14.4's `short_idct4x4llm_c`
+    using the two 16-bit fixed-point constants `cospi8sqrt2minus1 =
+    20091` and `sinpi8sqrt2 = 35468`, two passes of the On2 4-point
+    1-D inverse DCT, `(x + 4) >> 3` second-pass rounding.
+  * `add_residue_4x4` / `add_residue` / `clamp255` — the §14.5
+    predictor + residue summation, each pixel computed at 32-bit
+    precision and saturated to 8-bit via the §14.5 `clamp255`.
+
+Eighteen new unit tests: table shape + spec-value spot-checks (verified
+against the RFC), qindex clamping at both ends, Y1 DC/AC factor lookup
+selection, per-block DC/AC scaling, `clamp255` boundary behaviour, the
+WHT general-vs-fast-path equivalence over a value sweep, a hand-derived
+two-value WHT input traced through both passes, the DCT DC-only
+flat-block and rounding cases, a single-AC-coefficient DCT case
+re-deriving the spec arithmetic inline (proving the cosine constants
+land in the right lanes and produce a gradient, not a flat block), a
+full mixed-block DCT re-derivation guarding against a row/column
+transpose, and the §14.5 summation saturation at both clamp ends.
+Total: 104 tests across six modules.
+
+This round stays per-block and raster-order. The §14.2 macroblock
+orchestration (Y2 → 16 Y-DC seeding, the 24/25-block walk), the
+zig-zag → raster coefficient reordering, and the Y2/chroma dequant
+scaling are all explicitly **not** in scope — see the two §14 spec
+gaps below.
+
+### Spec gaps surfaced (round 8)
+
+**§14.1 page 77 — Y2 / chroma dequant scaling.** The RFC gives the raw
+`dc_qlookup` / `ac_qlookup` tables and states Y1 uses them directly, but
+the Y2-DC, Y2-AC, chroma-DC, and chroma-AC factors *"undergo either
+scaling or clamping before the multiplies. Details ... can be found in
+related lookup functions in dixie.c (Section 20.4)."* Those rules are not
+in the RFC body and `dixie.c` is reference source (off-limits under the
+clean-room policy), so the four non-Y1 factors are not computed in this
+round. Recommend a clean-room note giving the Y2/chroma scaling and
+clamping rules so the integration round can compute all six factors.
+
+**§13 page 60 — zig-zag scan order.** §13 names the coefficient ordering
+"zig-zag" but the 16-entry scan-to-raster permutation array appears only
+in the reference `idct_add.c` (Section 20.8). The §14 transforms here
+operate in raster order; the per-MB integration round must supply the
+reordering. Recommend a clean-room note giving the permutation.
+
 ### Spec gap surfaced
 
 **§13.3 page 67 pseudocode.** The token loop ends with the literal
@@ -265,10 +330,14 @@ per-macroblock §13.3 walker that aggregates 24/25 sub-blocks per
 MB, maintains the above/left non-zero-block predictors across
 raster order, and honours the `mb_skip_coeff` and `B_PRED` /
 `SPLITMV` exemptions on top of the round-7 `decode_block`
-primitive; motion-vector decoding (§17) against the updated
-`MV_CONTEXT`s; IDCT and inverse-WHT (§14); the loop filter (§15);
-the encoder. All top-level entry points (`decode_vp8`,
-`encode_vp8_keyframe`) still return `Error::NotImplemented`.
+primitive; the §14.2 macroblock-level transform orchestration
+(Y2 → 16 Y-DC seeding, the 24/25-block walk) wiring the round-8
+per-block transforms into reconstruction, plus the two §14 spec
+gaps (zig-zag → raster reordering, Y2/chroma dequant scaling);
+motion-vector decoding (§17) against the updated `MV_CONTEXT`s;
+the loop filter (§15); the encoder. All top-level entry points
+(`decode_vp8`, `encode_vp8_keyframe`) still return
+`Error::NotImplemented`.
 
 ## Clean-room sources
 

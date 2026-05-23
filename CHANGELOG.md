@@ -6,6 +6,45 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§11.3 / §12.3 `B_PRED` macroblock reconstruction** — new
+  `decode_keyframe_mb_bpred(subblock_modes, uv_mode, mb_skip_coeff,
+  neighbors, y_coeffs_dequant, u_coeffs_dequant, v_coeffs_dequant)
+  -> Result<ReconstructedMb, ReconstructError>` in `src/reconstruct.rs`,
+  the companion to the 16×16-mode orchestrator. Drives the sixteen
+  4×4 luma sub-blocks of a `B_PRED` macroblock with the §12.3
+  per-sub-block neighbour evolution: each sub-block is predicted with
+  `predict_b4x4` (one of the ten `B_DC_PRED` … `B_HU_PRED` sub-modes),
+  inverse-DCT'd and residue-added **in place** before the next
+  sub-block in raster order reads it — so a sub-block's `above` /
+  `left` / top-left `P` neighbours are the already-reconstructed
+  pixels, exactly as §20.14's reference `b_pred()` loop does. The
+  working luma buffer carries a one-pixel top-border row + left-border
+  column + a four-pixel above-right extension; the §12.3 right-edge
+  "above-right" fixup copies sub-block 3's `(-1,16)..=(-1,19)` pixels
+  down into the border slots above sub-blocks 7 / 11 / 15 (the
+  reference `copy_down`). A `B_PRED` macroblock has no Y2 block, so —
+  per §13 / §14.2 — no inverse-WHT seeding is applied; the 0th
+  coefficient of each Y sub-block is taken verbatim from its own
+  residue. Chroma uses the ordinary 8×8 §12.2 path. The §12.3
+  `B_HD_PRED` `svg2p(E+1)` erratum (task #957) is handled in the
+  pre-existing `predict_b4x4` kernel (read as `avg2p`). New surface:
+  - `MbNeighbors::y_above_right: Option<[u8; 4]>` — the four
+    above-and-to-the-right luma pixels the right-edge sub-blocks share
+    (`None` on the top MB row → 127; the caller applies the
+    rightmost-MB `(-1,15)` clamp).
+  - `ReconstructError::MissingSubblockModes` — surfaced when the
+    `B_PRED` entry is called without the sixteen 4×4 sub-block modes.
+
+  Ten new unit tests: missing-modes error; top-left-corner DC settling
+  to 128; per-sub-mode (all ten) skip-MB match against the standalone
+  `predict_b4x4` kernel for sub-block (0,0); left- and above-neighbour
+  evolution (sub-block (0,1)/(1,0) responding to sub-block (0,0)'s
+  residue); the right-edge above-right fixup propagating into
+  sub-blocks 3 / 7 / 15; top-row above-right defaulting to 127;
+  a full mixed-mode MB end-to-end (skip-vs-run invariance + residue
+  lift); and chroma using the 8×8 mode independent of luma. Total:
+  159 tests across nine modules (up from 149).
+
 * **§14.2 per-macroblock reconstruction orchestration** — new
   `src/reconstruct.rs` module. Ties the previously-isolated transform
   / prediction / summation primitives together for one macroblock

@@ -73,18 +73,24 @@
 //!   §12 intra-prediction kernels and the §14.5 predictor+residue
 //!   summation to produce reconstructed Y / U / V pixels for one
 //!   macroblock whose 16×16 luma mode is one of the four non-`B_PRED`
-//!   modes. Honours the §11.1 `mb_skip_coeff` short-circuit. The
-//!   `B_PRED` MB path (which needs per-sub-block intra-neighbour
-//!   evolution) and the per-frame raster walker are still pending.
-//!   See [`reconstruct`].
+//!   modes. Honours the §11.1 `mb_skip_coeff` short-circuit.
+//!   [`decode_keyframe_mb_bpred`] is the companion §11.3 / §12.3
+//!   `B_PRED` orchestrator: it drives the sixteen 4×4 luma sub-blocks
+//!   with per-sub-block neighbour evolution (each sub-block's
+//!   reconstructed pixels become the next sub-block's `above` / `left`),
+//!   applies the §12.3 right-edge above-right fixup for sub-blocks
+//!   7 / 11 / 15, omits the Y2 WHT seeding (a `B_PRED` MB has no Y2
+//!   block), and reconstructs the chroma planes with the same 8×8
+//!   §12.2 path. The per-frame raster walker is still pending. See
+//!   [`reconstruct`].
 //!
 //! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
 //! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
-//! prediction), the `B_PRED` per-sub-block intra walker, the per-frame
-//! raster walker (including the §15.1 loop-filter geometry that drives
-//! the [`loop_filter`] segment kernels), and the encoder are all still
-//! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
-//! points return [`Error::NotImplemented`].
+//! prediction), the per-frame raster walker (including the §15.1
+//! loop-filter geometry that drives the [`loop_filter`] segment
+//! kernels), and the encoder are all still scaffolded — the top-level
+//! `decode_vp8` / `encode_vp8_*` entry points return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -130,7 +136,8 @@ pub use macroblock::{
     IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
 };
 pub use reconstruct::{
-    decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError, ReconstructedMb,
+    decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
+    ReconstructedMb,
 };
 
 #[cfg(feature = "registry")]

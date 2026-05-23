@@ -470,18 +470,56 @@ helper round-trip test guarding the `extract_4x4` / `insert_4x4`
 plane-stride math against off-by-one. Total: 150 tests across
 eight modules.
 
+**Round 12 (2026-05-24).** Adds the §11.3 / §12.3 `B_PRED`
+macroblock reconstruction orchestrator — the per-sub-block intra
+walker the round-11 16×16 path deferred (`src/reconstruct.rs`).
+
+* `decode_keyframe_mb_bpred(subblock_modes, uv_mode, mb_skip_coeff,
+  neighbors, y_coeffs_dequant, u_coeffs_dequant, v_coeffs_dequant)
+  -> Result<ReconstructedMb, ReconstructError>` — drives the sixteen
+  4×4 luma sub-blocks in raster order, interleaving predict →
+  inverse-DCT → add-residue **per sub-block** so each sub-block's
+  reconstructed pixels become the next sub-block's `above` / `left` /
+  top-left `P` neighbours (the §12.3 neighbour evolution; mirrors
+  §20.14's in-place `b_pred()` loop). Each sub-block selects one of
+  the ten `B_DC_PRED` … `B_HU_PRED` kernels in `predict_b4x4`.
+* §12.3 right-edge "above-right" fixup: the working luma buffer
+  carries a top-border row + left-border column + a four-pixel
+  above-right extension; sub-block 3's `(-1,16)..=(-1,19)` pixels are
+  copied down into the border slots above sub-blocks 7 / 11 / 15
+  (`copy_down`). On the top MB row those four pixels are 127; the
+  caller supplies the rightmost-MB `(-1,15)` clamp.
+* No Y2 / inverse-WHT seeding — a `B_PRED` MB has no Y2 block (§13 /
+  §14.2); each Y sub-block's 0th coefficient comes from its own
+  residue. Chroma uses the ordinary 8×8 §12.2 path. The §12.3
+  `B_HD_PRED` `svg2p(E+1)` erratum (task #957) is handled in the
+  pre-existing `predict_b4x4` kernel (read as `avg2p`).
+* `MbNeighbors::y_above_right: Option<[u8; 4]>` — the four
+  above-right luma pixels (`None` on the top MB row → 127).
+* `ReconstructError::MissingSubblockModes` — for a `B_PRED` call
+  whose sixteen-mode record is absent.
+
+Ten new unit tests: missing-modes error; top-left-corner DC
+settling to a uniform 128; per-sub-mode (all ten) skip-MB match
+against the standalone `predict_b4x4` kernel for sub-block (0,0);
+left- and above-neighbour evolution (sub-blocks (0,1) / (1,0)
+responding to sub-block (0,0)'s residue); the right-edge above-right
+fixup propagating into sub-blocks 3 / 7 / 15; top-row above-right
+defaulting to 127; a full mixed-mode MB end-to-end (skip-vs-run
+invariance + residue lift); and chroma using the 8×8 mode
+independent of luma. Total: 159 tests across nine modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
-walk); the `B_PRED` per-sub-block intra walker (which reuses each
-sub-block's own reconstructed pixels as the next sub-block's
-`above` / `left` and applies the §12.3 right-edge subblock-7/11/15
-extra-pixel fixup against the rightmost macroblock); the per-frame
-raster walker on top of `decode_keyframe_mb_non_bpred` that
+walk); the per-frame raster walker on top of
+`decode_keyframe_mb_non_bpred` / `decode_keyframe_mb_bpred` that
 assembles the per-MB neighbour strips from the already-reconstructed
-frame buffer; the per-macroblock §13.3 token walker that aggregates
+frame buffer (including the `y_above_right` extraction + the
+rightmost-MB `(-1,15)` clamp the `B_PRED` path consumes); the
+per-macroblock §13.3 token walker that aggregates
 24/25 sub-blocks per MB, maintains the above/left non-zero-block
 predictors across raster order, and honours the `mb_skip_coeff` and
 `B_PRED` / `SPLITMV` exemptions on top of the round-7 `decode_block`

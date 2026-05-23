@@ -67,14 +67,24 @@
 //!   the caller forwards the `segment_id` and `mb_skip_coeff` already
 //!   read before the intra-vs-inter discriminator. See
 //!   [`macroblock`].
+//! * VP8 §14.2 per-macroblock reconstruction orchestration —
+//!   [`decode_keyframe_mb_non_bpred`] ties together token-decoded
+//!   coefficients, the §14.3 inverse WHT, the §14.4 inverse DCT, the
+//!   §12 intra-prediction kernels and the §14.5 predictor+residue
+//!   summation to produce reconstructed Y / U / V pixels for one
+//!   macroblock whose 16×16 luma mode is one of the four non-`B_PRED`
+//!   modes. Honours the §11.1 `mb_skip_coeff` short-circuit. The
+//!   `B_PRED` MB path (which needs per-sub-block intra-neighbour
+//!   evolution) and the per-frame raster walker are still pending.
+//!   See [`reconstruct`].
 //!
 //! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
 //! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
-//! prediction), the per-macroblock reconstruction walk (including the
-//! §15.1 loop-filter geometry that drives the [`loop_filter`] segment
-//! kernels), and the encoder are all still scaffolded — the top-level
-//! `decode_vp8` / `encode_vp8_*` entry points return
-//! [`Error::NotImplemented`].
+//! prediction), the `B_PRED` per-sub-block intra walker, the per-frame
+//! raster walker (including the §15.1 loop-filter geometry that drives
+//! the [`loop_filter`] segment kernels), and the encoder are all still
+//! scaffolded — the top-level `decode_vp8` / `encode_vp8_*` entry
+//! points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -86,6 +96,7 @@ pub mod intra_predict;
 pub mod inverse_transform;
 pub mod loop_filter;
 pub mod macroblock;
+pub mod reconstruct;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
@@ -117,6 +128,9 @@ pub use macroblock::{
     parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
     InterFrameIntraProbs, IntraBmode, IntraUvMode, IntraYMode, MacroblockError, MacroblockModes,
     IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
+};
+pub use reconstruct::{
+    decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError, ReconstructedMb,
 };
 
 #[cfg(feature = "registry")]

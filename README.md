@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 10)
+## Status — 2026-05-24 (round 11)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -409,31 +409,92 @@ overlay when both are present; mixed Y-only overlay; and the
 `Default` impl matching `defaults()`. Total: 139 tests across seven
 modules.
 
+**Round 11 (2026-05-24).** Adds the §14.2 per-macroblock
+reconstruction orchestrator — the glue that ties together the
+previously-isolated transform / prediction / summation primitives
+(new `src/reconstruct.rs`).
+
+* `decode_keyframe_mb_non_bpred(y_mode, uv_mode, mb_skip_coeff,
+  neighbors, y2_coeffs_dequant, y_coeffs_dequant, u_coeffs_dequant,
+  v_coeffs_dequant) -> Result<ReconstructedMb, ReconstructError>` —
+  runs the §14.2 four-step recipe for one macroblock whose Y mode is
+  one of the four 16×16 modes: (1) inverse-WHT the Y2 block and seed
+  each Y sub-block's coefficient 0 with `wht_output[i*4+j]` per the
+  §14.2 first-paragraph index rule; (2) inverse-DCT all sixteen Y
+  and eight chroma sub-blocks (the §14.2 second-paragraph
+  "24 inversions are independent" statement); (3) apply the §12
+  intra-prediction kernel selected by the §11 mode record; (4) sum
+  with `clamp255` (§14.5).
+* `MbNeighbors { y_above, y_left, y_topleft, u_above, u_left,
+  u_topleft, v_above, v_left, v_topleft }` — the surrounding pixel
+  context the §12 kernels read. All fields are `Option`; absence
+  invokes the spec's default-substitution rules in
+  [`intra_predict`] (127 / 129 / 128).
+* `ReconstructedMb { y: [u8; 256], u: [u8; 64], v: [u8; 64] }` —
+  the predictor-plus-residue output for the macroblock, before
+  loop filtering.
+* `ReconstructError::BPredNotSupported` — surfaced when called with
+  `y_mode == IntraYMode::B`. The `B_PRED` path needs a
+  per-sub-block intra-walker that re-uses each sub-block's
+  reconstructed pixels as the next sub-block's `above`/`left`
+  (§12.3 / §11.3 right-edge fixup); that is the next layer up.
+* `mb_skip_coeff` short-circuit (§11.1): when `true`, the entire
+  residue is zero by definition, so the orchestrator skips the WHT /
+  DCT / summation work and returns the prediction directly.
+
+Why dequantization is the caller's responsibility, not this
+orchestrator's: §14.1 Y2 / chroma dequant scaling is a documented
+spec gap (RFC defers to the reference decoder `dixie.c` source which
+is excluded under the workspace clean-room policy), and the zig-zag
+→ raster reordering for §13 token output is the same — keeping both
+out of this function's signature lets §14.2 land today and lets a
+future convenience wrapper (raw tokens + quantiser-index bundle)
+slot in once the gap docs land. Y1 factors are already in
+`Y1DequantFactors::from_indices`.
+
+Eleven new unit tests: `B_PRED` MB rejection with the proper error;
+top-left-corner skip MB with `DC_PRED` everywhere returning the
+spec's `DEFAULT_TOPLEFT_DC` (128) in every plane; skip MB with
+`V_PRED` and known above-strips matching standalone
+`predict_y16x16_v` / `predict_uv8x8_v` output; zero-residue
+non-skip MB equalling the skip MB output (the §14.2 path runs
+but contributes 0); a Y2 DC-only seeding test exercising the
+§14.2 first-paragraph rule end-to-end; a Y2 off-diagonal seeding
+test proving the `i*4+j` index rule (`y2[0]=8` + `y2[4]=8` →
+WHT → distinct sub-block residues in rows 0..1 vs rows 2..3);
+`V_PRED` with no `above` substituting `DEFAULT_ABOVE_PIXEL` (127)
+across both luma and chroma; `H_PRED` with no `left` substituting
+`DEFAULT_LEFT_PIXEL` (129); §14.5 `clamp255` saturation both
+high (every Y pixel → 255) and low (every Y pixel → 0); and a
+helper round-trip test guarding the `extract_4x4` / `insert_4x4`
+plane-stride math against off-by-one. Total: 150 tests across
+eight modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
-walk); the *integration* layer that turns the §12 kernels + decoded
-modes into reconstructed prediction blocks (i.e. walking the
-already-reconstructed frame buffer to assemble the per-block
-neighbour arrays + computing the §12.3 right-edge subblock-7/11/15
-extra-pixel fixup against the rightmost macroblock); the
-per-macroblock §13.3 walker that aggregates 24/25 sub-blocks per
-MB, maintains the above/left non-zero-block predictors across
-raster order, and honours the `mb_skip_coeff` and `B_PRED` /
-`SPLITMV` exemptions on top of the round-7 `decode_block`
-primitive; the §14.2 macroblock-level transform orchestration
-(Y2 → 16 Y-DC seeding, the 24/25-block walk) wiring the round-8
-per-block transforms into reconstruction, plus the two §14 spec
-gaps (zig-zag → raster reordering, Y2/chroma dequant scaling);
-motion-vector component decoding (§17.1) against the updated
-`MV_CONTEXT`s; the §15.1 loop-filter geometry (raster-order edge
-walk + the §15.1 page-86 step-2/4 skip rule + the §9.4 / §10
-per-macroblock `loop_filter_level` derivation) that drives the
-round-9 §15.2 / §15.3 / §15.4 per-segment kernels; the encoder. All
-top-level entry points (`decode_vp8`, `encode_vp8_keyframe`) still
-return `Error::NotImplemented`.
+walk); the `B_PRED` per-sub-block intra walker (which reuses each
+sub-block's own reconstructed pixels as the next sub-block's
+`above` / `left` and applies the §12.3 right-edge subblock-7/11/15
+extra-pixel fixup against the rightmost macroblock); the per-frame
+raster walker on top of `decode_keyframe_mb_non_bpred` that
+assembles the per-MB neighbour strips from the already-reconstructed
+frame buffer; the per-macroblock §13.3 token walker that aggregates
+24/25 sub-blocks per MB, maintains the above/left non-zero-block
+predictors across raster order, and honours the `mb_skip_coeff` and
+`B_PRED` / `SPLITMV` exemptions on top of the round-7 `decode_block`
+primitive; the two §14 spec gaps (zig-zag → raster reordering for
+§13 token output, and the §14.1 Y2/chroma dequant scaling that
+defers to `dixie.c` outside the clean-room policy); motion-vector
+component decoding (§17.1) against the updated `MV_CONTEXT`s; the
+§15.1 loop-filter geometry (raster-order edge walk + the §15.1
+page-86 step-2/4 skip rule + the §9.4 / §10 per-macroblock
+`loop_filter_level` derivation) that drives the round-9 §15.2 /
+§15.3 / §15.4 per-segment kernels; the encoder. All top-level entry
+points (`decode_vp8`, `encode_vp8_keyframe`) still return
+`Error::NotImplemented`.
 
 ## Clean-room sources
 

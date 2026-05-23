@@ -6,6 +6,53 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§14.2 per-macroblock reconstruction orchestration** — new
+  `src/reconstruct.rs` module. Ties the previously-isolated transform
+  / prediction / summation primitives together for one macroblock
+  whose 16×16 luma mode is one of the four non-`B_PRED` modes
+  (`DC_PRED` / `V_PRED` / `H_PRED` / `TM_PRED`). New surface:
+  - `decode_keyframe_mb_non_bpred(y_mode, uv_mode, mb_skip_coeff,
+    neighbors, y2_coeffs_dequant, y_coeffs_dequant, u_coeffs_dequant,
+    v_coeffs_dequant) -> Result<ReconstructedMb, ReconstructError>`
+    runs the §14.2 four-step recipe: (1) inverse-WHT the Y2 block
+    and seed each Y sub-block's coefficient 0 with the matching
+    `wht_output[i*4+j]` element (§14.2 first-paragraph index rule);
+    (2) inverse-DCT all sixteen Y and eight chroma sub-blocks
+    (§14.2 second paragraph); (3) apply the §12 intra-prediction
+    kernel selected by the §11 mode record; (4) sum with `clamp255`
+    per §14.5.
+  - `MbNeighbors { y_above, y_left, y_topleft, u_above, u_left,
+    u_topleft, v_above, v_left, v_topleft }` — the per-MB pixel
+    context the §12 kernels read, each field `Option`-wrapped so
+    frame-edge MBs trigger the spec's default-substitution rules.
+  - `ReconstructedMb { y: [u8; 256], u: [u8; 64], v: [u8; 64] }` —
+    the predictor-plus-residue output, before loop filtering.
+  - `ReconstructError::BPredNotSupported` — surfaced when called
+    with `IntraYMode::B`. The `B_PRED` branch needs a per-sub-block
+    intra walker that evolves the neighbour context after each
+    4×4 reconstruction (§12.3); that is the next layer up.
+  - `mb_skip_coeff` short-circuit (§11.1): zero residue → output
+    equals prediction, skipping the WHT / DCT / summation.
+
+  Dequantization is the caller's responsibility because §14.1
+  Y2 / chroma dequant scaling is a documented spec gap that defers
+  to the reference decoder `dixie.c` source (excluded under the
+  clean-room policy). Keeping dequant out of this signature lets
+  the §14.2 orchestration land without depending on that gap; a
+  future wrapper can accept raw tokens + a quantiser-index bundle
+  once the gap docs land.
+
+  Eleven new unit tests: `B_PRED` MB rejection; top-left-corner
+  skip MB matching `DEFAULT_TOPLEFT_DC` (128) in every plane; skip
+  MB with `V_PRED` matching standalone predictor output; zero-residue
+  non-skip path equals the skip path; Y2 DC-only seeding lifting all
+  sixteen Y sub-blocks; Y2 off-diagonal seeding proving the
+  `i * 4 + j` sub-block index rule; `V_PRED` with no `above`
+  substituting `DEFAULT_ABOVE_PIXEL` (127); `H_PRED` with no
+  `left` substituting `DEFAULT_LEFT_PIXEL` (129); §14.5 `clamp255`
+  saturation high (all-255) and low (all-0); and an
+  `extract_4x4`/`insert_4x4` helper round-trip. Total: 150 tests
+  across eight modules (up from 139).
 * **Interframe intra-predicted macroblock mode decoding** per RFC 6386
   §16.1 (extends `src/macroblock.rs`). The §16.1 layer is
   structurally analogous to the §11 key-frame layer but uses different

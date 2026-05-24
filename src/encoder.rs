@@ -124,9 +124,9 @@ impl std::error::Error for EncodeError {}
 /// `range`, `bottom`, and a per-position `bit_count` of remaining shifts
 /// before the next high-byte output. Encoded bytes accumulate in `out`.
 ///
-/// The implementation is a direct Rust port of the §7.3
-/// `init_bool_encoder` / `write_bool` / `add_one_to_output` /
-/// `flush_bool_encoder` C listing the RFC embeds inline.
+/// Implements §7.3 of RFC 6386 (the `init_bool_encoder` /
+/// `write_bool` / `add_one_to_output` / `flush_bool_encoder`
+/// C listing the RFC embeds inline).
 #[derive(Debug, Default)]
 pub struct BoolEncoder {
     out: Vec<u8>,

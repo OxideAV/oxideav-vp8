@@ -39,8 +39,20 @@
 //!   `coeff_tree` walker, the `DCTextra` extra-bits decode, the §13.5
 //!   default token-probability table, and a per-sub-block
 //!   `decode_block` primitive that recovers a `[i16; 16]` of
-//!   quantised coefficients. No per-macroblock walker yet. See
-//!   [`dct_tokens`].
+//!   quantised coefficients. The §13.3 per-macroblock token walk
+//!   ([`decode_mb_coeffs`]) sits on top of `decode_block`: it walks the
+//!   24/25 residual blocks of one macroblock (Y2 first when present, then
+//!   16 Y, 4 U, 4 V), threads the above / left non-zero predictor context
+//!   through the §20.16 `left_context_index` / `above_context_index` slot
+//!   tables (a nine-entry [`MbEntropyCtx`]: 4 Y, 2 U, 2 V, 1 Y2), honours
+//!   the §13.1 `mb_skip_coeff` short-circuit with the §20.16
+//!   `reset_mb_context` Y2-preserving rule, selects the `YAfterY2` /
+//!   `YNoY2` plane per the macroblock's `has_y2`, and reorders each block
+//!   into raster order via the §20.16 `zigzag[16]` table — producing an
+//!   [`frame::MbCoeffs`] directly from the bitstream. The coefficients are
+//!   the raw quantized token values; the §14.1 Y2 / chroma dequant scaling
+//!   remains a documented spec gap (§14.1 page 77 defers it to `dixie.c`
+//!   §20.4). See [`dct_tokens`].
 //! * VP8 dequantization and inverse transforms (RFC 6386 §14) — the
 //!   §14.1 `dc_qlookup` / `ac_qlookup` tables with Y-plane factor
 //!   computation, the §14.3 inverse WHT (general + single-DC fast
@@ -102,9 +114,10 @@
 //! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
 //! prediction), the §15.1 loop-filter geometry that drives the
 //! [`loop_filter`] segment kernels (a post-reconstruction pass on top of
-//! [`decode_keyframe`]'s plane output), the §13.3 per-MB token walk /
-//! §14.1 dequant scaling that would feed [`decode_keyframe`] straight
-//! from the bitstream, and the encoder are all still scaffolded — the
+//! [`decode_keyframe`]'s plane output), the §14.1 Y2 / chroma dequant
+//! scaling that — together with the now-landed §13.3 per-MB token walk
+//! ([`decode_mb_coeffs`]) — would feed [`decode_keyframe`] straight from
+//! the bitstream, and the encoder are all still scaffolded — the
 //! top-level `decode_vp8` / `encode_vp8_*` entry points return
 //! [`Error::NotImplemented`].
 
@@ -127,8 +140,9 @@ pub use coded_header::{
     UpdateSegmentation, Vp8CodedHeader, DEFAULT_MV_CONTEXT, MV_PROB_COUNT,
 };
 pub use dct_tokens::{
-    decode_block, merge_default_token_probs, BlockType, CoeffProbs, DctToken, DctTokenError,
-    COEFF_BANDS, DEFAULT_COEFF_PROBS,
+    decode_block, decode_mb_coeffs, merge_default_token_probs, BlockType, CoeffProbs, DctToken,
+    DctTokenError, MbCoeffError, MbEntropyCtx, COEFF_BANDS, DEFAULT_COEFF_PROBS,
+    MB_ENTROPY_CTX_LEN, ZIGZAG,
 };
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{

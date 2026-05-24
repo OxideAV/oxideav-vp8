@@ -6,6 +6,36 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.3 per-macroblock DCT-coefficient token walk** — new
+  `decode_mb_coeffs(dec, has_y2, mb_skip_coeff, coeff_probs, above, left)
+  -> Result<MbCoeffs, MbCoeffError>` in `src/dct_tokens.rs`, the
+  integration layer over the per-block `decode_block` primitive that feeds
+  `decode_keyframe` straight from the bitstream. Walks the 24/25 residual
+  blocks of one macroblock in the §13 `residual_data()` order — the §14.2
+  Y2 (WHT) block first when present, then the sixteen Y 4×4 DCT blocks,
+  then the four U and four V chroma blocks — selecting the `Y2` /
+  `YAfterY2` / `YNoY2` / `UV` plane per block, threading the §13.3 above /
+  left non-zero predictor context through the §20.16 `left_context_index` /
+  `above_context_index` slot tables (a nine-entry `MbEntropyCtx`: four Y,
+  two U, two V, one Y2), and updating both referenced predictor slots with
+  each block's non-zero status for the macroblocks below and to the right.
+  Honours the §13.1 `mb_skip_coeff` short-circuit with the §20.16
+  `reset_mb_context` rule (clear the eight Y/U/V slots; clear the Y2 slot
+  only when the macroblock would have carried a Y2 block, preserving it
+  across skipped `B_PRED` / `SPLITMV` macroblocks per the "most recent
+  macroblock that has a Y2 block" rule). Reorders each decoded block into
+  raster (natural) order via the §20.16 `zigzag[16]` table — the layout
+  the §14 inverse transforms consume. The emitted coefficients are the
+  **raw quantized** token values; the §14.1 Y2 / chroma dequant scaling
+  remains a documented spec gap (§14.1 page 77 defers it to `dixie.c`
+  §20.4). New surface: `decode_mb_coeffs`, `MbEntropyCtx`, `MbCoeffError`,
+  `ZIGZAG`, `MB_ENTROPY_CTX_LEN`. Adds 7 tests (zig-zag permutation
+  round-trip; §20.16 context-index table spot-check; skip-MB zeroing and
+  the `B_PRED` Y2-preservation rule; a synthetic MB round-trip recovering
+  the exact per-block raster layout across all planes; an empty-block
+  predictor-slot clear; and two-adjacent-MB left-context propagation with
+  a fresh-context negative control proving the propagation is
+  load-bearing).
 * **§12 / §14.2 per-frame keyframe raster walker** — new
   `decode_keyframe(mb_cols, mb_rows, modes, coeffs) ->
   Result<KeyframePlanes, FrameError>` in `src/frame.rs`, the layer above

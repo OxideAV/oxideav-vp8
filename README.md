@@ -296,11 +296,13 @@ clean-room policy), so the four non-Y1 factors are not computed in this
 round. Recommend a clean-room note giving the Y2/chroma scaling and
 clamping rules so the integration round can compute all six factors.
 
-**§13 page 60 — zig-zag scan order.** §13 names the coefficient ordering
-"zig-zag" but the 16-entry scan-to-raster permutation array appears only
-in the reference `idct_add.c` (Section 20.8). The §14 transforms here
-operate in raster order; the per-MB integration round must supply the
-reordering. Recommend a clean-room note giving the permutation.
+**§13 page 60 — zig-zag scan order (RESOLVED round 14).** §13 names the
+coefficient ordering "zig-zag" but the §13 body gives no permutation
+array. The 16-entry scan-to-raster permutation is, however, present in
+the §20.16 (tokens.c) reference annex as `zigzag[16]` — part of the RFC
+itself. The round-14 §13.3 per-MB walk (`decode_mb_coeffs`) reorders each
+decoded block into raster order using that table (`ZIGZAG`), closing the
+gap; the §14 transforms continue to operate in raster order.
 
 ### Spec gap surfaced
 
@@ -557,21 +559,71 @@ plus the `EmptyFrame`, `MacroblockCountMismatch`, and indexed
 `MissingSubblockModes` error paths. Total: 169 tests across ten
 modules.
 
+**Round 14 (2026-05-24).** Adds the §13.3 per-macroblock token walk
+— the missing link that feeds `decode_keyframe` straight from the
+bitstream, layered over the round-7 `decode_block` primitive
+(`src/dct_tokens.rs`).
+
+* `decode_mb_coeffs(dec, has_y2, mb_skip_coeff, coeff_probs, above,
+  left) -> Result<MbCoeffs, MbCoeffError>` — walks the 24/25 residual
+  blocks of one macroblock in the §13 `residual_data()` order: the
+  §14.2 Y2 (WHT) block first when `has_y2`, then the sixteen Y 4×4 DCT
+  blocks (plane `YAfterY2` when Y2 is present, else `YNoY2`), then the
+  four U and four V chroma blocks (plane `UV`). Each block runs the
+  round-7 `decode_block` token loop; the result is reordered into
+  raster (natural) order via the §20.16 `zigzag[16]` table.
+* Above/left non-zero predictor threading: a nine-entry
+  `MbEntropyCtx` (four Y, two U, two V, one Y2) per direction, indexed
+  per block by the §20.16 `left_context_index[25]` /
+  `above_context_index[25]` slot tables — Y subblocks share a left
+  slot per subblock row and an above slot per subblock column. Each
+  decoded block writes its non-zero status back into both referenced
+  slots (§13.3 "the two predictors referenced by the block are
+  replaced") so later blocks below/to-the-right read the correct
+  third-dimension probability context. The caller maintains one
+  `above` context per MB column and a single rolling `left`.
+* §13.1 skip short-circuit with the §20.16 `reset_mb_context` rule:
+  a `mb_skip_coeff` MB reads no tokens and clears the eight Y/U/V
+  slots; the Y2 slot is cleared **only** when the MB carries a Y2
+  block, preserving it across skipped `B_PRED` / `SPLITMV` MBs (the
+  §13.3 "most recent macroblock that has a Y2 block" rule).
+* New surface: `decode_mb_coeffs`, `MbEntropyCtx`, `MbCoeffError`,
+  `ZIGZAG`, `MB_ENTROPY_CTX_LEN`.
+* The emitted coefficients are the **raw quantized** token values:
+  the §14.1 Y2 / chroma dequant scaling remains a documented spec gap
+  (§14.1 page 77 defers it to `dixie.c` §20.4), so `decode_mb_coeffs`
+  does not multiply by any dequant factor. The zig-zag → raster
+  reordering — previously a §14 gap — is closed here using the §20.16
+  annex `zigzag[16]` table.
+
+Seven new unit tests: the zig-zag table is a bijection on 0..16 and
+round-trips scan↔raster; the §20.16 left/above context-index tables
+match the annex listing (including the Y2 slot 8); a skip MB yields
+all-zero coefficients and zeroes its predictor slots; a skipped
+`B_PRED` MB preserves the Y2 slot; a synthetic MB with distinctive
+per-plane coefficients round-trips to the exact per-block raster
+layout (Y2 + YAfterY2 first-coeff-1 luma + chroma DC) with matching
+post-MB context; an empty block clears its predictor slot even when
+an earlier block set it; and two horizontally-adjacent MBs sharing a
+rolling `left` context recover MB1 correctly only with the propagated
+context (a fresh-context negative control desyncs the range decoder,
+proving the propagation is load-bearing). Total: 176 tests across ten
+modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
-walk); the per-macroblock §13.3 token walker that aggregates
-24/25 sub-blocks per MB, maintains the above/left non-zero-block
-predictors across raster order, and honours the `mb_skip_coeff` and
-`B_PRED` / `SPLITMV` exemptions on top of the round-7 `decode_block`
-primitive (the missing link that would feed `decode_keyframe`
-straight from the bitstream); the two §14 spec gaps (zig-zag →
-raster reordering for §13 token output, and the §14.1 Y2/chroma
-dequant scaling that defers to `dixie.c` outside the clean-room
-policy) that keep `decode_keyframe`'s `MbCoeffs` caller-supplied for
-now; motion-vector component decoding (§17.1) against the updated
+walk); the §14.1 Y2 / chroma dequant scaling (the last §14 spec gap —
+§14.1 page 77 defers the Y2-DC / Y2-AC / chroma-DC / chroma-AC
+scaling/clamping to the reference `dixie.c` §20.4 lookup functions),
+which keeps `decode_mb_coeffs`' output and `decode_keyframe`'s
+`MbCoeffs` raw-quantized for now (the round-14 §13.3 token walk feeds
+the tokens; a thin dequant wrapper over `decode_mb_coeffs` lands once
+the §14.1 scaling rules are pinned down — the §13 zig-zag → raster
+reordering gap is already closed via the §20.16 `zigzag[16]` table);
+motion-vector component decoding (§17.1) against the updated
 `MV_CONTEXT`s; the §15.1 loop-filter geometry (raster-order edge
 walk over `decode_keyframe`'s plane output + the §15.1 page-86
 step-2/4 skip rule + the §9.4 / §10 per-macroblock

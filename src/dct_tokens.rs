@@ -29,17 +29,26 @@
 //!   `TokenProbUpdates` (from `coded_header::Vp8CodedHeader`) onto the
 //!   default table, producing a complete `coeff_probs[4][8][3][11]`
 //!   ready for `decode_block` calls.
+//! * The §13.3 per-macroblock token walk (`decode_mb_coeffs`): it
+//!   aggregates the 24/25 blocks of one macroblock — the §14.2 Y2 (WHT)
+//!   block first when present, then the sixteen Y DCT blocks, then the
+//!   four U and four V chroma blocks — threading the above / left
+//!   non-zero predictor context through the §20.16
+//!   `left_context_index` / `above_context_index` slot tables, honouring
+//!   the §13.1 `mb_skip_coeff` short-circuit (with the §20.16
+//!   `reset_mb_context` Y2-preserving rule), selecting the
+//!   `YAfterY2` / `YNoY2` plane per `has_y2`, and reordering each block
+//!   into raster order via the §20.16 `zigzag[16]` table. It produces a
+//!   [`crate::frame::MbCoeffs`].
 //!
 //! **What is NOT in this module yet:**
 //!
 //! * Dequantisation — multiplying the recovered `i16` coefficients by
-//!   the §14.1 `dc_qlookup` / `ac_qlookup` table values (round 8).
+//!   the §14.1 `dc_qlookup` / `ac_qlookup` table values. `decode_mb_coeffs`
+//!   emits the **raw quantized** token coefficients (in raster order);
+//!   the §14.1 Y2 / chroma dequant scaling remains a documented spec gap
+//!   (§14.1 page 77 defers it to `dixie.c` §20.4).
 //! * The inverse WHT / IDCT (§14.2 / §14.3).
-//! * The per-macroblock walk that aggregates 24/25 blocks per MB,
-//!   maintains the §13.3 above / left non-zero-block predictors, and
-//!   honours the `mb_skip_coeff` and `B_PRED` / `SPLITMV` exemptions
-//!   (this is the round-7+ integration layer — the per-block decode
-//!   primitive lives here as the building block).
 //!
 //! # Spec-pseudocode caveat
 //!
@@ -576,6 +585,246 @@ pub fn decode_block(
     Ok(non_zero_count)
 }
 
+// ===========================================================================
+// §13.3 per-macroblock token walk
+// ===========================================================================
+
+/// §13 page 60 zig-zag scan order, transcribed from the §20.16 (tokens.c)
+/// reference annex `zigzag[16]`. `ZIGZAG[c]` is the raster (natural-order)
+/// position of the coefficient at scan position `c`. The per-block token
+/// loop fills coefficients in scan order; this table places each into its
+/// raster slot for the §14 raster-order inverse transforms.
+pub const ZIGZAG: [usize; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// Number of per-plane non-zero predictor slots a macroblock maintains in
+/// each direction (above / left): four Y columns/rows, two U, two V, and
+/// one Y2 — the `token_entropy_ctx_t = int[4 + 2 + 2 + 1]` of the §20.16
+/// reference annex.
+pub const MB_ENTROPY_CTX_LEN: usize = 4 + 2 + 2 + 1;
+
+/// The §20.16 `left_context_index[25]` — maps a macroblock's 25 residual
+/// blocks (16 Y, then 4 U, 4 V, then the Y2 block as block 24) to a slot
+/// in the nine-entry "left" non-zero predictor vector. Y subblocks share a
+/// left slot per subblock *row* (slots 0..3); U and V each occupy two slots
+/// (4/5 and 6/7); Y2 is slot 8.
+const LEFT_CONTEXT_INDEX: [usize; 25] = [
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, // 16 Y
+    4, 4, 5, 5, // 4 U
+    6, 6, 7, 7, // 4 V
+    8, // Y2
+];
+
+/// The §20.16 `above_context_index[25]` — the companion mapping for the
+/// "above" predictor vector. Y subblocks share an above slot per subblock
+/// *column* (slots 0..3); U/V/Y2 mirror [`LEFT_CONTEXT_INDEX`].
+const ABOVE_CONTEXT_INDEX: [usize; 25] = [
+    0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, // 16 Y
+    4, 5, 4, 5, // 4 U
+    6, 7, 6, 7, // 4 V
+    8, // Y2
+];
+
+/// One macroblock's worth of non-zero coefficient predictors for a single
+/// direction (above *or* left), per the §13.3 "aggregate coefficient
+/// predictor" description: a single Y2 predictor, two each for U and V, and
+/// four for Y. A decoder maintains one [`MbEntropyCtx`] per macroblock
+/// column for the "above" row and a single rolling "left" instance.
+///
+/// Each entry is `true` if the most-recently-decoded block mapping to that
+/// slot had at least one non-zero coefficient. Off-frame predictors are
+/// `false` (the §13.3 "non-existent predictors ... taken to be empty"
+/// rule); a freshly [`Default`]-constructed context satisfies that.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MbEntropyCtx {
+    /// The nine non-zero flags, indexed by [`LEFT_CONTEXT_INDEX`] /
+    /// [`ABOVE_CONTEXT_INDEX`]: slots 0..3 = Y, 4..5 = U, 6..7 = V,
+    /// 8 = Y2.
+    pub nonzero: [bool; MB_ENTROPY_CTX_LEN],
+}
+
+impl MbEntropyCtx {
+    /// Apply the §20.16 `reset_mb_context` rule for a skipped macroblock.
+    ///
+    /// The eight Y/U/V slots are always cleared (a skipped macroblock has
+    /// no residue, so every same-plane neighbour predictor it contributes
+    /// is empty). The Y2 slot (8) is cleared **only** when this macroblock
+    /// would have carried a Y2 block (i.e. a non-`B_PRED` / non-`SPLITMV`
+    /// mode); otherwise it is preserved so that the most-recent Y2-bearing
+    /// macroblock in this column / row still drives the Y2 predictor, per
+    /// the §13.3 "most recent macroblock ... that has a Y2 block" rule.
+    fn reset_for_skip(&mut self, has_y2: bool) {
+        for slot in self.nonzero.iter_mut().take(8) {
+            *slot = false;
+        }
+        if has_y2 {
+            self.nonzero[8] = false;
+        }
+    }
+}
+
+/// Out-of-band conditions surfaced by [`decode_mb_coeffs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MbCoeffError {
+    /// A per-block token decode failed (bool-decoder ran dry, or a
+    /// corrupted tree table). Carries the residual block index
+    /// (`0..=24`, dixie order: 0..15 Y, 16..19 U, 20..23 V, 24 Y2) and
+    /// the underlying error.
+    Block {
+        /// The §20.16 residual block index that failed.
+        index: usize,
+        /// The per-block decode error.
+        source: DctTokenError,
+    },
+}
+
+impl core::fmt::Display for MbCoeffError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            MbCoeffError::Block { index, source } => {
+                write!(f, "vp8 mb coeffs: residual block {index}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MbCoeffError {}
+
+/// Reorder a scan-order coefficient block into raster (natural) order via
+/// the §20.16 zig-zag table. `scan[c]` (scan position `c`) is placed at
+/// raster position `ZIGZAG[c]`.
+#[inline]
+fn scan_to_raster(scan: &[i16; 16]) -> [i16; 16] {
+    let mut raster = [0i16; 16];
+    for (c, &v) in scan.iter().enumerate() {
+        raster[ZIGZAG[c]] = v;
+    }
+    raster
+}
+
+/// Decode one macroblock's worth of DCT/WHT coefficient tokens per RFC
+/// 6386 §13.3, threading the above / left non-zero predictor context the
+/// §13.3 third-dimension probability index requires.
+///
+/// This is the integration layer over [`decode_block`]: it walks all the
+/// residual blocks of one macroblock — the §14.2 Y2 (WHT) block first when
+/// present, then the sixteen Y 4×4 DCT blocks, then the four U and four V
+/// chroma blocks, in the §13 "residual_data()" order — selecting the
+/// correct [`BlockType`] plane and the correct above / left predictor slot
+/// per the §20.16 `left_context_index` / `above_context_index` tables, and
+/// updating those slots with each block's non-zero status for the
+/// macroblocks below and to the right (§13.3 "after each block is decoded,
+/// the two predictors referenced by the block are replaced").
+///
+/// # Inputs
+///
+/// * `dec` — the §13.2 boolean decoder positioned at this macroblock's
+///   residual record in the (second) DCT partition.
+/// * `has_y2` — whether this macroblock carries a Y2 block. `true` for the
+///   four 16×16 luma modes (and inter modes other than `SPLITMV`); `false`
+///   for `B_PRED` / `SPLITMV`, whose Y blocks instead carry their own DC.
+///   The caller derives this from the decoded [`crate::macroblock::IntraYMode`]
+///   (`!= B`).
+/// * `mb_skip_coeff` — the §11.1 / §13.1 skip flag. When `true` no tokens
+///   are read; the returned coefficients are all zero and the predictor
+///   context is updated per the §20.16 `reset_mb_context` rule (clear all
+///   Y/U/V slots; clear Y2 only when `has_y2`).
+/// * `coeff_probs` — the resolved `coeff_probs[4][8][3][11]` from
+///   [`merge_default_token_probs`].
+/// * `above` / `left` — the macroblock's incoming non-zero predictor
+///   contexts. Both are read for the *first* coefficient of each block and
+///   updated in place as blocks are decoded. The caller maintains a row of
+///   `above` contexts (one per macroblock column) and a single rolling
+///   `left` context, clearing both at the appropriate frame / row edges.
+///
+/// # Output
+///
+/// The macroblock's coefficients as an [`crate::frame::MbCoeffs`], with
+/// each 4×4 block placed in **raster (natural) order** (the layout the §14
+/// inverse transforms consume). The coefficients are the **raw quantized
+/// token values** — the §14.1 Y2 / chroma dequant scaling is a documented
+/// spec gap (§14.1 page 77 defers it to `dixie.c` §20.4), so this function
+/// does **not** multiply by any dequant factor. The caller must apply
+/// §14.1 dequantization before the inverse transforms once that gap is
+/// filled.
+pub fn decode_mb_coeffs(
+    dec: &mut BoolDecoder<'_>,
+    has_y2: bool,
+    mb_skip_coeff: bool,
+    coeff_probs: &CoeffProbs,
+    above: &mut MbEntropyCtx,
+    left: &mut MbEntropyCtx,
+) -> Result<crate::frame::MbCoeffs, MbCoeffError> {
+    let mut out = crate::frame::MbCoeffs::default();
+
+    // §13.1: a skip macroblock reads no tokens. Update the predictor
+    // context per the §20.16 `reset_mb_context` rule and return zeros.
+    if mb_skip_coeff {
+        above.reset_for_skip(has_y2);
+        left.reset_for_skip(has_y2);
+        return Ok(out);
+    }
+
+    // Decode one residual block: select the predictor slots, run the
+    // per-coefficient token loop, reorder to raster, and write back the
+    // non-zero status into both predictor vectors. `block_index` is the
+    // §20.16 residual block index (0..=24).
+    let decode_one = |dec: &mut BoolDecoder<'_>,
+                      block_index: usize,
+                      block_type: BlockType,
+                      above: &mut MbEntropyCtx,
+                      left: &mut MbEntropyCtx|
+     -> Result<[i16; 16], MbCoeffError> {
+        let a_slot = ABOVE_CONTEXT_INDEX[block_index];
+        let l_slot = LEFT_CONTEXT_INDEX[block_index];
+        let mut scan = [0i16; 16];
+        let nz = decode_block(
+            dec,
+            block_type,
+            coeff_probs,
+            above.nonzero[a_slot],
+            left.nonzero[l_slot],
+            &mut scan,
+        )
+        .map_err(|source| MbCoeffError::Block {
+            index: block_index,
+            source,
+        })?;
+        // §13.3: replace the two referenced predictors with this
+        // block's (non-)empty state for blocks below and to the right.
+        let has_coeffs = nz != 0;
+        above.nonzero[a_slot] = has_coeffs;
+        left.nonzero[l_slot] = has_coeffs;
+        Ok(scan_to_raster(&scan))
+    };
+
+    // §13 / §14.2 residual order: Y2 (when present) → 16 Y → 4 U → 4 V.
+    // The Y luma plane type is `YAfterY2` (DCT starts at coefficient 1)
+    // when a Y2 block carries the DCs, else `YNoY2` (DCT starts at 0).
+    if has_y2 {
+        // Y2 is residual block 24 in the §20.16 index tables.
+        out.y2 = decode_one(dec, 24, BlockType::Y2, above, left)?;
+    }
+
+    let y_plane = if has_y2 {
+        BlockType::YAfterY2
+    } else {
+        BlockType::YNoY2
+    };
+    for (i, y_block) in out.y.iter_mut().enumerate() {
+        *y_block = decode_one(dec, i, y_plane, above, left)?;
+    }
+
+    // U occupies residual blocks 16..=19, V occupies 20..=23.
+    for (i, u_block) in out.u.iter_mut().enumerate() {
+        *u_block = decode_one(dec, 16 + i, BlockType::UV, above, left)?;
+    }
+    for (i, v_block) in out.v.iter_mut().enumerate() {
+        *v_block = decode_one(dec, 20 + i, BlockType::UV, above, left)?;
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,5 +1338,514 @@ mod tests {
         let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
         assert_eq!(nz, 1);
         assert_eq!(out[0], 2114);
+    }
+
+    // -----------------------------------------------------------------
+    // §13.3 per-macroblock walk tests
+    // -----------------------------------------------------------------
+
+    /// Reorder a raster-order block back into scan order (the inverse of
+    /// `scan_to_raster`) so a test can specify the expected raster layout
+    /// and feed `encode_block` (which works in scan order).
+    fn raster_to_scan(raster: &[i16; 16]) -> [i16; 16] {
+        let mut scan = [0i16; 16];
+        for (c, slot) in scan.iter_mut().enumerate() {
+            *slot = raster[ZIGZAG[c]];
+        }
+        scan
+    }
+
+    /// A single shared bool-encoder that emits the whole macroblock
+    /// residual record contiguously (the per-block `TestEncoder` cannot be
+    /// concatenated). Mirrors `decode_mb_coeffs` exactly: block order,
+    /// plane selection, zig-zag, and predictor threading.
+    struct MbEncoder {
+        enc: TestEncoder,
+    }
+
+    impl MbEncoder {
+        fn new() -> Self {
+            Self {
+                enc: TestEncoder::new(),
+            }
+        }
+
+        fn write_block(
+            &mut self,
+            block_index: usize,
+            block_type: BlockType,
+            raster: &[i16; 16],
+            coeff_probs: &CoeffProbs,
+            above: &mut MbEntropyCtx,
+            left: &mut MbEntropyCtx,
+        ) {
+            let a_slot = ABOVE_CONTEXT_INDEX[block_index];
+            let l_slot = LEFT_CONTEXT_INDEX[block_index];
+            let above_nz = above.nonzero[a_slot];
+            let left_nz = left.nonzero[l_slot];
+            let scan = raster_to_scan(raster);
+
+            // Replay the §13.3 token loop, writing bits into the shared
+            // encoder (this is `encode_block`'s body, inlined to share the
+            // encoder state across blocks).
+            let plane = block_type.plane_index();
+            let first_coeff = block_type.first_coeff();
+            let mut ctx3 = (above_nz as usize) + (left_nz as usize);
+            let mut prev_was_zero = false;
+            let mut last_non_zero: i32 = -1;
+            for (idx, c) in scan.iter().enumerate().take(16) {
+                if idx >= first_coeff && *c != 0 {
+                    last_non_zero = idx as i32;
+                }
+            }
+            let mut nonzero_count = 0usize;
+            let mut i = first_coeff as i32;
+            while i < 16 {
+                let band = COEFF_BANDS[i as usize];
+                let probs = &coeff_probs[plane][band][ctx3];
+                let emit_eob = i > last_non_zero;
+                let abs_value: u16;
+                let sign: bool;
+                let token: DctToken;
+                if emit_eob {
+                    token = DctToken::Eob;
+                    abs_value = 0;
+                    sign = false;
+                } else {
+                    let v = scan[i as usize];
+                    sign = v < 0;
+                    abs_value = v.unsigned_abs();
+                    token = if abs_value == 0 {
+                        DctToken::Dct0
+                    } else if abs_value == 1 {
+                        DctToken::Dct1
+                    } else if abs_value == 2 {
+                        DctToken::Dct2
+                    } else if abs_value == 3 {
+                        DctToken::Dct3
+                    } else if abs_value == 4 {
+                        DctToken::Dct4
+                    } else if abs_value <= 6 {
+                        DctToken::Cat1
+                    } else if abs_value <= 10 {
+                        DctToken::Cat2
+                    } else if abs_value <= 18 {
+                        DctToken::Cat3
+                    } else if abs_value <= 34 {
+                        DctToken::Cat4
+                    } else if abs_value <= 66 {
+                        DctToken::Cat5
+                    } else {
+                        DctToken::Cat6
+                    };
+                }
+                let start = if prev_was_zero { 2i8 } else { 0i8 };
+                for (i_half, bit) in encode_token(token, start) {
+                    self.enc.write_bool(probs[i_half], bit);
+                }
+                if token == DctToken::Eob {
+                    break;
+                }
+                if let Some((base, plist)) = match token {
+                    DctToken::Cat1 => Some((CAT_BASE[0], PCAT1)),
+                    DctToken::Cat2 => Some((CAT_BASE[1], PCAT2)),
+                    DctToken::Cat3 => Some((CAT_BASE[2], PCAT3)),
+                    DctToken::Cat4 => Some((CAT_BASE[3], PCAT4)),
+                    DctToken::Cat5 => Some((CAT_BASE[4], PCAT5)),
+                    DctToken::Cat6 => Some((CAT_BASE[5], PCAT6)),
+                    _ => None,
+                } {
+                    let extra = abs_value - base;
+                    let n = plist.len();
+                    for (j, &p) in plist.iter().enumerate() {
+                        let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                        self.enc.write_bool(p, bit);
+                    }
+                }
+                if abs_value != 0 {
+                    self.enc.write_bool(128, sign);
+                    nonzero_count += 1;
+                }
+                ctx3 = if abs_value == 0 {
+                    0
+                } else if abs_value == 1 {
+                    1
+                } else {
+                    2
+                };
+                prev_was_zero = token == DctToken::Dct0;
+                i += 1;
+            }
+            // Mirror the decoder's predictor update.
+            let has_coeffs = nonzero_count != 0;
+            above.nonzero[a_slot] = has_coeffs;
+            left.nonzero[l_slot] = has_coeffs;
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.enc.finish()
+        }
+    }
+
+    /// Encode a whole macroblock contiguously and return the byte stream.
+    /// `above` / `left` are threaded and left holding the post-MB context.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_mb_shared(
+        has_y2: bool,
+        coeff_probs: &CoeffProbs,
+        above: &mut MbEntropyCtx,
+        left: &mut MbEntropyCtx,
+        y2_raster: &[i16; 16],
+        y_raster: &[[i16; 16]; 16],
+        u_raster: &[[i16; 16]; 4],
+        v_raster: &[[i16; 16]; 4],
+    ) -> Vec<u8> {
+        let mut mb = MbEncoder::new();
+        if has_y2 {
+            mb.write_block(24, BlockType::Y2, y2_raster, coeff_probs, above, left);
+        }
+        let y_plane = if has_y2 {
+            BlockType::YAfterY2
+        } else {
+            BlockType::YNoY2
+        };
+        for (i, b) in y_raster.iter().enumerate() {
+            mb.write_block(i, y_plane, b, coeff_probs, above, left);
+        }
+        for (i, b) in u_raster.iter().enumerate() {
+            mb.write_block(16 + i, BlockType::UV, b, coeff_probs, above, left);
+        }
+        for (i, b) in v_raster.iter().enumerate() {
+            mb.write_block(20 + i, BlockType::UV, b, coeff_probs, above, left);
+        }
+        mb.finish()
+    }
+
+    #[test]
+    fn zigzag_is_a_permutation_of_0_15() {
+        // §20.16 zigzag[16] must be a bijection on 0..16 so
+        // scan_to_raster / raster_to_scan round-trip.
+        let mut seen = [false; 16];
+        for &r in &ZIGZAG {
+            assert!(!seen[r], "duplicate raster index {r}");
+            seen[r] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+        // Round-trip a distinct-valued block.
+        let raster: [i16; 16] = core::array::from_fn(|i| (i as i16) - 8);
+        assert_eq!(scan_to_raster(&raster_to_scan(&raster)), raster);
+    }
+
+    #[test]
+    fn context_index_tables_match_section_20_16() {
+        // Spot-check the §20.16 left/above slot tables against the RFC
+        // annex listing, including the Y2 (block 24) slot.
+        assert_eq!(LEFT_CONTEXT_INDEX[0], 0);
+        assert_eq!(LEFT_CONTEXT_INDEX[4], 1);
+        assert_eq!(LEFT_CONTEXT_INDEX[15], 3);
+        assert_eq!(LEFT_CONTEXT_INDEX[16], 4); // first U
+        assert_eq!(LEFT_CONTEXT_INDEX[20], 6); // first V
+        assert_eq!(LEFT_CONTEXT_INDEX[24], 8); // Y2
+        assert_eq!(ABOVE_CONTEXT_INDEX[0], 0);
+        assert_eq!(ABOVE_CONTEXT_INDEX[4], 0);
+        assert_eq!(ABOVE_CONTEXT_INDEX[5], 1);
+        assert_eq!(ABOVE_CONTEXT_INDEX[16], 4);
+        assert_eq!(ABOVE_CONTEXT_INDEX[24], 8);
+    }
+
+    #[test]
+    fn mb_skip_yields_zero_coeffs_and_resets_context() {
+        // A skip MB reads no tokens and zeroes its Y/U/V predictor slots.
+        // With has_y2 = true the Y2 slot is also cleared.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut above = MbEntropyCtx {
+            nonzero: [true; MB_ENTROPY_CTX_LEN],
+        };
+        let mut left = MbEntropyCtx {
+            nonzero: [true; MB_ENTROPY_CTX_LEN],
+        };
+        // No bytes are consumed; a trivial buffer suffices.
+        let buf = [0u8; 8];
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mb = decode_mb_coeffs(&mut dec, true, true, probs, &mut above, &mut left).unwrap();
+        assert_eq!(mb.y2, [0i16; 16]);
+        assert_eq!(mb.y, [[0i16; 16]; 16]);
+        assert_eq!(mb.u, [[0i16; 16]; 4]);
+        assert_eq!(mb.v, [[0i16; 16]; 4]);
+        assert_eq!(above.nonzero, [false; MB_ENTROPY_CTX_LEN]);
+        assert_eq!(left.nonzero, [false; MB_ENTROPY_CTX_LEN]);
+    }
+
+    #[test]
+    fn mb_skip_bpred_preserves_y2_context() {
+        // §20.16 reset_mb_context: a skipped B_PRED MB (no Y2) clears the
+        // eight Y/U/V slots but preserves the Y2 slot (8).
+        let probs = &DEFAULT_COEFF_PROBS;
+        let mut above = MbEntropyCtx {
+            nonzero: [true; MB_ENTROPY_CTX_LEN],
+        };
+        let mut left = MbEntropyCtx {
+            nonzero: [true; MB_ENTROPY_CTX_LEN],
+        };
+        let buf = [0u8; 8];
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let _ = decode_mb_coeffs(&mut dec, false, true, probs, &mut above, &mut left).unwrap();
+        for slot in 0..8 {
+            assert!(!above.nonzero[slot], "above slot {slot} not cleared");
+            assert!(!left.nonzero[slot], "left slot {slot} not cleared");
+        }
+        assert!(above.nonzero[8], "above Y2 slot must be preserved");
+        assert!(left.nonzero[8], "left Y2 slot must be preserved");
+    }
+
+    #[test]
+    fn synthetic_mb_decodes_to_expected_per_block_layout() {
+        // Build a macroblock with distinctive coefficients in each plane,
+        // encode it contiguously, and verify decode_mb_coeffs recovers the
+        // exact per-block raster layout — including the Y2 block, the
+        // YAfterY2 first-coefficient-1 luma plane, and chroma.
+        let probs = &DEFAULT_COEFF_PROBS;
+
+        let mut y2 = [0i16; 16];
+        y2[0] = 9;
+        y2[3] = -4;
+        y2[15] = 2;
+
+        // Each Y block: a recognisable value at raster position 1 (AC,
+        // since the YAfterY2 plane starts decoding at scan coefficient 1).
+        // Raster position 0 (the DC) must stay 0 — it is owned by Y2 and
+        // never decoded for the YAfterY2 plane.
+        let mut y = [[0i16; 16]; 16];
+        for (k, blk) in y.iter_mut().enumerate() {
+            blk[1] = (k as i16) - 8; // distinct per block, some negative
+            if k % 3 == 0 {
+                blk[5] = 3;
+            }
+        }
+
+        let mut u = [[0i16; 16]; 4];
+        let mut v = [[0i16; 16]; 4];
+        for (k, blk) in u.iter_mut().enumerate() {
+            blk[0] = (k as i16) + 1; // DC present (UV plane starts at 0)
+        }
+        for (k, blk) in v.iter_mut().enumerate() {
+            blk[0] = -((k as i16) + 1);
+            blk[2] = 7;
+        }
+
+        let mut enc_above = MbEntropyCtx::default();
+        let mut enc_left = MbEntropyCtx::default();
+        let buf = encode_mb_shared(true, probs, &mut enc_above, &mut enc_left, &y2, &y, &u, &v);
+
+        let mut dec_above = MbEntropyCtx::default();
+        let mut dec_left = MbEntropyCtx::default();
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mb =
+            decode_mb_coeffs(&mut dec, true, false, probs, &mut dec_above, &mut dec_left).unwrap();
+
+        assert_eq!(mb.y2, y2, "Y2 block mismatch");
+        assert_eq!(mb.y, y, "Y blocks mismatch");
+        assert_eq!(mb.u, u, "U blocks mismatch");
+        assert_eq!(mb.v, v, "V blocks mismatch");
+
+        // The decoder's post-MB context must equal the encoder's.
+        assert_eq!(dec_above, enc_above, "above context drift");
+        assert_eq!(dec_left, enc_left, "left context drift");
+
+        // Sanity on the resulting context: Y2 had coeffs (slot 8 set);
+        // every Y column/row slot set (each Y block has a nonzero AC);
+        // U/V slots set.
+        assert!(dec_above.nonzero[8], "Y2 above predictor should be set");
+        for slot in 0..8 {
+            assert!(dec_above.nonzero[slot], "above slot {slot} should be set");
+        }
+    }
+
+    #[test]
+    fn empty_block_clears_its_predictor_slot() {
+        // A block that decodes to all-zero (immediate EOB) must clear its
+        // predictor slot even if it was set on entry, so the slot reflects
+        // the LAST block mapped to it. We encode a Y MB where Y block 0
+        // (slots above=0, left=0) is empty while Y block 1 (above=1,
+        // left=0) is non-empty, then assert the resulting context.
+        let probs = &DEFAULT_COEFF_PROBS;
+        let y2 = [0i16; 16];
+        let mut y = [[0i16; 16]; 16];
+        // Y block 0 empty; Y block 1 has an AC coeff. Leave the rest empty.
+        y[1][1] = 5;
+        let u = [[0i16; 16]; 4];
+        let v = [[0i16; 16]; 4];
+
+        let mut enc_above = MbEntropyCtx::default();
+        let mut enc_left = MbEntropyCtx::default();
+        let buf = encode_mb_shared(true, probs, &mut enc_above, &mut enc_left, &y2, &y, &u, &v);
+        let mut dec_above = MbEntropyCtx::default();
+        let mut dec_left = MbEntropyCtx::default();
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mb =
+            decode_mb_coeffs(&mut dec, true, false, probs, &mut dec_above, &mut dec_left).unwrap();
+        assert_eq!(mb.y, y);
+        // Above slot for Y column 0 (blocks 0,4,8,12): the last decoded
+        // block touching above-slot 0 is Y block 12 (empty) → false.
+        assert!(
+            !dec_above.nonzero[0],
+            "above slot 0 should be cleared by later empty block"
+        );
+        // Above slot for Y column 1 (blocks 1,5,9,13): last is block 13
+        // (empty) → false; but block 1 was non-empty earlier — confirm the
+        // slot reflects the *last* block, not the earlier non-empty one.
+        assert!(
+            !dec_above.nonzero[1],
+            "above slot 1 must reflect last (empty) block"
+        );
+        assert_eq!(dec_above, enc_above);
+        assert_eq!(dec_left, enc_left);
+    }
+
+    #[test]
+    fn two_adjacent_mbs_propagate_left_context() {
+        // §13.3: the left predictor of MB(col=1) is the right column of
+        // MB(col=0). Decode two horizontally-adjacent MBs sharing a single
+        // rolling `left` context (and independent `above` rows), and prove
+        // the second MB's first-coefficient context depends on the first
+        // MB's right-edge blocks.
+        //
+        // We construct MB0 so that its right-column Y blocks (3,7,11,15 ->
+        // left slot 3) and right-column U/V are non-empty, then verify the
+        // identical MB1 token bytes decode correctly only when the carried
+        // `left` context is used. The strongest proof: decode MB1 with the
+        // propagated context vs a fresh (all-false) context and show the
+        // recovered coefficients differ (a context mismatch desyncs the
+        // bool decoder, corrupting the stream).
+        let probs = &DEFAULT_COEFF_PROBS;
+
+        // MB0: give every block a non-empty residue so all left slots end
+        // up set (especially the right-column-driven slot 3, and U/V).
+        let y2_0 = {
+            let mut b = [0i16; 16];
+            b[0] = 2;
+            b
+        };
+        let mut y0 = [[0i16; 16]; 16];
+        for blk in y0.iter_mut() {
+            blk[1] = 1;
+        }
+        let mut u0 = [[0i16; 16]; 4];
+        let mut v0 = [[0i16; 16]; 4];
+        for blk in u0.iter_mut() {
+            blk[0] = 1;
+        }
+        for blk in v0.iter_mut() {
+            blk[0] = 1;
+        }
+
+        // MB1: distinctive coefficients so we can assert exact recovery.
+        let y2_1 = {
+            let mut b = [0i16; 16];
+            b[0] = -5;
+            b[1] = 2;
+            b
+        };
+        let mut y1 = [[0i16; 16]; 16];
+        for (k, blk) in y1.iter_mut().enumerate() {
+            blk[1] = (k as i16) - 5;
+        }
+        let mut u1 = [[0i16; 16]; 4];
+        let mut v1 = [[0i16; 16]; 4];
+        for (k, blk) in u1.iter_mut().enumerate() {
+            blk[0] = (k as i16) + 2;
+        }
+        for (k, blk) in v1.iter_mut().enumerate() {
+            blk[0] = -((k as i16) + 2);
+        }
+
+        // Encode both MBs with the shared rolling `left` and a per-column
+        // `above` row of two contexts (mirroring a 2-wide MB row).
+        let mut enc_left = MbEntropyCtx::default();
+        let mut enc_above0 = MbEntropyCtx::default();
+        let mut enc_above1 = MbEntropyCtx::default();
+        let buf0 = encode_mb_shared(
+            true,
+            probs,
+            &mut enc_above0,
+            &mut enc_left,
+            &y2_0,
+            &y0,
+            &u0,
+            &v0,
+        );
+        // After MB0, `enc_left` holds MB0's right-edge context — exactly
+        // what MB1 must consume. Capture it for the negative control.
+        let left_after_mb0 = enc_left;
+        let buf1 = encode_mb_shared(
+            true,
+            probs,
+            &mut enc_above1,
+            &mut enc_left,
+            &y2_1,
+            &y1,
+            &u1,
+            &v1,
+        );
+
+        // Decode MB0, then MB1 with the propagated `left`.
+        let mut dec_left = MbEntropyCtx::default();
+        let mut dec_above0 = MbEntropyCtx::default();
+        let mut dec_above1 = MbEntropyCtx::default();
+        let mut dec0 = BoolDecoder::init(&buf0).unwrap();
+        let mb0 = decode_mb_coeffs(
+            &mut dec0,
+            true,
+            false,
+            probs,
+            &mut dec_above0,
+            &mut dec_left,
+        )
+        .unwrap();
+        assert_eq!(mb0.y, y0);
+        assert_eq!(
+            dec_left, left_after_mb0,
+            "MB0 must yield MB1's left context"
+        );
+
+        let mut dec1 = BoolDecoder::init(&buf1).unwrap();
+        let mb1 = decode_mb_coeffs(
+            &mut dec1,
+            true,
+            false,
+            probs,
+            &mut dec_above1,
+            &mut dec_left,
+        )
+        .unwrap();
+        assert_eq!(mb1.y2, y2_1, "MB1 Y2 with propagated left context");
+        assert_eq!(mb1.y, y1, "MB1 Y with propagated left context");
+        assert_eq!(mb1.u, u1, "MB1 U with propagated left context");
+        assert_eq!(mb1.v, v1, "MB1 V with propagated left context");
+
+        // Negative control: decoding MB1 with a FRESH (all-false) left
+        // context picks the wrong probability rows on the first
+        // coefficient of every block, desyncing the range decoder. The
+        // recovered coefficients must NOT match the encoded MB1 — proving
+        // the propagation is load-bearing, not incidental.
+        let mut wrong_left = MbEntropyCtx::default();
+        let mut wrong_above = MbEntropyCtx::default();
+        let mut dec_wrong = BoolDecoder::init(&buf1).unwrap();
+        let mb_wrong = decode_mb_coeffs(
+            &mut dec_wrong,
+            true,
+            false,
+            probs,
+            &mut wrong_above,
+            &mut wrong_left,
+        );
+        // It may decode (to garbage) or error; either way it must not
+        // reproduce the correct MB1 coefficients.
+        if let Ok(garbage) = mb_wrong {
+            assert!(
+                garbage.y != y1 || garbage.y2 != y2_1 || garbage.u != u1 || garbage.v != v1,
+                "fresh-left decode unexpectedly matched — propagation not load-bearing?"
+            );
+        }
     }
 }

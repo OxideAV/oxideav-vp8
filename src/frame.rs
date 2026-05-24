@@ -379,6 +379,25 @@ fn gather_neighbors(planes: &KeyframePlanes, mb_row: usize, mb_col: usize) -> Mb
     n
 }
 
+/// Public-in-crate alias of [`gather_neighbors`] for the multi-frame driver.
+pub(crate) fn gather_neighbors_public(
+    planes: &KeyframePlanes,
+    mb_row: usize,
+    mb_col: usize,
+) -> MbNeighbors {
+    gather_neighbors(planes, mb_row, mb_col)
+}
+
+/// Public-in-crate alias of [`write_mb`] for the multi-frame driver.
+pub(crate) fn write_mb_public(
+    planes: &mut KeyframePlanes,
+    mb_row: usize,
+    mb_col: usize,
+    recon: &ReconstructedMb,
+) {
+    write_mb(planes, mb_row, mb_col, recon);
+}
+
 /// Write a reconstructed macroblock into the full-frame plane buffers at
 /// macroblock position `(mb_row, mb_col)`.
 fn write_mb(planes: &mut KeyframePlanes, mb_row: usize, mb_col: usize, recon: &ReconstructedMb) {

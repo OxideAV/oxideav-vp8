@@ -458,6 +458,26 @@ pub struct FrameFilterConfig {
     /// The `B_PRED` mode delta — `mode_delta[0]` in §20.6. Only
     /// consulted when `delta_enabled` and the macroblock is `B_PRED`.
     pub bpred_mode_delta: i16,
+    /// The reference-frame delta applied to inter MBs predicting from
+    /// `LAST` — `ref_delta[LAST_FRAME]` in §20.6. Only consulted by
+    /// the interframe loop-filter path ([`filter_inter_frame`]).
+    pub ref_delta_last: i16,
+    /// The reference-frame delta applied to inter MBs predicting from
+    /// `GOLDEN` — `ref_delta[GOLDEN_FRAME]` in §20.6. Only consulted by
+    /// the interframe loop-filter path.
+    pub ref_delta_golden: i16,
+    /// The reference-frame delta applied to inter MBs predicting from
+    /// `ALTREF` — `ref_delta[ALTREF_FRAME]` in §20.6.
+    pub ref_delta_altref: i16,
+    /// The mode delta applied to inter MBs whose `y_mode` is `ZEROMV` —
+    /// `mode_delta[1]` in §20.6.
+    pub zero_mv_mode_delta: i16,
+    /// The mode delta applied to inter MBs whose `y_mode` is `NEARESTMV`,
+    /// `NEARMV`, or `NEWMV` — `mode_delta[2]` in §20.6.
+    pub other_mv_mode_delta: i16,
+    /// The mode delta applied to inter MBs whose `y_mode` is `SPLITMV` —
+    /// `mode_delta[3]` in §20.6.
+    pub split_mv_mode_delta: i16,
 }
 
 impl FrameFilterConfig {
@@ -513,7 +533,102 @@ impl FrameFilterConfig {
             delta_enabled: lf.loop_filter_adj_enable,
             ref_delta_current,
             bpred_mode_delta,
+            ref_delta_last: 0,
+            ref_delta_golden: 0,
+            ref_delta_altref: 0,
+            zero_mv_mode_delta: 0,
+            other_mv_mode_delta: 0,
+            split_mv_mode_delta: 0,
         }
+    }
+
+    /// Build the interframe configuration from a parsed boolean-coded
+    /// frame header and the carried (across-frame) reference / mode delta
+    /// state.
+    ///
+    /// Unlike [`FrameFilterConfig::keyframe`], the §9.4 deltas persist
+    /// across frames per RFC 6386 §9.4: "the values from the previous
+    /// frame are used, unless they are updated in the current header."
+    /// The caller carries `carried_ref_deltas[4]` and `carried_mode_deltas[4]`
+    /// across frames and asks this constructor to overlay the current
+    /// frame's `mb_lf_adjustments` updates on top. The four `ref` indices
+    /// are `{CURRENT=0, LAST=1, GOLDEN=2, ALTREF=3}` and the four `mode`
+    /// indices are `{B_PRED=0, ZERO_MV=1, NEAREST/NEAR/NEW_MV=2, SPLIT_MV=3}`.
+    pub fn interframe(
+        header: &crate::Vp8CodedHeader,
+        carried_ref_deltas: [i16; 4],
+        carried_mode_deltas: [i16; 4],
+    ) -> Self {
+        let mut segment_lf_level = [0i16; MAX_MB_SEGMENTS];
+        let mut segment_abs = false;
+        if header.segmentation_enabled {
+            if let Some(seg) = header.update_segmentation {
+                segment_abs = seg.segment_feature_mode_absolute;
+                for (dst, src) in segment_lf_level
+                    .iter_mut()
+                    .zip(seg.loop_filter_update.iter())
+                {
+                    *dst = src.unwrap_or(0);
+                }
+            }
+        }
+
+        let lf = &header.mb_lf_adjustments;
+        let mut ref_deltas = carried_ref_deltas;
+        let mut mode_deltas = carried_mode_deltas;
+        if lf.loop_filter_adj_enable {
+            for (i, slot) in ref_deltas.iter_mut().enumerate() {
+                if let Some(v) = lf.ref_frame_delta_update[i] {
+                    *slot = v;
+                }
+            }
+            for (i, slot) in mode_deltas.iter_mut().enumerate() {
+                if let Some(v) = lf.mb_mode_delta_update[i] {
+                    *slot = v;
+                }
+            }
+        }
+
+        FrameFilterConfig {
+            simple: header.filter_type,
+            key_frame: false,
+            loop_filter_level: header.loop_filter_level,
+            sharpness_level: header.sharpness_level,
+            segmentation_enabled: header.segmentation_enabled,
+            segment_abs,
+            segment_lf_level,
+            delta_enabled: lf.loop_filter_adj_enable,
+            ref_delta_current: ref_deltas[0],
+            bpred_mode_delta: mode_deltas[0],
+            ref_delta_last: ref_deltas[1],
+            ref_delta_golden: ref_deltas[2],
+            ref_delta_altref: ref_deltas[3],
+            zero_mv_mode_delta: mode_deltas[1],
+            other_mv_mode_delta: mode_deltas[2],
+            split_mv_mode_delta: mode_deltas[3],
+        }
+    }
+
+    /// Extract the four `[CURRENT, LAST, GOLDEN, ALTREF]` reference deltas
+    /// from a resolved config, in the order the §20.6 `ref_delta[]` array
+    /// uses. Used by the across-frame state to carry the deltas to the next
+    /// frame's [`FrameFilterConfig::interframe`] call.
+    pub fn ref_deltas(&self) -> [i16; 4] {
+        [
+            self.ref_delta_current,
+            self.ref_delta_last,
+            self.ref_delta_golden,
+            self.ref_delta_altref,
+        ]
+    }
+    /// Extract the four `[B_PRED, ZERO_MV, OTHER_MV, SPLIT_MV]` mode deltas.
+    pub fn mode_deltas(&self) -> [i16; 4] {
+        [
+            self.bpred_mode_delta,
+            self.zero_mv_mode_delta,
+            self.other_mv_mode_delta,
+            self.split_mv_mode_delta,
+        ]
     }
 }
 
@@ -561,6 +676,218 @@ pub fn calculate_mb_filter_level(
 
     // §20.6: clamp to 0..=63 after the deltas.
     level.clamp(0, 63) as u8
+}
+
+/// Per-macroblock loop-filter level for an interframe — the §20.6
+/// `calculate_filter_parameters` body with the full §9.4 reference + mode
+/// delta branching:
+///
+/// * the reference delta is selected by the MB's `ref_frame` (intra =
+///   `CURRENT_FRAME`, otherwise the LAST / GOLDEN / ALTREF the MB
+///   predicted from);
+/// * the mode delta is selected by `(ref_frame, y_mode)`: an intra MB
+///   only gets the `mode_delta[0]` `B_PRED` contribution; an inter MB
+///   picks among `mode_delta[1]` (ZEROMV), `mode_delta[3]` (SPLITMV), or
+///   `mode_delta[2]` (everything else — NEAREST / NEAR / NEW).
+///
+/// The mode-bucket-from-y_mode mapping mirrors the [`InterMode`] mapping
+/// that [`crate::state::Vp8DecoderState`] uses when writing per-MB modes
+/// into the `modes` slice: SPLITMV macroblocks are recorded with
+/// `y_mode = B_PRED` (so the §15.1 "filter internal edges" rule fires
+/// the way the spec wants), other whole-MB inter MBs get
+/// `y_mode = DC_PRED`. We therefore pass the original `InterMode` (or
+/// `None` for intra) in here, separate from the `y_mode` the caller
+/// recorded for the §15 geometry.
+///
+/// [`InterMode`]: crate::near_mv::InterMode
+pub fn calculate_mb_filter_level_inter(
+    config: &FrameFilterConfig,
+    segment_id: Option<u8>,
+    ref_frame: Option<crate::motion_comp::RefFrame>,
+    inter_mode: Option<crate::near_mv::InterMode>,
+    y_mode_for_bpred: IntraYMode,
+) -> u8 {
+    use crate::motion_comp::RefFrame as RF;
+    use crate::near_mv::InterMode as IM;
+
+    let mut level = config.loop_filter_level as i32;
+    if config.segmentation_enabled {
+        let seg = segment_id.unwrap_or(0) as usize;
+        let seg = seg.min(MAX_MB_SEGMENTS - 1);
+        if config.segment_abs {
+            level = config.segment_lf_level[seg] as i32;
+        } else {
+            level += config.segment_lf_level[seg] as i32;
+        }
+    }
+    level = level.clamp(0, 63);
+
+    if config.delta_enabled {
+        // §20.6 ref_delta lookup by reference frame.
+        let ref_delta = match ref_frame {
+            None => config.ref_delta_current,
+            Some(RF::Last) => config.ref_delta_last,
+            Some(RF::Golden) => config.ref_delta_golden,
+            Some(RF::AltRef) => config.ref_delta_altref,
+        };
+        level += ref_delta as i32;
+        // §20.6 mode_delta lookup. Intra → only B_PRED contributes.
+        match (ref_frame, inter_mode) {
+            (None, _) => {
+                if y_mode_for_bpred == IntraYMode::B {
+                    level += config.bpred_mode_delta as i32;
+                }
+            }
+            (Some(_), Some(IM::Zero)) => {
+                level += config.zero_mv_mode_delta as i32;
+            }
+            (Some(_), Some(IM::Split)) => {
+                level += config.split_mv_mode_delta as i32;
+            }
+            (Some(_), _) => {
+                level += config.other_mv_mode_delta as i32;
+            }
+        }
+    }
+
+    level.clamp(0, 63) as u8
+}
+
+/// Interframe analogue of [`filter_frame`]: walk the macroblocks in raster
+/// order applying the §15 / §20.6 filter to each MB's edges, but use
+/// [`calculate_mb_filter_level_inter`] for the per-MB level so each MB's
+/// reference frame + inter mode is consulted (the keyframe path was
+/// limited to the §9.4 CURRENT_FRAME / B_PRED slots).
+///
+/// `ref_frames[r]` carries the per-MB ref frame (`None` = intra) in the
+/// same raster order as `modes` / `coeffs`. `inter_modes[r]` carries the
+/// §16.2 [`InterMode`] for inter MBs (ignored for intra), in the same
+/// order. Both must have length `mb_rows * mb_cols`.
+pub fn filter_inter_frame(
+    planes: &mut KeyframePlanes,
+    modes: &[MacroblockModes],
+    coeffs: &[MbCoeffs],
+    ref_frames: &[Option<crate::motion_comp::RefFrame>],
+    inter_modes: &[Option<crate::near_mv::InterMode>],
+    config: &FrameFilterConfig,
+) {
+    let mb_cols = planes.mb_cols;
+    let mb_rows = planes.mb_rows;
+    if mb_cols == 0 || mb_rows == 0 {
+        return;
+    }
+    let expected = mb_cols * mb_rows;
+    if modes.len() != expected
+        || coeffs.len() != expected
+        || ref_frames.len() != expected
+        || inter_modes.len() != expected
+    {
+        return;
+    }
+
+    let ys = planes.y_stride;
+    let cs = planes.uv_stride;
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let index = mb_row * mb_cols + mb_col;
+            let mb = &modes[index];
+
+            let level = calculate_mb_filter_level_inter(
+                config,
+                mb.segment_id,
+                ref_frames[index],
+                inter_modes[index],
+                mb.y_mode,
+            );
+            if level == 0 {
+                continue;
+            }
+            let params = LoopFilterParams::derive(level, config.sharpness_level, config.key_frame);
+
+            // §15.1 page 86 filter_subblocks rule mirrors the keyframe
+            // pass: B_PRED / SPLITMV (we mapped SPLITMV → y_mode B_PRED
+            // in the modes record) OR any coded coefficient.
+            let filter_subblocks = mb.y_mode == IntraYMode::B || mb_has_coeffs(&coeffs[index]);
+
+            let y_x0 = mb_col * 16;
+            let y_y0 = mb_row * 16;
+            let uv_x0 = mb_col * 8;
+            let uv_y0 = mb_row * 8;
+
+            if config.simple {
+                if mb_col > 0 {
+                    filter_v_edge_simple(&mut planes.y, ys, y_x0, y_y0, params.mbedge_limit);
+                }
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_v_edge_simple(
+                            &mut planes.y,
+                            ys,
+                            y_x0 + 4 * q,
+                            y_y0,
+                            params.sub_bedge_limit,
+                        );
+                    }
+                }
+                if mb_row > 0 {
+                    filter_h_edge_simple(&mut planes.y, ys, y_y0, y_x0, params.mbedge_limit);
+                }
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_h_edge_simple(
+                            &mut planes.y,
+                            ys,
+                            y_y0 + 4 * q,
+                            y_x0,
+                            params.sub_bedge_limit,
+                        );
+                    }
+                }
+            } else {
+                if mb_col > 0 {
+                    filter_v_edge_normal(&mut planes.y, ys, y_x0, y_y0, 16, &params, true);
+                    filter_v_edge_normal(&mut planes.u, cs, uv_x0, uv_y0, 8, &params, true);
+                    filter_v_edge_normal(&mut planes.v, cs, uv_x0, uv_y0, 8, &params, true);
+                }
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_v_edge_normal(
+                            &mut planes.y,
+                            ys,
+                            y_x0 + 4 * q,
+                            y_y0,
+                            16,
+                            &params,
+                            false,
+                        );
+                    }
+                    filter_v_edge_normal(&mut planes.u, cs, uv_x0 + 4, uv_y0, 8, &params, false);
+                    filter_v_edge_normal(&mut planes.v, cs, uv_x0 + 4, uv_y0, 8, &params, false);
+                }
+                if mb_row > 0 {
+                    filter_h_edge_normal(&mut planes.y, ys, y_y0, y_x0, 16, &params, true);
+                    filter_h_edge_normal(&mut planes.u, cs, uv_y0, uv_x0, 8, &params, true);
+                    filter_h_edge_normal(&mut planes.v, cs, uv_y0, uv_x0, 8, &params, true);
+                }
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_h_edge_normal(
+                            &mut planes.y,
+                            ys,
+                            y_y0 + 4 * q,
+                            y_x0,
+                            16,
+                            &params,
+                            false,
+                        );
+                    }
+                    filter_h_edge_normal(&mut planes.u, cs, uv_y0 + 4, uv_x0, 8, &params, false);
+                    filter_h_edge_normal(&mut planes.v, cs, uv_y0 + 4, uv_x0, 8, &params, false);
+                }
+            }
+        }
+    }
 }
 
 /// Whether a macroblock has any coded (non-zero) DCT coefficient.
@@ -1174,6 +1501,12 @@ mod tests {
             delta_enabled: false,
             ref_delta_current: 0,
             bpred_mode_delta: 0,
+            ref_delta_last: 0,
+            ref_delta_golden: 0,
+            ref_delta_altref: 0,
+            zero_mv_mode_delta: 0,
+            other_mv_mode_delta: 0,
+            split_mv_mode_delta: 0,
         }
     }
 

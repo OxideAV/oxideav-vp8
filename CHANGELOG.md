@@ -6,6 +6,107 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Top-level interframe `Vp8DecoderState::decode_frame` driver
+  (RFC 6386 §9 / §16)** — new `src/state.rs` module owning the §9
+  three-slot reference-frame buffer (`LAST` / `GOLDEN` / `ALTREF`),
+  threading the §9.10 entropy / intra-mode / MV carry-state across
+  frames (with the `refresh_entropy_probs` rollback per the §20
+  `saved_entropy` reference pattern), and rotating the slots per the §9
+  `copy_buffer_to_alternate` / `copy_buffer_to_golden` /
+  `refresh_golden_frame` / `refresh_alternate_frame` / `refresh_last`
+  ladder. The per-frame walker dispatches each macroblock to the §16
+  intra-on-interframe path or the §16.2 / §16.3 / §18 inter path,
+  threads the `MbInfo` neighbour records left-to-right + above row, and
+  resolves the per-MB vector (ZEROMV / NEARESTMV / NEARMV / NEWMV /
+  SPLITMV) before reconstruction.
+
+  Decoder surface (`src/state.rs`):
+
+  * `Vp8DecoderState { last, golden, altref, coeff_probs, intra_probs,
+    mv_contexts, sign_bias, ref_lf_deltas, mode_lf_deltas, .. }` — the
+    persistent decoder state. `new()` / `default()` start empty; the
+    first packet must be a key frame.
+  * `RefFrameSlot { y, u, v, y_stride, uv_stride, mb_cols, mb_rows }` —
+    one slot of the three-slot ladder, sized to the macroblock-aligned
+    plane buffers the §18 motion-comp fetch consumes.
+  * `Vp8DecoderState::decode_frame(&mut self, bytes) ->
+    Result<Vp8DecodedFrame, DecodeError>` — the top-level driver. Parses
+    the §9.1 + §19.2 headers, dispatches the §11/§16 macroblock layer,
+    reconstructs each MB (intra orchestrator on intra MBs, §18 inter
+    motion-comp on inter MBs), runs the §15.1 loop filter, updates the
+    entropy carry-state per §9.10, rotates the reference slots per §9,
+    and emits a visible-cropped I420 picture.
+
+  Loop-filter extensions (`src/loop_filter.rs`):
+
+  * `FrameFilterConfig` gains `ref_delta_last` / `ref_delta_golden` /
+    `ref_delta_altref` and `zero_mv_mode_delta` / `other_mv_mode_delta`
+    / `split_mv_mode_delta` so the full §9.4 four-entry delta ladder
+    fits in one config; `FrameFilterConfig::interframe(header,
+    carried_ref_deltas, carried_mode_deltas)` builds the interframe
+    config (carrying the §9.4 "deltas persist until updated" rule
+    across frames); `FrameFilterConfig::ref_deltas()` /
+    `mode_deltas()` extract the four-entry arrays the state caches for
+    the next frame.
+  * `calculate_mb_filter_level_inter(config, segment_id, ref_frame,
+    inter_mode, y_mode_for_bpred)` — the §20.6 `calculate_filter_parameters`
+    body with the full ref-frame + mode-bucket branching (an intra MB
+    consults `ref_delta[CURRENT]` and `mode_delta[B_PRED]`; an inter
+    MB consults `ref_delta[LAST/GOLDEN/ALTREF]` and
+    `mode_delta[ZERO/SPLIT/OTHER]`).
+  * `filter_inter_frame(planes, modes, coeffs, ref_frames, inter_modes,
+    config)` — the §15 raster walker that takes a per-MB ref-frame +
+    inter-mode slice and uses `calculate_mb_filter_level_inter` per MB
+    (vs the keyframe-only `filter_frame` which assumes CURRENT_FRAME).
+
+  Bool-decoder extension (`src/bool_decoder.rs`):
+
+  * `BoolDecoder::init_partition(bytes)` — the §20-reference tolerant
+    init: a sub-2-byte DCT partition (which tiny ALTREF-style frames can
+    produce) zero-initialises the `value` register and presents an
+    empty input slice, matching the §20 spec `init_bool_decoder` `else`
+    branch. Used in the per-frame partition setup in `state.rs` and
+    the (existing) `decoder::decode_vp8` keyframe path.
+
+  Decoder-trait integration (`src/decoder.rs`):
+
+  * `Vp8Decoder` (the `oxideav_core::Decoder` impl) now owns a
+    `Vp8DecoderState` and routes `receive_frame` through
+    `decode_frame`, so the trait surface handles inter frames too. The
+    only `Error::Unsupported` it returns is "interframe arrived before
+    any key frame" (a stream-mis-feed error).
+
+  Public-in-crate helpers added on `frame.rs` / `decoder.rs`:
+  `gather_neighbors_public` / `write_mb_public` / `carve_dct_partitions`
+  / `crop_to_visible_public` — the bottom-half intra reconstruction and
+  partition-carving primitives the new driver shares with the keyframe
+  path.
+
+  Test additions (9 new tests, 4 of them multi-frame bit-exact):
+
+  * `state::tests::fresh_state_rejects_interframe` — the no-keyframe
+    refusal.
+  * `state::tests::key_frame_populates_all_three_reference_slots` —
+    §9.7 / §9.8 implicit refresh.
+  * `state::tests::stateful_key_frame_decode_matches_stateless` —
+    re-runs three single-keyframe fixtures through the stateful driver
+    and asserts bit-exact match vs the stateless `decode_vp8`.
+  * `state::tests::i_frame_then_p_frame_64x64_key_frame_decodes_bit_exact`
+    — sub-test verifying the I frame round-trips on its own.
+  * `state::tests::i_frame_then_p_frame_64x64_p_frame_first_diff_report`
+    — diagnostic that prints the first divergent byte if any.
+  * `state::tests::i_frame_then_p_frame_64x64_decodes_bit_exact` —
+    end-to-end 1 I + 1 P bit-exact against the libvpx YUV (the round's
+    target fixture).
+  * `state::tests::golden_update_cycle_decodes_bit_exact` — 5-frame
+    fixture with mid-GOP golden refresh, bit-exact.
+  * `state::tests::altref_arnr_on_decodes_bit_exact` — 10-frame fixture
+    with `auto-alt-ref` + ARNR, bit-exact.
+  * `decoder::tests::registry_tests::vp8_decoder_decodes_multi_frame_through_trait_api`
+    — end-to-end 2-frame decode through the `Decoder` trait surface.
+
+  Test count: 346 (default features) / 341 (standalone) — was 309/305.
+
 * **§16.4 SPLITMV per-sub-block motion-vector decoding + §18 SPLITMV
   reconstruction path** — appended to `src/near_mv.rs` and
   `src/motion_comp.rs`. The walk that turns a §16.2 `Split`

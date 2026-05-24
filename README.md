@@ -2,50 +2,47 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 119)
+## Status — 2026-05-25 (round 120)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
 on 2026-05-20. Rebuild work tracks RFC 6386 exclusively, with
 black-box `ffmpeg` / `libvpx` invocations as the only validator.
 
-**Key-frame decode is complete and bit-exact.** As of round 17 the
-top-level `decode_vp8` driver decodes intra-only (key) frames end to end —
-bitstream → dequant → reconstruct → loop-filter → I420 pixels — and is
-**byte-for-byte identical** to the libvpx/ffmpeg reference output on ten
-VP8 conformance fixtures spanning 16×16 … 128×128, one and four DCT
-partitions, and loop-filter levels 0 / 1 / 33 / 38 plus the simple-filter
-mode. Round 18 began inter-frame (§16) support with the §17 motion-vector
-component decoder. Round 19 added the first inter-prediction slice that
-*consumes* those vectors: §16.2 reference-frame selection and §18
-whole-pixel motion compensation + inter-MB reconstruction. Round 117
-adds §18.3 sub-pixel motion compensation: the sixtap (bicubic) and
-bilinear interpolation tap tables, the horizontal-then-vertical six-tap
-convolution, and the per-sub-block fractional-MV dispatch wired into the
-non-SPLITMV inter prediction path, so non-zero-fraction vectors
-reconstruct correctly. Round 118 adds the §16.2 / §16.3 / §18.1
-near/nearest motion-vector census + inter-mode tree (`src/near_mv.rs`):
-the §16.3 `vp8_find_near_mvs` spatial census over the three neighbours,
-the §16.3 sign-bias correction, the §16.2 `mv_ref` tree resolving
-NEARESTMV / NEARMV / ZEROMV / NEWMV / SPLITMV, the §18.1 one-MB-border
-clamp, and the `decode_inter_mb` integration that drives the resolved
-vector through the §18 prediction path so a whole-MB inter macroblock
-decodes end-to-end (bitstream → census → mode → reconstructed pixels).
-**Round 119 adds §16.4 SPLITMV per-sub-block motion-vector decoding:
-the §20.13 `mv_partitions` table + `mvpartition_tree` partition shape
-(`TopBottom` / `LeftRight` / `Quarters` / `MV_16`), the §20.13
-`sub_mv_ref_tree` + 5×3 context-keyed `submv_ref_probs2` table, the
-§16.4 `vp8_mvCont` left/above context derivation, the §20.11
-`above_block_mv` / `left_block_mv` neighbour-sub-block MV lookups with
-the SPLITMV-bottom-row / SPLITMV-right-column borrow rules, and the
-§16.4 `decode_split_mv` partition walk filling the sixteen
-per-sub-block vectors. Wired through to a §18 SPLITMV reconstruction
-path (`predict_split_mv` / `reconstruct_split_mv_mb` — per-sub-block
-luma vector + §18.1 four-luma-average chroma vector + no Y2 / DC-in-Y
-residue) and exposed as the end-to-end `decode_split_mv_mb` driver.**
-The top-level interframe `decode_vp8` driver (per-frame inter-MB
-census threading + reference-frame plumbing) and the encoder are not
-yet implemented.
+**Multi-frame interframe decode is now complete and bit-exact.** As of
+round 120 the new `Vp8DecoderState` driver
+(`src/state.rs`, `decode_frame(&mut self, bytes)`) owns the
+RFC 6386 §9 three-slot reference-frame buffer (`LAST` / `GOLDEN` /
+`ALTREF`), threads the §9.10 entropy / intra-mode / MV carry-state
+across frames (including the `refresh_entropy_probs` saved-entropy
+rollback per the §20 reference pattern), and rotates the slots per the
+§9 `copy_buffer_to_alternate` / `copy_buffer_to_golden` /
+`refresh_golden_frame` / `refresh_alternate_frame` / `refresh_last`
+ladder. The per-frame walker dispatches each macroblock to either the
+keyframe intra path or the §16 inter path: an inter MB reads the §16.2
+reference-frame bits, runs the §16.3 census + §16.2 mode tree against
+the carried `MbInfo` neighbour records, resolves the per-mode vector
+(ZERO / NEAREST / NEAR / NEW / SPLITMV), and reconstructs pixels via
+the §18 motion-comp kernels fetching from the correct reference slot;
+an intra MB on an interframe uses the §16.1 intra-on-interframe tree.
+The §15 loop-filter post-pass now uses the full §9.4 reference + mode
+delta ladder (the new `FrameFilterConfig::interframe` /
+`filter_inter_frame`) so each MB's level reflects its ref frame
+(`ref_delta[LAST/GOLDEN/ALTREF]`) and §16.2 mode bucket
+(`mode_delta[ZERO/OTHER/SPLIT]`).
+
+End-to-end **byte-for-byte identical** to libvpx/ffmpeg reference
+output on three multi-frame fixtures:
+
+* `i-frame-then-p-frame-64x64` — 1 I + 1 P (the round's target),
+* `golden-update-cycle` — 5 frames with mid-GOP golden refresh,
+* `altref-arnr-on` — 10 frames with `auto-alt-ref` + ARNR.
+
+Plus the ten single-keyframe fixtures from earlier rounds, all still
+passing through the new stateful driver. Test count: 346 (default
+features) / 341 (standalone) — was 309/305 in round 119. The encoder
+(`encode_vp8_*`) remains scaffolded — the §13 / §14 encode side has
+not been written.
 
 ### Landed
 

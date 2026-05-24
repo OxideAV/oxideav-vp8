@@ -113,6 +113,41 @@ impl<'a> BoolDecoder<'a> {
         })
     }
 
+    /// Initialise the decoder from a possibly-undersized partition.
+    ///
+    /// Mirrors the §20 reference's `init_bool_decoder`, which tolerates
+    /// `sz < 2` by zero-initialising the value register and presenting an
+    /// empty input. Tiny VP8 frames where the DCT partition rounds down
+    /// to a 0- or 1-byte slice can land here: the surrounding macroblock
+    /// layer reads only `mb_skip = 1` flags from this partition, which
+    /// is satisfiable from the `value = 0` initial state.
+    ///
+    /// Callers reading the §19.2 control partition or the §9.1 frame
+    /// header should keep using [`BoolDecoder::init`], which rejects
+    /// truncated input as an error (every valid VP8 frame's control
+    /// partition is at least 2 bytes).
+    pub fn init_partition(input: &'a [u8]) -> Self {
+        if input.len() >= 2 {
+            let first = input[0] as u32;
+            let second = input[1] as u32;
+            let value = (first << 8) | second;
+            BoolDecoder {
+                input: &input[2..],
+                range: 255,
+                value,
+                bit_count: 0,
+            }
+        } else {
+            // §20 reference: tiny partition → value = 0, no buffered input.
+            BoolDecoder {
+                input: &[],
+                range: 255,
+                value: 0,
+                bit_count: 0,
+            }
+        }
+    }
+
     /// Read one boolean with probability `prob / 256` of being 0.
     ///
     /// Returns `Ok(false)` for a coded zero and `Ok(true)` for a coded

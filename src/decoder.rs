@@ -163,6 +163,26 @@ impl From<FrameError> for DecodeError {
         DecodeError::Frame(value)
     }
 }
+impl From<crate::bool_decoder::BoolDecoderError> for DecodeError {
+    fn from(value: crate::bool_decoder::BoolDecoderError) -> Self {
+        // Surface a bool-decoder mishap during interframe macroblock-header
+        // reads as a macroblock error (the §19.3 prefix is part of the
+        // macroblock layer).
+        DecodeError::Macroblock(MacroblockError::from(value))
+    }
+}
+impl From<crate::near_mv::InterMbError> for DecodeError {
+    fn from(value: crate::near_mv::InterMbError) -> Self {
+        match value {
+            crate::near_mv::InterMbError::BoolDecoder(inner) => {
+                DecodeError::Macroblock(MacroblockError::from(inner))
+            }
+            crate::near_mv::InterMbError::SplitNotSupported { .. } => DecodeError::Unsupported(
+                "vp8 interframe: SPLITMV reconstruction path tripped an internal mis-dispatch",
+            ),
+        }
+    }
+}
 
 /// Fully-decoded, loop-filtered VP8 key-frame in I420 layout.
 ///
@@ -283,7 +303,10 @@ pub fn decode_vp8(bytes: &[u8]) -> Result<Vp8DecodedFrame, DecodeError> {
 /// are 3-byte little-endian size words, then the partitions follow
 /// concatenated. The last partition's length is implied by what is left.
 /// `num_partitions == 1` skips the size table entirely.
-fn carve_dct_partitions(section: &[u8], num_partitions: usize) -> Result<Vec<&[u8]>, DecodeError> {
+pub(crate) fn carve_dct_partitions(
+    section: &[u8],
+    num_partitions: usize,
+) -> Result<Vec<&[u8]>, DecodeError> {
     debug_assert!((1..=8).contains(&num_partitions));
     let table_len = (num_partitions - 1) * 3;
     if section.len() < table_len {
@@ -456,6 +479,15 @@ fn decode_residuals(
     Ok(coeffs)
 }
 
+/// Public-in-crate alias of [`crop_to_visible`] for the multi-frame driver.
+pub(crate) fn crop_to_visible_public(
+    planes: &KeyframePlanes,
+    width: u32,
+    height: u32,
+) -> Vp8DecodedFrame {
+    crop_to_visible(planes, width, height)
+}
+
 /// Crop the §14.2 reconstructed plane buffers (sized to whole macroblocks)
 /// to the §9.1 visible width / height and return a packed I420 frame.
 fn crop_to_visible(planes: &KeyframePlanes, width: u32, height: u32) -> Vp8DecodedFrame {
@@ -499,7 +531,7 @@ mod registry {
         Error, Frame, Packet, PixelFormat, Result, RuntimeContext, VideoFrame,
     };
 
-    use super::{decode_vp8, DecodeError, Vp8DecodedFrame};
+    use super::{DecodeError, Vp8DecodedFrame};
 
     /// Canonical codec id under which this decoder registers. Matches the
     /// long-standing `oxideav-vp9` / `oxideav-av1` naming convention.
@@ -545,28 +577,37 @@ mod registry {
         }
     }
 
-    /// `oxideav_core::Decoder` impl over [`decode_vp8`].
+    /// `oxideav_core::Decoder` impl driving [`Vp8DecoderState`].
     ///
     /// Each `send_packet` queues one compressed packet; the next
-    /// `receive_frame` consumes it and runs the keyframe decode chain.
-    /// Interframes surface [`Error::Unsupported`] (the inner
-    /// `DecodeError::Unsupported`); the decoder remains in a usable state
-    /// after the error — the caller can flush and start a fresh stream
-    /// from the next key frame.
+    /// `receive_frame` consumes it and feeds it to
+    /// [`Vp8DecoderState::decode_frame`], which threads reference frames
+    /// and entropy carry-state across calls. Both key frames and
+    /// interframes decode end-to-end; the only `DecodeError::Unsupported`
+    /// returned now is "interframe arrived before any key frame" (a
+    /// stream-mis-feed error, not a missing feature).
+    ///
+    /// [`Vp8DecoderState::decode_frame`]: crate::state::Vp8DecoderState::decode_frame
     pub struct Vp8Decoder {
         codec_id: CodecId,
         pending: VecDeque<Packet>,
         eof: bool,
+        state: crate::state::Vp8DecoderState,
     }
 
     impl Vp8Decoder {
         /// Build a fresh decoder bound to the supplied codec id. The id is
-        /// reported verbatim by [`Decoder::codec_id`].
+        /// reported verbatim by [`Decoder::codec_id`]. The internal
+        /// [`Vp8DecoderState`] starts empty — the first packet fed to
+        /// `send_packet` / `receive_frame` must be a key frame.
+        ///
+        /// [`Vp8DecoderState`]: crate::state::Vp8DecoderState
         pub fn new(codec_id: CodecId) -> Self {
             Self {
                 codec_id,
                 pending: VecDeque::new(),
                 eof: false,
+                state: crate::state::Vp8DecoderState::new(),
             }
         }
     }
@@ -599,7 +640,7 @@ mod registry {
                     Err(Error::NeedMore)
                 };
             };
-            let decoded = decode_vp8(&pkt.data)?;
+            let decoded = self.state.decode_frame(&pkt.data)?;
             let mut vf: VideoFrame = decoded.into();
             vf.pts = pkt.pts;
             Ok(Frame::Video(vf))
@@ -613,6 +654,7 @@ mod registry {
         fn reset(&mut self) -> Result<()> {
             self.pending.clear();
             self.eof = false;
+            self.state = crate::state::Vp8DecoderState::new();
             Ok(())
         }
     }
@@ -979,7 +1021,11 @@ mod tests {
         use oxideav_core::{CodecId, Decoder as _, Error, Frame, Packet, TimeBase};
 
         #[test]
-        fn vp8_decoder_returns_unsupported_for_inter_frame() {
+        fn vp8_decoder_returns_unsupported_for_interframe_before_keyframe() {
+            // An interframe fed in with no prior key frame can't decode
+            // (the §16 inter-prediction layer has no reference to predict
+            // from); surfaces `Error::Unsupported` via the
+            // `Vp8DecoderState` driver's empty-reference-slot check.
             let mut dec = Vp8Decoder::new(CodecId::new(VP8_CODEC_ID));
             let pkt = Packet::new(0, TimeBase::new(1, 1000), interframe_bytes());
             dec.send_packet(&pkt).expect("queue packet");
@@ -1021,6 +1067,41 @@ mod tests {
             assert_eq!(v.pts, Some(42));
             // After draining, the next call needs more input.
             assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+        }
+
+        /// End-to-end multi-frame decode through the `Decoder` trait
+        /// surface — feed the two-frame `i-frame-then-p-frame-64x64`
+        /// fixture as two consecutive `Packet`s and assert both frames
+        /// produce a `Frame::Video` (the bit-exact pixel-match itself is
+        /// covered by the state-module tests).
+        #[test]
+        fn vp8_decoder_decodes_multi_frame_through_trait_api() {
+            const IVF: &[u8] =
+                include_bytes!("../tests/fixtures/i-frame-then-p-frame-64x64/input.ivf");
+            // Walk the IVF (32-byte DKIF + per-frame 12-byte headers).
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            let mut cur = 32usize;
+            while cur + 12 <= IVF.len() {
+                let size = u32::from_le_bytes([IVF[cur], IVF[cur + 1], IVF[cur + 2], IVF[cur + 3]])
+                    as usize;
+                let body = cur + 12;
+                frames.push(IVF[body..body + size].to_vec());
+                cur = body + size;
+            }
+            assert_eq!(frames.len(), 2, "fixture has 2 frames");
+            let mut dec = Vp8Decoder::new(CodecId::new(VP8_CODEC_ID));
+            for (i, bytes) in frames.iter().enumerate() {
+                let pkt = Packet::new(i as u32, TimeBase::new(1, 1000), bytes.clone());
+                dec.send_packet(&pkt).expect("send packet");
+                let frame = dec.receive_frame().expect("decode through trait API");
+                let Frame::Video(v) = frame else {
+                    panic!("expected Video frame, got {frame:?}");
+                };
+                assert_eq!(v.planes.len(), 3, "I420 has 3 planes");
+                assert_eq!(v.planes[0].stride, 64);
+                assert_eq!(v.planes[1].stride, 32);
+                assert_eq!(v.planes[2].stride, 32);
+            }
         }
 
         #[test]

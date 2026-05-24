@@ -212,17 +212,32 @@
 //!   [`decoder::Vp8DecodedFrame`]. Interframes (§16) are surfaced as a
 //!   clean [`decoder::DecodeError::Unsupported`]. See [`decoder`].
 //!
+//! * VP8 multi-frame stateful decoder driver
+//!   ([`state::Vp8DecoderState`], [`state::Vp8DecoderState::decode_frame`])
+//!   owning the RFC 6386 §9 three-slot reference-frame buffer
+//!   ([`state::RefFrameSlot`] for `LAST` / `GOLDEN` / `ALTREF`), the §9.10
+//!   entropy / intra-mode / MV carry-state (with the §20 `saved_entropy`
+//!   rollback when `refresh_entropy_probs` is false), and the §9
+//!   `copy_buffer_to_*` / `refresh_*` slot rotation. The per-frame walker
+//!   dispatches each macroblock to either the §11 keyframe intra path or
+//!   the §16 inter path (intra-on-interframe via
+//!   [`parse_inter_frame_intra_macroblock_modes`], whole-MB inter via
+//!   `select_ref_frame` → §16.3 census → §16.2 inter-mode tree →
+//!   `reconstruct_inter_mb`, SPLITMV via `decode_split_mv` →
+//!   `reconstruct_split_mv_mb`), runs the §15.1 loop-filter post-pass
+//!   with the full §9.4 ref + mode delta ladder
+//!   ([`loop_filter::FrameFilterConfig::interframe`] +
+//!   [`loop_filter::filter_inter_frame`] +
+//!   [`loop_filter::calculate_mb_filter_level_inter`]), and emits a
+//!   visible-cropped I420 picture per frame.
+//!
 //! With the §13.3 per-MB token walk ([`dct_tokens::decode_mb_coeffs`]),
-//! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]), and
-//! the top-level [`decode_vp8`] driver now landed, the keyframe decode
-//! chain bitstream → dequant → reconstruct → loop-filter → pixels is
-//! complete end-to-end. Motion-vector decoding (§17), the §16.2 / §16.3
-//! near/nearest/best census + inter-mode tree, the §18 motion compensation
-//! (whole-pixel + sub-pixel), and the §18.1 clamp now decode a whole-MB
-//! inter macroblock end-to-end at the slice level ([`decode_inter_mb`]).
-//! Still scaffolded: the §16.4 SPLITMV per-sub-block walk, the top-level
-//! interframe driver (`decode_vp8` still returns
-//! [`decoder::DecodeError::Unsupported`] for interframes), and the encoder
+//! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]), the
+//! per-key-frame [`decode_vp8`] driver, the §16.4 SPLITMV walk, and now
+//! the multi-frame [`state::Vp8DecoderState`] all landed, the full
+//! key+inter decode chain is bit-exact against the libvpx/ffmpeg reference
+//! on multi-frame fixtures (single I + P; 5-frame mid-GOP golden refresh;
+//! 10-frame `auto-alt-ref` + ARNR). Still scaffolded: the encoder
 //! (`encode_vp8_*` returns [`Error::NotImplemented`]).
 
 #![warn(missing_debug_implementations)]
@@ -242,6 +257,7 @@ pub mod motion_comp;
 pub mod motion_vector;
 pub mod near_mv;
 pub mod reconstruct;
+pub mod state;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
@@ -304,6 +320,7 @@ pub use reconstruct::{
     decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
     ReconstructedMb,
 };
+pub use state::{RefFrameSlot, Vp8DecoderState};
 
 /// Crate-local error type for the not-yet-implemented surfaces.
 ///

@@ -6,6 +6,39 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§15.1 loop-filter frame geometry** — `filter_frame` in
+  `src/loop_filter.rs`, the per-frame post-pass that applies the existing
+  §15.2 simple / §15.3 normal kernels across a reconstructed
+  `KeyframePlanes`. Walks macroblocks in raster order and runs the four
+  §15.1 page-86 steps in order — left inter-MB vertical edge (skipped on
+  the leftmost column), three internal vertical subblock edges (1/4, 1/2,
+  3/4 width; one centre edge for chroma), top inter-MB horizontal edge
+  (skipped on the topmost row), three internal horizontal subblock edges
+  — with chroma analogues for the normal filter (the simple filter is
+  luma-only per §15.2). Steps 2 and 4 are skipped when the MB is neither
+  `B_PRED` nor `SPLITMV` *and* has no coded coefficient (the §20.6 annex
+  note: the gate is the decoded-coefficient count, not the bitstream skip
+  flag, so the pass inspects the dequantized `MbCoeffs` directly), and the
+  whole MB is skipped when its resolved level is 0 (§15 page 84). The
+  per-MB level derivation, `calculate_mb_filter_level`, implements the
+  §20.6 `dixie.c` `calculate_filter_parameters` body — part of RFC 6386,
+  not external source: base `loop_filter_level`, the §10 per-segment
+  override (delta adds / absolute replaces, clamped `0..=63`), then the
+  §9.4 reference + `B_PRED` mode deltas (clamped again). `LoopFilterParams`
+  `mbedge_limit` / `sub_bedge_limit` already equal the §20.6 `2*E + I`
+  disabling metric, so they pass straight into the kernels as the
+  `edge_limit` argument. `FrameFilterConfig` carries the resolved frame
+  state, with `FrameFilterConfig::keyframe` building it from a
+  `Vp8CodedHeader` (resolving the per-segment LF levels and the §9.4
+  current-frame / `B_PRED` deltas). New surface: `filter_frame`,
+  `calculate_mb_filter_level`, `FrameFilterConfig`, `MAX_REF_LF_DELTAS`,
+  `MAX_MODE_LF_DELTAS`, `MAX_MB_SEGMENTS`. Adds 15 tests (level derivation:
+  base, segment delta/absolute, dual clamp, ref/mode deltas, delta-disable;
+  frame geometry: level-0 no-op, a hand-derived normal MB-edge rewrite of
+  the six straddling pixels, leftmost-column left-edge skip, simple-filter
+  luma-only, the coeff/`B_PRED`-gated subblock steps, and the
+  header→config resolution). Total 206 tests.
+
 * **§14.1 dequantization scaling + bitstream→dequant wrapper** — new
   `src/dequant.rs` module closing the last §14 spec gap. `MbDequantFactors`
   computes the six §14.1 dequant factors (Y1 DC/AC, Y2 DC/AC, chroma DC/AC)

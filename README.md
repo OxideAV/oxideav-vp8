@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 13)
+## Status — 2026-05-24 (round 16)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -653,19 +653,63 @@ deltas); per-plane in-place `dequantize`; the wrapper matching
 moves reconstructed luma further from the flat-128 prediction. Total:
 191 tests across eleven modules.
 
+**Round 16 (2026-05-24).** Adds the §15.1 loop-filter *frame geometry*
+— `filter_frame` in `src/loop_filter.rs`, the per-frame post-pass that
+drives the round-9 §15.2 / §15.3 / §15.4 per-segment kernels across a
+reconstructed `KeyframePlanes`.
+
+  * `filter_frame(planes, modes, coeffs, config)` walks macroblocks in
+    raster order and runs the four §15.1 page-86 steps in order: (1)
+    left inter-MB vertical edge (skipped on the leftmost column), (2)
+    three internal vertical subblock edges at 1/4, 1/2, 3/4 of the luma
+    width plus one centre edge per chroma block, (3) top inter-MB
+    horizontal edge (skipped on the topmost row), (4) three internal
+    horizontal subblock edges. Normal filter does luma + both chroma;
+    the simple filter is luma-only (§15.2). The ordering is load-bearing
+    — many pixels straddle two edges and are filtered twice.
+  * Steps 2 and 4 are skipped when the MB is neither `B_PRED` nor
+    `SPLITMV` *and* has no coded coefficient. Per the §20.6 annex note,
+    the gate is the decoded-coefficient count, so the pass inspects the
+    dequantized `MbCoeffs` rather than the bitstream skip flag. The whole
+    MB is skipped when its resolved level is 0 (§15 page 84).
+  * `calculate_mb_filter_level` implements the §20.6 `dixie.c`
+    `calculate_filter_parameters` body: base `loop_filter_level`, the §10
+    per-segment override (delta adds / absolute replaces, clamped
+    `0..=63`), then the §9.4 reference + `B_PRED` mode deltas (clamped
+    again). The §15.4 `LoopFilterParams` `mbedge_limit` / `sub_bedge_limit`
+    already equal the §20.6 `2*E + I` disabling metric, so they pass
+    straight into the kernels.
+  * `FrameFilterConfig` carries the resolved frame state;
+    `FrameFilterConfig::keyframe` builds it from a `Vp8CodedHeader`
+    (resolving per-segment LF levels and the §9.4 current-frame / `B_PRED`
+    deltas — a key frame has no prior persisted delta state).
+  * New surface: `filter_frame`, `calculate_mb_filter_level`,
+    `FrameFilterConfig`, `MAX_REF_LF_DELTAS`, `MAX_MODE_LF_DELTAS`,
+    `MAX_MB_SEGMENTS`.
+
+Fifteen new unit tests: level derivation (base, segment delta/absolute,
+the dual `0..=63` clamp, ref + `B_PRED` mode deltas, delta-disable); a
+hand-derived normal MB-edge rewrite of the six straddling pixels
+(`p2..q2`) at a 100/110 boundary; level-0 whole-MB no-op; leftmost-column
+left-edge skip (with the horizontal edge still touching column 0);
+simple-filter luma-only; the coeff-gated vs `B_PRED`-forced subblock
+steps; and the header→`FrameFilterConfig` resolution. Total: 206 tests
+across eleven modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
 walk); motion-vector component decoding (§17.1) against the updated
-`MV_CONTEXT`s; the §15.1 loop-filter geometry (raster-order edge
-walk over `decode_keyframe`'s plane output + the §15.1 page-86
-step-2/4 skip rule + the §9.4 / §10 per-macroblock
-`loop_filter_level` derivation) that drives the round-9 §15.2 /
-§15.3 / §15.4 per-segment kernels; the encoder. All top-level entry
-points (`decode_vp8`, `encode_vp8_keyframe`) still return
-`Error::NotImplemented`.
+`MV_CONTEXT`s; the encoder. All top-level entry points (`decode_vp8`,
+`encode_vp8_keyframe`) still return `Error::NotImplemented`.
+
+The round-16 `filter_frame` geometry targets the key-frame case (every
+MB is intra / `CURRENT_FRAME`); the inter-frame mode/reference delta
+ladder (the other three `mode_delta` slots and the non-current
+`ref_delta` slots, plus the persisted-across-frames delta state) will be
+wired when the §16 inter-prediction branch lands.
 
 ## Clean-room sources
 

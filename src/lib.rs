@@ -79,9 +79,23 @@
 //!   simple filter, the §15.3 normal subblock / macroblock filters, and
 //!   the §15.4 control-parameter derivation
 //!   ([`LoopFilterParams::derive`]). Pure per-edge-segment kernels
-//!   operating on a caller-supplied pixel window; the §15.1
-//!   raster-order edge geometry is the integration round's job. See
-//!   [`loop_filter`].
+//!   operating on a caller-supplied pixel window. See [`loop_filter`].
+//! * VP8 §15.1 loop-filter frame geometry — [`filter_frame`], the
+//!   per-frame post-pass that walks the reconstructed [`KeyframePlanes`]
+//!   in raster order and applies the §15.2 / §15.3 kernels across each
+//!   macroblock's left inter-MB edge, three internal vertical subblock
+//!   edges, top inter-MB edge, and three internal horizontal subblock
+//!   edges (chroma analogues for the normal filter; the simple filter is
+//!   luma-only), honouring the §15.1 page-86 steps-2/4 skip rule (mode
+//!   neither `B_PRED` nor `SPLITMV` *and* no coded coefficient) and the
+//!   §15 page-84 level-0 whole-MB skip. The per-MB level derivation
+//!   ([`calculate_mb_filter_level`]) implements the §20.6 `dixie.c`
+//!   `calculate_filter_parameters` body: base `loop_filter_level` + §10
+//!   per-segment override (delta or absolute, clamped `0..=63`) + §9.4
+//!   reference / mode deltas (clamped again). [`FrameFilterConfig`]
+//!   carries the resolved frame state, with
+//!   [`FrameFilterConfig::keyframe`] building it from a
+//!   [`Vp8CodedHeader`]. See [`loop_filter`].
 //! * VP8 interframe intra-predicted macroblock mode decoding (RFC 6386
 //!   §16.1) — the dynamic `ymode_prob` / `uv_mode_prob` resolution
 //!   ([`InterFrameIntraProbs::for_frame_header`]) including the §16.1
@@ -125,13 +139,14 @@
 //! With the §13.3 per-MB token walk ([`dct_tokens::decode_mb_coeffs`]) and
 //! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]) now
 //! landed, the keyframe decode chain bitstream → dequant → reconstruct →
-//! pixels is complete at the per-macroblock granularity. Motion-vector
-//! decoding (§17), the inter-predicted §16.2 / §16.3 / §16.4 branch
-//! (`mv_ref` tree, near/nearest/best census, split prediction), the §15.1
-//! loop-filter geometry that drives the [`loop_filter`] segment kernels (a
-//! post-reconstruction pass on top of [`decode_keyframe`]'s plane output),
-//! and the encoder are all still scaffolded — the top-level `decode_vp8` /
-//! `encode_vp8_*` entry points return [`Error::NotImplemented`].
+//! pixels is complete at the per-macroblock granularity, and the §15.1
+//! loop-filter frame geometry ([`filter_frame`]) now runs as a
+//! post-reconstruction pass on top of [`decode_keyframe`]'s plane output.
+//! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
+//! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
+//! prediction), and the encoder are all still scaffolded — the top-level
+//! `decode_vp8` / `encode_vp8_*` entry points return
+//! [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
@@ -174,7 +189,9 @@ pub use inverse_transform::{
     QINDEX_RANGE,
 };
 pub use loop_filter::{
-    clamp_s8, common_adjust, mb_filter, s2u, simple_segment, subblock_filter, u2s, LoopFilterParams,
+    calculate_mb_filter_level, clamp_s8, common_adjust, filter_frame, mb_filter, s2u,
+    simple_segment, subblock_filter, u2s, FrameFilterConfig, LoopFilterParams, MAX_MB_SEGMENTS,
+    MAX_MODE_LF_DELTAS, MAX_REF_LF_DELTAS,
 };
 pub use macroblock::{
     parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,

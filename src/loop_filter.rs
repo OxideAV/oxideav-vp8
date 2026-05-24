@@ -39,22 +39,24 @@
 //!   `sub_bedge_limit` from a per-macroblock `loop_filter_level`, the
 //!   frame `sharpness_level`, and the key-frame flag.
 //!
-//! # What is NOT in this module (out of scope for §15 standalone)
+//! # §15.1 frame geometry (also in this module)
 //!
-//! * The §15.1 macroblock-by-macroblock filter *geometry* — walking the
-//!   reconstructed frame in raster order, gathering the 16 luma / 8
-//!   chroma segments straddling each of the four edges per macroblock,
-//!   honouring the order of the four filtering steps, and applying the
-//!   §15.1 page 86 skip rule (steps 2 and 4 skipped when the macroblock
-//!   is neither `B_PRED` nor `SPLITMV` and has no coded coefficient).
-//!   That orchestration belongs to the per-macroblock reconstruction
-//!   walk (the integration round); this module provides the per-segment
-//!   primitives it calls.
+//! * The §15.1 macroblock-by-macroblock filter *geometry* —
+//!   [`filter_frame`] walks the reconstructed [`crate::KeyframePlanes`]
+//!   in raster order, gathers the 16 luma / 8 chroma segments straddling
+//!   each of the four edges per macroblock, honours the order of the four
+//!   filtering steps, and applies the §15.1 page 86 skip rule (steps 2
+//!   and 4 skipped when the macroblock is neither `B_PRED` nor `SPLITMV`
+//!   and has no coded coefficient) plus the §15 page 84 level-0 whole-MB
+//!   skip. It calls the per-segment primitives above.
 //! * The §9.4 / §10 derivation of the per-macroblock `loop_filter_level`
-//!   itself (segment override + the reference-frame / prediction-mode
-//!   deltas). [`LoopFilterParams::derive`] takes the already-resolved
-//!   level as input; computing it from the [`crate::Vp8CodedHeader`]
-//!   fields is the integration round's job.
+//!   itself — [`calculate_mb_filter_level`] implements the §20.6
+//!   `calculate_filter_parameters` body (segment override + the
+//!   reference-frame / prediction-mode deltas).
+//!   [`LoopFilterParams::derive`] still takes an already-resolved level
+//!   for callers wanting just the §15.4 limit derivation;
+//!   [`FrameFilterConfig::keyframe`] resolves the level inputs from a
+//!   [`crate::Vp8CodedHeader`].
 
 /// The §15.4 control parameters for one filtering pass over a
 /// macroblock, derived from a resolved (post-override) per-macroblock
@@ -368,6 +370,501 @@ pub fn mb_filter(
     }
 }
 
+// ===================================================================
+// §15.1 / §15.2 frame loop-filter geometry
+// ===================================================================
+//
+// This section implements the §15.1 "Filter Geometry and Overall
+// Procedure" — the per-frame pass that walks the reconstructed plane
+// buffers in raster-scan order and applies the §15.2 simple or §15.3
+// normal filter kernels above to the edges between adjacent macroblocks
+// and the edges between adjacent subblocks.
+//
+// The arithmetic that derives the per-macroblock filter level from the
+// base `loop_filter_level`, the §10 per-segment override, and the §9.4
+// reference / mode deltas is the §20.6 `calculate_filter_parameters`
+// body of the RFC's reference-decoder annex (`dixie.c`, part of RFC 6386
+// itself). The four-step per-macroblock edge iteration — left
+// inter-MB edge, three internal vertical subblock edges, top inter-MB
+// edge, three internal horizontal subblock edges, with chroma analogues
+// — is the §20.6 `filter_row_normal` / `filter_row_simple` geometry.
+//
+// `LoopFilterParams::derive` above already returns the §15.4 limits in
+// the form the kernels consume: its `mbedge_limit` / `sub_bedge_limit`
+// equal the `2 * E + I` disabling metric the §20.6 `normal_threshold`
+// (and the §20.6 simple `mb_limit` / `b_limit`) compute, so the
+// geometry pass passes those precomputed values straight into
+// `mb_filter` / `subblock_filter` / `simple_segment` as their
+// `edge_limit` argument.
+
+use crate::frame::{KeyframePlanes, MbCoeffs};
+use crate::macroblock::{IntraYMode, MacroblockModes};
+
+/// Number of reference-frame loop-filter deltas (`MAX_REF_LF_DELTAS`,
+/// RFC 6386 §9.4) — one per reference-frame slot.
+pub const MAX_REF_LF_DELTAS: usize = 4;
+/// Number of prediction-mode loop-filter deltas (`MAX_MODE_LF_DELTAS`,
+/// RFC 6386 §9.4).
+pub const MAX_MODE_LF_DELTAS: usize = 4;
+/// Number of segments (`MAX_MB_SEGMENTS`, RFC 6386 §10).
+pub const MAX_MB_SEGMENTS: usize = 4;
+
+/// Frame-constant configuration controlling the §15 loop-filter pass.
+///
+/// Holds the resolved (post-header) state the §20.6
+/// `calculate_filter_parameters` body reads: the base
+/// `loop_filter_level` and `sharpness_level`, the §10 per-segment level
+/// override config, and the §9.4 reference / mode delta config. Build it
+/// with [`FrameFilterConfig::keyframe`] from a parsed
+/// [`crate::Vp8CodedHeader`], or construct directly for unit testing.
+///
+/// On a key frame every macroblock predicts from the current frame, so
+/// of the four §9.4 mode deltas only `mode_delta[0]` (the `B_PRED`
+/// delta) ever applies, and the reference delta is always the
+/// current-frame slot. The geometry pass below therefore models exactly
+/// those two contributions; the remaining inter-frame mode/reference
+/// deltas are reserved for the §16 inter-prediction round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameFilterConfig {
+    /// `filter_type` — `false` selects the §15.3 normal filter, `true`
+    /// the §15.2 simple filter.
+    pub simple: bool,
+    /// Whether the current frame is a key frame (selects the §15.4
+    /// key-frame `hev_threshold` ladder).
+    pub key_frame: bool,
+    /// Base frame `loop_filter_level` (`0..=63`, RFC 6386 §9.4).
+    pub loop_filter_level: u8,
+    /// Frame `sharpness_level` (`0..=7`, RFC 6386 §9.4).
+    pub sharpness_level: u8,
+    /// `segmentation_enabled` (RFC 6386 §9.3) — gates the §10
+    /// per-segment loop-filter override.
+    pub segmentation_enabled: bool,
+    /// `segment_feature_mode` (RFC 6386 §9.3 4.a): `true` = absolute
+    /// (the per-segment value *replaces* the base level), `false` =
+    /// delta (it is *added* to the base level). Only consulted when
+    /// `segmentation_enabled`.
+    pub segment_abs: bool,
+    /// The four §10 per-segment loop-filter levels (absolute values or
+    /// signed deltas per `segment_abs`). Only consulted when
+    /// `segmentation_enabled`.
+    pub segment_lf_level: [i16; MAX_MB_SEGMENTS],
+    /// `loop_filter_adj_enable` (RFC 6386 §9.4) — gates the per-MB
+    /// reference / mode delta adjustment.
+    pub delta_enabled: bool,
+    /// The reference-frame delta applied for the current (intra) frame —
+    /// `ref_delta[CURRENT_FRAME]` in §20.6. Only consulted when
+    /// `delta_enabled`.
+    pub ref_delta_current: i16,
+    /// The `B_PRED` mode delta — `mode_delta[0]` in §20.6. Only
+    /// consulted when `delta_enabled` and the macroblock is `B_PRED`.
+    pub bpred_mode_delta: i16,
+}
+
+impl FrameFilterConfig {
+    /// Build the key-frame configuration from a parsed boolean-coded
+    /// frame header.
+    ///
+    /// Resolves the §10 per-segment loop-filter levels from the header's
+    /// `update_segmentation.loop_filter_update` (a `None` entry means the
+    /// segment carries level 0 — the §9.3 "value is 0" path) and the
+    /// §9.4 reference / mode deltas from `mb_lf_adjustments`. Because a
+    /// key frame has no prior persisted delta state (the §9.4 deltas are
+    /// "updated for the current frame" and key frames begin a fresh
+    /// sequence), a `None` update entry resolves to 0.
+    ///
+    /// The reference delta used is the current-frame slot
+    /// (`ref_frame_delta_update[0]`, the `CURRENT_FRAME` reference per
+    /// §20.6's `ref_delta[CURRENT_FRAME]`) and the only mode delta that
+    /// applies on a key frame is the `B_PRED` slot
+    /// (`mb_mode_delta_update[0]`, `mode_delta[0]` in §20.6).
+    pub fn keyframe(header: &crate::Vp8CodedHeader) -> Self {
+        let mut segment_lf_level = [0i16; MAX_MB_SEGMENTS];
+        let mut segment_abs = false;
+        if header.segmentation_enabled {
+            if let Some(seg) = header.update_segmentation {
+                segment_abs = seg.segment_feature_mode_absolute;
+                for (dst, src) in segment_lf_level
+                    .iter_mut()
+                    .zip(seg.loop_filter_update.iter())
+                {
+                    *dst = src.unwrap_or(0);
+                }
+            }
+        }
+
+        let lf = &header.mb_lf_adjustments;
+        let (ref_delta_current, bpred_mode_delta) = if lf.loop_filter_adj_enable {
+            (
+                lf.ref_frame_delta_update[0].unwrap_or(0),
+                lf.mb_mode_delta_update[0].unwrap_or(0),
+            )
+        } else {
+            (0, 0)
+        };
+
+        FrameFilterConfig {
+            simple: header.filter_type,
+            key_frame: true,
+            loop_filter_level: header.loop_filter_level,
+            sharpness_level: header.sharpness_level,
+            segmentation_enabled: header.segmentation_enabled,
+            segment_abs,
+            segment_lf_level,
+            delta_enabled: lf.loop_filter_adj_enable,
+            ref_delta_current,
+            bpred_mode_delta,
+        }
+    }
+}
+
+/// Resolve the per-macroblock loop-filter level per the §20.6
+/// `calculate_filter_parameters` body: start from the frame base,
+/// apply the §10 per-segment override (delta or absolute), clamp to
+/// `0..=63`, apply the §9.4 reference + mode deltas, then clamp again.
+///
+/// `segment_id` is the macroblock's §10 segment (`None` resolves to
+/// segment 0, the §10 default when the map was not updated). `y_mode`
+/// selects the §9.4 `B_PRED` mode delta. Returns the resolved level in
+/// `0..=63`; the caller skips filtering entirely when it is 0 (RFC 6386
+/// §15 page 84).
+pub fn calculate_mb_filter_level(
+    config: &FrameFilterConfig,
+    segment_id: Option<u8>,
+    y_mode: IntraYMode,
+) -> u8 {
+    // §20.6: filter_level = loopfilter_hdr.level.
+    let mut level = config.loop_filter_level as i32;
+
+    // §20.6 + §10: per-segment override.
+    if config.segmentation_enabled {
+        let seg = segment_id.unwrap_or(0) as usize;
+        let seg = seg.min(MAX_MB_SEGMENTS - 1);
+        if config.segment_abs {
+            level = config.segment_lf_level[seg] as i32;
+        } else {
+            level += config.segment_lf_level[seg] as i32;
+        }
+    }
+
+    // §20.6: clamp to 0..=63 after the segment override.
+    level = level.clamp(0, 63);
+
+    // §20.6 + §9.4: reference / mode deltas. On a key frame every MB is
+    // CURRENT_FRAME, so the reference delta always applies and only the
+    // B_PRED mode delta participates.
+    if config.delta_enabled {
+        level += config.ref_delta_current as i32;
+        if y_mode == IntraYMode::B {
+            level += config.bpred_mode_delta as i32;
+        }
+    }
+
+    // §20.6: clamp to 0..=63 after the deltas.
+    level.clamp(0, 63) as u8
+}
+
+/// Whether a macroblock has any coded (non-zero) DCT coefficient.
+///
+/// The §20.6 step-2 / step-4 skip rule (RFC 6386 §15.1 page 86) is
+/// "neither `B_PRED` nor `SPLITMV` *and* no DCT coefficient coded for
+/// the whole macroblock". The §20.6 annex notes this conditional is
+/// "actually dependent on the number of coefficients decoded, not the
+/// skip flag as coded in the bitstream" — so we examine the
+/// dequantized coefficient bundle directly rather than trusting
+/// `mb_skip_coeff`.
+fn mb_has_coeffs(coeffs: &MbCoeffs) -> bool {
+    coeffs.y2.iter().any(|&c| c != 0)
+        || coeffs.y.iter().any(|b| b.iter().any(|&c| c != 0))
+        || coeffs.u.iter().any(|b| b.iter().any(|&c| c != 0))
+        || coeffs.v.iter().any(|b| b.iter().any(|&c| c != 0))
+}
+
+/// Apply the normal §15.3 filter to one vertical edge of a plane.
+///
+/// `x` is the column at the edge (`p`-side is `x - 1`, `q`-side is `x`);
+/// `y0` is the first row of the edge, `len` the number of rows (16 for
+/// luma, 8 for chroma). `mb_edge` selects the wide [`mb_filter`] for
+/// inter-macroblock edges vs. the [`subblock_filter`] for inter-subblock
+/// edges.
+#[allow(clippy::too_many_arguments)]
+fn filter_v_edge_normal(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y0: usize,
+    len: usize,
+    params: &LoopFilterParams,
+    mb_edge: bool,
+) {
+    let edge_limit = if mb_edge {
+        params.mbedge_limit
+    } else {
+        params.sub_bedge_limit
+    };
+    let mut seg = [0u8; 8];
+    for r in 0..len {
+        let row = (y0 + r) * stride;
+        // Gather the 8-pixel segment p3 p2 p1 p0 | q0 q1 q2 q3 centred on
+        // the vertical edge at column `x` (p-side is to the left).
+        for (k, slot) in seg.iter_mut().enumerate() {
+            *slot = plane[row + x - 4 + k];
+        }
+        if mb_edge {
+            mb_filter(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+                0,
+            );
+        } else {
+            subblock_filter(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+                0,
+            );
+        }
+        for (k, &val) in seg.iter().enumerate() {
+            plane[row + x - 4 + k] = val;
+        }
+    }
+}
+
+/// Apply the normal §15.3 filter to one horizontal edge of a plane.
+///
+/// `y` is the row at the edge (`p`-side is `y - 1`, `q`-side is `y`);
+/// `x0` is the first column, `len` the number of columns.
+#[allow(clippy::too_many_arguments)]
+fn filter_h_edge_normal(
+    plane: &mut [u8],
+    stride: usize,
+    y: usize,
+    x0: usize,
+    len: usize,
+    params: &LoopFilterParams,
+    mb_edge: bool,
+) {
+    let edge_limit = if mb_edge {
+        params.mbedge_limit
+    } else {
+        params.sub_bedge_limit
+    };
+    let mut seg = [0u8; 8];
+    for c in 0..len {
+        let col = x0 + c;
+        // Gather the 8-pixel segment straddling the horizontal edge at
+        // row `y` (p-side is above).
+        for (k, slot) in seg.iter_mut().enumerate() {
+            *slot = plane[(y - 4 + k) * stride + col];
+        }
+        if mb_edge {
+            mb_filter(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+                0,
+            );
+        } else {
+            subblock_filter(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+                0,
+            );
+        }
+        for (k, &val) in seg.iter().enumerate() {
+            plane[(y - 4 + k) * stride + col] = val;
+        }
+    }
+}
+
+/// Apply the §15.2 simple filter to one vertical edge (luma only).
+///
+/// The simple filter examines a 4-pixel window `p1 p0 | q0 q1`; the
+/// `edge_limit` is the precomputed `mbedge_limit` / `sub_bedge_limit`.
+fn filter_v_edge_simple(plane: &mut [u8], stride: usize, x: usize, y0: usize, edge_limit: u8) {
+    let mut seg = [0u8; 4];
+    for r in 0..16 {
+        let row = (y0 + r) * stride;
+        for (k, slot) in seg.iter_mut().enumerate() {
+            *slot = plane[row + x - 2 + k];
+        }
+        simple_segment(edge_limit, &mut seg, 0);
+        for (k, &val) in seg.iter().enumerate() {
+            plane[row + x - 2 + k] = val;
+        }
+    }
+}
+
+/// Apply the §15.2 simple filter to one horizontal edge (luma only).
+fn filter_h_edge_simple(plane: &mut [u8], stride: usize, y: usize, x0: usize, edge_limit: u8) {
+    let mut seg = [0u8; 4];
+    for c in 0..16 {
+        let col = x0 + c;
+        for (k, slot) in seg.iter_mut().enumerate() {
+            *slot = plane[(y - 2 + k) * stride + col];
+        }
+        simple_segment(edge_limit, &mut seg, 0);
+        for (k, &val) in seg.iter().enumerate() {
+            plane[(y - 2 + k) * stride + col] = val;
+        }
+    }
+}
+
+/// Run the §15 loop filter over a reconstructed key frame in place.
+///
+/// This is the §15.1 frame-geometry pass: it walks the macroblocks of
+/// `planes` in raster-scan order and, for each, applies the four §15.1
+/// filtering steps using the kernels above —
+///
+/// 1. the left (vertical) inter-macroblock edge (skipped on the leftmost
+///    column),
+/// 2. the three internal vertical subblock edges,
+/// 3. the top (horizontal) inter-macroblock edge (skipped on the topmost
+///    row),
+/// 4. the three internal horizontal subblock edges,
+///
+/// with the chroma analogues for the normal filter (the §15.2 simple
+/// filter touches only luma). Steps 2 and 4 are skipped for a macroblock
+/// whose coding mode is neither `B_PRED` nor `SPLITMV` *and* which has no
+/// coded coefficient (RFC 6386 §15.1 page 86). The whole macroblock is
+/// skipped when its resolved §20.6 filter level is 0 (RFC 6386 §15
+/// page 84). `modes` and `coeffs` must each have `mb_cols * mb_rows`
+/// entries in the same raster order as [`crate::decode_keyframe`].
+///
+/// The §20.6 ordering "must be respected" (RFC 6386 §15.1 page 86): many
+/// pixels straddle two or more edges and are filtered more than once, so
+/// the raster MB order and the within-MB step order are both load-bearing.
+pub fn filter_frame(
+    planes: &mut KeyframePlanes,
+    modes: &[MacroblockModes],
+    coeffs: &[MbCoeffs],
+    config: &FrameFilterConfig,
+) {
+    let mb_cols = planes.mb_cols;
+    let mb_rows = planes.mb_rows;
+    if mb_cols == 0 || mb_rows == 0 {
+        return;
+    }
+    let expected = mb_cols * mb_rows;
+    if modes.len() != expected || coeffs.len() != expected {
+        return;
+    }
+
+    let ys = planes.y_stride;
+    let cs = planes.uv_stride;
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let index = mb_row * mb_cols + mb_col;
+            let mb = &modes[index];
+
+            let level = calculate_mb_filter_level(config, mb.segment_id, mb.y_mode);
+            // §15 page 84: skip the macroblock entirely when level is 0.
+            if level == 0 {
+                continue;
+            }
+            let params = LoopFilterParams::derive(level, config.sharpness_level, config.key_frame);
+
+            // §15.1 page 86: steps 2 and 4 run when the MB is B_PRED /
+            // SPLITMV (no SPLITMV on key frames) OR has any coded coeff.
+            let filter_subblocks = mb.y_mode == IntraYMode::B || mb_has_coeffs(&coeffs[index]);
+
+            let y_x0 = mb_col * 16;
+            let y_y0 = mb_row * 16;
+            let uv_x0 = mb_col * 8;
+            let uv_y0 = mb_row * 8;
+
+            if config.simple {
+                // §20.6 filter_row_simple — luma only.
+                // Step 1: left inter-MB edge.
+                if mb_col > 0 {
+                    filter_v_edge_simple(&mut planes.y, ys, y_x0, y_y0, params.mbedge_limit);
+                }
+                // Step 2: internal vertical subblock edges (1/4, 1/2, 3/4).
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_v_edge_simple(
+                            &mut planes.y,
+                            ys,
+                            y_x0 + 4 * q,
+                            y_y0,
+                            params.sub_bedge_limit,
+                        );
+                    }
+                }
+                // Step 3: top inter-MB edge.
+                if mb_row > 0 {
+                    filter_h_edge_simple(&mut planes.y, ys, y_y0, y_x0, params.mbedge_limit);
+                }
+                // Step 4: internal horizontal subblock edges.
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_h_edge_simple(
+                            &mut planes.y,
+                            ys,
+                            y_y0 + 4 * q,
+                            y_x0,
+                            params.sub_bedge_limit,
+                        );
+                    }
+                }
+            } else {
+                // §20.6 filter_row_normal — luma + both chroma planes.
+                // Step 1: left inter-MB edges.
+                if mb_col > 0 {
+                    filter_v_edge_normal(&mut planes.y, ys, y_x0, y_y0, 16, &params, true);
+                    filter_v_edge_normal(&mut planes.u, cs, uv_x0, uv_y0, 8, &params, true);
+                    filter_v_edge_normal(&mut planes.v, cs, uv_x0, uv_y0, 8, &params, true);
+                }
+                // Step 2: internal vertical subblock edges. Luma has
+                // three (1/4, 1/2, 3/4); chroma has one (centre, 1/2).
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_v_edge_normal(
+                            &mut planes.y,
+                            ys,
+                            y_x0 + 4 * q,
+                            y_y0,
+                            16,
+                            &params,
+                            false,
+                        );
+                    }
+                    filter_v_edge_normal(&mut planes.u, cs, uv_x0 + 4, uv_y0, 8, &params, false);
+                    filter_v_edge_normal(&mut planes.v, cs, uv_x0 + 4, uv_y0, 8, &params, false);
+                }
+                // Step 3: top inter-MB edges.
+                if mb_row > 0 {
+                    filter_h_edge_normal(&mut planes.y, ys, y_y0, y_x0, 16, &params, true);
+                    filter_h_edge_normal(&mut planes.u, cs, uv_y0, uv_x0, 8, &params, true);
+                    filter_h_edge_normal(&mut planes.v, cs, uv_y0, uv_x0, 8, &params, true);
+                }
+                // Step 4: internal horizontal subblock edges.
+                if filter_subblocks {
+                    for q in 1..4 {
+                        filter_h_edge_normal(
+                            &mut planes.y,
+                            ys,
+                            y_y0 + 4 * q,
+                            y_x0,
+                            16,
+                            &params,
+                            false,
+                        );
+                    }
+                    filter_h_edge_normal(&mut planes.u, cs, uv_y0 + 4, uv_x0, 8, &params, false);
+                    filter_h_edge_normal(&mut planes.v, cs, uv_y0 + 4, uv_x0, 8, &params, false);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +1155,446 @@ mod tests {
         assert_eq!(&seg[10..12], &[7, 7]);
         // Window matches the hand-derived result above.
         assert_eq!(&seg[2..10], &[100, 102, 104, 107, 109, 112, 114, 116]);
+    }
+
+    // ----- §15.1 / §20.6 per-MB filter-level derivation ----------------
+    // KeyframePlanes, MbCoeffs, IntraYMode and MacroblockModes come in via
+    // `use super::*`; IntraUvMode is only needed by the test helpers.
+    use crate::macroblock::IntraUvMode;
+
+    fn base_config() -> FrameFilterConfig {
+        FrameFilterConfig {
+            simple: false,
+            key_frame: true,
+            loop_filter_level: 20,
+            sharpness_level: 0,
+            segmentation_enabled: false,
+            segment_abs: false,
+            segment_lf_level: [0; MAX_MB_SEGMENTS],
+            delta_enabled: false,
+            ref_delta_current: 0,
+            bpred_mode_delta: 0,
+        }
+    }
+
+    fn flat_planes(value: u8, mb_cols: usize, mb_rows: usize) -> KeyframePlanes {
+        let y_stride = mb_cols * 16;
+        let uv_stride = mb_cols * 8;
+        KeyframePlanes {
+            y: vec![value; y_stride * mb_rows * 16],
+            u: vec![value; uv_stride * mb_rows * 8],
+            v: vec![value; uv_stride * mb_rows * 8],
+            y_stride,
+            uv_stride,
+            mb_cols,
+            mb_rows,
+        }
+    }
+
+    fn mode(y_mode: IntraYMode, segment_id: Option<u8>) -> MacroblockModes {
+        MacroblockModes {
+            segment_id,
+            mb_skip_coeff: true,
+            y_mode,
+            subblock_modes: None,
+            uv_mode: IntraUvMode::Dc,
+        }
+    }
+
+    #[test]
+    fn mb_filter_level_no_overrides_is_base() {
+        let c = base_config();
+        assert_eq!(calculate_mb_filter_level(&c, None, IntraYMode::Dc), 20);
+        // segment_id ignored when segmentation disabled.
+        assert_eq!(calculate_mb_filter_level(&c, Some(3), IntraYMode::Dc), 20);
+    }
+
+    #[test]
+    fn mb_filter_level_segment_delta_adds() {
+        let mut c = base_config();
+        c.segmentation_enabled = true;
+        c.segment_abs = false;
+        c.segment_lf_level = [5, -8, 0, 0];
+        // segment 0: 20 + 5 = 25.
+        assert_eq!(calculate_mb_filter_level(&c, Some(0), IntraYMode::Dc), 25);
+        // segment 1: 20 + (-8) = 12.
+        assert_eq!(calculate_mb_filter_level(&c, Some(1), IntraYMode::Dc), 12);
+    }
+
+    #[test]
+    fn mb_filter_level_segment_absolute_replaces() {
+        let mut c = base_config();
+        c.segmentation_enabled = true;
+        c.segment_abs = true;
+        c.segment_lf_level = [40, 0, 63, 7];
+        // absolute mode replaces the base entirely.
+        assert_eq!(calculate_mb_filter_level(&c, Some(0), IntraYMode::Dc), 40);
+        assert_eq!(calculate_mb_filter_level(&c, Some(2), IntraYMode::Dc), 63);
+        // absolute 0 -> level 0 (caller then skips the MB).
+        assert_eq!(calculate_mb_filter_level(&c, Some(1), IntraYMode::Dc), 0);
+    }
+
+    #[test]
+    fn mb_filter_level_segment_clamps_before_deltas() {
+        // §20.6 clamps to 0..=63 after the segment override and again
+        // after the deltas. A segment delta that overshoots saturates.
+        let mut c = base_config();
+        c.segmentation_enabled = true;
+        c.segment_abs = false;
+        c.segment_lf_level = [60, -40, 0, 0];
+        // 20 + 60 = 80 -> clamp 63.
+        assert_eq!(calculate_mb_filter_level(&c, Some(0), IntraYMode::Dc), 63);
+        // 20 - 40 = -20 -> clamp 0.
+        assert_eq!(calculate_mb_filter_level(&c, Some(1), IntraYMode::Dc), 0);
+    }
+
+    #[test]
+    fn mb_filter_level_ref_and_bpred_mode_deltas() {
+        let mut c = base_config();
+        c.delta_enabled = true;
+        c.ref_delta_current = 4;
+        c.bpred_mode_delta = -3;
+        // Non-B_PRED: only the reference delta applies. 20 + 4 = 24.
+        assert_eq!(calculate_mb_filter_level(&c, None, IntraYMode::Dc), 24);
+        // B_PRED: ref + mode. 20 + 4 - 3 = 21.
+        assert_eq!(calculate_mb_filter_level(&c, None, IntraYMode::B), 21);
+    }
+
+    #[test]
+    fn mb_filter_level_deltas_clamp_at_ends() {
+        let mut c = base_config();
+        c.loop_filter_level = 62;
+        c.delta_enabled = true;
+        c.ref_delta_current = 10; // 62 + 10 = 72 -> clamp 63.
+        assert_eq!(calculate_mb_filter_level(&c, None, IntraYMode::Dc), 63);
+        c.loop_filter_level = 2;
+        c.ref_delta_current = -10; // 2 - 10 = -8 -> clamp 0.
+        assert_eq!(calculate_mb_filter_level(&c, None, IntraYMode::Dc), 0);
+    }
+
+    #[test]
+    fn mb_filter_level_deltas_disabled_when_flag_off() {
+        let mut c = base_config();
+        c.delta_enabled = false;
+        c.ref_delta_current = 30;
+        c.bpred_mode_delta = 30;
+        // Both deltas ignored.
+        assert_eq!(calculate_mb_filter_level(&c, None, IntraYMode::B), 20);
+    }
+
+    // ----- §15.1 frame geometry ----------------------------------------
+
+    #[test]
+    fn filter_frame_level_zero_is_noop() {
+        let mut c = base_config();
+        c.loop_filter_level = 0;
+        // Two MBs with a sharp boundary; level 0 must leave them alone.
+        let mut planes = flat_planes(100, 2, 1);
+        for px in planes.y[16..32].iter_mut() {
+            *px = 200;
+        }
+        let before = planes.clone();
+        let modes = vec![mode(IntraYMode::Dc, None), mode(IntraYMode::Dc, None)];
+        let coeffs = vec![MbCoeffs::default(); 2];
+        filter_frame(&mut planes, &modes, &coeffs, &c);
+        assert_eq!(planes, before, "level 0 must skip filtering entirely");
+    }
+
+    #[test]
+    fn filter_frame_normal_mb_edge_hand_derived() {
+        // A 2×1 luma frame: MB(0,0) flat 100, MB(0,1) flat 110. Skip
+        // coeffs so the subblock steps are skipped, isolating MB(0,1)'s
+        // left inter-MB vertical edge (frame column 16). The normal MB
+        // filter's wide low-variance branch rewrites p2,p1,p0,q0,q1,q2
+        // (columns 13..=18) to the hand-derived values; everything else
+        // is untouched.
+        //
+        // level 20, sharpness 0, key frame:
+        //   interior_limit = 20, mbedge_limit = (20+2)*2+20 = 64,
+        //   hev_threshold = 1 (level >= 15).
+        // signed p* = -28, q* = -18; |p1-p0| = |q1-q0| = 0 -> low var.
+        // w = c(c(-28 - -18) + 3*(-18 - -28)) = c(c(-10) + 30) = c(20) = 20.
+        // a0 = c((27*20+63)>>7) = c(4) = 4: P0=104, Q0=106.
+        // a1 = c((18*20+63)>>7) = c(3) = 3: P1=105, Q1=107.
+        // a2 = c((9*20+63)>>7)  = c(1) = 1: P2=103, Q2=109.
+        let c = base_config();
+        let mut planes = flat_planes(100, 2, 1);
+        for r in 0..16 {
+            for px in planes.y[r * 32 + 16..r * 32 + 32].iter_mut() {
+                *px = 110;
+            }
+        }
+        let before = planes.clone();
+        let modes = vec![mode(IntraYMode::Dc, None), mode(IntraYMode::Dc, None)];
+        let coeffs = vec![MbCoeffs::default(); 2]; // no coeffs -> steps 2/4 skipped
+        filter_frame(&mut planes, &modes, &coeffs, &c);
+
+        // The six pixels straddling column 16 on every row are rewritten.
+        // Columns 13,14,15 = P2,P1,P0; columns 16,17,18 = Q0,Q1,Q2.
+        for r in 0..16 {
+            let row = r * 32;
+            assert_eq!(planes.y[row + 13], 101, "P2 row {r}");
+            assert_eq!(planes.y[row + 14], 103, "P1 row {r}");
+            assert_eq!(planes.y[row + 15], 104, "P0 row {r}");
+            assert_eq!(planes.y[row + 16], 106, "Q0 row {r}");
+            assert_eq!(planes.y[row + 17], 107, "Q1 row {r}");
+            assert_eq!(planes.y[row + 18], 109, "Q2 row {r}");
+            // Columns away from the edge are untouched.
+            assert_eq!(planes.y[row + 12], before.y[row + 12]);
+            assert_eq!(planes.y[row + 19], before.y[row + 19]);
+            assert_eq!(planes.y[row], 100);
+            assert_eq!(planes.y[row + 31], 110);
+        }
+        // Chroma planes are flat (both MBs same value) -> unchanged.
+        assert_eq!(planes.u, before.u);
+        assert_eq!(planes.v, before.v);
+    }
+
+    #[test]
+    fn filter_frame_leftmost_mb_skips_left_edge() {
+        // A single-MB-wide frame stacked 2 rows: MB(0,0) flat 100,
+        // MB(1,0) flat 120. There is no left inter-MB edge for either MB
+        // (both are on the leftmost column), so step 1 is skipped; the
+        // top inter-MB edge of MB(1,0) (frame row 16) is filtered.
+        let c = base_config();
+        let mut planes = flat_planes(100, 1, 2);
+        for px in planes.y[16 * 16..32 * 16].iter_mut() {
+            *px = 120;
+        }
+        // Also flatten chroma rows: MB(1,0) chroma 120 to exercise the
+        // horizontal chroma edge.
+        for px in planes.u[8 * 8..16 * 8].iter_mut() {
+            *px = 120;
+        }
+        for px in planes.v[8 * 8..16 * 8].iter_mut() {
+            *px = 120;
+        }
+        let before = planes.clone();
+        let modes = vec![mode(IntraYMode::Dc, None), mode(IntraYMode::Dc, None)];
+        let coeffs = vec![MbCoeffs::default(); 2];
+        filter_frame(&mut planes, &modes, &coeffs, &c);
+
+        // No vertical edge is ever filtered (both MBs are leftmost and
+        // skip coeffs disable internal subblock edges), so every row's
+        // far-from-the-horizontal-edge pixels are untouched: rows 0..=12
+        // and 19..=31 stay exactly at their original flat fills. The
+        // horizontal MB edge at luma row 16 rewrites rows 13..=18.
+        for r in 0..13 {
+            for col in 0..16 {
+                assert_eq!(
+                    planes.y[r * 16 + col],
+                    before.y[r * 16 + col],
+                    "row {r} col {col} (above horizontal edge influence) untouched"
+                );
+            }
+        }
+        for r in 19..32 {
+            for col in 0..16 {
+                assert_eq!(
+                    planes.y[r * 16 + col],
+                    before.y[r * 16 + col],
+                    "row {r} col {col} (below horizontal edge influence) untouched"
+                );
+            }
+        }
+        // The horizontal MB edge at luma row 16 changed the pixels above
+        // and below it (including column 0 — horizontal edges span the
+        // full MB width, so the leftmost column IS a p/q here).
+        assert_ne!(planes.y[15 * 16], before.y[15 * 16], "P-side col0 moved");
+        assert_ne!(planes.y[16 * 16], before.y[16 * 16], "Q-side col0 moved");
+        // Chroma horizontal edge at chroma row 8 also moved.
+        assert_ne!(planes.u[7 * 8 + 3], before.u[7 * 8 + 3]);
+        assert_ne!(planes.v[8 * 8 + 3], before.v[8 * 8 + 3]);
+    }
+
+    #[test]
+    fn filter_frame_simple_touches_only_luma() {
+        // Simple filter: a 2×1 frame with a luma step. Only luma is
+        // touched; chroma (even if it had a step) is left alone.
+        let mut c = base_config();
+        c.simple = true;
+        let mut planes = flat_planes(100, 2, 1);
+        for r in 0..16 {
+            for px in planes.y[r * 32 + 16..r * 32 + 32].iter_mut() {
+                *px = 110;
+            }
+        }
+        // Introduce a chroma step too — the simple filter must ignore it.
+        for r in 0..8 {
+            for px in planes.u[r * 16 + 8..r * 16 + 16].iter_mut() {
+                *px = 130;
+            }
+        }
+        let before = planes.clone();
+        let modes = vec![mode(IntraYMode::Dc, None), mode(IntraYMode::Dc, None)];
+        let coeffs = vec![MbCoeffs::default(); 2];
+        filter_frame(&mut planes, &modes, &coeffs, &c);
+
+        // Luma changed at the MB edge (column 16).
+        assert_ne!(planes.y[15], before.y[15], "luma P0 moved");
+        assert_ne!(planes.y[16], before.y[16], "luma Q0 moved");
+        // Chroma untouched by the simple filter.
+        assert_eq!(planes.u, before.u, "simple filter must not touch U");
+        assert_eq!(planes.v, before.v, "simple filter must not touch V");
+    }
+
+    #[test]
+    fn filter_frame_subblock_steps_gated_by_coeffs() {
+        // A single non-skip MB (mode DC) with a synthetic internal luma
+        // ramp. With no coded coefficients the internal subblock edges
+        // must be skipped (the §15.1 page-86 rule); with a coefficient
+        // present they run and modify the interior.
+        let c = base_config();
+        // Build a luma plane with a step at internal vertical edge x=8
+        // (the 1/2 subblock edge), flat elsewhere within the MB.
+        let mut planes = flat_planes(100, 1, 1);
+        for r in 0..16 {
+            for col in 8..16 {
+                planes.y[r * 16 + col] = 112;
+            }
+        }
+        let modes = vec![mode(IntraYMode::Dc, None)];
+
+        // No coefficients -> steps 2/4 skipped -> the internal edge at
+        // column 8 is NOT filtered.
+        let mut p_skip = planes.clone();
+        filter_frame(&mut p_skip, &modes, &[MbCoeffs::default()], &c);
+        assert_eq!(
+            p_skip, planes,
+            "no coeffs: internal subblock edges must be skipped (top-left MB has no MB edges either)"
+        );
+
+        // A single coded coefficient -> steps 2/4 run -> column 8 edge
+        // gets filtered.
+        let mut coeffs = MbCoeffs::default();
+        coeffs.y[0][1] = 7; // any non-zero coefficient flags coded data
+        let mut p_run = planes.clone();
+        filter_frame(&mut p_run, &modes, &[coeffs], &c);
+        assert_ne!(
+            p_run, planes,
+            "coded coeff: internal subblock edge must be filtered"
+        );
+        // The change is localized around column 8.
+        assert_ne!(p_run.y[7], planes.y[7], "P0 of x=8 edge moved");
+        assert_ne!(p_run.y[8], planes.y[8], "Q0 of x=8 edge moved");
+    }
+
+    #[test]
+    fn filter_frame_bpred_runs_subblocks_without_coeffs() {
+        // A B_PRED MB triggers the subblock steps even with no coded
+        // coefficients (mode B_PRED satisfies the §15.1 page-86 rule).
+        let c = base_config();
+        let mut planes = flat_planes(100, 1, 1);
+        for r in 0..16 {
+            for col in 8..16 {
+                planes.y[r * 16 + col] = 112;
+            }
+        }
+        let modes = vec![mode(IntraYMode::B, None)];
+        let mut p = planes.clone();
+        filter_frame(&mut p, &modes, &[MbCoeffs::default()], &c);
+        assert_ne!(
+            p, planes,
+            "B_PRED MB must filter internal subblock edges even when skip"
+        );
+    }
+
+    #[test]
+    fn filter_frame_config_keyframe_resolves_header() {
+        // FrameFilterConfig::keyframe pulls the level inputs out of a
+        // parsed header. Build a minimal header by hand and check the
+        // resolved config.
+        use crate::coded_header::{MbLfAdjustments, UpdateSegmentation};
+
+        let mut header = minimal_header();
+        header.filter_type = true; // simple
+        header.loop_filter_level = 31;
+        header.sharpness_level = 5;
+        header.segmentation_enabled = true;
+        header.update_segmentation = Some(UpdateSegmentation {
+            update_mb_segmentation_map: true,
+            update_segment_feature_data: true,
+            segment_feature_mode_absolute: true,
+            quantizer_update: [None; 4],
+            loop_filter_update: [Some(10), None, Some(-4), Some(63)],
+            segment_prob: [None; 3],
+        });
+        header.mb_lf_adjustments = MbLfAdjustments {
+            loop_filter_adj_enable: true,
+            mode_ref_lf_delta_update: true,
+            ref_frame_delta_update: [Some(2), None, None, None],
+            mb_mode_delta_update: [Some(-5), None, None, None],
+        };
+
+        let cfg = FrameFilterConfig::keyframe(&header);
+        assert!(cfg.simple);
+        assert!(cfg.key_frame);
+        assert_eq!(cfg.loop_filter_level, 31);
+        assert_eq!(cfg.sharpness_level, 5);
+        assert!(cfg.segmentation_enabled);
+        assert!(cfg.segment_abs);
+        assert_eq!(cfg.segment_lf_level, [10, 0, -4, 63]);
+        assert!(cfg.delta_enabled);
+        assert_eq!(cfg.ref_delta_current, 2);
+        assert_eq!(cfg.bpred_mode_delta, -5);
+    }
+
+    #[test]
+    fn filter_frame_config_keyframe_no_segmentation() {
+        let header = minimal_header();
+        let cfg = FrameFilterConfig::keyframe(&header);
+        assert!(!cfg.segmentation_enabled);
+        assert_eq!(cfg.segment_lf_level, [0; MAX_MB_SEGMENTS]);
+        assert!(!cfg.delta_enabled);
+        assert_eq!(cfg.ref_delta_current, 0);
+        assert_eq!(cfg.bpred_mode_delta, 0);
+    }
+
+    /// A minimal `Vp8CodedHeader` with the loop-filter knobs zeroed,
+    /// used by the `FrameFilterConfig::keyframe` resolution tests.
+    fn minimal_header() -> crate::Vp8CodedHeader {
+        use crate::coded_header::{MbLfAdjustments, QuantIndices};
+        crate::Vp8CodedHeader {
+            color_space: Some(false),
+            clamping_type: Some(false),
+            segmentation_enabled: false,
+            update_segmentation: None,
+            filter_type: false,
+            loop_filter_level: 0,
+            sharpness_level: 0,
+            mb_lf_adjustments: MbLfAdjustments {
+                loop_filter_adj_enable: false,
+                mode_ref_lf_delta_update: false,
+                ref_frame_delta_update: [None; 4],
+                mb_mode_delta_update: [None; 4],
+            },
+            log2_nbr_of_dct_partitions: 0,
+            nbr_of_dct_partitions: 1,
+            quant_indices: QuantIndices {
+                y_ac_qi: 0,
+                y_dc_delta: None,
+                y2_dc_delta: None,
+                y2_ac_delta: None,
+                uv_dc_delta: None,
+                uv_ac_delta: None,
+            },
+            refresh_entropy_probs: false,
+            refresh_golden_frame: None,
+            refresh_alternate_frame: None,
+            copy_buffer_to_golden: None,
+            copy_buffer_to_alternate: None,
+            sign_bias_golden: None,
+            sign_bias_alternate: None,
+            refresh_last: None,
+            token_prob_updates: [[[[None; 11]; 3]; 8]; 4],
+            mb_no_skip_coeff: false,
+            prob_skip_false: None,
+            prob_intra: None,
+            prob_last: None,
+            prob_gf: None,
+            intra_y_mode_prob_update: None,
+            intra_uv_mode_prob_update: None,
+            mv_prob_update: None,
+        }
     }
 }

@@ -4,6 +4,33 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **§16.2 / §18 whole-pixel interframe motion compensation** — new
+  `src/motion_comp.rs`, the first inter-prediction slice that *consumes*
+  the §17 motion vectors. `select_ref_frame` reads the §16.2
+  `prob_last` / `prob_gf` reference-frame selector into a `RefFrame`
+  (`Last` / `Golden` / `AltRef`). `stored_luma_mv` applies the §18.1
+  stored-luma doubling (quarter-pel → eighth-pel), `chroma_mv` the §18.1
+  `avg()` chroma averaging (cross-checked against the §20.14
+  `(c + 1 + (c >> 31) * 2) / 2` closed form), and `apply_full_pixel` the
+  version-3 full-pel-chroma truncation (`& ~7`). `fetch_block_whole_pixel`
+  is the §20.14 `build_mc_border` edge-replicated 4×4 reference fetch
+  specialised to whole-pixel offsets. `predict_inter_mb_whole_pixel`
+  assembles the §18.2 whole-MB prediction buffer for a non-SPLITMV
+  macroblock (one vector for all sixteen Y sub-blocks, the averaged
+  chroma vector for the eight chroma sub-blocks) reading a borrowed
+  `ReferencePlanes`, and `reconstruct_inter_mb_whole_pixel` folds in the
+  §14 dequantized residual (Y2 WHT seeding + per-sub-block inverse DCT +
+  §14.5 `clamp255` summation) to complete inter-MB reconstruction.
+  Sub-pixel (§18.3 sixtap / bilinear) vectors are refused with
+  `MotionCompError::SubPixelNotSupported`; the §16.3 near/nearest/best
+  census and §16.4 SPLITMV remain later rounds. 23 new unit tests
+  (reference-frame selector read order, §18.1 adjustments incl. the
+  §20.14 closed-form cross-check, `build_mc_border` edge replication,
+  whole-MB prediction copy / offset / rejection, and inter-MB
+  reconstruction skip + DC-residue paths).
+
 ## [0.2.0](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.13...v0.1.14) - 2026-05-24
 
 ### Other

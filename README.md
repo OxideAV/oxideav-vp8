@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 18)
+## Status — 2026-05-24 (round 19)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -15,10 +15,12 @@ bitstream → dequant → reconstruct → loop-filter → I420 pixels — and is
 **byte-for-byte identical** to the libvpx/ffmpeg reference output on ten
 VP8 conformance fixtures spanning 16×16 … 128×128, one and four DCT
 partitions, and loop-filter levels 0 / 1 / 33 / 38 plus the simple-filter
-mode. **Round 18 begins inter-frame (§16) support with the §17
-motion-vector component decoder.** The full inter-prediction pipeline
-(§16 `mv_ref` census, SPLITMV, §18 sub-pixel interpolation) and the
-encoder are not yet implemented.
+mode. Round 18 began inter-frame (§16) support with the §17 motion-vector
+component decoder. **Round 19 adds the first inter-prediction slice that
+*consumes* those vectors: §16.2 reference-frame selection and §18
+whole-pixel motion compensation + inter-MB reconstruction.** The §18.3
+sub-pixel interpolation, the §16.3 `mv_ref` near/nearest/best census, the
+§16.4 SPLITMV walk, and the encoder are not yet implemented.
 
 ### Landed
 
@@ -798,6 +800,64 @@ the ±1023 extremes; `read_mv` reading row-then-column contexts plus a
 load-bearing swapped-context negative control; `resolve_mv_contexts`
 identity / overlay / cross-frame persistence / round-trip-under-resolved-
 context; and the `Mv` default. Total: 238 tests across thirteen modules.
+
+**Round 19 (2026-05-24).** Lands the first inter-prediction slice that
+*consumes* the §17 motion vectors: §16.2 reference-frame selection and
+§18 whole-pixel motion compensation (new `src/motion_comp.rs`). VP8
+motion vectors carry a sub-pixel fraction that §18.3 sixtap / bilinear
+interpolation resolves; that interpolation is large and deferred, so this
+round lands the *whole-pixel* path — the §18.3 page-115 "the prediction
+subblock is simply copied" case (the §20.14 `filter_block` special case
+`mx | my == 0`).
+
+  * `select_ref_frame(dec, prob_last, prob_gf)` — §16.2 reference
+    selector. `B(prob_last) == 0` → `Last`; else `B(prob_gf)` picks
+    `Golden` (0) / `AltRef` (1). Returns a `RefFrame`.
+  * `stored_luma_mv(mv)` — §18.1 stored-luma doubling (quarter-pel →
+    eighth-pel, ±2046 range). `chroma_mv(luma_mv)` — §18.1 `avg()` chroma
+    averaging of the single repeated whole-MB vector, cross-checked
+    against the §20.14 closed form `(c + 1 + (c >> 31) * 2) / 2`.
+    `apply_full_pixel(mv)` — §18.1 version-3 full-pel-chroma truncation
+    (`& ~7`). `whole_pixel_fraction_is_zero(mv)` — the §18.3 whole-pixel
+    test (`(row & 7) | (col & 7) == 0`).
+  * `fetch_block_whole_pixel(...)` — the §20.14 `build_mc_border`
+    edge-replicated 4×4 reference fetch, specialised to whole-pixel
+    offsets (out-of-plane reads clamp to the nearest edge pixel; integer
+    offset is `mv >> 3` with sign propagation, §18.2).
+  * `predict_inter_mb_whole_pixel(reference, mb_col, mb_row, luma_mv,
+    full_pixel)` — §18.2 whole-MB prediction buffer for a non-SPLITMV MB
+    (one vector for all sixteen Y sub-blocks, the averaged chroma vector
+    for the eight chroma sub-blocks), reading a borrowed `ReferencePlanes`
+    (the reference frame's I420 planes). Refuses a sub-pixel vector with
+    `MotionCompError::SubPixelNotSupported`.
+  * `reconstruct_inter_mb_whole_pixel(...)` — prediction + §14 dequantized
+    residual (Y2 WHT seeding + per-sub-block inverse DCT + §14.5
+    `clamp255` summation), honouring the §11.1 `mb_skip_coeff`
+    short-circuit. The inter analogue of
+    `decode_keyframe_mb_non_bpred`.
+  * New surface: `RefFrame`, `ReferencePlanes`, `MotionCompError`,
+    `select_ref_frame`, `stored_luma_mv`, `chroma_mv`, `apply_full_pixel`,
+    `whole_pixel_fraction_is_zero`, `fetch_block_whole_pixel`,
+    `predict_inter_mb_whole_pixel`, `reconstruct_inter_mb_whole_pixel`.
+
+The round stays at whole-pixel motion compensation for the four whole-MB
+inter modes; the §18.3 sub-pixel interpolation, the §16.3
+`vp8_find_near_mvs` near/nearest/best census (this slice takes the
+*resolved* per-MB vector as an input), and the §16.4 SPLITMV per-sub-block
+walk are explicitly **not** in scope.
+
+Twenty-three new unit tests: the §16.2 selector read order (`Last` /
+`Golden` / `AltRef` paths + distinct-prob wiring) round-tripped through a
+test-side VP8 bool encoder; the §18.1 adjustments (doubling, `avg()`
+formula, the §20.14 closed-form cross-check across a spread of
+eighth-pel inputs, full-pel truncation, the whole-pixel test); the
+§20.14 `build_mc_border` edge replication (zero offset, integer offset,
+left / top / bottom-right corner clamps); whole-MB prediction (zero-MV
+copy of the matching reference MB, whole-pixel-offset shift, sub-pixel
+luma + chroma rejection, full-pixel-version acceptance); and inter-MB
+reconstruction (skip == prediction, a DC-residue path verified against
+the public transform primitives, sub-pixel rejection). Total: 261 tests
+across fourteen modules.
 
 ### Not yet landed
 

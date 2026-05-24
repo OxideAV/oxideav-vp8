@@ -150,6 +150,26 @@
 //!   `mv_ref` / SPLITMV machinery are deferred to later inter-prediction
 //!   rounds. See [`motion_vector`].
 //!
+//! * VP8 whole-pixel interframe motion compensation (RFC 6386 §16.2 /
+//!   §18) — the first inter-prediction slice that *consumes* a decoded
+//!   motion vector. [`select_ref_frame`] reads the §16.2 `prob_last` /
+//!   `prob_gf` reference selector into a [`RefFrame`]; [`stored_luma_mv`]
+//!   applies the §18.1 stored-luma doubling, [`chroma_mv`] the §18.1
+//!   `avg()` chroma averaging (cross-checked against the §20.14 closed
+//!   form), and [`apply_full_pixel`] the version-3 full-pel-chroma
+//!   truncation. [`fetch_block_whole_pixel`] is the §20.14
+//!   `build_mc_border` edge-replicated 4×4 reference fetch specialised to
+//!   whole-pixel offsets, [`predict_inter_mb_whole_pixel`] assembles the
+//!   §18.2 whole-MB prediction buffer for a non-SPLITMV macroblock
+//!   ([`ReferencePlanes`] borrows the reference frame's I420 planes), and
+//!   [`reconstruct_inter_mb_whole_pixel`] folds in the §14 dequantized
+//!   residual (Y2 WHT seeding + per-sub-block inverse DCT + §14.5
+//!   summation) to complete inter-MB reconstruction. Sub-pixel (§18.3
+//!   sixtap / bilinear) vectors are refused with
+//!   [`MotionCompError::SubPixelNotSupported`]; the §16.3
+//!   near/nearest/best census and §16.4 SPLITMV are later rounds. See
+//!   [`motion_comp`].
+//!
 //! * VP8 top-level per-frame decode driver ([`decode_vp8`]) and the
 //!   [`oxideav_core::Decoder`] integration ([`decoder::Vp8Decoder`],
 //!   gated on the default-on `registry` feature). [`decode_vp8`] takes
@@ -185,6 +205,7 @@ pub mod intra_predict;
 pub mod inverse_transform;
 pub mod loop_filter;
 pub mod macroblock;
+pub mod motion_comp;
 pub mod motion_vector;
 pub mod reconstruct;
 
@@ -224,6 +245,11 @@ pub use macroblock::{
     parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
     InterFrameIntraProbs, IntraBmode, IntraUvMode, IntraYMode, MacroblockError, MacroblockModes,
     IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
+};
+pub use motion_comp::{
+    apply_full_pixel, chroma_mv, fetch_block_whole_pixel, predict_inter_mb_whole_pixel,
+    reconstruct_inter_mb_whole_pixel, select_ref_frame, stored_luma_mv,
+    whole_pixel_fraction_is_zero, MotionCompError, RefFrame, ReferencePlanes,
 };
 pub use motion_vector::{
     default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,

@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 19)
+## Status — 2026-05-24 (round 118)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -23,8 +23,16 @@ adds §18.3 sub-pixel motion compensation: the sixtap (bicubic) and
 bilinear interpolation tap tables, the horizontal-then-vertical six-tap
 convolution, and the per-sub-block fractional-MV dispatch wired into the
 non-SPLITMV inter prediction path, so non-zero-fraction vectors
-reconstruct correctly.** The §16.3 `mv_ref` near/nearest/best census, the
-§16.4 SPLITMV walk, and the encoder are not yet implemented.
+reconstruct correctly.** **Round 118 adds the §16.2 / §16.3 / §18.1
+near/nearest motion-vector census + inter-mode tree (`src/near_mv.rs`):
+the §16.3 `vp8_find_near_mvs` spatial census over the three neighbours,
+the §16.3 sign-bias correction, the §16.2 `mv_ref` tree resolving
+NEARESTMV / NEARMV / ZEROMV / NEWMV / SPLITMV, the §18.1 one-MB-border
+clamp, and the `decode_inter_mb` integration that drives the resolved
+vector through the §18 prediction path so a whole-MB inter macroblock
+decodes end-to-end (bitstream → census → mode → reconstructed pixels).**
+The §16.4 SPLITMV per-sub-block walk, the top-level interframe driver,
+and the encoder are not yet implemented.
 
 ### Landed
 
@@ -905,17 +913,60 @@ agreement, filter-set sensitivity, skip == prediction, a sub-pixel
 DC-residue path, and whole-pixel agreement with the round-19 legacy
 path). Total: 281 tests across fourteen modules.
 
+**Round 118 (2026-05-24).** §16.2 / §16.3 / §18.1 near/nearest
+motion-vector census + inter-mode tree — `src/near_mv.rs`, the slice that
+decides *which* vector a whole-MB inter macroblock uses (the round-19 /
+round-117 motion-compensation slices take the resolved vector as input).
+New surface:
+
+  * `find_near_mvs(above, left, aboveleft, current_ref, sign_bias)` — the
+    §16.3 / §20.11 `vp8_find_near_mvs` spatial census. Surveys the three
+    neighbours (`MbInfo` records; `MbInfo::border()` is the §16.3 1-MB
+    off-frame border of 0,0 vectors), accumulating the weighted candidate
+    list (above / left weight 2, above-left weight 1) with the §16.3
+    dedupe, the SPLITMV-merge-with-NEAREST rule, the near↔nearest swap,
+    and the best := nearest store; returns the `best / nearest / near`
+    candidates plus the four-entry `cnt` census. `SignBias` carries the
+    §9.7 `sign_bias_golden` / `sign_bias_alternate` bits and drives the
+    §16.3 `mv_bias` negation.
+  * `mv_ref_probs(cnt)` — the §16.3 / §20.13 `vp8_mv_ref_probs`:
+    `probs[i] = MV_COUNTS_TO_PROBS[cnt[i]][i]` (the `mv_counts_to_probs`
+    / `vp8_mode_contexts` table). `read_inter_mode(dec, probs)` walks
+    `MV_REF_TREE` (the §20.13 `mv_ref_tree`) into an `InterMode`.
+  * `clamp_mv(mv, bounds)` / `MvClampRect::for_mb(...)` — the §16.3 /
+    §18.1 / §20.11 `clamp_mv` one-MB-border clamp (quarter-pixel; the
+    §20.11 eighth-pixel bounds halved consistently).
+  * `resolve_inter_mb_mv(...)` — census → probs → mode → the single
+    per-MB vector: ZEROMV zero, NEARESTMV / NEARMV clamped candidate,
+    NEWMV clamped-best + decoded §17 differential (the §18.1 secondary
+    clamp), SPLITMV reported with the clamped best base.
+  * `decode_inter_mb(...)` — the end-to-end integration entry: runs the
+    resolution then drives `reconstruct_inter_mb` with the resolved
+    vector, so a whole-MB inter macroblock decodes from bitstream to
+    reconstructed Y/U/V pixels.
+
+Thirty-two new unit tests: tree / table shape, every inter-mode
+round-trip (incl. under the default census probs), census coverage
+(all-border, single-neighbour, intra-skip, zero-vector CNT_ZERO scoring,
+dedupe, near↔nearest swap, SPLITMV weighting, sign-bias negate /
+no-negate), clamp bounds + confinement, `mv_ref_probs` per-column
+indexing, per-mode `resolve_inter_mb_mv`, and four byte-exact
+`decode_inter_mb` end-to-end reconstructions (ZEROMV co-located copy,
+NEARESTMV neighbour vector, NEWMV best + differential, SPLITMV error
+surface). Total: 309 tests across fifteen modules.
+
 ### Not yet landed
 
-The §16.3 `mv_ref` near/nearest/best census (the three-neighbour
-weighted score + motion-vector clamping that resolve the per-MB vector
-this slice takes as an input) and the §16.4 SPLITMV per-sub-block walk;
-the top-level interframe decode driver that threads decoded vectors
-through `predict_inter_mb` per MB; the encoder. §18 motion compensation
-itself — whole-pixel (round 19) and §18.3 sub-pixel (round 117) — is now
-in place for the four whole-MB inter modes. `decode_vp8` returns
-`DecodeError::Unsupported` for any non-key frame, and
-`encode_vp8_keyframe` still returns `Error::NotImplemented`.
+The §16.4 SPLITMV per-sub-block walk (`decode_inter_mb` surfaces
+`InterMbError::SplitNotSupported` with the clamped best base); the
+top-level interframe decode driver that threads the per-MB census +
+reconstruction across a frame; the encoder. §16.2 / §16.3 mode + MV
+resolution (round 118) and §18 motion compensation — whole-pixel
+(round 19) and §18.3 sub-pixel (round 117) — are now in place for the
+four whole-MB inter modes, decoding a single inter macroblock end-to-end
+at the slice level. `decode_vp8` still returns `DecodeError::Unsupported`
+for any non-key frame, and `encode_vp8_keyframe` still returns
+`Error::NotImplemented`.
 
 The round-16 `filter_frame` geometry targets the key-frame case (every
 MB is intra / `CURRENT_FRAME`); the inter-frame mode/reference delta

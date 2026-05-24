@@ -175,9 +175,30 @@
 //!   [`predict_inter_mb_whole_pixel`] /
 //!   [`reconstruct_inter_mb_whole_pixel`] entry points are retained and
 //!   refuse a sub-pixel vector with
-//!   [`MotionCompError::SubPixelNotSupported`]. The §16.3
-//!   near/nearest/best census and §16.4 SPLITMV are later rounds. See
-//!   [`motion_comp`].
+//!   [`MotionCompError::SubPixelNotSupported`]. See [`motion_comp`].
+//!
+//! * VP8 near/nearest motion-vector census and inter-mode tree (RFC 6386
+//!   §16.2 / §16.3 / §18.1) — [`near_mv`], the slice that decides *which*
+//!   vector a whole-MB inter macroblock uses. [`find_near_mvs`] is the
+//!   §16.3 `vp8_find_near_mvs` spatial census over the above / left /
+//!   above-left [`MbInfo`] neighbours ([`MbInfo::border`] for the §16.3
+//!   1-MB off-frame border), producing the `best` / `nearest` / `near`
+//!   candidates and the weighted `cnt` census (with the §16.3 dedupe,
+//!   SPLITMV-merge, near↔nearest swap, and best:=nearest store).
+//!   [`SignBias`] carries the §9.7 sign-bias bits and drives the §16.3
+//!   `mv_bias` negation; [`mv_ref_probs`] derives the §16.2 tree
+//!   probabilities from the census via [`MV_COUNTS_TO_PROBS`]; and
+//!   [`read_inter_mode`] walks [`MV_REF_TREE`] into an [`InterMode`].
+//!   [`clamp_mv`] / [`MvClampRect`] are the §16.3 / §18.1 one-MB-border
+//!   clamp. [`resolve_inter_mb_mv`] ties census → probabilities → mode →
+//!   the single per-MB vector (ZEROMV / NEARESTMV / NEARMV / NEWMV, the
+//!   last adding the §17 differential to the clamped best per §18.1), and
+//!   [`decode_inter_mb`] drives [`reconstruct_inter_mb`] with that vector
+//!   so a whole-MB inter macroblock decodes from bitstream to
+//!   reconstructed pixels. §16.4 SPLITMV's per-sub-block walk is a
+//!   follow-up ([`ResolvedInterMode::Split`] /
+//!   [`InterMbError::SplitNotSupported`] carry the clamped best base).
+//!   See [`near_mv`].
 //!
 //! * VP8 top-level per-frame decode driver ([`decode_vp8`]) and the
 //!   [`oxideav_core::Decoder`] integration ([`decoder::Vp8Decoder`],
@@ -195,11 +216,14 @@
 //! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]), and
 //! the top-level [`decode_vp8`] driver now landed, the keyframe decode
 //! chain bitstream → dequant → reconstruct → loop-filter → pixels is
-//! complete end-to-end. Motion-vector decoding (§17), the inter-predicted
-//! §16.2 / §16.3 / §16.4 branch (`mv_ref` tree, near/nearest/best census,
-//! split prediction), and the encoder are all still scaffolded — the
-//! `encode_vp8_*` entry point returns [`Error::NotImplemented`] and
-//! interframes return [`decoder::DecodeError::Unsupported`].
+//! complete end-to-end. Motion-vector decoding (§17), the §16.2 / §16.3
+//! near/nearest/best census + inter-mode tree, the §18 motion compensation
+//! (whole-pixel + sub-pixel), and the §18.1 clamp now decode a whole-MB
+//! inter macroblock end-to-end at the slice level ([`decode_inter_mb`]).
+//! Still scaffolded: the §16.4 SPLITMV per-sub-block walk, the top-level
+//! interframe driver (`decode_vp8` still returns
+//! [`decoder::DecodeError::Unsupported`] for interframes), and the encoder
+//! (`encode_vp8_*` returns [`Error::NotImplemented`]).
 
 #![warn(missing_debug_implementations)]
 
@@ -216,6 +240,7 @@ pub mod loop_filter;
 pub mod macroblock;
 pub mod motion_comp;
 pub mod motion_vector;
+pub mod near_mv;
 pub mod reconstruct;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
@@ -265,6 +290,11 @@ pub use motion_comp::{
 pub use motion_vector::{
     default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,
     MvContexts, SMALL_MVTREE,
+};
+pub use near_mv::{
+    clamp_mv, decode_inter_mb, find_near_mvs, mv_ref_probs, read_inter_mode, resolve_inter_mb_mv,
+    InterMbError, InterMode, MbInfo, MvClampRect, NearMvs, ResolvedInterMode, SignBias,
+    MV_COUNTS_TO_PROBS, MV_REF_TREE,
 };
 pub use reconstruct::{
     decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,

@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§16.2 / §16.3 / §18.1 near/nearest motion-vector census + inter-mode
+  tree** — new `src/near_mv.rs`, the inter-prediction slice that decides
+  *which* vector a whole-MB inter macroblock uses. `find_near_mvs` is the
+  §16.3 / §20.11 `vp8_find_near_mvs` spatial census: it surveys the
+  above / left / above-left neighbours (`MbInfo` records, `MbInfo::border`
+  for the §16.3 1-MB off-frame border of 0,0 vectors), accumulates the
+  weighted candidate list (above/left weight 2, above-left weight 1) with
+  the §16.3 dedupe, the SPLITMV-merge-with-NEAREST rule, the
+  near↔nearest swap, and the best := nearest store, returning the
+  `best / nearest / near` candidates plus the four-entry `cnt` census.
+  `mv_bias` applies the §16.3 sign-bias negation (`SignBias` carries the
+  §9.7 `sign_bias_golden` / `sign_bias_alternate` bits, indexed by the
+  dixie `reference_frame` enum). `mv_ref_probs` derives the four §16.2
+  tree probabilities from `cnt` via `MV_COUNTS_TO_PROBS` (the §20.13
+  `mv_counts_to_probs[6][4]` / `vp8_mode_contexts` table), and
+  `read_inter_mode` walks `MV_REF_TREE` (the §20.13 `mv_ref_tree`) into an
+  `InterMode` (`Zero` / `Nearest` / `Near` / `New` / `Split`). `clamp_mv`
+  / `MvClampRect::for_mb` are the §16.3 / §18.1 / §20.11 `clamp_mv`
+  one-MB-border clamp (quarter-pixel, the §20.11 eighth-pixel bounds
+  halved consistently). `resolve_inter_mb_mv` ties census → probs → mode
+  → per-mode vector: `ZEROMV` zero, `NEARESTMV` / `NEARMV` clamped
+  candidate, `NEWMV` clamped-best + decoded §17 differential (the §18.1
+  secondary clamp), `SPLITMV` reported with the clamped best base.
+  `decode_inter_mb` is the end-to-end integration entry: it runs the
+  resolution then drives `motion_comp::reconstruct_inter_mb` with the
+  resolved vector, so a whole-MB inter macroblock decodes from bitstream
+  to reconstructed Y/U/V pixels (`InterMbError::SplitNotSupported` carries
+  the best base for the deferred §16.4 walk). 32 new unit tests (tree /
+  table shape, every inter-mode round-trip incl. under default census
+  probs, census all-border / single-neighbour / intra-skip / zero-vector
+  CNT_ZERO scoring / dedupe / near↔nearest swap / SPLITMV weighting / sign
+  bias, clamp bounds + confinement, `mv_ref_probs` per-column indexing,
+  per-mode `resolve_inter_mb_mv`, and four byte-exact `decode_inter_mb`
+  end-to-end reconstructions — ZEROMV co-located copy, NEARESTMV neighbour
+  vector, NEWMV best+differential, SPLITMV error surface). §16.4 SPLITMV
+  per-sub-block walk remains a follow-up.
+
 * **§18.3 sub-pixel motion compensation (sixtap luma + bilinear)** —
   extends `src/motion_comp.rs` with the §18.3 fractional-MV interpolation
   path. `SIXTAP_FILTERS` / `BILINEAR_FILTERS` are the §18.3 `filters` /

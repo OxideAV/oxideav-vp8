@@ -37,12 +37,14 @@
 //!
 //! ## Scope
 //!
-//! Only **key frames** are decoded in this round. Interframes (§16
-//! `is_inter_mb`, motion-vector decoding, reference-frame compositing)
-//! are surfaced as [`DecodeError::Unsupported`]; the caller can detect a
-//! key-frame-only stream and decode it end-to-end against this entry
-//! point, but a stream containing P-frames will refuse cleanly on the
-//! first non-key packet (rather than silently mis-decoding).
+//! [`decode_vp8`] is the **stateless** single-frame entry point — it
+//! decodes one key frame in isolation and returns
+//! [`DecodeError::Unsupported`] on an interframe (since interframes
+//! need a reference-frame buffer this function does not own). For
+//! multi-frame streams with P-frames, use
+//! [`crate::state::Vp8DecoderState::decode_frame`], which owns the
+//! RFC 6386 §9 three-slot reference-frame buffer and handles both
+//! key frames and interframes end-to-end.
 
 use crate::bool_decoder::BoolDecoder;
 use crate::coded_header::{CodedHeaderError, Vp8CodedHeader};

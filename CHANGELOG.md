@@ -6,6 +6,33 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§18.3 sub-pixel motion compensation (sixtap luma + bilinear)** —
+  extends `src/motion_comp.rs` with the §18.3 fractional-MV interpolation
+  path. `SIXTAP_FILTERS` / `BILINEAR_FILTERS` are the §18.3 `filters` /
+  `BilinearFilters` 8×6 tap tables (each row summing to 128);
+  `FilterSet` / `filter_set_for_version` reproduce the §20.14
+  `version == 0 ? sixtap : bilinear` selection (both planes share the
+  frame's set). `interp` is the §18.3 single-sample six-tap
+  `clamp255((Σ p·fil + 64) >> 7)`; `sixtap_horiz` / `sixtap_vert` /
+  `sixtap_2d` are the §20.14 horizontal-then-vertical convolutions with
+  the byte-clamped 9-row intermediate. `fetch_block_halo` is the §20.14
+  `build_mc_border` 9×9 support-halo fetch (the 4×4 block plus the
+  two-before / three-after taps, edge-replicated, block origin at (2,2)).
+  `filter_block_4x4` is the §20.14 `filter_block` dispatcher (whole-pixel
+  copy or six-tap synthesis per sub-block). `predict_inter_mb` /
+  `reconstruct_inter_mb` are the full non-SPLITMV prediction +
+  §14-residue path: unlike the retained whole-pixel-only
+  `predict_inter_mb_whole_pixel` / `reconstruct_inter_mb_whole_pixel`,
+  they interpolate sub-pixel vectors directly instead of returning
+  `MotionCompError::SubPixelNotSupported`. 19 new unit tests (tap-table
+  values + sum-to-128 + DC pass-through, version→set selection, `interp`
+  formula incl. negative-tap clamp, `sixtap_2d` byte-exact against an
+  independent §18.3 Hinterp/Vinterp transcription over every (mx,my)
+  fraction for both sets, halo edge replication, `filter_block`
+  dispatch, and whole-MB sub-pixel prediction / reconstruction incl.
+  legacy-path agreement on whole-pixel vectors). §16.3
+  near/nearest/best census and §16.4 SPLITMV remain later rounds.
+
 * **§16.2 / §18 whole-pixel interframe motion compensation** — new
   `src/motion_comp.rs`, the first inter-prediction slice that *consumes*
   the §17 motion vectors. `select_ref_frame` reads the §16.2

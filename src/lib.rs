@@ -150,23 +150,32 @@
 //!   `mv_ref` / SPLITMV machinery are deferred to later inter-prediction
 //!   rounds. See [`motion_vector`].
 //!
-//! * VP8 whole-pixel interframe motion compensation (RFC 6386 §16.2 /
-//!   §18) — the first inter-prediction slice that *consumes* a decoded
-//!   motion vector. [`select_ref_frame`] reads the §16.2 `prob_last` /
-//!   `prob_gf` reference selector into a [`RefFrame`]; [`stored_luma_mv`]
-//!   applies the §18.1 stored-luma doubling, [`chroma_mv`] the §18.1
-//!   `avg()` chroma averaging (cross-checked against the §20.14 closed
-//!   form), and [`apply_full_pixel`] the version-3 full-pel-chroma
-//!   truncation. [`fetch_block_whole_pixel`] is the §20.14
-//!   `build_mc_border` edge-replicated 4×4 reference fetch specialised to
-//!   whole-pixel offsets, [`predict_inter_mb_whole_pixel`] assembles the
-//!   §18.2 whole-MB prediction buffer for a non-SPLITMV macroblock
-//!   ([`ReferencePlanes`] borrows the reference frame's I420 planes), and
-//!   [`reconstruct_inter_mb_whole_pixel`] folds in the §14 dequantized
+//! * VP8 interframe motion compensation (RFC 6386 §16.2 / §18) — the
+//!   inter-prediction slice that *consumes* a decoded motion vector.
+//!   [`select_ref_frame`] reads the §16.2 `prob_last` / `prob_gf`
+//!   reference selector into a [`RefFrame`]; [`stored_luma_mv`] applies
+//!   the §18.1 stored-luma doubling, [`chroma_mv`] the §18.1 `avg()`
+//!   chroma averaging (cross-checked against the §20.14 closed form), and
+//!   [`apply_full_pixel`] the version-3 full-pel-chroma truncation.
+//!   [`fetch_block_whole_pixel`] is the §20.14 `build_mc_border`
+//!   edge-replicated 4×4 reference fetch specialised to whole-pixel
+//!   offsets; [`fetch_block_halo`] is the 9×9 support-halo fetch the
+//!   six-tap convolution needs. The §18.3 sub-pixel interpolation lands
+//!   here: [`SIXTAP_FILTERS`] / [`BILINEAR_FILTERS`] are the §18.3 tap
+//!   tables ([`filter_set_for_version`] / [`FilterSet`] pick the set by
+//!   frame-tag version), [`interp`] / [`sixtap_2d`] are the §20.14
+//!   one-dimensional convolutions, and [`filter_block_4x4`] is the
+//!   §20.14 `filter_block` per-sub-block dispatcher (whole-pixel copy or
+//!   horizontal-then-vertical six-tap synthesis). [`predict_inter_mb`]
+//!   assembles the §18.2 whole-MB prediction buffer for a non-SPLITMV
+//!   macroblock ([`ReferencePlanes`] borrows the reference frame's I420
+//!   planes), and [`reconstruct_inter_mb`] folds in the §14 dequantized
 //!   residual (Y2 WHT seeding + per-sub-block inverse DCT + §14.5
-//!   summation) to complete inter-MB reconstruction. Sub-pixel (§18.3
-//!   sixtap / bilinear) vectors are refused with
-//!   [`MotionCompError::SubPixelNotSupported`]; the §16.3
+//!   summation) to complete inter-MB reconstruction. The whole-pixel-only
+//!   [`predict_inter_mb_whole_pixel`] /
+//!   [`reconstruct_inter_mb_whole_pixel`] entry points are retained and
+//!   refuse a sub-pixel vector with
+//!   [`MotionCompError::SubPixelNotSupported`]. The §16.3
 //!   near/nearest/best census and §16.4 SPLITMV are later rounds. See
 //!   [`motion_comp`].
 //!
@@ -247,9 +256,11 @@ pub use macroblock::{
     IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
 };
 pub use motion_comp::{
-    apply_full_pixel, chroma_mv, fetch_block_whole_pixel, predict_inter_mb_whole_pixel,
-    reconstruct_inter_mb_whole_pixel, select_ref_frame, stored_luma_mv,
-    whole_pixel_fraction_is_zero, MotionCompError, RefFrame, ReferencePlanes,
+    apply_full_pixel, chroma_mv, fetch_block_halo, fetch_block_whole_pixel, filter_block_4x4,
+    filter_set_for_version, interp, predict_inter_mb, predict_inter_mb_whole_pixel,
+    reconstruct_inter_mb, reconstruct_inter_mb_whole_pixel, select_ref_frame, sixtap_2d,
+    stored_luma_mv, whole_pixel_fraction_is_zero, FilterSet, MotionCompError, RefFrame,
+    ReferencePlanes, BILINEAR_FILTERS, SIXTAP_FILTERS,
 };
 pub use motion_vector::{
     default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,

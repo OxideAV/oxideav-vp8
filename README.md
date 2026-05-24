@@ -16,10 +16,14 @@ bitstream → dequant → reconstruct → loop-filter → I420 pixels — and is
 VP8 conformance fixtures spanning 16×16 … 128×128, one and four DCT
 partitions, and loop-filter levels 0 / 1 / 33 / 38 plus the simple-filter
 mode. Round 18 began inter-frame (§16) support with the §17 motion-vector
-component decoder. **Round 19 adds the first inter-prediction slice that
+component decoder. Round 19 added the first inter-prediction slice that
 *consumes* those vectors: §16.2 reference-frame selection and §18
-whole-pixel motion compensation + inter-MB reconstruction.** The §18.3
-sub-pixel interpolation, the §16.3 `mv_ref` near/nearest/best census, the
+whole-pixel motion compensation + inter-MB reconstruction. **Round 117
+adds §18.3 sub-pixel motion compensation: the sixtap (bicubic) and
+bilinear interpolation tap tables, the horizontal-then-vertical six-tap
+convolution, and the per-sub-block fractional-MV dispatch wired into the
+non-SPLITMV inter prediction path, so non-zero-fraction vectors
+reconstruct correctly.** The §16.3 `mv_ref` near/nearest/best census, the
 §16.4 SPLITMV walk, and the encoder are not yet implemented.
 
 ### Landed
@@ -859,14 +863,59 @@ reconstruction (skip == prediction, a DC-residue path verified against
 the public transform primitives, sub-pixel rejection). Total: 261 tests
 across fourteen modules.
 
+**Round 117 (2026-05-24).** §18.3 sub-pixel motion compensation, wired
+into `predict_inter_mb` / `reconstruct_inter_mb` so non-zero-fraction
+vectors reconstruct correctly. VP8 motion vectors carry an eighth-pixel
+fraction (`mv & 7` per component); when either fraction is non-zero,
+§18.3 synthesises the missing samples via a horizontal then a vertical
+one-dimensional six-tap convolution. New surface in
+`src/motion_comp.rs`:
+
+  * `SIXTAP_FILTERS` / `BILINEAR_FILTERS` — the §18.3 `filters` /
+    `BilinearFilters` 8×6 tap tables (each row sums to 128: "DC is always
+    passed"). `FilterSet` + `filter_set_for_version(v)` reproduce the
+    §20.14 `version == 0 ? sixtap : bilinear` selection; both luma and
+    chroma share the frame's one set.
+  * `interp(fil, support)` — the §18.3 single-sample six-tap
+    `clamp255((Σ p·fil + 64) >> 7)`. `sixtap_horiz` / `sixtap_vert` /
+    `sixtap_2d(halo, mx, my, filters)` — the §20.14 convolutions, with
+    the byte-clamped 9-row intermediate (negative partial sums clamp to
+    0, exactly as the reference's `unsigned char` temp buffer).
+  * `fetch_block_halo(...)` — the §20.14 `build_mc_border` 9×9
+    edge-replicated support fetch (4×4 block + two-before / three-after
+    taps; block origin at halo `(2,2)`). `filter_block_4x4(...)` — the
+    §20.14 `filter_block` dispatcher: whole-pixel copy or `sixtap_2d`.
+  * `predict_inter_mb(reference, mb_col, mb_row, luma_mv, full_pixel,
+    filters)` / `reconstruct_inter_mb(..)` — the full non-SPLITMV
+    prediction + §14-residue path, routing each sub-block through
+    `filter_block_4x4`. The round-19 whole-pixel-only
+    `predict_inter_mb_whole_pixel` / `reconstruct_inter_mb_whole_pixel`
+    entry points are retained (they still refuse sub-pixel vectors).
+
+Nineteen new unit tests: the tap-table values + sum-to-128 + DC
+pass-through + bilinear-centre-taps shape; the version→set selection;
+the `interp` formula incl. a negative-tap `clamp255` floor;
+`sixtap_2d` byte-exact against an **independent** §18.3 Hinterp/Vinterp
+transcription over every `(mx, my)` fraction for both filter sets
+(plus flat-halo DC, whole-fraction copy, and a horizontal-only
+known-value check); `fetch_block_halo` window + block-origin + corner
+clamp; `filter_block` whole-pixel-copy vs sub-pixel dispatch; and the
+whole-MB sub-pixel `predict_inter_mb` / `reconstruct_inter_mb` (per-block
+agreement, filter-set sensitivity, skip == prediction, a sub-pixel
+DC-residue path, and whole-pixel agreement with the round-19 legacy
+path). Total: 281 tests across fourteen modules.
+
 ### Not yet landed
 
-The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
-(`mv_ref` tree, near/nearest/best census + the three-neighbour
-weighted score, motion-vector clamping, split-prediction sub-block
-walk); the §18 inter-prediction buffer + sub-pixel interpolation; the
-encoder. `decode_vp8` returns `DecodeError::Unsupported` for any non-key
-frame, and `encode_vp8_keyframe` still returns `Error::NotImplemented`.
+The §16.3 `mv_ref` near/nearest/best census (the three-neighbour
+weighted score + motion-vector clamping that resolve the per-MB vector
+this slice takes as an input) and the §16.4 SPLITMV per-sub-block walk;
+the top-level interframe decode driver that threads decoded vectors
+through `predict_inter_mb` per MB; the encoder. §18 motion compensation
+itself — whole-pixel (round 19) and §18.3 sub-pixel (round 117) — is now
+in place for the four whole-MB inter modes. `decode_vp8` returns
+`DecodeError::Unsupported` for any non-key frame, and
+`encode_vp8_keyframe` still returns `Error::NotImplemented`.
 
 The round-16 `filter_frame` geometry targets the key-frame case (every
 MB is intra / `CURRENT_FRAME`); the inter-frame mode/reference delta

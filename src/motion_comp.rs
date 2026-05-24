@@ -1,5 +1,6 @@
 //! Interframe motion compensation — RFC 6386 §16.2 reference selection,
-//! §18.1 motion-vector adjustment, and §18.2 whole-pixel prediction.
+//! §18.1 motion-vector adjustment, §18.2 whole-pixel prediction, and
+//! §18.3 sub-pixel (sixtap / bilinear) interpolation.
 //!
 //! This module is the first inter-frame *prediction* slice: it consumes
 //! the §17 motion vectors decoded by [`crate::motion_vector`] and turns a
@@ -10,17 +11,23 @@
 //! NEWMV offset is added to) and the §16.4 SPLITMV walk; those choose
 //! *which* vector applies, this applies it.
 //!
-//! ## Scope this round — whole-pixel motion compensation
+//! ## Scope — whole-pixel + sub-pixel motion compensation
 //!
-//! VP8 motion vectors carry a fractional (sub-pixel) part: §18.3 sixtap
-//! / bilinear interpolation synthesises the missing samples. That
-//! interpolation is large and is deferred to the next round. What lands
-//! here is the *whole-pixel* path — the case where, after the §18.1
-//! adjustments, both fractional components are zero, so §18.3 page 115
-//! says "the prediction subblock is simply copied". This is the
-//! `filter_block` special case `mx | my == 0` in the §20.14 reference
-//! decoder, where `filter_block` returns the reference pointer unchanged
-//! and `recon_1_block` adds the residue straight onto the copied pixels.
+//! VP8 motion vectors carry a fractional (sub-pixel) part. After the
+//! §18.1 adjustments, each component's low three bits (`& 7`) are an
+//! eighth-pixel forward displacement:
+//!
+//! * **Whole-pixel** (`mx | my == 0`): §18.3 page 115 "the prediction
+//!   subblock is simply copied". This is the `filter_block` special case
+//!   in the §20.14 reference decoder, where `filter_block` returns the
+//!   reference pointer unchanged.
+//! * **Sub-pixel** (either fraction non-zero): §18.3 synthesises the
+//!   missing samples via a horizontal then a vertical one-dimensional
+//!   six-tap convolution ([`sixtap_2d`]). The tap set is chosen by the
+//!   frame-tag version — `version == 0` uses the bicubic
+//!   [`SIXTAP_FILTERS`], any other version uses the [`BILINEAR_FILTERS`]
+//!   (§20.14 `subpixel_filters` assignment). Both luma and chroma share
+//!   the version-selected set.
 //!
 //! Concretely this module provides:
 //!
@@ -33,22 +40,34 @@
 //!   `avg()` averaging, and the version-3 full-pel truncation).
 //! * [`whole_pixel_fraction_is_zero`] — the §18.3 whole-pixel test
 //!   applied to an already-§18.1-adjusted (eighth-pixel) vector.
+//! * [`SIXTAP_FILTERS`] / [`BILINEAR_FILTERS`] / [`FilterSet`] /
+//!   [`filter_set_for_version`] — the §18.3 filter tables and the §20.14
+//!   version→tap-set selector.
+//! * [`interp`] / [`sixtap_horiz`] / [`sixtap_vert`] / [`sixtap_2d`] —
+//!   the §18.3 / §20.14 one-dimensional convolution primitives.
 //! * [`fetch_block_whole_pixel`] — the §20.14 `build_mc_border`
 //!   edge-replicated 4×4 block fetch, specialised to whole-pixel offsets
 //!   (no six-tap support pixels needed).
-//! * [`predict_inter_mb_whole_pixel`] — the §18.2 whole-MB prediction
-//!   buffer for a non-SPLITMV macroblock (one vector for all sixteen Y
-//!   sub-blocks, the averaged chroma vector for the eight chroma
-//!   sub-blocks).
-//! * [`reconstruct_inter_mb_whole_pixel`] — prediction + §14 dequantized
-//!   residual, producing a [`ReconstructedMb`].
+//! * [`fetch_block_halo`] — the §20.14 `build_mc_border` 9×9 halo fetch
+//!   (the 4×4 block plus the two-before / three-after support pixels the
+//!   six-tap convolution needs in each dimension).
+//! * [`filter_block_4x4`] — the §20.14 `filter_block`: whole-pixel copy
+//!   or [`sixtap_2d`] sub-pixel synthesis for one 4×4 sub-block.
+//! * [`predict_inter_mb`] — the §18.2 whole-MB prediction buffer for a
+//!   non-SPLITMV macroblock (one vector for all sixteen Y sub-blocks, the
+//!   averaged chroma vector for the eight chroma sub-blocks), routing each
+//!   sub-block through whole-pixel copy or sub-pixel interpolation.
+//! * [`reconstruct_inter_mb`] — prediction + §14 dequantized residual,
+//!   producing a [`ReconstructedMb`].
+//!
+//! The whole-pixel-only [`predict_inter_mb_whole_pixel`] /
+//! [`reconstruct_inter_mb_whole_pixel`] entry points are retained for
+//! callers that only ever pass whole-pixel vectors; they refuse a
+//! sub-pixel vector with [`MotionCompError::SubPixelNotSupported`]. New
+//! callers should prefer [`predict_inter_mb`] / [`reconstruct_inter_mb`].
 //!
 //! ## What is deferred (next inter-prediction rounds)
 //!
-//! * §18.3 sub-pixel interpolation (sixtap + bilinear). When a vector's
-//!   §18.1-adjusted fraction is non-zero, [`predict_inter_mb_whole_pixel`]
-//!   and [`reconstruct_inter_mb_whole_pixel`] return
-//!   [`MotionCompError::SubPixelNotSupported`] rather than guess.
 //! * §16.4 SPLITMV (per-sub-block vectors): this round handles the four
 //!   whole-MB inter modes (`mv_nearest` / `mv_near` / `mv_zero` /
 //!   `mv_new`), all of which apply one vector to the whole MB.
@@ -57,7 +76,7 @@
 //!   slice.
 
 use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
-use crate::inverse_transform::{add_residue_4x4, inverse_dct_4x4, inverse_wht_4x4};
+use crate::inverse_transform::{add_residue_4x4, clamp255, inverse_dct_4x4, inverse_wht_4x4};
 use crate::motion_vector::Mv;
 use crate::reconstruct::ReconstructedMb;
 
@@ -130,9 +149,12 @@ pub struct ReferencePlanes<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionCompError {
     /// The §18.1-adjusted motion vector has a non-zero fractional part,
-    /// so §18.3 sub-pixel interpolation is required — which this round
-    /// does not implement. The whole-pixel path covers only vectors
-    /// whose eighth-pixel fraction is `(0, 0)`.
+    /// so §18.3 sub-pixel interpolation is required. Returned only by the
+    /// whole-pixel-only entry points
+    /// ([`predict_inter_mb_whole_pixel`] /
+    /// [`reconstruct_inter_mb_whole_pixel`]); the full
+    /// [`predict_inter_mb`] / [`reconstruct_inter_mb`] path handles
+    /// sub-pixel vectors directly and never returns this.
     SubPixelNotSupported,
 }
 
@@ -248,6 +270,257 @@ pub fn whole_pixel_fraction_is_zero(mv: Mv) -> bool {
     (mv.row & 7) == 0 && (mv.col & 7) == 0
 }
 
+/// The §18.3 bicubic ("six-tap") interpolation filter table, indexed by
+/// the eighth-pixel fractional displacement (0..=7).
+///
+/// RFC 6386 §18.3 `filters[8][6]` (= the §20.14 `sixtap_filters`):
+///
+/// ```text
+/// const int filters [8] [6] = {        /* indexed by displacement */
+///     { 0,  0,  128,    0,   0,  0 },  /* degenerate whole-pixel */
+///     { 0, -6,  123,   12,  -1,  0 },  /* 1/8 */
+///     { 2, -11, 108,   36,  -8,  1 },  /* 1/4 */
+///     { 0, -9,   93,   50,  -6,  0 },  /* 3/8 */
+///     { 3, -16,  77,   77, -16,  3 },  /* 1/2 is symmetric */
+///     { 0, -6,   50,   93,  -9,  0 },  /* 5/8 = reverse of 3/8 */
+///     { 1, -8,   36,  108, -11,  2 },  /* 3/4 = reverse of 1/4 */
+///     { 0, -1,   12,  123,  -6,  0 }   /* 7/8 = reverse of 1/8 */
+/// };
+/// ```
+///
+/// "Filter taps taken to 7-bit precision. Because DC is always passed,
+/// taps always sum to 128."
+pub static SIXTAP_FILTERS: [[i32; 6]; 8] = [
+    [0, 0, 128, 0, 0, 0],
+    [0, -6, 123, 12, -1, 0],
+    [2, -11, 108, 36, -8, 1],
+    [0, -9, 93, 50, -6, 0],
+    [3, -16, 77, 77, -16, 3],
+    [0, -6, 50, 93, -9, 0],
+    [1, -8, 36, 108, -11, 2],
+    [0, -1, 12, 123, -6, 0],
+];
+
+/// The §18.3 bilinear interpolation filter table, indexed by the
+/// eighth-pixel fractional displacement (0..=7).
+///
+/// RFC 6386 §18.3 `BilinearFilters[8][6]` (= the §20.14
+/// `bilinear_filters`):
+///
+/// ```text
+/// const int BilinearFilters[8][6] =
+/// {
+///     { 0, 0, 128,   0, 0, 0 },
+///     { 0, 0, 112,  16, 0, 0 },
+///     { 0, 0,  96,  32, 0, 0 },
+///     { 0, 0,  80,  48, 0, 0 },
+///     { 0, 0,  64,  64, 0, 0 },
+///     { 0, 0,  48,  80, 0, 0 },
+///     { 0, 0,  32,  96, 0, 0 },
+///     { 0, 0,  16, 112, 0, 0 }
+/// };
+/// ```
+///
+/// Only the centre two taps are non-zero, so the bilinear filter never
+/// reaches the outer support pixels; the convolution machinery is shared
+/// with the six-tap path regardless.
+pub static BILINEAR_FILTERS: [[i32; 6]; 8] = [
+    [0, 0, 128, 0, 0, 0],
+    [0, 0, 112, 16, 0, 0],
+    [0, 0, 96, 32, 0, 0],
+    [0, 0, 80, 48, 0, 0],
+    [0, 0, 64, 64, 0, 0],
+    [0, 0, 48, 80, 0, 0],
+    [0, 0, 32, 96, 0, 0],
+    [0, 0, 16, 112, 0, 0],
+];
+
+/// Which §18.3 tap set a frame uses, selected by the frame-tag version.
+///
+/// RFC 6386 §20.14 `setup_subpixel_filters`:
+/// `if (version) subpixel_filters = bilinear_filters; else
+/// subpixel_filters = sixtap_filters;`. Both luma and chroma share the
+/// frame's one set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterSet {
+    /// The bicubic six-tap set ([`SIXTAP_FILTERS`]) — frame-tag
+    /// `version == 0`.
+    Sixtap,
+    /// The bilinear set ([`BILINEAR_FILTERS`]) — frame-tag `version != 0`.
+    Bilinear,
+}
+
+impl FilterSet {
+    /// The 8×6 tap table backing this filter set.
+    #[inline]
+    pub fn taps(self) -> &'static [[i32; 6]; 8] {
+        match self {
+            FilterSet::Sixtap => &SIXTAP_FILTERS,
+            FilterSet::Bilinear => &BILINEAR_FILTERS,
+        }
+    }
+}
+
+/// Select the §18.3 interpolation filter set for a frame-tag version —
+/// RFC 6386 §20.14.
+///
+/// `version == 0` → bicubic six-tap; any other version → bilinear.
+#[inline]
+pub fn filter_set_for_version(version: u8) -> FilterSet {
+    if version == 0 {
+        FilterSet::Sixtap
+    } else {
+        FilterSet::Bilinear
+    }
+}
+
+/// One-dimensional synthesis of a single interpolated sample — RFC 6386
+/// §18.3 `interp`.
+///
+/// ```text
+/// Pixel interp(const int fil[6], const Pixel *p, const int s) {
+///     int32 a = 0; int i = 0;
+///     p -= s + s;                 /* move back two positions */
+///     do { a += *p * fil[i]; p += s; } while (++i < 6);
+///     return clamp255((a + 64) >> 7);
+/// }
+/// ```
+///
+/// `support` holds the six contributing source samples in increasing
+/// position order — i.e. `[p[-2s], p[-1s], p[0], p[+1s], p[+2s],
+/// p[+3s]]` — so the caller folds the stride `s` into the gather and
+/// this primitive is a pure six-tap dot product with `(a + 64) >> 7`
+/// rounding and a final `clamp255`.
+#[inline]
+pub fn interp(filter: &[i32; 6], support: &[u8; 6]) -> u8 {
+    let mut a = 0i32;
+    for i in 0..6 {
+        a += support[i] as i32 * filter[i];
+    }
+    clamp255((a + 64) >> 7)
+}
+
+/// Horizontal six-tap convolution — RFC 6386 §20.14 `sixtap_horiz`.
+///
+/// Reads `rows` rows of `cols` output samples from `reference` (a plane
+/// of stride `ref_stride`), with the convolution origin at each output
+/// column; each output sample uses the six horizontal neighbours
+/// `reference[c-2 ..= c+3]`. Writes into `output` at stride `out_stride`.
+/// The intermediate is an 8-bit value: `clamp255((sum + 64) >> 7)`, so
+/// negative partial sums are clamped to 0 exactly as in the reference
+/// decoder (the intermediate buffer there is `unsigned char`).
+///
+/// `ref0` is the index in `reference` of output column 0, row 0 (the
+/// convolution origin); the function reads `reference[ref0 - 2 ..]`.
+#[allow(clippy::too_many_arguments)] // mirrors the §20.14 sixtap_horiz signature.
+fn sixtap_horiz(
+    output: &mut [u8],
+    out_stride: usize,
+    reference: &[u8],
+    ref_stride: usize,
+    ref0: usize,
+    cols: usize,
+    rows: usize,
+    filter: &[i32; 6],
+) {
+    for r in 0..rows {
+        let row_base = ref0 + r * ref_stride;
+        for c in 0..cols {
+            let mut support = [0u8; 6];
+            for (k, s) in support.iter_mut().enumerate() {
+                // taps span reference[c-2 ..= c+3].
+                *s = reference[row_base + c + k - 2];
+            }
+            output[r * out_stride + c] = interp(filter, &support);
+        }
+    }
+}
+
+/// Vertical six-tap convolution — RFC 6386 §20.14 `sixtap_vert`.
+///
+/// The vertical counterpart of [`sixtap_horiz`]: each output sample uses
+/// the six vertical neighbours `reference[(r-2 ..= r+3) * ref_stride]`.
+/// Operates on the horizontally-filtered intermediate produced by
+/// [`sixtap_horiz`].
+#[allow(clippy::too_many_arguments)] // mirrors the §20.14 sixtap_vert signature.
+fn sixtap_vert(
+    output: &mut [u8],
+    out_stride: usize,
+    reference: &[u8],
+    ref_stride: usize,
+    ref0: usize,
+    cols: usize,
+    rows: usize,
+    filter: &[i32; 6],
+) {
+    for r in 0..rows {
+        for c in 0..cols {
+            let col_base = ref0 + r * ref_stride + c;
+            let mut support = [0u8; 6];
+            for (k, s) in support.iter_mut().enumerate() {
+                // taps span reference[(r-2 ..= r+3) * ref_stride].
+                *s = reference[col_base + (k * ref_stride) - 2 * ref_stride];
+            }
+            output[r * out_stride + c] = interp(filter, &support);
+        }
+    }
+}
+
+/// Two-dimensional six-tap interpolation of a 4×4 sub-block — RFC 6386
+/// §20.14 `sixtap_2d`.
+///
+/// ```text
+/// sixtap_horiz(temp, 16, reference - 2*stride, stride, cols, rows + 5,
+///              filters[mx]);
+/// sixtap_vert(output, output_stride, temp + 2*16, 16, cols, rows,
+///             filters[my]);
+/// ```
+///
+/// `halo` is the 9×9 edge-replicated source region from
+/// [`fetch_block_halo`]: row-major, stride 9, with the 4×4 block origin
+/// at `halo[(2,2)]`. The horizontal pass synthesises a 4-wide × 9-tall
+/// intermediate (the block rows plus the two-above / three-below support
+/// the vertical pass needs); the vertical pass then synthesises the final
+/// 4×4. `(mx, my)` are the eighth-pixel fractions (`mv & 7`); `filters`
+/// is the version-selected tap set.
+pub fn sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]) -> [u8; 16] {
+    // Horizontal pass: 9 rows (the 4 block rows + 2 above + 3 below) ×
+    // 4 cols. Intermediate is 8-bit (clamped), stride 4.
+    //
+    // halo stride is 9; the block origin is at (2, 2). sixtap_horiz reads
+    // from "reference - 2*stride" with cols=4, rows=9 — i.e. starting at
+    // halo row 0, and each output column c reads halo[col-2 ..= col+3]
+    // relative to block-origin column 2. So ref0 = 2 (block-origin column
+    // within the halo), and the first row read is halo row 0 (the function
+    // adds no vertical offset; rows iterate 0..9 from ref0's row).
+    let mut temp = [0u8; 9 * 4];
+    sixtap_horiz(
+        &mut temp,
+        4,
+        halo,
+        9,
+        /* ref0 = */ 2, // block-origin column; row 0 of the 9-row span
+        4,
+        9,
+        &filters[mx],
+    );
+
+    // Vertical pass: 4 rows × 4 cols, reading the intermediate at "temp +
+    // 2*stride" — i.e. block-origin row 2 within the 9-row intermediate.
+    let mut out = [0u8; 16];
+    sixtap_vert(
+        &mut out,
+        4,
+        &temp,
+        4,
+        /* ref0 = */ 2 * 4, // block-origin row 2, column 0
+        4,
+        4,
+        &filters[my],
+    );
+    out
+}
+
 /// Fetch a 4×4 whole-pixel prediction block from a reference plane with
 /// the §20.14 `build_mc_border` edge-replication rule.
 ///
@@ -296,6 +569,88 @@ pub fn fetch_block_whole_pixel(
         }
     }
     out
+}
+
+/// Fetch the 9×9 edge-replicated halo a six-tap 4×4 interpolation needs —
+/// RFC 6386 §20.14 `build_mc_border` / `recon_1_edge_block`.
+///
+/// The six-tap convolution of a 4×4 sub-block references two pixels
+/// before and three pixels after the block in each dimension, so the
+/// source support is a `(4+5) × (4+5) = 9×9` region. This fetch
+/// reproduces the §20.14 `build_mc_border` emulated block: it covers
+/// source positions `[src_y0 - 2, src_y0 + 6] × [src_x0 - 2, src_x0 + 6]`
+/// (where `(src_x0, src_y0) = (blk_x, blk_y) + (mv >> 3)` is the
+/// integer-offset block origin), clamping any out-of-plane read to the
+/// nearest edge pixel. The result is row-major with stride 9; the 4×4
+/// block origin sits at `halo[(2, 2)]`, matching [`sixtap_2d`]'s
+/// expectation.
+///
+/// For an in-bounds fetch this is just a 9×9 window; the clamp makes the
+/// edge case identical to `build_mc_border`'s row/column replication,
+/// which is the whole-pixel [`fetch_block_whole_pixel`] rule extended to
+/// the support halo.
+pub fn fetch_block_halo(
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    blk_x: usize,
+    blk_y: usize,
+    mv: Mv,
+) -> [u8; 81] {
+    let off_x = (mv.col >> 3) as isize;
+    let off_y = (mv.row >> 3) as isize;
+    // The halo origin is two pixels above/left of the integer block
+    // origin (the first six-tap support pixel).
+    let src_x0 = blk_x as isize + off_x - 2;
+    let src_y0 = blk_y as isize + off_y - 2;
+
+    let w = w as isize;
+    let h = h as isize;
+    let mut out = [0u8; 81];
+    for r in 0..9 {
+        let sy = (src_y0 + r as isize).clamp(0, h - 1);
+        for c in 0..9 {
+            let sx = (src_x0 + c as isize).clamp(0, w - 1);
+            out[r * 9 + c] = plane[sy as usize * stride + sx as usize];
+        }
+    }
+    out
+}
+
+/// Predict one 4×4 sub-block — RFC 6386 §20.14 `filter_block`.
+///
+/// Mirrors the reference decoder's `filter_block`: extract the
+/// eighth-pixel fractions `mx = mv.col & 7`, `my = mv.row & 7`. If both
+/// are zero the prediction is the whole-pixel copy
+/// ([`fetch_block_whole_pixel`]); otherwise it is the [`sixtap_2d`]
+/// horizontal-then-vertical convolution of the [`fetch_block_halo`]
+/// support region under the version-selected `filters`.
+///
+/// `mv` is the §18.1-adjusted (eighth-pixel) vector for this plane;
+/// `(blk_x, blk_y)` is the sub-block's top-left position in the plane in
+/// pixels (before the motion offset); `w` / `h` are the plane's pixel
+/// dimensions.
+#[allow(clippy::too_many_arguments)] // mirrors the §20.14 filter_block call shape.
+pub fn filter_block_4x4(
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    blk_x: usize,
+    blk_y: usize,
+    mv: Mv,
+    filters: &[[i32; 6]; 8],
+) -> [u8; 16] {
+    let mx = (mv.col & 7) as usize;
+    let my = (mv.row & 7) as usize;
+    if mx == 0 && my == 0 {
+        // Whole-pixel: the §18.3 "prediction subblock is simply copied".
+        fetch_block_whole_pixel(plane, stride, w, h, blk_x, blk_y, mv)
+    } else {
+        let halo = fetch_block_halo(plane, stride, w, h, blk_x, blk_y, mv);
+        sixtap_2d(&halo, mx, my, filters)
+    }
 }
 
 /// Build the §18.2 whole-pixel prediction buffer for a non-SPLITMV
@@ -505,6 +860,188 @@ pub fn reconstruct_inter_mb_whole_pixel(
     }
 
     Ok(out)
+}
+
+/// Build the §18.2 prediction buffer for a non-SPLITMV inter-predicted
+/// macroblock, with §18.3 sub-pixel interpolation — RFC 6386 §18.
+///
+/// The full prediction path: the same `luma_mv` (raw §17-decoded,
+/// quarter-pixel) applies to all sixteen Y sub-blocks; the chroma vector
+/// is the §18.1 average of that one vector. Each sub-block is routed
+/// through [`filter_block_4x4`], which copies whole-pixel sub-blocks and
+/// six-tap-interpolates sub-pixel sub-blocks under `filters`.
+///
+/// `full_pixel` is the version-3 full-pel-chroma flag
+/// (`frame_hdr.version == 3`); `filters` is the §20.14 version-selected
+/// tap set (use [`filter_set_for_version`] then [`FilterSet::taps`]).
+///
+/// `(mb_col, mb_row)` is the macroblock position; the reference planes
+/// supply the dimensions.
+pub fn predict_inter_mb(
+    reference: &ReferencePlanes<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    luma_mv: Mv,
+    full_pixel: bool,
+    filters: &[[i32; 6]; 8],
+) -> ReconstructedMb {
+    // §18.1: double the quarter-pixel luma vector to eighth-pixel
+    // resolution.
+    let mut ymv = stored_luma_mv(luma_mv);
+    // §18.1 chroma averaging (avg() of the single repeated vector).
+    let mut uvmv = chroma_mv(ymv);
+    if full_pixel {
+        // §18.1 version-3 full-pel-chroma truncation.
+        ymv = apply_full_pixel(ymv);
+        uvmv = apply_full_pixel(uvmv);
+    }
+
+    let lw = reference.mb_cols * 16;
+    let lh = reference.mb_rows * 16;
+    let cw = reference.mb_cols * 8;
+    let ch = reference.mb_rows * 8;
+
+    let mut out = ReconstructedMb::default();
+
+    // Luma: sixteen 4×4 sub-blocks, each filtered with the same ymv.
+    let y_x0 = mb_col * 16;
+    let y_y0 = mb_row * 16;
+    for sb in 0..4 {
+        for sc in 0..4 {
+            let blk = filter_block_4x4(
+                reference.y,
+                reference.y_stride,
+                lw,
+                lh,
+                y_x0 + sc * 4,
+                y_y0 + sb * 4,
+                ymv,
+                filters,
+            );
+            for r in 0..4 {
+                let dst = (sb * 4 + r) * 16 + sc * 4;
+                out.y[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+            }
+        }
+    }
+
+    // Chroma: four 4×4 sub-blocks per plane, each filtered with uvmv.
+    let uv_x0 = mb_col * 8;
+    let uv_y0 = mb_row * 8;
+    for sb in 0..2 {
+        for sc in 0..2 {
+            let ublk = filter_block_4x4(
+                reference.u,
+                reference.uv_stride,
+                cw,
+                ch,
+                uv_x0 + sc * 4,
+                uv_y0 + sb * 4,
+                uvmv,
+                filters,
+            );
+            let vblk = filter_block_4x4(
+                reference.v,
+                reference.uv_stride,
+                cw,
+                ch,
+                uv_x0 + sc * 4,
+                uv_y0 + sb * 4,
+                uvmv,
+                filters,
+            );
+            for r in 0..4 {
+                let dst = (sb * 4 + r) * 8 + sc * 4;
+                out.u[dst..dst + 4].copy_from_slice(&ublk[r * 4..r * 4 + 4]);
+                out.v[dst..dst + 4].copy_from_slice(&vblk[r * 4..r * 4 + 4]);
+            }
+        }
+    }
+
+    out
+}
+
+/// Reconstruct one inter-predicted (non-SPLITMV) macroblock with §18.3
+/// sub-pixel interpolation — RFC 6386 §16.2 / §18 prediction + §14
+/// residue.
+///
+/// The full-resolution analogue of [`reconstruct_inter_mb_whole_pixel`]:
+///
+/// 1. Build the §18.2/§18.3 prediction buffer ([`predict_inter_mb`],
+///    whole-pixel copy or six-tap interpolation per sub-block).
+/// 2. If `mb_skip_coeff`, the residue is zero and the prediction is the
+///    reconstruction (§11.1 skip short-circuit).
+/// 3. Otherwise inverse-WHT the Y2 block (an inter non-SPLITMV MB has a
+///    Y2 block, §14.2), seed each Y sub-block DC, inverse-DCT all 24
+///    sub-blocks, and add the residue with `clamp255` (§14.5).
+///
+/// `filters` is the §20.14 version-selected tap set. The coefficient
+/// arrays are pre-dequantized (the caller's responsibility, matching the
+/// keyframe path).
+#[allow(clippy::too_many_arguments)] // each parameter is a distinct §14.2/§18 input.
+pub fn reconstruct_inter_mb(
+    reference: &ReferencePlanes<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    luma_mv: Mv,
+    full_pixel: bool,
+    filters: &[[i32; 6]; 8],
+    mb_skip_coeff: bool,
+    y2_coeffs_dequant: &[i16; 16],
+    y_coeffs_dequant: &[[i16; 16]; 16],
+    u_coeffs_dequant: &[[i16; 16]; 4],
+    v_coeffs_dequant: &[[i16; 16]; 4],
+) -> ReconstructedMb {
+    let mut out = predict_inter_mb(reference, mb_col, mb_row, luma_mv, full_pixel, filters);
+
+    if mb_skip_coeff {
+        return out;
+    }
+
+    // §14.2: inverse-WHT Y2 and seed each Y sub-block's DC.
+    let mut y2_residue = [0i16; 16];
+    inverse_wht_4x4(y2_coeffs_dequant, &mut y2_residue);
+    let mut y_coeffs = *y_coeffs_dequant;
+    for i in 0..4 {
+        for j in 0..4 {
+            y_coeffs[i * 4 + j][0] = y2_residue[i * 4 + j];
+        }
+    }
+
+    // Luma: inverse-DCT + add residue per sub-block.
+    for i in 0..4 {
+        for j in 0..4 {
+            let idx = i * 4 + j;
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&y_coeffs[idx], &mut residue);
+            let pred = extract_4x4(&out.y, 16, i, j);
+            let mut summed = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut summed);
+            insert_4x4(&mut out.y, 16, i, j, &summed);
+        }
+    }
+
+    // Chroma: inverse-DCT + add residue per sub-block, U then V.
+    for i in 0..2 {
+        for j in 0..2 {
+            let idx = i * 2 + j;
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&u_coeffs_dequant[idx], &mut residue);
+            let pred = extract_4x4(&out.u, 8, i, j);
+            let mut summed = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut summed);
+            insert_4x4(&mut out.u, 8, i, j, &summed);
+
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&v_coeffs_dequant[idx], &mut residue);
+            let pred = extract_4x4(&out.v, 8, i, j);
+            let mut summed = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut summed);
+            insert_4x4(&mut out.v, 8, i, j, &summed);
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -1139,5 +1676,532 @@ mod tests {
             ),
             Err(MotionCompError::SubPixelNotSupported)
         );
+    }
+
+    // ----- §18.3 sub-pixel interpolation -----------------------------
+
+    #[test]
+    fn filter_tables_match_spec_values() {
+        // §18.3 / §20.14: spot-check the documented rows.
+        assert_eq!(SIXTAP_FILTERS[0], [0, 0, 128, 0, 0, 0]);
+        assert_eq!(SIXTAP_FILTERS[1], [0, -6, 123, 12, -1, 0]);
+        assert_eq!(SIXTAP_FILTERS[2], [2, -11, 108, 36, -8, 1]);
+        assert_eq!(SIXTAP_FILTERS[4], [3, -16, 77, 77, -16, 3]);
+        assert_eq!(SIXTAP_FILTERS[7], [0, -1, 12, 123, -6, 0]);
+        assert_eq!(BILINEAR_FILTERS[0], [0, 0, 128, 0, 0, 0]);
+        assert_eq!(BILINEAR_FILTERS[4], [0, 0, 64, 64, 0, 0]);
+        assert_eq!(BILINEAR_FILTERS[7], [0, 0, 16, 112, 0, 0]);
+    }
+
+    #[test]
+    fn filter_taps_always_sum_to_128() {
+        // §18.3: "Because DC is always passed, taps always sum to 128."
+        for f in SIXTAP_FILTERS.iter() {
+            assert_eq!(f.iter().sum::<i32>(), 128);
+        }
+        for f in BILINEAR_FILTERS.iter() {
+            assert_eq!(f.iter().sum::<i32>(), 128);
+        }
+    }
+
+    #[test]
+    fn bilinear_uses_only_centre_two_taps() {
+        // The bilinear filter never reaches the outer support pixels.
+        for f in BILINEAR_FILTERS.iter() {
+            assert_eq!(f[0], 0);
+            assert_eq!(f[1], 0);
+            assert_eq!(f[4], 0);
+            assert_eq!(f[5], 0);
+        }
+    }
+
+    #[test]
+    fn filter_set_selected_by_version() {
+        // §20.14: version 0 → six-tap; non-zero → bilinear.
+        assert_eq!(filter_set_for_version(0), FilterSet::Sixtap);
+        assert_eq!(filter_set_for_version(1), FilterSet::Bilinear);
+        assert_eq!(filter_set_for_version(2), FilterSet::Bilinear);
+        assert_eq!(filter_set_for_version(3), FilterSet::Bilinear);
+        assert!(core::ptr::eq(
+            FilterSet::Sixtap.taps(),
+            &SIXTAP_FILTERS as &[[i32; 6]; 8]
+        ));
+        assert!(core::ptr::eq(
+            FilterSet::Bilinear.taps(),
+            &BILINEAR_FILTERS as &[[i32; 6]; 8]
+        ));
+    }
+
+    #[test]
+    fn interp_matches_spec_formula() {
+        // §18.3 interp: clamp255((sum_i support[i]*fil[i] + 64) >> 7).
+        // Whole-pixel filter (index 0) passes the centre tap unchanged.
+        let support = [10u8, 20, 30, 40, 50, 60];
+        assert_eq!(interp(&SIXTAP_FILTERS[0], &support), 30);
+        // 1/2 symmetric filter, computed by hand:
+        // 3*10 -16*20 +77*30 +77*40 -16*50 +3*60
+        // = 30 -320 +2310 +3080 -800 +180 = 4480; (4480+64)>>7 = 35.
+        assert_eq!(interp(&SIXTAP_FILTERS[4], &support), 35);
+        // Constant support → DC passes (taps sum 128): (128*K+64)>>7 = K.
+        let flat = [200u8; 6];
+        for f in SIXTAP_FILTERS.iter() {
+            assert_eq!(interp(f, &flat), 200);
+        }
+        // clamp255 floor: a strongly negative partial sum clamps to 0.
+        // filter index 2 has negative taps -11 and -8; drive the negative
+        // taps high and the positive taps to 0.
+        let neg = [0u8, 255, 0, 0, 255, 0];
+        // 2*0 -11*255 +108*0 +36*0 -8*255 +1*0 = -4845; +64 = -4781;
+        // >>7 (arithmetic) = -38 → clamp255 → 0.
+        assert_eq!(interp(&SIXTAP_FILTERS[2], &neg), 0);
+    }
+
+    /// Independent §18.3 `interp` over a slice with explicit stride —
+    /// a literal transcription of the spec-prose code block, used to
+    /// cross-check [`sixtap_2d`].
+    fn ref_interp(fil: &[i32; 6], p: &[u8], origin: isize, s: isize) -> u8 {
+        let mut a = 0i32;
+        let mut idx = origin - s - s; // "move back two positions"
+        for &tap in fil.iter() {
+            a += p[idx as usize] as i32 * tap;
+            idx += s;
+        }
+        ((a + 64) >> 7).clamp(0, 255) as u8
+    }
+
+    /// Independent §18.3 Hinterp + Vinterp over the same 9×9 halo
+    /// [`sixtap_2d`] consumes, reproducing the spec prose verbatim:
+    /// horizontal pass producing 9 rows of 4, vertical pass producing
+    /// the final 4×4. The halo block origin is at (2, 2), stride 9.
+    fn ref_sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]) -> [u8; 16] {
+        let hfil = &filters[mx];
+        let vfil = &filters[my];
+        // Hinterp: temp[9][4]. Spec advances p by the vertical stride per
+        // row, starting at the subblock origin. interp moves back two
+        // positions, so the support spans rows [origin-? n/a here] — for
+        // the horizontal pass the step is 1 (within a row) and we read
+        // rows [block_origin_row .. +8]. The halo's row 2 is the block
+        // origin row; Hinterp's row r corresponds to halo row r (the
+        // §20.14 sixtap_horiz starts at reference - 2*stride = halo row
+        // 0, producing 9 rows). To match that, iterate halo rows 0..9.
+        let mut temp = [[0u8; 4]; 9];
+        for (r, trow) in temp.iter_mut().enumerate() {
+            for (c, t) in trow.iter_mut().enumerate() {
+                // Row base in the halo: block-origin column is 2.
+                let base = r * 9 + 2;
+                *t = ref_interp(hfil, halo, (base + c) as isize, 1);
+            }
+        }
+        // Vinterp: read temp at block-origin row (halo row 2 → temp row
+        // 2) with vertical step = 4 (row width). Flatten temp to a
+        // 9*4 row-major buffer.
+        let mut flat = [0u8; 36];
+        for r in 0..9 {
+            for c in 0..4 {
+                flat[r * 4 + c] = temp[r][c];
+            }
+        }
+        let mut out = [0u8; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                // Block-origin row within the 9-row intermediate is row 2.
+                let base = (2 + r) * 4 + c;
+                out[r * 4 + c] = ref_interp(vfil, &flat, base as isize, 4);
+            }
+        }
+        out
+    }
+
+    /// Pseudo-random 9×9 halo for cross-checking the convolution.
+    fn rand_halo(seed: u64) -> [u8; 81] {
+        let mut s = seed;
+        let mut h = [0u8; 81];
+        for px in h.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *px = (s >> 33) as u8;
+        }
+        h
+    }
+
+    #[test]
+    fn sixtap_2d_matches_independent_spec_reference() {
+        // Cross-check the production sixtap_2d against a literal
+        // transcription of §18.3 Hinterp/Vinterp over the same halo, for
+        // every (mx, my) sub-pixel pair and both filter sets.
+        for set in [&SIXTAP_FILTERS, &BILINEAR_FILTERS] {
+            for seed in 0..3u64 {
+                let halo = rand_halo(seed * 977 + 13);
+                for mx in 0..8 {
+                    for my in 0..8 {
+                        let got = sixtap_2d(&halo, mx, my, set);
+                        let want = ref_sixtap_2d(&halo, mx, my, set);
+                        assert_eq!(got, want, "mx={mx} my={my} seed={seed}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sixtap_2d_flat_halo_passes_dc() {
+        // A constant source must interpolate to the same constant for any
+        // fraction (taps sum to 128, DC preserved, no clamp).
+        let halo = [137u8; 81];
+        for mx in 0..8 {
+            for my in 0..8 {
+                let out = sixtap_2d(&halo, mx, my, &SIXTAP_FILTERS);
+                assert!(out.iter().all(|&p| p == 137), "mx={mx} my={my}");
+                let outb = sixtap_2d(&halo, mx, my, &BILINEAR_FILTERS);
+                assert!(outb.iter().all(|&p| p == 137), "bilinear mx={mx} my={my}");
+            }
+        }
+    }
+
+    #[test]
+    fn sixtap_2d_whole_fraction_copies_block() {
+        // (mx,my)=(0,0) is the degenerate whole-pixel filter: the centre
+        // tap is 128 in both dimensions, so sixtap_2d copies the 4×4
+        // block at the halo origin (rows/cols 2..6).
+        let halo = rand_halo(42);
+        let out = sixtap_2d(&halo, 0, 0, &SIXTAP_FILTERS);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(out[r * 4 + c], halo[(2 + r) * 9 + (2 + c)], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn sixtap_2d_horizontal_only_known_values() {
+        // my=0 (vertical filter is the centre-tap copy), so the result is
+        // a pure horizontal convolution of the block-origin rows. Build a
+        // horizontal ramp halo so the answer is easy to verify against
+        // ref_interp directly.
+        let mut halo = [0u8; 81];
+        for r in 0..9 {
+            for c in 0..9 {
+                halo[r * 9 + c] = (c * 20) as u8; // 0,20,40,...,160
+            }
+        }
+        let out = sixtap_2d(&halo, 2, 0, &SIXTAP_FILTERS); // mx=1/4
+        for r in 0..4 {
+            for c in 0..4 {
+                let want = ref_interp(&SIXTAP_FILTERS[2], &halo, (r * 9 + 2 + c) as isize, 1);
+                assert_eq!(out[r * 4 + c], want, "({r},{c})");
+            }
+        }
+    }
+
+    // ----- §20.14 build_mc_border halo fetch -------------------------
+
+    #[test]
+    fn halo_in_bounds_is_plain_window() {
+        // A fetch well inside the plane is a 9×9 window starting two
+        // pixels up/left of the integer block origin.
+        let w = 16;
+        let h = 16;
+        let plane = ramp_plane(w, h);
+        // mv (16, 8) → integer offset (16>>3, 8>>3) = (2, 1). Block at
+        // (4, 4) → src origin (6, 5); halo origin (6-2, 5-2) = (4, 3).
+        let halo = fetch_block_halo(&plane, w, w, h, 4, 4, Mv { row: 16, col: 8 });
+        for r in 0..9 {
+            for c in 0..9 {
+                assert_eq!(halo[r * 9 + c], plane[(4 + r) * w + (3 + c)], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn halo_block_origin_at_2_2() {
+        // The integer block origin must sit at halo[(2,2)].
+        let w = 16;
+        let h = 16;
+        let plane = ramp_plane(w, h);
+        // Zero mv, block at (4, 4): src origin (4, 4) → halo[(2,2)].
+        let halo = fetch_block_halo(&plane, w, w, h, 4, 4, Mv { row: 0, col: 0 });
+        assert_eq!(halo[2 * 9 + 2], plane[4 * w + 4]);
+    }
+
+    #[test]
+    fn halo_clamps_at_top_left_corner() {
+        // Block at (0,0), zero mv: halo origin (-2,-2). All out-of-plane
+        // rows/cols replicate the nearest edge — matching build_mc_border.
+        let w = 8;
+        let h = 8;
+        let plane = ramp_plane(w, h);
+        let halo = fetch_block_halo(&plane, w, w, h, 0, 0, Mv { row: 0, col: 0 });
+        for r in 0..9 {
+            for c in 0..9 {
+                let sy = (r as isize - 2).clamp(0, h as isize - 1) as usize;
+                let sx = (c as isize - 2).clamp(0, w as isize - 1) as usize;
+                assert_eq!(halo[r * 9 + c], plane[sy * w + sx], "({r},{c})");
+            }
+        }
+    }
+
+    // ----- §20.14 filter_block dispatch ------------------------------
+
+    #[test]
+    fn filter_block_whole_pixel_copies() {
+        // mx|my == 0 → filter_block_4x4 == fetch_block_whole_pixel.
+        let w = 16;
+        let h = 16;
+        let plane = ramp_plane(w, h);
+        let mv = Mv { row: 16, col: 8 }; // integer offset, no fraction
+        let filt = filter_block_4x4(&plane, w, w, h, 4, 4, mv, &SIXTAP_FILTERS);
+        let copy = fetch_block_whole_pixel(&plane, w, w, h, 4, 4, mv);
+        assert_eq!(filt, copy);
+    }
+
+    #[test]
+    fn filter_block_sub_pixel_interpolates() {
+        // A fractional mv routes through sixtap_2d on the fetched halo.
+        let w = 16;
+        let h = 16;
+        let plane = ramp_plane(w, h);
+        let mv = Mv { row: 10, col: 19 }; // my = 10&7 = 2, mx = 19&7 = 3
+        let halo = fetch_block_halo(&plane, w, w, h, 4, 4, mv);
+        let want = sixtap_2d(&halo, 3, 2, &SIXTAP_FILTERS);
+        let got = filter_block_4x4(&plane, w, w, h, 4, 4, mv, &SIXTAP_FILTERS);
+        assert_eq!(got, want);
+    }
+
+    // ----- §18.2/§18.3 sub-pixel whole-MB prediction -----------------
+
+    #[test]
+    fn predict_inter_mb_sub_pixel_matches_per_block() {
+        // The whole-MB prediction must equal the per-sub-block
+        // filter_block_4x4 applied with the §18.1-adjusted vectors.
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        // luma quarter-pel (3, 5) → doubled (6, 10): luma fractions
+        // (6&7, 10&7) = (6, 2), sub-pixel. chroma avg(6..)=3, avg(10..)=5
+        // → fractions (3, 5), also sub-pixel.
+        let luma_mv = Mv { row: 3, col: 5 };
+        let pred = predict_inter_mb(&reference, 1, 1, luma_mv, false, &SIXTAP_FILTERS);
+
+        let ymv = stored_luma_mv(luma_mv);
+        let uvmv = chroma_mv(ymv);
+        let lw = 48;
+        let lh = 48;
+        let cw = 24;
+        let ch = 24;
+        // Luma.
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let blk = filter_block_4x4(
+                    &y,
+                    48,
+                    lw,
+                    lh,
+                    16 + sc * 4,
+                    16 + sb * 4,
+                    ymv,
+                    &SIXTAP_FILTERS,
+                );
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let pr = sb * 4 + r;
+                        let pc = sc * 4 + c;
+                        assert_eq!(pred.y[pr * 16 + pc], blk[r * 4 + c], "luma ({pr},{pc})");
+                    }
+                }
+            }
+        }
+        // Chroma U.
+        for sb in 0..2 {
+            for sc in 0..2 {
+                let blk = filter_block_4x4(
+                    &u,
+                    24,
+                    cw,
+                    ch,
+                    8 + sc * 4,
+                    8 + sb * 4,
+                    uvmv,
+                    &SIXTAP_FILTERS,
+                );
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let pr = sb * 4 + r;
+                        let pc = sc * 4 + c;
+                        assert_eq!(pred.u[pr * 8 + pc], blk[r * 4 + c], "u ({pr},{pc})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn predict_inter_mb_whole_pixel_agrees_with_legacy() {
+        // For a whole-pixel vector, predict_inter_mb must produce the
+        // same buffer as the legacy whole-pixel-only entry point.
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        let mv = Mv { row: 8, col: 16 }; // whole-pixel after §18.1
+        let full = predict_inter_mb(&reference, 1, 1, mv, false, &SIXTAP_FILTERS);
+        let legacy = predict_inter_mb_whole_pixel(&reference, 1, 1, mv, false).unwrap();
+        assert_eq!(full, legacy);
+    }
+
+    #[test]
+    fn predict_inter_mb_uses_selected_filter_set() {
+        // Bilinear and six-tap give different results for the same
+        // sub-pixel vector (the outer taps differ), so the prediction
+        // must depend on the chosen set.
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        let luma_mv = Mv { row: 3, col: 5 };
+        let six = predict_inter_mb(&reference, 1, 1, luma_mv, false, &SIXTAP_FILTERS);
+        let bil = predict_inter_mb(&reference, 1, 1, luma_mv, false, &BILINEAR_FILTERS);
+        assert_ne!(six.y, bil.y);
+    }
+
+    #[test]
+    fn reconstruct_inter_mb_skip_equals_prediction() {
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        let mv = Mv { row: 3, col: 5 }; // sub-pixel
+        let pred = predict_inter_mb(&reference, 1, 1, mv, false, &SIXTAP_FILTERS);
+        let recon = reconstruct_inter_mb(
+            &reference,
+            1,
+            1,
+            mv,
+            false,
+            &SIXTAP_FILTERS,
+            true, // skip
+            &[0i16; 16],
+            &[[0i16; 16]; 16],
+            &[[0i16; 16]; 4],
+            &[[0i16; 16]; 4],
+        );
+        assert_eq!(recon, pred);
+    }
+
+    #[test]
+    fn reconstruct_inter_mb_sub_pixel_adds_dc_residue() {
+        // Sub-pixel prediction + a pure Y2 DC term: luma lifts uniformly,
+        // chroma equals prediction.
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        let mv = Mv { row: 3, col: 5 }; // sub-pixel
+        let pred = predict_inter_mb(&reference, 1, 1, mv, false, &SIXTAP_FILTERS);
+
+        let mut y2 = [0i16; 16];
+        y2[0] = 64;
+        let recon = reconstruct_inter_mb(
+            &reference,
+            1,
+            1,
+            mv,
+            false,
+            &SIXTAP_FILTERS,
+            false,
+            &y2,
+            &[[0i16; 16]; 16],
+            &[[0i16; 16]; 4],
+            &[[0i16; 16]; 4],
+        );
+
+        // Independent luma delta via the public transforms.
+        let mut y2_residue = [0i16; 16];
+        inverse_wht_4x4(&y2, &mut y2_residue);
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = y2_residue[0];
+        let mut residue = [0i16; 16];
+        inverse_dct_4x4(&coeffs, &mut residue);
+        let delta = residue[0];
+        assert_ne!(delta, 0);
+
+        assert_eq!(recon.u, pred.u);
+        assert_eq!(recon.v, pred.v);
+        for i in 0..256 {
+            let expect = (pred.y[i] as i32 + delta as i32).clamp(0, 255) as u8;
+            assert_eq!(recon.y[i], expect, "luma px {i}");
+        }
+    }
+
+    #[test]
+    fn reconstruct_inter_mb_matches_legacy_for_whole_pixel() {
+        // A whole-pixel vector through the full path must equal the
+        // legacy whole-pixel reconstruction (filters are unused there).
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        let mv = Mv { row: 8, col: 16 };
+        let mut y2 = [0i16; 16];
+        y2[0] = 48;
+        let mut ycoeffs = [[0i16; 16]; 16];
+        ycoeffs[5][3] = 12;
+        let ucoeffs = [[0i16; 16]; 4];
+        let vcoeffs = [[0i16; 16]; 4];
+        let full = reconstruct_inter_mb(
+            &reference,
+            1,
+            1,
+            mv,
+            false,
+            &SIXTAP_FILTERS,
+            false,
+            &y2,
+            &ycoeffs,
+            &ucoeffs,
+            &vcoeffs,
+        );
+        let legacy = reconstruct_inter_mb_whole_pixel(
+            &reference, 1, 1, mv, false, false, &y2, &ycoeffs, &ucoeffs, &vcoeffs,
+        )
+        .unwrap();
+        assert_eq!(full, legacy);
     }
 }

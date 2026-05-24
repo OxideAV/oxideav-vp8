@@ -2,6 +2,31 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 125)
+
+**Encoder Phase 1 (frame-header writers + silent-keyframe path)
+landed.** A new `src/encoder.rs` ships the RFC 6386 §7.3 `BoolEncoder`
+plus the §9.1 / §9.3 / §9.4 / §9.5 / §9.6 / §9.7 / §9.9 / §9.11
+frame-header writer subroutines (`write_frame_tag`,
+`write_segment_update_flags`, `write_loop_filter`,
+`write_token_partition_count`, `write_quant_indices`,
+`write_no_token_prob_updates`, `write_mb_no_skip_coeff`,
+`patch_first_partition_size`) and a top-level
+`encode_silent_keyframe(params)` that composes them into a
+structurally-valid all-zero-quantization key frame. Every macroblock
+is coded as `mb_skip_coeff = 1` (`prob_skip_false = 1`) with `DC_PRED`
+luma + chroma, so the DCT partition carries no token data and the
+encoder neither selects modes nor quantizes — that lands in a later
+round once the §13 / §14 encode side ships. The emitted bytes
+round-trip through the crate's own decoder at multiple dimensions
+(16×16, 32×32, 32×24, 48×16, 64×64) and at every legal §9.5 partition
+count (1 / 2 / 4 / 8); `ffmpeg -c:v vp8` accepts the same bytes
+wrapped in IVF (`tests/encoder_external_decode.rs`). A direct-API
+`oxideav_vp8::encoder::make_encoder` factory parallels the registry
+path per the workspace dual-API convention; `encode_vp8_keyframe`
+(legacy entry) now delegates to the same path instead of returning
+`NotImplemented`.
+
 ## Status — 2026-05-25 (round 120)
 
 **Clean-room rebuild in progress.** The prior implementation was
@@ -39,10 +64,11 @@ output on three multi-frame fixtures:
 * `altref-arnr-on` — 10 frames with `auto-alt-ref` + ARNR.
 
 Plus the ten single-keyframe fixtures from earlier rounds, all still
-passing through the new stateful driver. Test count: 346 (default
-features) / 341 (standalone) — was 309/305 in round 119. The encoder
-(`encode_vp8_*`) remains scaffolded — the §13 / §14 encode side has
-not been written.
+passing through the new stateful driver. Test count: 361 lib + 3
+ffmpeg-external + 5 public-error-surface (default features) / 356 lib
+(standalone) — was 346 / 341 in round 120. The Phase 1 encoder
+(silent-keyframe path) ships in round 125; the §13 / §14 RD-driven
+encode side is still future work.
 
 **Round 122 surface tweak.** A public `Vp8Error` umbrella enum is now
 re-exported from the crate root (`pub enum Vp8Error { Decode(DecodeError),

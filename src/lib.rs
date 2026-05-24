@@ -237,8 +237,20 @@
 //! the multi-frame [`state::Vp8DecoderState`] all landed, the full
 //! key+inter decode chain is bit-exact against the libvpx/ffmpeg reference
 //! on multi-frame fixtures (single I + P; 5-frame mid-GOP golden refresh;
-//! 10-frame `auto-alt-ref` + ARNR). Still scaffolded: the encoder
-//! (`encode_vp8_*` returns [`Error::NotImplemented`]).
+//! 10-frame `auto-alt-ref` + ARNR).
+//!
+//! * **VP8 encoder Phase 1** — the bitstream-formatting half of the
+//!   encoder ([`encoder`]). Ships the §7.3 [`encoder::BoolEncoder`] (a
+//!   Rust port of the `bool_encoder` C listing embedded in RFC 6386
+//!   §7.3), the §9.1 / §9.3 / §9.4 / §9.5 / §9.6 / §9.9 / §9.10 / §9.11
+//!   frame-header writer subroutines, and the top-level
+//!   [`encoder::encode_silent_keyframe`] driver. Every emitted MB is
+//!   coded as `mb_skip_coeff = 1` with `DC_PRED` luma + chroma, so the
+//!   §13 token / §14 transform / mode-selection logic is not exercised
+//!   yet — but the resulting bytes are a structurally-valid VP8 key
+//!   frame the crate's own [`decode_vp8`] consumes and that
+//!   `ffmpeg -c:v vp8` accepts when wrapped in an IVF container. The
+//!   §13 / §14 rate-distortion encode side is future work.
 
 #![warn(missing_debug_implementations)]
 
@@ -247,6 +259,7 @@ pub mod coded_header;
 pub mod dct_tokens;
 pub mod decoder;
 pub mod dequant;
+pub mod encoder;
 pub mod frame;
 pub mod frame_header;
 pub mod intra_predict;
@@ -271,6 +284,12 @@ pub use dct_tokens::{
 };
 pub use decoder::{decode_vp8, DecodeError, Vp8DecodedFrame};
 pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
+pub use encoder::{
+    encode_silent_keyframe, make_encoder, patch_first_partition_size, write_frame_tag,
+    write_loop_filter, write_mb_no_skip_coeff, write_no_token_prob_updates, write_quant_indices,
+    write_segment_update_flags, write_token_partition_count, BoolEncoder, EncodeError,
+    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams,
+};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
@@ -399,10 +418,20 @@ impl From<Error> for Vp8Error {
 
 /// Encode a VP8 keyframe.
 ///
-/// Still scaffolded — the encoder has not been written yet (the §13 /
-/// §14 encode side is a future round). Returns [`Error::NotImplemented`].
-pub fn encode_vp8_keyframe(_pixels: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
+/// Phase 1 of the encoder is implemented: this routes to
+/// [`encode_silent_keyframe`], which emits a structurally-valid
+/// all-zero-quantization key frame for the supplied dimensions
+/// (`_pixels` is currently ignored — the §13 / §14 encode round will
+/// wire in actual pixel-driven residual coding).
+///
+/// Errors are surfaced as the legacy crate-level [`Error`] (currently
+/// only [`Error::NotImplemented`]) for backwards compatibility with
+/// callers that already pattern-match against it. To consume the
+/// richer [`EncodeError`] surface directly, call
+/// [`encode_silent_keyframe`] instead.
+pub fn encode_vp8_keyframe(_pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
+    encode_silent_keyframe(SilentKeyframeParams::new(width, height))
+        .map_err(|_| Error::NotImplemented)
 }
 
 /// Install the VP8 codec (decoder) into a runtime context. Delegates to

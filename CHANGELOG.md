@@ -4,6 +4,19 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.0...v0.2.1) - 2026-05-24
+
+### Other
+
+- Phase 1 — §9 frame-header writers + silent-keyframe path
+- expose public Vp8Error umbrella at crate root
+- refresh decode_vp8 scope docstring (no behaviour change)
+- multi-frame Vp8DecoderState driver + bit-exact P-frame decode
+- §16.4 SPLITMV per-sub-block MV decoding + §18 SPLITMV reconstruction
+- §16.2/§16.3/§18.1 near/nearest MV census + inter-mode tree
+- §18.3 sub-pixel motion compensation (sixtap + bilinear)
+- Add §16.2/§18 whole-pixel interframe motion compensation
+
 ### Added
 
 * **VP8 encoder Phase 1: §9 frame-header writers + silent-keyframe

@@ -44,6 +44,15 @@ features) / 341 (standalone) — was 309/305 in round 119. The encoder
 (`encode_vp8_*`) remains scaffolded — the §13 / §14 encode side has
 not been written.
 
+**Round 122 surface tweak.** A public `Vp8Error` umbrella enum is now
+re-exported from the crate root (`pub enum Vp8Error { Decode(DecodeError),
+Encode(Error) }`) with `Display` / `std::error::Error` / `From<DecodeError>`
+/ `From<Error>` impls. This unblocks downstream consumers (notably
+`oxideav-webp`'s lossy VP8 path) that need a single stable error symbol
+to build a `From<oxideav_vp8::Vp8Error>` adapter against. The existing
+per-module errors (`DecodeError`, `Error`, etc.) are unchanged. A
+`tests/public_error_surface.rs` integration test locks the visibility.
+
 ### Landed
 
 **Round 1 (2026-05-20).** `BoolDecoder` — the VP8 boolean (range)

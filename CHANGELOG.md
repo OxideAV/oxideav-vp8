@@ -6,6 +6,19 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Public `Vp8Error` umbrella error at the crate root** — a new
+  `pub enum Vp8Error { Decode(DecodeError), Encode(Error) }` exposed
+  from `lib.rs`, with `Display` / `std::error::Error` (with `source()`
+  delegation) / `From<DecodeError>` / `From<Error>` impls. Downstream
+  consumers (notably `oxideav-webp`'s lossy VP8 path) can now build
+  their own `From<oxideav_vp8::Vp8Error>` adapters against a single
+  stable symbol instead of having to spell out every per-module sub-error.
+  A new `tests/public_error_surface.rs` integration test imports
+  `Vp8Error` from the crate root and exercises every variant + the
+  `From` machinery + `Display` delegation + `source()` chaining, so a
+  future visibility regression fails to compile rather than silently
+  breaking webp's build.
+
 * **Top-level interframe `Vp8DecoderState::decode_frame` driver
   (RFC 6386 §9 / §16)** — new `src/state.rs` module owning the §9
   three-slot reference-frame buffer (`LAST` / `GOLDEN` / `ALTREF`),

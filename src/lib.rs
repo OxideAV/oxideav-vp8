@@ -343,6 +343,60 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Unified top-level error surface for the crate.
+///
+/// `Vp8Error` is the single public error type downstream consumers
+/// (notably `oxideav-webp`'s lossy VP8 path) build their own
+/// `From<oxideav_vp8::Vp8Error>` adapters against. It collapses the
+/// crate's two distinct error sources — the encoder stub
+/// [`Error`] and the decoder pipeline [`decoder::DecodeError`] — into
+/// one shape so a consumer doesn't have to know which sub-API a call
+/// went through.
+///
+/// This is intentionally an **enum wrapping the existing sub-errors**
+/// (not a copy of their variants), so any future variant added to
+/// [`Error`] or [`DecodeError`] surfaces automatically through
+/// `Vp8Error` without a breaking change here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Vp8Error {
+    /// A decoder-side failure — surfaced through the [`decode_vp8`] /
+    /// [`state::Vp8DecoderState`] pipeline.
+    Decode(DecodeError),
+    /// An encoder-side failure — currently always
+    /// [`Error::NotImplemented`] until the §13 / §14 encode round lands.
+    Encode(Error),
+}
+
+impl core::fmt::Display for Vp8Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Vp8Error::Decode(e) => write!(f, "{e}"),
+            Vp8Error::Encode(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for Vp8Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Vp8Error::Decode(e) => Some(e),
+            Vp8Error::Encode(e) => Some(e),
+        }
+    }
+}
+
+impl From<DecodeError> for Vp8Error {
+    fn from(value: DecodeError) -> Self {
+        Vp8Error::Decode(value)
+    }
+}
+
+impl From<Error> for Vp8Error {
+    fn from(value: Error) -> Self {
+        Vp8Error::Encode(value)
+    }
+}
+
 /// Encode a VP8 keyframe.
 ///
 /// Still scaffolded — the encoder has not been written yet (the §13 /

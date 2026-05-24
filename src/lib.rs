@@ -51,8 +51,22 @@
 //!   into raster order via the §20.16 `zigzag[16]` table — producing an
 //!   [`frame::MbCoeffs`] directly from the bitstream. The coefficients are
 //!   the raw quantized token values; the §14.1 Y2 / chroma dequant scaling
-//!   remains a documented spec gap (§14.1 page 77 defers it to `dixie.c`
-//!   §20.4). See [`dct_tokens`].
+//!   is applied by the [`dequant`] layer. See [`dct_tokens`].
+//! * VP8 §14.1 dequantization scaling and the bitstream→dequant wrapper —
+//!   [`dequant::MbDequantFactors`] computes the six §14.1 dequant factors
+//!   (Y1 DC/AC, Y2 DC/AC, chroma DC/AC) from the §9.6 quantiser indices,
+//!   applying the §20.4 `dixie.c` `dequant_init` scaling / clamping rules
+//!   (Y2 DC × 2, Y2 AC × 155/100 floored at 8, chroma DC capped at 132)
+//!   over the §14.1 `dc_qlookup` / `ac_qlookup` tables with the §20.4
+//!   `clamp_q` index saturation. [`dequant::MbDequantFactors::for_segment`]
+//!   layers the §10 per-segment quantizer override (delta or absolute) on
+//!   the frame baseline. [`dequant::MbDequantFactors::dequantize`] scales a
+//!   raw [`frame::MbCoeffs`] in place, and
+//!   [`dequant::decode_and_dequantize_mb`] is the wrapper that runs
+//!   [`dct_tokens::decode_mb_coeffs`] then dequantizes — turning the
+//!   bitstream straight into the pre-dequantized [`frame::MbCoeffs`] that
+//!   [`frame::decode_keyframe`] consumes, completing the keyframe decode
+//!   chain bitstream → dequant → reconstruct → pixels. See [`dequant`].
 //! * VP8 dequantization and inverse transforms (RFC 6386 §14) — the
 //!   §14.1 `dc_qlookup` / `ac_qlookup` tables with Y-plane factor
 //!   computation, the §14.3 inverse WHT (general + single-DC fast
@@ -105,27 +119,26 @@
 //!   MB's decoded luma mode, and writing reconstructed pixels into the
 //!   [`frame::KeyframePlanes`] I420 buffers. Off-frame edges are reported
 //!   as `None` so the §12.2 `DC_PRED` averaging distinguishes genuine
-//!   pixels from 127 / 129 fills. Consumes caller-supplied
-//!   [`frame::MbCoeffs`] (pre-dequantized) because the §13.3 per-MB token
-//!   walk and §14.1 Y2 / chroma dequant scaling remain documented spec
-//!   gaps. See [`frame`].
+//!   pixels from 127 / 129 fills. Consumes [`frame::MbCoeffs`]
+//!   (pre-dequantized) produced by the [`dequant`] layer. See [`frame`].
 //!
-//! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
-//! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
-//! prediction), the §15.1 loop-filter geometry that drives the
-//! [`loop_filter`] segment kernels (a post-reconstruction pass on top of
-//! [`decode_keyframe`]'s plane output), the §14.1 Y2 / chroma dequant
-//! scaling that — together with the now-landed §13.3 per-MB token walk
-//! ([`decode_mb_coeffs`]) — would feed [`decode_keyframe`] straight from
-//! the bitstream, and the encoder are all still scaffolded — the
-//! top-level `decode_vp8` / `encode_vp8_*` entry points return
-//! [`Error::NotImplemented`].
+//! With the §13.3 per-MB token walk ([`dct_tokens::decode_mb_coeffs`]) and
+//! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]) now
+//! landed, the keyframe decode chain bitstream → dequant → reconstruct →
+//! pixels is complete at the per-macroblock granularity. Motion-vector
+//! decoding (§17), the inter-predicted §16.2 / §16.3 / §16.4 branch
+//! (`mv_ref` tree, near/nearest/best census, split prediction), the §15.1
+//! loop-filter geometry that drives the [`loop_filter`] segment kernels (a
+//! post-reconstruction pass on top of [`decode_keyframe`]'s plane output),
+//! and the encoder are all still scaffolded — the top-level `decode_vp8` /
+//! `encode_vp8_*` entry points return [`Error::NotImplemented`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;
+pub mod dequant;
 pub mod frame;
 pub mod frame_header;
 pub mod intra_predict;
@@ -144,6 +157,7 @@ pub use dct_tokens::{
     DctTokenError, MbCoeffError, MbEntropyCtx, COEFF_BANDS, DEFAULT_COEFF_PROBS,
     MB_ENTROPY_CTX_LEN, ZIGZAG,
 };
+pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,

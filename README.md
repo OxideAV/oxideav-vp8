@@ -286,15 +286,16 @@ gaps below.
 
 ### Spec gaps surfaced (round 8)
 
-**§14.1 page 77 — Y2 / chroma dequant scaling.** The RFC gives the raw
-`dc_qlookup` / `ac_qlookup` tables and states Y1 uses them directly, but
-the Y2-DC, Y2-AC, chroma-DC, and chroma-AC factors *"undergo either
-scaling or clamping before the multiplies. Details ... can be found in
-related lookup functions in dixie.c (Section 20.4)."* Those rules are not
-in the RFC body and `dixie.c` is reference source (off-limits under the
-clean-room policy), so the four non-Y1 factors are not computed in this
-round. Recommend a clean-room note giving the Y2/chroma scaling and
-clamping rules so the integration round can compute all six factors.
+**§14.1 page 77 — Y2 / chroma dequant scaling (RESOLVED round 15).** The
+RFC body gives the raw `dc_qlookup` / `ac_qlookup` tables and states Y1
+uses them directly, but the Y2-DC, Y2-AC, chroma-DC, and chroma-AC
+factors *"undergo either scaling or clamping before the multiplies.
+Details ... can be found in related lookup functions in dixie.c (Section
+20.4)."* Section 20.4 (`dixie.c`) is the RFC's own reference-decoder
+annex — part of RFC 6386, not external source — so its `dequant_init`
+rules are in-spec: Y2 DC × 2, Y2 AC × 155/100 floored at 8, chroma DC
+capped at 132, with the §20.4 `clamp_q` index saturation. Round 15
+implements all six factors in `src/dequant.rs`.
 
 **§13 page 60 — zig-zag scan order (RESOLVED round 14).** §13 names the
 coefficient ordering "zig-zag" but the §13 body gives no permutation
@@ -445,14 +446,13 @@ previously-isolated transform / prediction / summation primitives
   DCT / summation work and returns the prediction directly.
 
 Why dequantization is the caller's responsibility, not this
-orchestrator's: §14.1 Y2 / chroma dequant scaling is a documented
-spec gap (RFC defers to the reference decoder `dixie.c` source which
-is excluded under the workspace clean-room policy), and the zig-zag
-→ raster reordering for §13 token output is the same — keeping both
-out of this function's signature lets §14.2 land today and lets a
-future convenience wrapper (raw tokens + quantiser-index bundle)
-slot in once the gap docs land. Y1 factors are already in
-`Y1DequantFactors::from_indices`.
+orchestrator's (as of round 11): the §14.1 Y2 / chroma dequant
+scaling and the §13 zig-zag → raster reordering were both open at
+round 11 — keeping them out of this function's signature let §14.2
+land then and let a convenience wrapper slot in later. (Both are now
+closed: the zig-zag in round 14, the §14.1 scaling in round 15's
+`decode_and_dequantize_mb` — the §20.4 rules are RFC-internal, not
+external source.) Y1 factors are in `Y1DequantFactors::from_indices`.
 
 Eleven new unit tests: `B_PRED` MB rejection with the proper error;
 top-left-corner skip MB with `DC_PRED` everywhere returning the
@@ -542,10 +542,11 @@ orchestrators (`src/frame.rs`).
   `Vec<u8>` + strides + `mb_cols` / `mb_rows`), `MbCoeffs`
   (pre-dequantized Y2 / 16 Y / 4 U / 4 V), `FrameError`
   (`EmptyFrame`, `MacroblockCountMismatch`, indexed `Macroblock`).
-* Caller supplies pre-dequantized `MbCoeffs`: the §13.3 per-MB
-  token walk and the §14.1 Y2/chroma dequant scaling are still
-  documented spec gaps, so this round lands the frame-level raster
-  geometry without depending on them.
+* Caller supplies pre-dequantized `MbCoeffs`: at round 12 the §13.3
+  per-MB token walk and the §14.1 Y2/chroma dequant scaling were both
+  open, so this round landed the frame-level raster geometry without
+  depending on them. (Both are now closed — round 14 token walk, round
+  15 dequant; `decode_and_dequantize_mb` produces the `MbCoeffs`.)
 
 Ten new unit tests: a 2×2-MB synthetic key frame round-tripping
 through the walker (output matches an independent hand-gathered
@@ -610,20 +611,54 @@ context (a fresh-context negative control desyncs the range decoder,
 proving the propagation is load-bearing). Total: 176 tests across ten
 modules.
 
+**Round 15 (2026-05-24).** Closes the last §14 spec gap — the §14.1
+Y2 / chroma dequant scaling — and wires the bitstream→dequant→
+reconstruct→pixels chain end to end (new `src/dequant.rs`).
+
+* `MbDequantFactors` — the six §14.1 dequant factors (Y1 DC/AC, Y2
+  DC/AC, chroma DC/AC) for one macroblock's segment, computed per the
+  §20.4 `dixie.c` `dequant_init` rules (part of RFC 6386): Y1 DC/AC
+  use the `dc_qlookup` / `ac_qlookup` tables directly; **Y2 DC = dc_q
+  × 2**; **Y2 AC = ac_q × 155 / 100, floored at 8**; **chroma DC =
+  dc_q, capped at 132**; chroma AC = ac_q. Every index goes through
+  the §20.4 `clamp_q` 0..=127 saturation. The `* 155 / 100` is
+  integer arithmetic (truncating).
+* `MbDequantFactors::from_quant_indices(&QuantIndices)` — the
+  frame-level derivation (base `q = yac_qi`, each §9.6 delta applied
+  per plane). `MbDequantFactors::for_segment(&QuantIndices,
+  segment_quant, absolute)` layers the §10 per-segment quantizer
+  override: absolute mode replaces the base index, delta mode adds to
+  it; the five per-plane deltas still apply on top.
+* `MbDequantFactors::dequantize(&mut MbCoeffs)` — scales a raw
+  (quantized) `MbCoeffs` in place (coefficient 0 × DC factor, 1..=15 ×
+  AC factor per block, products in `i32` stored back as `i16` per
+  §14.1 page 76).
+* `decode_and_dequantize_mb(...)` — the bitstream→dequant wrapper:
+  runs `decode_mb_coeffs` then `dequantize`, turning the token
+  partition straight into the pre-dequantized `MbCoeffs` that
+  `decode_keyframe` consumes. This completes the keyframe decode chain
+  bitstream → dequant → reconstruct → pixels.
+* New surface: `MbDequantFactors`, `decode_and_dequantize_mb`,
+  `UV_DC_MAX`, `Y2_AC_MIN`; `MbCoeffs` now derives `PartialEq` / `Eq`.
+
+Fifteen new unit tests: each scaling rule in isolation (Y1 direct
+lookups; Y2 DC ×2; Y2 AC ×155/100 truncation + the <8 floor lifting
+6→8; chroma DC 132 cap; chroma AC delta); index clamping at both ends
+through the factors; the §10 segment delta vs absolute base derivation
+keeping per-plane deltas; an independent re-derivation of the §20.4
+`dequant_init` body for the §9.6 worked vector (q=64 with five
+deltas); per-plane in-place `dequantize`; the wrapper matching
+`decode_mb_coeffs` + `dequantize` on a real `BoolDecoder`; and a full
+1×1 keyframe decode through the wired chain proving a larger quantizer
+moves reconstructed luma further from the flat-128 prediction. Total:
+191 tests across eleven modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
-walk); the §14.1 Y2 / chroma dequant scaling (the last §14 spec gap —
-§14.1 page 77 defers the Y2-DC / Y2-AC / chroma-DC / chroma-AC
-scaling/clamping to the reference `dixie.c` §20.4 lookup functions),
-which keeps `decode_mb_coeffs`' output and `decode_keyframe`'s
-`MbCoeffs` raw-quantized for now (the round-14 §13.3 token walk feeds
-the tokens; a thin dequant wrapper over `decode_mb_coeffs` lands once
-the §14.1 scaling rules are pinned down — the §13 zig-zag → raster
-reordering gap is already closed via the §20.16 `zigzag[16]` table);
-motion-vector component decoding (§17.1) against the updated
+walk); motion-vector component decoding (§17.1) against the updated
 `MV_CONTEXT`s; the §15.1 loop-filter geometry (raster-order edge
 walk over `decode_keyframe`'s plane output + the §15.1 page-86
 step-2/4 skip rule + the §9.4 / §10 per-macroblock

@@ -93,7 +93,7 @@ use crate::reconstruct::{
 /// factors (the caller's responsibility — see the module-level note on
 /// the dequant spec gap). The walker forwards them unchanged into the
 /// selected orchestrator.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MbCoeffs {
     /// The 25th (Y2) block's dequantized WHT coefficients in row-major
     /// order. Ignored for `B_PRED` macroblocks (which have no Y2 block)

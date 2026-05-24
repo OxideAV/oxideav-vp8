@@ -12,11 +12,10 @@
 //!   is `dc_qlookup[clamp(yac_qi + ydc_delta)]` and the Y1-AC factor is
 //!   `ac_qlookup[clamp(yac_qi)]`, where the qindex is clamped to the
 //!   `0..=127` table range. The Y2 and chroma factors require the
-//!   scaling / clamping rules that §14.1 defers to the reference file
-//!   `dixie.c` (Section 20.4) — that source is off-limits under the
-//!   workspace clean-room rule, so those factors are a **documented
-//!   gap** (see the module-level "Spec gap" note) and are NOT computed
-//!   here.
+//!   scaling / clamping rules from §14.1 / the §20.4 `dixie.c` annex
+//!   (which is part of RFC 6386); those six-factor derivations live in
+//!   the [`crate::dequant`] module. This module provides only the raw
+//!   lookup tables and the Y1-only factor helper.
 //! * **§14.3 inverse WHT** — `inverse_wht_4x4`, a faithful port of the
 //!   `vp8_short_inv_walsh4x4_c` C source given in the RFC body, plus
 //!   `inverse_wht_4x4_dc_only`, the single-DC fast path
@@ -44,27 +43,24 @@
 //!   per-macroblock integration round must supply the reordering before
 //!   calling the raster-order transforms here.
 //! * The **Y2-DC / Y2-AC / chroma-DC / chroma-AC dequant factors** —
-//!   the scaling and clamping rules §14.1 defers to `dixie.c`. Also a
-//!   documented gap.
+//!   the scaling and clamping rules from §14.1 / §20.4. These now live
+//!   in [`crate::dequant`] ([`crate::dequant::MbDequantFactors`]).
 //! * The §14.2 macroblock-level orchestration (Y2 → 16 Y DC seeding,
 //!   the 24/25-block walk) — that is the integration round's job; this
 //!   module provides only the per-block primitives.
 //!
-//! # Spec gaps surfaced
+//! # Resolved spec references
 //!
-//! * **§14.1 page 77 Y2 / chroma dequant scaling.** The spec gives the
-//!   raw `dc_qlookup` / `ac_qlookup` tables and says Y1 uses them
-//!   directly, but the Y2 and chroma factors *"undergo either scaling
-//!   or clamping before the multiplies. Details ... can be found in
-//!   related lookup functions in dixie.c (Section 20.4)."* Those
-//!   factors are not in the RFC body. Recommend the docs collaborator
-//!   add a clean-room note giving the Y2-DC, Y2-AC, chroma-DC, and
-//!   chroma-AC scaling/clamping rules so the integration round can
-//!   compute all six factors.
-//! * **§13 page 60 zig-zag scan order.** §13 names the coefficient
-//!   ordering "zig-zag" but the permutation array is only in the
-//!   reference `idct_add.c`. Recommend a clean-room note giving the
-//!   16-entry scan-to-raster permutation.
+//! * **§14.1 page 77 Y2 / chroma dequant scaling.** §14.1 page 77 says
+//!   the Y2 and chroma factors *"undergo either scaling or clamping
+//!   before the multiplies. Details ... can be found in related lookup
+//!   functions in dixie.c (Section 20.4)."* Section 20.4 is part of RFC
+//!   6386 (the reference-decoder annex), so the scaling / clamping rules
+//!   it gives are in-spec; they are implemented in [`crate::dequant`].
+//! * **§13 page 60 zig-zag scan order.** The 16-entry scan-to-raster
+//!   permutation is given by the §20.16 `zigzag[16]` table (also part of
+//!   RFC 6386); the per-MB token walk applies it (see
+//!   [`crate::dct_tokens`]).
 
 /// Number of entries in each §14.1 dequantization lookup table; the
 /// 7-bit quantiser index (`L(7)`, §9.6) plus deltas is clamped into

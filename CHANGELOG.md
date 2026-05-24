@@ -6,6 +6,34 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§14.1 dequantization scaling + bitstream→dequant wrapper** — new
+  `src/dequant.rs` module closing the last §14 spec gap. `MbDequantFactors`
+  computes the six §14.1 dequant factors (Y1 DC/AC, Y2 DC/AC, chroma DC/AC)
+  per the §20.4 `dixie.c` `dequant_init` rules — part of RFC 6386, not
+  external source: Y1 DC/AC use the `dc_qlookup` / `ac_qlookup` tables
+  directly; Y2 DC = `dc_q × 2`; Y2 AC = `ac_q × 155 / 100` floored at 8;
+  chroma DC = `dc_q` capped at 132; chroma AC = `ac_q`; every index goes
+  through the §20.4 `clamp_q` 0..=127 saturation. `from_quant_indices`
+  derives the frame-level factors from a `QuantIndices` (base `q = yac_qi`,
+  each §9.6 delta applied per plane); `for_segment` layers the §10
+  per-segment quantizer override (absolute replaces the base, delta adds to
+  it, per-plane deltas still apply). `dequantize(&mut MbCoeffs)` scales a
+  raw quantized bundle in place (coefficient 0 × DC, 1..=15 × AC, products
+  in `i32` stored as `i16` per §14.1 page 76). `decode_and_dequantize_mb`
+  is the wrapper that runs `decode_mb_coeffs` then `dequantize`, turning the
+  token partition straight into the pre-dequantized `MbCoeffs` that
+  `decode_keyframe` consumes — completing the keyframe decode chain
+  bitstream → dequant → reconstruct → pixels. New surface:
+  `MbDequantFactors`, `decode_and_dequantize_mb`, `UV_DC_MAX`, `Y2_AC_MIN`.
+  `MbCoeffs` now derives `PartialEq` / `Eq`. Adds 15 tests (each scaling
+  rule in isolation including the <8 Y2-AC floor and 132 chroma-DC cap and
+  the truncating `×155/100`; index clamping; the §10 segment delta/absolute
+  derivation; an independent re-derivation of the §20.4 `dequant_init` body
+  for the §9.6 worked vector; per-plane in-place dequant; the wrapper
+  matching `decode_mb_coeffs` + `dequantize`; and a full keyframe decode
+  through the wired chain proving a larger quantizer lifts luma further off
+  the prediction). Total 191 tests.
+
 * **§13.3 per-macroblock DCT-coefficient token walk** — new
   `decode_mb_coeffs(dec, has_y2, mb_skip_coeff, coeff_probs, above, left)
   -> Result<MbCoeffs, MbCoeffError>` in `src/dct_tokens.rs`, the

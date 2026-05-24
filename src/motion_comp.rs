@@ -1044,6 +1044,245 @@ pub fn reconstruct_inter_mb(
     out
 }
 
+// ───────────────────────── §16.4 / §18 SPLITMV ─────────────────────────────
+
+/// The §18.1 chroma sub-block index of luma sub-block `b` (`0..=15`) —
+/// RFC 6386 §18.1, the §20.11 expression `(b>>1&1) + (b>>2&2)`.
+///
+/// Maps the sixteen Y sub-blocks onto the four chroma sub-blocks (each
+/// chroma sub-block covers four luma sub-blocks); the closed form expands
+/// to the §18.1 enumeration `{0,1,4,5}→0`, `{2,3,6,7}→1`, `{8,9,12,13}→2`,
+/// `{10,11,14,15}→3`.
+#[inline]
+pub fn chroma_idx_for_luma_subblock(b: usize) -> usize {
+    ((b >> 1) & 1) + ((b >> 2) & 2)
+}
+
+/// Derive the four §18.1 chroma sub-block motion vectors from the sixteen
+/// SPLITMV per-luma-sub-block vectors — RFC 6386 §18.1 `avg(...)`.
+///
+/// Per §18.1 each chroma sub-block's vector is the four-vector average of
+/// the four luma sub-blocks occupying the same visible area; the §20.14
+/// `avg()` primitive (also used by [`chroma_mv`] for the whole-MB case)
+/// performs the divide-by-8 + sign-aware rounding. `split_luma_mvs` are
+/// the raw quarter-pixel per-sub-block vectors (the SPLITMV decode output);
+/// the result is in eighth-pixel units already (matching `chroma_mv`).
+pub fn split_chroma_mvs(split_luma_mvs: &[Mv; 16]) -> [Mv; 4] {
+    // Sum the (doubled) luma components per chroma slot.
+    let mut sum_row = [0i32; 4];
+    let mut sum_col = [0i32; 4];
+    for (b, mv) in split_luma_mvs.iter().enumerate() {
+        let c = chroma_idx_for_luma_subblock(b);
+        // §18.1 "stored luma motion vectors are all doubled": the §20.11
+        // chroma loop sums the *doubled* vectors before the avg(). We mimic
+        // by stacking 4 copies of the stored-luma value into the §18.1 avg.
+        let r = (mv.row as i32).wrapping_mul(2);
+        let cc = (mv.col as i32).wrapping_mul(2);
+        sum_row[c] = sum_row[c].wrapping_add(r);
+        sum_col[c] = sum_col[c].wrapping_add(cc);
+    }
+    let mut out = [Mv::default(); 4];
+    for c in 0..4 {
+        let s_r = sum_row[c];
+        let s_c = sum_col[c];
+        // §18.1 avg(): sign-aware divide-by-8 with rounding adjustment.
+        let row = if s_r >= 0 {
+            (s_r + 4) >> 3
+        } else {
+            -((-s_r + 4) >> 3)
+        };
+        let col = if s_c >= 0 {
+            (s_c + 4) >> 3
+        } else {
+            -((-s_c + 4) >> 3)
+        };
+        out[c] = Mv {
+            row: row as i16,
+            col: col as i16,
+        };
+    }
+    out
+}
+
+/// Build the §18.2/§18.3 prediction buffer for a SPLITMV inter-predicted
+/// macroblock — RFC 6386 §16.4 / §18.
+///
+/// Sixteen luma sub-blocks, each interpolated under *its own* quarter-pixel
+/// vector (after the §18.1 doubling); four chroma sub-blocks per plane,
+/// each interpolated under the §18.1 four-vector average of the
+/// corresponding luma group ([`split_chroma_mvs`]).
+///
+/// Unlike [`predict_inter_mb`], no §18.1 secondary clamp is applied —
+/// §18.1 page 114 "secondary clamping is not performed for SPLITMV
+/// macroblocks, meaning any subblock's motion vector ... may point outside
+/// the clamping zone."
+///
+/// `full_pixel` is the version-3 full-pel-chroma flag; `filters` is the
+/// §20.14 version-selected tap set; `split_luma_mvs` is the
+/// [`crate::near_mv::SplitMvResult::split_mvs`] field.
+pub fn predict_split_mv(
+    reference: &ReferencePlanes<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    split_luma_mvs: &[Mv; 16],
+    full_pixel: bool,
+    filters: &[[i32; 6]; 8],
+) -> ReconstructedMb {
+    let lw = reference.mb_cols * 16;
+    let lh = reference.mb_rows * 16;
+    let cw = reference.mb_cols * 8;
+    let ch = reference.mb_rows * 8;
+
+    let mut out = ReconstructedMb::default();
+
+    // Luma: each 4×4 sub-block under its own §18.1-doubled vector.
+    let y_x0 = mb_col * 16;
+    let y_y0 = mb_row * 16;
+    for sb in 0..4 {
+        for sc in 0..4 {
+            let b = sb * 4 + sc;
+            let mut ymv = stored_luma_mv(split_luma_mvs[b]);
+            if full_pixel {
+                ymv = apply_full_pixel(ymv);
+            }
+            let blk = filter_block_4x4(
+                reference.y,
+                reference.y_stride,
+                lw,
+                lh,
+                y_x0 + sc * 4,
+                y_y0 + sb * 4,
+                ymv,
+                filters,
+            );
+            for r in 0..4 {
+                let dst = (sb * 4 + r) * 16 + sc * 4;
+                out.y[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+            }
+        }
+    }
+
+    // Chroma: the four §18.1 averaged vectors, one per chroma sub-block.
+    let chroma = split_chroma_mvs(split_luma_mvs);
+    let uv_x0 = mb_col * 8;
+    let uv_y0 = mb_row * 8;
+    for sb in 0..2 {
+        for sc in 0..2 {
+            let c = sb * 2 + sc;
+            let mut uvmv = chroma[c];
+            if full_pixel {
+                uvmv = apply_full_pixel(uvmv);
+            }
+            let ublk = filter_block_4x4(
+                reference.u,
+                reference.uv_stride,
+                cw,
+                ch,
+                uv_x0 + sc * 4,
+                uv_y0 + sb * 4,
+                uvmv,
+                filters,
+            );
+            let vblk = filter_block_4x4(
+                reference.v,
+                reference.uv_stride,
+                cw,
+                ch,
+                uv_x0 + sc * 4,
+                uv_y0 + sb * 4,
+                uvmv,
+                filters,
+            );
+            for r in 0..4 {
+                let dst = (sb * 4 + r) * 8 + sc * 4;
+                out.u[dst..dst + 4].copy_from_slice(&ublk[r * 4..r * 4 + 4]);
+                out.v[dst..dst + 4].copy_from_slice(&vblk[r * 4..r * 4 + 4]);
+            }
+        }
+    }
+
+    out
+}
+
+/// Reconstruct one SPLITMV macroblock — RFC 6386 §16.4 / §18 prediction +
+/// §14 residue.
+///
+/// SPLITMV macroblocks have no Y2 block (§14.2 "for ... `SPLITMV`, the
+/// 0th Y coefficients are part of the residue signal"), so each Y
+/// sub-block's full 16 coefficients go straight through the inverse DCT
+/// (no WHT seeding).
+///
+/// 1. Build the §18.2/§18.3 prediction buffer ([`predict_split_mv`]).
+/// 2. If `mb_skip_coeff`, the residue is zero and the prediction is the
+///    reconstruction (§11.1 skip short-circuit).
+/// 3. Otherwise inverse-DCT each of the 16 Y + 4 U + 4 V sub-blocks and
+///    add the residue with `clamp255`.
+///
+/// `filters` is the §20.14 version-selected tap set. The coefficient
+/// arrays are pre-dequantized (caller's responsibility, matching
+/// [`reconstruct_inter_mb`]).
+#[allow(clippy::too_many_arguments)] // each parameter is a distinct §14.2/§16.4 input.
+pub fn reconstruct_split_mv_mb(
+    reference: &ReferencePlanes<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    split_luma_mvs: &[Mv; 16],
+    full_pixel: bool,
+    filters: &[[i32; 6]; 8],
+    mb_skip_coeff: bool,
+    y_coeffs_dequant: &[[i16; 16]; 16],
+    u_coeffs_dequant: &[[i16; 16]; 4],
+    v_coeffs_dequant: &[[i16; 16]; 4],
+) -> ReconstructedMb {
+    let mut out = predict_split_mv(
+        reference,
+        mb_col,
+        mb_row,
+        split_luma_mvs,
+        full_pixel,
+        filters,
+    );
+
+    if mb_skip_coeff {
+        return out;
+    }
+
+    // Luma: inverse-DCT + add residue per sub-block (no Y2 for SPLITMV).
+    for i in 0..4 {
+        for j in 0..4 {
+            let idx = i * 4 + j;
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&y_coeffs_dequant[idx], &mut residue);
+            let pred = extract_4x4(&out.y, 16, i, j);
+            let mut summed = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut summed);
+            insert_4x4(&mut out.y, 16, i, j, &summed);
+        }
+    }
+
+    // Chroma: inverse-DCT + add residue per sub-block, U then V.
+    for i in 0..2 {
+        for j in 0..2 {
+            let idx = i * 2 + j;
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&u_coeffs_dequant[idx], &mut residue);
+            let pred = extract_4x4(&out.u, 8, i, j);
+            let mut summed = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut summed);
+            insert_4x4(&mut out.u, 8, i, j, &summed);
+
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&v_coeffs_dequant[idx], &mut residue);
+            let pred = extract_4x4(&out.v, 8, i, j);
+            let mut summed = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut summed);
+            insert_4x4(&mut out.v, 8, i, j, &summed);
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -281,20 +281,24 @@ pub use macroblock::{
     IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
 };
 pub use motion_comp::{
-    apply_full_pixel, chroma_mv, fetch_block_halo, fetch_block_whole_pixel, filter_block_4x4,
-    filter_set_for_version, interp, predict_inter_mb, predict_inter_mb_whole_pixel,
-    reconstruct_inter_mb, reconstruct_inter_mb_whole_pixel, select_ref_frame, sixtap_2d,
-    stored_luma_mv, whole_pixel_fraction_is_zero, FilterSet, MotionCompError, RefFrame,
-    ReferencePlanes, BILINEAR_FILTERS, SIXTAP_FILTERS,
+    apply_full_pixel, chroma_idx_for_luma_subblock, chroma_mv, fetch_block_halo,
+    fetch_block_whole_pixel, filter_block_4x4, filter_set_for_version, interp, predict_inter_mb,
+    predict_inter_mb_whole_pixel, predict_split_mv, reconstruct_inter_mb,
+    reconstruct_inter_mb_whole_pixel, reconstruct_split_mv_mb, select_ref_frame, sixtap_2d,
+    split_chroma_mvs, stored_luma_mv, whole_pixel_fraction_is_zero, FilterSet, MotionCompError,
+    RefFrame, ReferencePlanes, BILINEAR_FILTERS, SIXTAP_FILTERS,
 };
 pub use motion_vector::{
     default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,
     MvContexts, SMALL_MVTREE,
 };
 pub use near_mv::{
-    clamp_mv, decode_inter_mb, find_near_mvs, mv_ref_probs, read_inter_mode, resolve_inter_mb_mv,
-    InterMbError, InterMode, MbInfo, MvClampRect, NearMvs, ResolvedInterMode, SignBias,
-    MV_COUNTS_TO_PROBS, MV_REF_TREE,
+    above_block_mv, clamp_mv, decode_inter_mb, decode_split_mv, decode_split_mv_mb, find_near_mvs,
+    left_block_mv, mv_ref_probs, partition_id, read_inter_mode, read_mv_partition,
+    resolve_inter_mb_mv, submv_ref, submv_ref_context, InterMbError, InterMode, MbInfo,
+    MvClampRect, MvPartition, NearMvs, ResolvedInterMode, SignBias, SplitMvResult, SubMvRefMode,
+    MV_COUNTS_TO_PROBS, MV_PARTITIONS, MV_PARTITION_PROBS, MV_PARTITION_TREE, MV_REF_TREE,
+    SUBMV_REF_PROBS, SUBMV_REF_TREE,
 };
 pub use reconstruct::{
     decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,

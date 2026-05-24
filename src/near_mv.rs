@@ -51,7 +51,9 @@
 //! clamp the same vectors.
 
 use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
-use crate::motion_comp::{reconstruct_inter_mb, RefFrame, ReferencePlanes};
+use crate::motion_comp::{
+    reconstruct_inter_mb, reconstruct_split_mv_mb, RefFrame, ReferencePlanes,
+};
 use crate::motion_vector::{read_mv, Mv, MvContexts};
 use crate::reconstruct::ReconstructedMb;
 
@@ -134,6 +136,13 @@ pub struct MbInfo {
     /// Whether this MB was coded SPLITMV — feeds the §16.3
     /// `cnt[CNT_SPLITMV]` recomputation.
     pub is_split: bool,
+    /// The sixteen per-sub-block vectors (§16.4 `this->split.mvs[16]`) when
+    /// this MB was coded SPLITMV; `None` for every other mode. Read by the
+    /// §20.11 `above_block_mv` / `left_block_mv` neighbour lookup when the
+    /// *next* macroblock is itself SPLITMV: a non-split neighbour falls back
+    /// to its whole-MB [`mv`](MbInfo::mv), so this is only populated when
+    /// [`is_split`](MbInfo::is_split) is `true`.
+    pub split_mvs: Option<[Mv; 16]>,
 }
 
 impl MbInfo {
@@ -145,6 +154,7 @@ impl MbInfo {
             ref_frame: None,
             mv: Mv { row: 0, col: 0 },
             is_split: false,
+            split_mvs: None,
         }
     }
 }
@@ -517,6 +527,360 @@ pub fn resolve_inter_mb_mv(
     Ok(resolved)
 }
 
+// ───────────────────────── §16.4 SPLITMV ──────────────────────────────────
+
+/// The four §16.4 partition shapes — RFC 6386 §16.4 `MVpartition` /
+/// §20.13 `mv_partitions[4][16]`.
+///
+/// Each variant subdivides the 4×4 grid of Y sub-blocks (raster-indexed
+/// 0..=15) into a fixed group of partitions; the order they're decoded in
+/// is the partition-id order (0 first, then 1, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvPartition {
+    /// §16.4 `mv_top_bottom` — two pieces, sub-blocks `{0..7}` (top
+    /// half) and `{8..15}` (bottom half). Partition tree code "110".
+    TopBottom,
+    /// §16.4 `mv_left_right` — two pieces, sub-blocks
+    /// `{0,1,4,5,8,9,12,13}` (left half) and
+    /// `{2,3,6,7,10,11,14,15}` (right half). Partition tree code "111".
+    LeftRight,
+    /// §16.4 `mv_quarters` — four 2×2 quadrants
+    /// (`{0,1,4,5}`, `{2,3,6,7}`, `{8,9,12,13}`, `{10,11,14,15}`).
+    /// Partition tree code "10".
+    Quarters,
+    /// §16.4 `MV_16` — every sub-block carries its own vector. Partition
+    /// tree code "0".
+    Mv16,
+}
+
+/// `mv_partitions[4][16]` — RFC 6386 §16.4 / §20.13.
+///
+/// Indexed by `partition_id` (0=TopBottom, 1=LeftRight, 2=Quarters,
+/// 3=Mv16) and sub-block raster index (0..=15). Each entry is the
+/// partition-group id this sub-block belongs to; sub-blocks with the same
+/// group id share a vector.
+///
+/// Transcribed verbatim from §20.13.
+pub const MV_PARTITIONS: [[u8; 16]; 4] = [
+    [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+    [0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+    [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+];
+
+/// `mvpartition_tree` — RFC 6386 §16.4 / §20.13 `split_mv_tree`.
+///
+/// `{-3, 2, -2, 4, -0, -1}` — leaf `-3` is `Mv16`, `-2` `Quarters`, `-0`
+/// `TopBottom`, `-1` `LeftRight`. Tree node at offset `i` reads
+/// `MV_PARTITION_PROBS[i >> 1]`.
+pub const MV_PARTITION_TREE: [i8; 6] = [-3, 2, -2, 4, -0, -1];
+
+/// `mvpartition_probs[3]` — RFC 6386 §16.4 / §20.13 `split_mv_probs`.
+///
+/// `{110, 111, 150}` — the fixed probability table the partition tree is
+/// read against. There is no probability-update for this tree (the §17
+/// `mv_prob_update()` updates only the per-component contexts).
+pub const MV_PARTITION_PROBS: [u8; 3] = [110, 111, 150];
+
+/// The four §16.4 sub-block inter-prediction modes — RFC 6386 §16.4
+/// `sub_mv_ref` enumeration, in [`SUBMV_REF_TREE`] leaf order.
+///
+/// Each variant says how the per-sub-block vector is sourced:
+///
+/// * [`Left4x4`](SubMvRefMode::Left4x4) — copy the neighbour MV
+///   immediately to the left of the partition's first sub-block.
+/// * [`Above4x4`](SubMvRefMode::Above4x4) — copy the neighbour MV above
+///   the partition's first sub-block.
+/// * [`Zero4x4`](SubMvRefMode::Zero4x4) — zero motion vector.
+/// * [`New4x4`](SubMvRefMode::New4x4) — `read_mv` differential added
+///   component-wise to the clamped "best" base from `find_near_mvs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubMvRefMode {
+    /// `LEFT4X4` — leaf "0" of [`SUBMV_REF_TREE`].
+    Left4x4,
+    /// `ABOVE4X4` — leaf "10".
+    Above4x4,
+    /// `ZERO4X4` — leaf "110".
+    Zero4x4,
+    /// `NEW4X4` — leaf "111".
+    New4x4,
+}
+
+/// `sub_mv_ref_tree[6]` — RFC 6386 §16.4 / §20.13.
+///
+/// `{-LEFT4X4, 2, -ABOVE4X4, 4, -ZERO4X4, -NEW4X4}`, with the leaves
+/// remapped to [`SubMvRefMode`] discriminant indices
+/// (`Left4x4=0`, `Above4x4=1`, `Zero4x4=2`, `New4x4=3`).
+pub const SUBMV_REF_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+
+/// `sub_mv_ref_prob[5][3]` — RFC 6386 §16.4 / §20.13 `submv_ref_probs2`.
+///
+/// Indexed by context (0..=4, see [`submv_ref_context`]), with three
+/// entries each feeding [`SUBMV_REF_TREE`]'s three internal nodes.
+/// Transcribed verbatim from §16.4 / §20.13.
+pub const SUBMV_REF_PROBS: [[u8; 3]; 5] = [
+    [147, 136, 18], // SUBMVREF_NORMAL
+    [106, 145, 1],  // SUBMVREF_LEFT_ZED
+    [179, 121, 1],  // SUBMVREF_ABOVE_ZED
+    [223, 1, 34],   // SUBMVREF_LEFT_ABOVE_SAME
+    [208, 1, 1],    // SUBMVREF_LEFT_ABOVE_ZED
+];
+
+/// `vp8_mvCont(l, a)` — RFC 6386 §16.4 sub-block MV context.
+///
+/// Picks one of five [`SUBMV_REF_PROBS`] rows from the left + above
+/// sub-block neighbour vectors:
+///
+/// * Both zero and equal → `4` (`SUBMVREF_LEFT_ABOVE_ZED`).
+/// * Equal (and non-zero) → `3` (`SUBMVREF_LEFT_ABOVE_SAME`).
+/// * Above zero (left non-zero, unequal) → `2` (`SUBMVREF_ABOVE_ZED`).
+/// * Left zero (above non-zero, unequal) → `1` (`SUBMVREF_LEFT_ZED`).
+/// * Otherwise → `0` (`SUBMVREF_NORMAL`).
+#[inline]
+pub fn submv_ref_context(left: Mv, above: Mv) -> usize {
+    let lez = left == Mv::default();
+    let aez = above == Mv::default();
+    let lea = left == above;
+    if lea && lez {
+        4
+    } else if lea {
+        3
+    } else if aez {
+        2
+    } else if lez {
+        1
+    } else {
+        0
+    }
+}
+
+/// Walk the §16.4 `sub_mv_ref_tree` to read a sub-block mode — RFC 6386
+/// §16.4 / §20.11 `submv_ref`.
+///
+/// Picks the context from `(left, above)`, then `bool_read_tree` against
+/// [`SUBMV_REF_PROBS`].
+pub fn submv_ref(
+    dec: &mut BoolDecoder<'_>,
+    left: Mv,
+    above: Mv,
+) -> Result<SubMvRefMode, BoolDecoderError> {
+    let ctx = submv_ref_context(left, above);
+    let probs = &SUBMV_REF_PROBS[ctx];
+    let mut i: usize = 0;
+    loop {
+        let prob = probs[i >> 1];
+        let bit = dec.read_bool(prob)? as usize;
+        let next = SUBMV_REF_TREE[i + bit];
+        if next <= 0 {
+            return Ok(match -next {
+                0 => SubMvRefMode::Left4x4,
+                1 => SubMvRefMode::Above4x4,
+                2 => SubMvRefMode::Zero4x4,
+                _ => SubMvRefMode::New4x4,
+            });
+        }
+        i = next as usize;
+    }
+}
+
+/// Walk the §16.4 `mvpartition_tree` to read a partition id — RFC 6386
+/// §16.4 / §20.11 `bool_read_tree(split_mv_tree, split_mv_probs)`.
+///
+/// `{-3, 2, -2, 4, -0, -1}` encodes `Mv16 = "0"`, `Quarters = "10"`,
+/// `TopBottom = "110"`, `LeftRight = "111"`.
+pub fn read_mv_partition(dec: &mut BoolDecoder<'_>) -> Result<MvPartition, BoolDecoderError> {
+    let mut i: usize = 0;
+    loop {
+        let prob = MV_PARTITION_PROBS[i >> 1];
+        let bit = dec.read_bool(prob)? as usize;
+        let next = MV_PARTITION_TREE[i + bit];
+        if next <= 0 {
+            // Leaves encode the partition id in their absolute value:
+            // -0 = TopBottom, -1 = LeftRight, -2 = Quarters, -3 = Mv16.
+            return Ok(match -next {
+                0 => MvPartition::TopBottom,
+                1 => MvPartition::LeftRight,
+                2 => MvPartition::Quarters,
+                _ => MvPartition::Mv16,
+            });
+        }
+        i = next as usize;
+    }
+}
+
+/// Look up the §20.11 `above_block_mv` neighbour vector for sub-block `b`.
+///
+/// * `b < 4` (top row of the current MB) — the neighbour is in the above
+///   MB. If the above MB is SPLITMV, its bottom row sub-block `b + 12`
+///   provides the vector; otherwise its whole-MB `mv`. An intra above MB
+///   contributes zero (per §16.4 "subblocks within an intra-predicted
+///   macroblock take their MV to be zero").
+/// * `b >= 4` — the neighbour is sub-block `b - 4` of the current MB,
+///   which (per the §16.4 in-order constraint) is already filled.
+#[inline]
+pub fn above_block_mv(this_split: &[Mv; 16], above: &MbInfo, b: usize) -> Mv {
+    if b < 4 {
+        if above.ref_frame.is_none() {
+            return Mv::default();
+        }
+        if above.is_split {
+            if let Some(ref mvs) = above.split_mvs {
+                return mvs[b + 12];
+            }
+            // SPLITMV neighbour but no per-sub-block detail surfaced — the
+            // §16.4 fallback is the whole-MB vector.
+            return above.mv;
+        }
+        above.mv
+    } else {
+        this_split[b - 4]
+    }
+}
+
+/// Look up the §20.11 `left_block_mv` neighbour vector for sub-block `b`.
+///
+/// * `b & 3 == 0` (left column of the current MB) — the neighbour is in
+///   the left MB. SPLITMV left neighbour: sub-block `b + 3`; otherwise the
+///   left MB's whole-MB `mv`. Intra left MB contributes zero.
+/// * Otherwise — sub-block `b - 1` of the current MB.
+#[inline]
+pub fn left_block_mv(this_split: &[Mv; 16], left: &MbInfo, b: usize) -> Mv {
+    if b & 3 == 0 {
+        if left.ref_frame.is_none() {
+            return Mv::default();
+        }
+        if left.is_split {
+            if let Some(ref mvs) = left.split_mvs {
+                return mvs[b + 3];
+            }
+            return left.mv;
+        }
+        left.mv
+    } else {
+        this_split[b - 1]
+    }
+}
+
+/// The §16.4 SPLITMV decode result: the resolved partition shape and the
+/// sixteen per-sub-block vectors.
+///
+/// `partition` is the [`MvPartition`] read from [`read_mv_partition`];
+/// `split_mvs` is the §20.11 `this->split.mvs[16]` array filled by the
+/// partition walk (sub-blocks belonging to the same partition share a
+/// vector; for `Mv16` every entry is distinct).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitMvResult {
+    /// The resolved partition shape.
+    pub partition: MvPartition,
+    /// The sixteen per-sub-block vectors (quarter-pixel), in raster order.
+    pub split_mvs: [Mv; 16],
+}
+
+/// Decode one SPLITMV macroblock's per-sub-block motion vectors — RFC 6386
+/// §16.4 / §20.11 `decode_split_mv`.
+///
+/// Steps (verbatim from §20.11):
+///
+/// 1. Read the partition id via [`read_mv_partition`].
+/// 2. For each partition group `j` in order, find the first sub-block
+///    `k` whose partition entry is `j` (the "anchor" sub-block).
+/// 3. Resolve the anchor's left and above neighbour MVs via
+///    [`left_block_mv`] / [`above_block_mv`] (these consult earlier
+///    sub-blocks of the current MB plus the [`MbInfo`] neighbours).
+/// 4. Run [`submv_ref`] to read the sub-block mode and produce the
+///    partition's vector:
+///    * `LEFT4X4` → left neighbour, `ABOVE4X4` → above neighbour,
+///    * `ZERO4X4` → `(0, 0)`,
+///    * `NEW4X4` → `read_mv(mv_contexts)` differential added
+///      component-wise to `best_mv` (the §18.1-clamped "best" predictor
+///      from the prior `find_near_mvs`).
+/// 5. Write the partition's vector into every sub-block belonging to
+///    group `j`.
+///
+/// `best_mv` is the clamped "best" predictor (the
+/// [`ResolvedInterMode::Split::best`] field). `mv_contexts` is the
+/// resolved §17 MV component probability pair.
+pub fn decode_split_mv(
+    dec: &mut BoolDecoder<'_>,
+    above: &MbInfo,
+    left: &MbInfo,
+    best_mv: Mv,
+    mv_contexts: &MvContexts,
+) -> Result<SplitMvResult, BoolDecoderError> {
+    let partition = read_mv_partition(dec)?;
+    let part_id = partition_id(partition);
+    let table = &MV_PARTITIONS[part_id];
+
+    // `num_groups` is how many distinct partition groups this shape carries
+    // — 2 for top/bottom or left/right, 4 for quarters, 16 for MV_16.
+    let num_groups: usize = match partition {
+        MvPartition::TopBottom | MvPartition::LeftRight => 2,
+        MvPartition::Quarters => 4,
+        MvPartition::Mv16 => 16,
+    };
+
+    let mut split_mvs = [Mv::default(); 16];
+    let mut filled = [false; 16];
+
+    for j in 0..num_groups {
+        // Find the first sub-block belonging to partition group `j`.
+        // (`mv_partitions` is laid out so that group ids appear in order:
+        // group 0's first member is always at the lowest index that hasn't
+        // been claimed; the `for (k = 0; j != partition[k]; k++)` in
+        // §20.11 finds it directly.)
+        let mut k: usize = 0;
+        while table[k] as usize != j {
+            k += 1;
+            debug_assert!(k < 16, "partition group {j} has no member in table");
+        }
+
+        // Resolve neighbour vectors at sub-block `k` and pick a mode.
+        let left_mv = left_block_mv(&split_mvs, left, k);
+        let above_mv = above_block_mv(&split_mvs, above, k);
+        let mode = submv_ref(dec, left_mv, above_mv)?;
+
+        let mv = match mode {
+            SubMvRefMode::Left4x4 => left_mv,
+            SubMvRefMode::Above4x4 => above_mv,
+            SubMvRefMode::Zero4x4 => Mv::default(),
+            SubMvRefMode::New4x4 => {
+                let diff = read_mv(dec, mv_contexts)?;
+                Mv {
+                    row: best_mv.row.wrapping_add(diff.row),
+                    col: best_mv.col.wrapping_add(diff.col),
+                }
+            }
+        };
+
+        // Fill every sub-block in this partition group.
+        for (idx, &g) in table.iter().enumerate() {
+            if g as usize == j {
+                split_mvs[idx] = mv;
+                filled[idx] = true;
+            }
+        }
+    }
+
+    debug_assert!(filled.iter().all(|&f| f), "every sub-block must be filled");
+
+    Ok(SplitMvResult {
+        partition,
+        split_mvs,
+    })
+}
+
+/// The partition-id of an [`MvPartition`] (its index into
+/// [`MV_PARTITIONS`]).
+#[inline]
+pub fn partition_id(p: MvPartition) -> usize {
+    match p {
+        MvPartition::TopBottom => 0,
+        MvPartition::LeftRight => 1,
+        MvPartition::Quarters => 2,
+        MvPartition::Mv16 => 3,
+    }
+}
+
 /// Errors surfaced by [`decode_inter_mb`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterMbError {
@@ -625,6 +989,84 @@ pub fn decode_inter_mb(
     );
 
     Ok((recon, mv))
+}
+
+/// Decode and reconstruct one SPLITMV-predicted macroblock end-to-end —
+/// RFC 6386 §16.2 / §16.3 / §16.4 / §18.
+///
+/// The SPLITMV analogue of [`decode_inter_mb`]: runs the §16.3 census +
+/// §16.2 inter-mode tree, asserts the resolved mode is SPLITMV (errors
+/// otherwise — the caller dispatches to [`decode_inter_mb`] for whole-MB
+/// modes), then runs the §16.4 partition + per-sub-block walk
+/// ([`decode_split_mv`]) and the §18 reconstruction
+/// ([`reconstruct_split_mv_mb`]).
+///
+/// Returns the reconstructed pixels and the [`SplitMvResult`] (caller
+/// stores `split_mvs[15]` as the MB's `mv` and `Some(split_mvs)` as the
+/// next neighbour's [`MbInfo::split_mvs`]).
+///
+/// `full_pixel` is the version-3 full-pel-chroma flag; `filters` the
+/// §20.14 version-selected tap set; the coefficient arrays are
+/// pre-dequantized (matching the [`decode_inter_mb`] convention).
+#[allow(clippy::too_many_arguments)] // each parameter is a distinct §16/§18 input.
+pub fn decode_split_mv_mb(
+    dec: &mut BoolDecoder<'_>,
+    reference: &ReferencePlanes<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    above: &MbInfo,
+    left: &MbInfo,
+    aboveleft: &MbInfo,
+    current_ref: RefFrame,
+    sign_bias: SignBias,
+    mv_contexts: &MvContexts,
+    full_pixel: bool,
+    filters: &[[i32; 6]; 8],
+    mb_skip_coeff: bool,
+    y_coeffs_dequant: &[[i16; 16]; 16],
+    u_coeffs_dequant: &[[i16; 16]; 4],
+    v_coeffs_dequant: &[[i16; 16]; 4],
+) -> Result<(ReconstructedMb, SplitMvResult), InterMbError> {
+    let bounds = MvClampRect::for_mb(mb_col, mb_row, reference.mb_cols, reference.mb_rows);
+    let resolved = resolve_inter_mb_mv(
+        dec,
+        above,
+        left,
+        aboveleft,
+        current_ref,
+        sign_bias,
+        &bounds,
+        mv_contexts,
+    )?;
+
+    let best = match resolved {
+        ResolvedInterMode::Split { best } => best,
+        ResolvedInterMode::Whole { .. } => {
+            // Programmer error: the caller should have routed a non-Split
+            // resolution to `decode_inter_mb`. Surface a clean error so a
+            // mis-dispatch is caught loudly.
+            return Err(InterMbError::SplitNotSupported {
+                best: Mv::default(),
+            });
+        }
+    };
+
+    let split = decode_split_mv(dec, above, left, best, mv_contexts)?;
+
+    let recon = reconstruct_split_mv_mb(
+        reference,
+        mb_col,
+        mb_row,
+        &split.split_mvs,
+        full_pixel,
+        filters,
+        mb_skip_coeff,
+        y_coeffs_dequant,
+        u_coeffs_dequant,
+        v_coeffs_dequant,
+    );
+
+    Ok((recon, split))
 }
 
 #[cfg(test)]
@@ -824,6 +1266,66 @@ mod tests {
             self.write_mv_component(&contexts[0], mv.row as i32);
             self.write_mv_component(&contexts[1], mv.col as i32);
         }
+
+        /// Emit the §16.4 `mvpartition_tree` path for `partition`.
+        fn write_mv_partition(&mut self, partition: MvPartition) {
+            // Target leaf value (matches the negative leaves in
+            // MV_PARTITION_TREE: -3 Mv16, -2 Quarters, -0 TopBottom, -1 LR).
+            let target: i8 = match partition {
+                MvPartition::Mv16 => -3,
+                MvPartition::Quarters => -2,
+                MvPartition::TopBottom => 0, // leaf value is "-0" = 0
+                MvPartition::LeftRight => -1,
+            };
+            // The tree has a "-0" leaf (TopBottom), which collides numerically
+            // with internal node 0. Walk explicitly: tree is fixed and small.
+            // {-3, 2, -2, 4, -0, -1}: Mv16 = "0", Quarters = "10",
+            // TopBottom = "110", LeftRight = "111".
+            let bits: &[bool] = match partition {
+                MvPartition::Mv16 => &[false],
+                MvPartition::Quarters => &[true, false],
+                MvPartition::TopBottom => &[true, true, false],
+                MvPartition::LeftRight => &[true, true, true],
+            };
+            // Each bit reads MV_PARTITION_PROBS[i>>1]; node indices walked:
+            // start 0; bit=true → next at offset 2; bit=true → next at
+            // offset 4.
+            let mut i: usize = 0;
+            for &bit in bits {
+                self.write_bool(MV_PARTITION_PROBS[i >> 1], bit);
+                let next = MV_PARTITION_TREE[i + bit as usize];
+                if next <= 0 {
+                    break;
+                }
+                i = next as usize;
+            }
+            let _ = target; // documented above; explicit walk avoids it.
+        }
+
+        /// Emit the §16.4 `sub_mv_ref_tree` path for `mode` under
+        /// `(left, above)` context — uses the same `bool_read_tree` shape as
+        /// the decoder.
+        fn write_submv_ref(&mut self, left: Mv, above: Mv, mode: SubMvRefMode) {
+            let ctx = submv_ref_context(left, above);
+            let probs = &SUBMV_REF_PROBS[ctx];
+            // Tree: {-0 LEFT, 2, -1 ABOVE, 4, -2 ZERO, -3 NEW}
+            // LEFT = "0", ABOVE = "10", ZERO = "110", NEW = "111".
+            let bits: &[bool] = match mode {
+                SubMvRefMode::Left4x4 => &[false],
+                SubMvRefMode::Above4x4 => &[true, false],
+                SubMvRefMode::Zero4x4 => &[true, true, false],
+                SubMvRefMode::New4x4 => &[true, true, true],
+            };
+            let mut i: usize = 0;
+            for &bit in bits {
+                self.write_bool(probs[i >> 1], bit);
+                let next = SUBMV_REF_TREE[i + bit as usize];
+                if next <= 0 {
+                    break;
+                }
+                i = next as usize;
+            }
+        }
     }
 
     fn inter(ref_frame: RefFrame, mv: Mv) -> MbInfo {
@@ -831,6 +1333,7 @@ mod tests {
             ref_frame: Some(ref_frame),
             mv,
             is_split: false,
+            split_mvs: None,
         }
     }
 
@@ -839,6 +1342,7 @@ mod tests {
             ref_frame: Some(ref_frame),
             mv,
             is_split: true,
+            split_mvs: None,
         }
     }
 
@@ -1689,5 +2193,690 @@ mod tests {
                 best: expected_best
             }
         );
+    }
+
+    // ---- §16.4 SPLITMV: tables and tree shape -----------------------
+
+    #[test]
+    fn mv_partitions_matches_spec() {
+        // §20.13 mv_partitions[4][16]: transcribed verbatim.
+        assert_eq!(
+            MV_PARTITIONS[0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            MV_PARTITIONS[1],
+            [0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1]
+        );
+        assert_eq!(
+            MV_PARTITIONS[2],
+            [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3]
+        );
+        assert_eq!(
+            MV_PARTITIONS[3],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
+    }
+
+    #[test]
+    fn mv_partition_tree_matches_spec() {
+        // §20.13 split_mv_tree = {-3, 2, -2, 4, -0, -1}.
+        assert_eq!(MV_PARTITION_TREE, [-3, 2, -2, 4, 0, -1]);
+    }
+
+    #[test]
+    fn mv_partition_probs_matches_spec() {
+        // §16.4 mvpartition_probs / §20.13 split_mv_probs = {110, 111, 150}.
+        assert_eq!(MV_PARTITION_PROBS, [110, 111, 150]);
+    }
+
+    #[test]
+    fn submv_ref_tree_matches_spec() {
+        // §20.13 sub_mv_ref_tree = {-LEFT4X4, 2, -ABOVE4X4, 4, -ZERO4X4,
+        // -NEW4X4}, leaves remapped to SubMvRefMode discriminant indices.
+        assert_eq!(SUBMV_REF_TREE, [0, 2, -1, 4, -2, -3]);
+    }
+
+    #[test]
+    fn submv_ref_probs_matches_spec() {
+        // §20.13 submv_ref_probs2[5][3] — verbatim from the listing.
+        assert_eq!(SUBMV_REF_PROBS[0], [147, 136, 18]);
+        assert_eq!(SUBMV_REF_PROBS[1], [106, 145, 1]);
+        assert_eq!(SUBMV_REF_PROBS[2], [179, 121, 1]);
+        assert_eq!(SUBMV_REF_PROBS[3], [223, 1, 34]);
+        assert_eq!(SUBMV_REF_PROBS[4], [208, 1, 1]);
+    }
+
+    #[test]
+    fn submv_ref_context_picks_five_buckets() {
+        let zero = Mv::default();
+        let a = Mv { row: 4, col: 0 };
+        let b = Mv { row: 0, col: 4 };
+        // Both zero, equal → 4 (LEFT_ABOVE_ZED).
+        assert_eq!(submv_ref_context(zero, zero), 4);
+        // Equal, non-zero → 3 (LEFT_ABOVE_SAME).
+        assert_eq!(submv_ref_context(a, a), 3);
+        // Above zero, left non-zero, unequal → 2 (ABOVE_ZED).
+        assert_eq!(submv_ref_context(a, zero), 2);
+        // Left zero, above non-zero, unequal → 1 (LEFT_ZED).
+        assert_eq!(submv_ref_context(zero, a), 1);
+        // Both non-zero, unequal → 0 (NORMAL).
+        assert_eq!(submv_ref_context(a, b), 0);
+    }
+
+    // ---- §16.4 SPLITMV: partition tree round-trip -------------------
+
+    fn roundtrip_partition(p: MvPartition) -> MvPartition {
+        let mut enc = BoolEncoder::new();
+        enc.write_mv_partition(p);
+        let bytes = enc.finish();
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        read_mv_partition(&mut dec).unwrap()
+    }
+
+    #[test]
+    fn every_partition_round_trips() {
+        for p in [
+            MvPartition::TopBottom,
+            MvPartition::LeftRight,
+            MvPartition::Quarters,
+            MvPartition::Mv16,
+        ] {
+            assert_eq!(roundtrip_partition(p), p, "partition {:?}", p);
+        }
+    }
+
+    // ---- §16.4 SPLITMV: submv_ref round-trip ------------------------
+
+    fn roundtrip_submv_ref(left: Mv, above: Mv, mode: SubMvRefMode) -> SubMvRefMode {
+        let mut enc = BoolEncoder::new();
+        enc.write_submv_ref(left, above, mode);
+        let bytes = enc.finish();
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        submv_ref(&mut dec, left, above).unwrap()
+    }
+
+    #[test]
+    fn every_submv_ref_mode_round_trips() {
+        // Use a "normal" context (left and above distinct non-zero).
+        let left = Mv { row: 4, col: 0 };
+        let above = Mv { row: 0, col: 4 };
+        for mode in [
+            SubMvRefMode::Left4x4,
+            SubMvRefMode::Above4x4,
+            SubMvRefMode::Zero4x4,
+            SubMvRefMode::New4x4,
+        ] {
+            assert_eq!(roundtrip_submv_ref(left, above, mode), mode);
+        }
+    }
+
+    #[test]
+    fn submv_ref_round_trips_under_all_contexts() {
+        // Exercise each of the five context rows by constructing l/a pairs
+        // that fall into each bucket.
+        let zero = Mv::default();
+        let a = Mv { row: 4, col: 0 };
+        let b = Mv { row: 0, col: 4 };
+        let cases: &[(Mv, Mv)] = &[
+            (a, b),       // 0 NORMAL
+            (zero, a),    // 1 LEFT_ZED
+            (a, zero),    // 2 ABOVE_ZED
+            (a, a),       // 3 LEFT_ABOVE_SAME
+            (zero, zero), // 4 LEFT_ABOVE_ZED
+        ];
+        for (left, above) in cases {
+            for mode in [
+                SubMvRefMode::Left4x4,
+                SubMvRefMode::Above4x4,
+                SubMvRefMode::Zero4x4,
+                SubMvRefMode::New4x4,
+            ] {
+                assert_eq!(roundtrip_submv_ref(*left, *above, mode), mode);
+            }
+        }
+    }
+
+    // ---- §16.4 SPLITMV: neighbour MV lookups ------------------------
+
+    #[test]
+    fn above_block_mv_intra_neighbour_is_zero() {
+        let split_mvs = [Mv::default(); 16];
+        let intra = MbInfo::border();
+        // Top row sub-blocks: b in 0..4 read from neighbour; intra → zero.
+        for b in 0..4 {
+            assert_eq!(above_block_mv(&split_mvs, &intra, b), Mv::default());
+        }
+    }
+
+    #[test]
+    fn above_block_mv_non_split_neighbour_uses_whole_mv() {
+        let split_mvs = [Mv::default(); 16];
+        let v = Mv { row: 8, col: -4 };
+        let above = inter(RefFrame::Last, v);
+        for b in 0..4 {
+            assert_eq!(above_block_mv(&split_mvs, &above, b), v);
+        }
+    }
+
+    #[test]
+    fn above_block_mv_split_neighbour_uses_bottom_row() {
+        let split_mvs = [Mv::default(); 16];
+        // Build a SPLITMV above with a distinct vector per sub-block.
+        let above_split: [Mv; 16] = core::array::from_fn(|k| Mv {
+            row: k as i16,
+            col: -(k as i16),
+        });
+        let above = MbInfo {
+            ref_frame: Some(RefFrame::Last),
+            mv: above_split[15],
+            is_split: true,
+            split_mvs: Some(above_split),
+        };
+        for b in 0..4 {
+            // Above MB's bottom row is sub-blocks 12..15, mapped by b+12.
+            assert_eq!(above_block_mv(&split_mvs, &above, b), above_split[b + 12]);
+        }
+    }
+
+    #[test]
+    fn above_block_mv_internal_uses_current_mb() {
+        let split_mvs: [Mv; 16] = core::array::from_fn(|k| Mv {
+            row: (k * 2) as i16,
+            col: (k * 3) as i16,
+        });
+        let above = MbInfo::border();
+        // b >= 4 reads from current MB's sub-block b - 4.
+        for b in 4..16 {
+            assert_eq!(above_block_mv(&split_mvs, &above, b), split_mvs[b - 4]);
+        }
+    }
+
+    #[test]
+    fn left_block_mv_intra_neighbour_is_zero() {
+        let split_mvs = [Mv::default(); 16];
+        let intra = MbInfo::border();
+        // Left column sub-blocks: b ∈ {0, 4, 8, 12} read from neighbour.
+        for &b in &[0usize, 4, 8, 12] {
+            assert_eq!(left_block_mv(&split_mvs, &intra, b), Mv::default());
+        }
+    }
+
+    #[test]
+    fn left_block_mv_split_neighbour_uses_right_column() {
+        let split_mvs = [Mv::default(); 16];
+        let left_split: [Mv; 16] = core::array::from_fn(|k| Mv {
+            row: -(k as i16),
+            col: k as i16,
+        });
+        let left = MbInfo {
+            ref_frame: Some(RefFrame::Last),
+            mv: left_split[15],
+            is_split: true,
+            split_mvs: Some(left_split),
+        };
+        // Left MB's right column is sub-blocks 3, 7, 11, 15 → b + 3 for
+        // b = 0, 4, 8, 12.
+        for &b in &[0usize, 4, 8, 12] {
+            assert_eq!(left_block_mv(&split_mvs, &left, b), left_split[b + 3]);
+        }
+    }
+
+    #[test]
+    fn left_block_mv_internal_uses_current_mb() {
+        let split_mvs: [Mv; 16] = core::array::from_fn(|k| Mv {
+            row: (k * 5) as i16,
+            col: (k * 7) as i16,
+        });
+        let left = MbInfo::border();
+        // b & 3 != 0 reads from current MB's sub-block b - 1.
+        for b in 0..16 {
+            if b & 3 == 0 {
+                continue;
+            }
+            assert_eq!(left_block_mv(&split_mvs, &left, b), split_mvs[b - 1]);
+        }
+    }
+
+    // ---- §16.4 SPLITMV: decode_split_mv shape coverage --------------
+
+    /// All-ZERO4x4 SPLITMV: every partition picks ZERO so the result is
+    /// sixteen zero vectors regardless of best/neighbours.
+    fn decode_all_zero_split(partition: MvPartition, num_groups: usize) -> SplitMvResult {
+        let above = MbInfo::border();
+        let left = MbInfo::border();
+        let best = Mv { row: 64, col: 64 }; // ignored by ZERO4x4
+        let mv_ctx = default_contexts();
+
+        let mut enc = BoolEncoder::new();
+        enc.write_mv_partition(partition);
+        // For each partition group, the anchor's neighbours are zero (both
+        // l and a come from the all-border neighbours and unfilled current
+        // sub-blocks default-to-zero). So context = 4 (LEFT_ABOVE_ZED).
+        for _ in 0..num_groups {
+            enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::Zero4x4);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        decode_split_mv(&mut dec, &above, &left, best, &mv_ctx).unwrap()
+    }
+
+    #[test]
+    fn decode_split_mv_top_bottom_all_zero() {
+        let res = decode_all_zero_split(MvPartition::TopBottom, 2);
+        assert_eq!(res.partition, MvPartition::TopBottom);
+        for mv in res.split_mvs.iter() {
+            assert_eq!(*mv, Mv::default());
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_left_right_all_zero() {
+        let res = decode_all_zero_split(MvPartition::LeftRight, 2);
+        assert_eq!(res.partition, MvPartition::LeftRight);
+        for mv in res.split_mvs.iter() {
+            assert_eq!(*mv, Mv::default());
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_quarters_all_zero() {
+        let res = decode_all_zero_split(MvPartition::Quarters, 4);
+        assert_eq!(res.partition, MvPartition::Quarters);
+        for mv in res.split_mvs.iter() {
+            assert_eq!(*mv, Mv::default());
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_mv16_all_zero() {
+        let res = decode_all_zero_split(MvPartition::Mv16, 16);
+        assert_eq!(res.partition, MvPartition::Mv16);
+        for mv in res.split_mvs.iter() {
+            assert_eq!(*mv, Mv::default());
+        }
+    }
+
+    // ---- §16.4 SPLITMV: per-mode semantics --------------------------
+
+    #[test]
+    fn decode_split_mv_top_bottom_zero_new() {
+        // TopBottom: group 0 (top half, sub-blocks 0..7) picks ZERO; group 1
+        // (bottom half, sub-blocks 8..15) picks NEW with a small diff.
+        let above = MbInfo::border();
+        let left = MbInfo::border();
+        let best = Mv { row: 4, col: 8 };
+        let diff = Mv { row: 4, col: -4 };
+        let mv_ctx = default_contexts();
+
+        let mut enc = BoolEncoder::new();
+        enc.write_mv_partition(MvPartition::TopBottom);
+        // Group 0 (k=0): l=zero, a=zero, ctx=4 → ZERO4x4.
+        enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::Zero4x4);
+        // Group 1 (k=8): l=zero (border), a=sub-block 4 = zero (filled by
+        // group 0). ctx=4 → NEW4x4 with diff.
+        enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::New4x4);
+        enc.write_mv(&mv_ctx, diff);
+        let bytes = enc.finish();
+
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        let res = decode_split_mv(&mut dec, &above, &left, best, &mv_ctx).unwrap();
+        let expected_new = Mv {
+            row: best.row + diff.row,
+            col: best.col + diff.col,
+        };
+        // Top half zero, bottom half NEW.
+        for b in 0..8 {
+            assert_eq!(res.split_mvs[b], Mv::default(), "top sub-block {}", b);
+        }
+        for b in 8..16 {
+            assert_eq!(res.split_mvs[b], expected_new, "bottom sub-block {}", b);
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_top_bottom_above4x4() {
+        // TopBottom: group 0 picks ABOVE4x4 from the above neighbour MB
+        // (a non-split neighbour with a known whole-MB vector).
+        let above_mv = Mv { row: 16, col: -8 };
+        let above = inter(RefFrame::Last, above_mv);
+        let left = MbInfo::border();
+        let best = Mv { row: 4, col: 8 };
+        let mv_ctx = default_contexts();
+
+        let mut enc = BoolEncoder::new();
+        enc.write_mv_partition(MvPartition::TopBottom);
+        // Group 0 (k=0): l=zero (border), a=above_mv (non-split neighbour).
+        // Context: lez=true, aez=false, lea=false → ctx = 1 (LEFT_ZED).
+        // Encoder emits "10" path under that context.
+        enc.write_submv_ref(Mv::default(), above_mv, SubMvRefMode::Above4x4);
+        // Group 1 (k=8): l=zero (border), a=sub-block 4 = above_mv (just
+        // filled). ctx: lez=true, aez=false, lea=false → 1. Pick ZERO4x4.
+        enc.write_submv_ref(Mv::default(), above_mv, SubMvRefMode::Zero4x4);
+        let bytes = enc.finish();
+
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        let res = decode_split_mv(&mut dec, &above, &left, best, &mv_ctx).unwrap();
+        for b in 0..8 {
+            assert_eq!(res.split_mvs[b], above_mv, "top sub-block {}", b);
+        }
+        for b in 8..16 {
+            assert_eq!(res.split_mvs[b], Mv::default(), "bottom sub-block {}", b);
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_left_right_left4x4() {
+        // LeftRight: group 0 (left half) picks LEFT4x4 from the left
+        // neighbour MB.
+        let left_mv = Mv { row: -4, col: 16 };
+        let left = inter(RefFrame::Last, left_mv);
+        let above = MbInfo::border();
+        let best = Mv { row: 4, col: 8 };
+        let mv_ctx = default_contexts();
+
+        let mut enc = BoolEncoder::new();
+        enc.write_mv_partition(MvPartition::LeftRight);
+        // Group 0 (k=0): l=left_mv, a=zero (border).
+        // Context: lez=false, aez=true → ctx=2 (ABOVE_ZED). LEFT4x4.
+        enc.write_submv_ref(left_mv, Mv::default(), SubMvRefMode::Left4x4);
+        // Group 1 (k=2): l=sub-block 1 (left_mv, just filled by group 0),
+        // a=zero (border). Same ctx=2. Pick ZERO4x4.
+        enc.write_submv_ref(left_mv, Mv::default(), SubMvRefMode::Zero4x4);
+        let bytes = enc.finish();
+
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        let res = decode_split_mv(&mut dec, &above, &left, best, &mv_ctx).unwrap();
+        // Left half (cols 0..2 each row) = left_mv; right half (cols 2..4) = zero.
+        let left_group: &[usize] = &[0, 1, 4, 5, 8, 9, 12, 13];
+        let right_group: &[usize] = &[2, 3, 6, 7, 10, 11, 14, 15];
+        for &b in left_group {
+            assert_eq!(res.split_mvs[b], left_mv, "left sub-block {}", b);
+        }
+        for &b in right_group {
+            assert_eq!(res.split_mvs[b], Mv::default(), "right sub-block {}", b);
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_mv16_per_sub_block_new() {
+        // MV_16: every sub-block carries its own NEW4x4 vector. Test that
+        // anchor `k` for each group is the sub-block itself and the
+        // decoded vectors land in raster order.
+        let above = MbInfo::border();
+        let left = MbInfo::border();
+        let best = Mv { row: 0, col: 0 };
+        let mv_ctx = default_contexts();
+
+        // For deterministic ctx, encode neighbours that all start zero and
+        // build progressively. Use NEW4x4 with a per-sub-block diff that
+        // depends on the index so we can verify ordering.
+        let diffs: [Mv; 16] = core::array::from_fn(|i| Mv {
+            row: i as i16,
+            col: -(i as i16),
+        });
+
+        let mut enc = BoolEncoder::new();
+        enc.write_mv_partition(MvPartition::Mv16);
+        // Walk anchor sub-blocks 0..16 in order; left/above neighbours are
+        // the resolved per-sub-block MVs from earlier writes (the decoder
+        // queries them as part of its `submv_ref` context derivation).
+        let mut split_so_far = [Mv::default(); 16];
+        for b in 0..16 {
+            // Neighbours per left_block_mv / above_block_mv.
+            let l_mv = if b & 3 == 0 {
+                Mv::default() // left is border MB → zero
+            } else {
+                split_so_far[b - 1]
+            };
+            let a_mv = if b < 4 {
+                Mv::default() // above is border MB → zero
+            } else {
+                split_so_far[b - 4]
+            };
+            enc.write_submv_ref(l_mv, a_mv, SubMvRefMode::New4x4);
+            enc.write_mv(&mv_ctx, diffs[b]);
+            split_so_far[b] = Mv {
+                row: best.row + diffs[b].row,
+                col: best.col + diffs[b].col,
+            };
+        }
+        let bytes = enc.finish();
+
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        let res = decode_split_mv(&mut dec, &above, &left, best, &mv_ctx).unwrap();
+        assert_eq!(res.partition, MvPartition::Mv16);
+        for (b, diff) in diffs.iter().enumerate() {
+            let expected = Mv {
+                row: best.row + diff.row,
+                col: best.col + diff.col,
+            };
+            assert_eq!(res.split_mvs[b], expected, "sub-block {}", b);
+        }
+    }
+
+    // ---- §16.4 SPLITMV: end-to-end decode_split_mv_mb ---------------
+
+    #[test]
+    fn decode_split_mv_mb_zero_split_copies_colocated_block() {
+        // A SPLITMV MB where every sub-block resolves to zero with
+        // skip_coeff = true must reconstruct to the co-located reference
+        // MB (the same property `decode_inter_mb_zeromv_copies_colocated`
+        // tests for the whole-MB ZEROMV path).
+        let (y, u, v) = build_reference(2, 2);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 32,
+            uv_stride: 16,
+            mb_cols: 2,
+            mb_rows: 2,
+        };
+
+        // Census neighbours: all intra (border). The CNT_SPLITMV bucket is
+        // 0 and `find_near_mvs` returns slot 0 = (0,0); the inter-mode tree
+        // still encodes a Split path against the resulting probabilities.
+        let above = MbInfo::border();
+        let left = MbInfo::border();
+        let border = MbInfo::border();
+        let cnt = find_near_mvs(&above, &left, &border, RefFrame::Last, SignBias::default()).cnt;
+        let probs = mv_ref_probs(&cnt);
+        let mv_ctx = default_contexts();
+
+        // Encode: SPLITMV inter-mode + TopBottom partition + two ZERO4x4.
+        // Both anchors see (left=zero, above=zero) → ctx 4 (LEFT_ABOVE_ZED).
+        let mut enc = BoolEncoder::new();
+        enc.write_inter_mode(&probs, InterMode::Split);
+        enc.write_mv_partition(MvPartition::TopBottom);
+        enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::Zero4x4);
+        enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::Zero4x4);
+        let bytes = enc.finish();
+
+        let filters = crate::motion_comp::filter_set_for_version(0).taps();
+        let coeffs = zero_coeffs();
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        let (recon, split) = decode_split_mv_mb(
+            &mut dec,
+            &reference,
+            1,
+            1,
+            &above,
+            &left,
+            &border,
+            RefFrame::Last,
+            SignBias::default(),
+            &mv_ctx,
+            false,
+            filters,
+            true, // skip_coeff
+            &coeffs.y,
+            &coeffs.u,
+            &coeffs.v,
+        )
+        .unwrap();
+
+        assert_eq!(split.partition, MvPartition::TopBottom);
+        for mv in split.split_mvs.iter() {
+            assert_eq!(*mv, Mv::default());
+        }
+        // Reconstructed luma == reference MB (1,1).
+        for r in 0..16 {
+            for c in 0..16 {
+                assert_eq!(
+                    recon.y[r * 16 + c],
+                    y[(16 + r) * 32 + (16 + c)],
+                    "y ({r},{c})"
+                );
+            }
+        }
+        for r in 0..8 {
+            for c in 0..8 {
+                assert_eq!(recon.u[r * 8 + c], u[(8 + r) * 16 + (8 + c)], "u ({r},{c})");
+                assert_eq!(recon.v[r * 8 + c], v[(8 + r) * 16 + (8 + c)], "v ({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn decode_split_mv_mb_top_bottom_distinct_halves() {
+        // TopBottom SPLITMV with the top half ZERO (copies colocated) and
+        // the bottom half NEW(diff) so the bottom-half luma sub-blocks come
+        // from a shifted reference position. Use whole-pixel-after-doubling
+        // vectors so we can compare exact byte values.
+        // Best base from census = (0, 0) since neighbours are border, then
+        // diff (4, 8) → final luma (4, 8) → doubled (8, 16) → luma offset
+        // (1, 2), chroma offset (avg of 4 luma sub-block MVs).
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+
+        // Census: all-intra neighbours so best = (0, 0); the NEW4x4 diff
+        // then equals the final per-sub-block vector.
+        let above = MbInfo::border();
+        let border = MbInfo::border();
+        let cnt = find_near_mvs(
+            &above,
+            &border,
+            &border,
+            RefFrame::Last,
+            SignBias::default(),
+        )
+        .cnt;
+        let probs = mv_ref_probs(&cnt);
+        let mv_ctx = default_contexts();
+
+        // Encode SPLITMV / TopBottom / ZERO (top half) / NEW with diff.
+        let diff = Mv { row: 4, col: 8 };
+        let mut enc = BoolEncoder::new();
+        enc.write_inter_mode(&probs, InterMode::Split);
+        enc.write_mv_partition(MvPartition::TopBottom);
+        // Group 0 (top, k=0): l=zero, a=zero → ctx=4. ZERO.
+        enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::Zero4x4);
+        // Group 1 (bottom, k=8): l=zero (border), a=sub-block 4 (zero,
+        // just filled by top half). ctx=4. NEW.
+        enc.write_submv_ref(Mv::default(), Mv::default(), SubMvRefMode::New4x4);
+        enc.write_mv(&mv_ctx, diff);
+        let bytes = enc.finish();
+
+        let filters = crate::motion_comp::filter_set_for_version(0).taps();
+        let coeffs = zero_coeffs();
+        let mut dec = BoolDecoder::init(&bytes).unwrap();
+        let (recon, split) = decode_split_mv_mb(
+            &mut dec,
+            &reference,
+            1,
+            1,
+            &above,
+            &border,
+            &border,
+            RefFrame::Last,
+            SignBias::default(),
+            &mv_ctx,
+            false,
+            filters,
+            true, // skip_coeff
+            &coeffs.y,
+            &coeffs.u,
+            &coeffs.v,
+        )
+        .unwrap();
+
+        assert_eq!(split.partition, MvPartition::TopBottom);
+        // Top half: zero vector, reference MB(1,1) verbatim. Rows 0..8.
+        for r in 0..8 {
+            for c in 0..16 {
+                assert_eq!(
+                    recon.y[r * 16 + c],
+                    y[(16 + r) * 48 + (16 + c)],
+                    "top y ({r},{c})"
+                );
+            }
+        }
+        // Bottom half: vector (4, 8) → doubled (8, 16) → whole-pixel offset
+        // (1, 2). Rows 8..16 read from reference (16+1+r, 16+2+c).
+        for r in 8..16 {
+            for c in 0..16 {
+                let ref_r = 16 + 1 + r;
+                let ref_c = 16 + 2 + c;
+                assert_eq!(
+                    recon.y[r * 16 + c],
+                    y[ref_r * 48 + ref_c],
+                    "bot y ({r},{c})"
+                );
+            }
+        }
+        // Verify split_mvs[15] == diff (matches dixie `this->base.mv =
+        // this->split.mvs[15]`).
+        assert_eq!(split.split_mvs[15], diff);
+    }
+
+    // ---- §18.1 SPLITMV chroma averaging -----------------------------
+
+    #[test]
+    fn split_chroma_mvs_avg_matches_whole_mb_when_uniform() {
+        use crate::motion_comp::{chroma_mv, split_chroma_mvs, stored_luma_mv};
+        // With all sixteen luma vectors equal, §18.1 avg() across each
+        // chroma slot must equal the whole-MB `chroma_mv` of the single
+        // (stored-luma-doubled) vector.
+        let mv = Mv { row: 10, col: -6 };
+        let luma_split = [mv; 16];
+        let split = split_chroma_mvs(&luma_split);
+        let expected = chroma_mv(stored_luma_mv(mv));
+        for (c, slot) in split.iter().enumerate() {
+            assert_eq!(*slot, expected, "chroma slot {}", c);
+        }
+    }
+
+    #[test]
+    fn chroma_idx_for_luma_subblock_groups_match_spec() {
+        // §18.1 enumeration: {0,1,4,5}→0, {2,3,6,7}→1, {8,9,12,13}→2,
+        // {10,11,14,15}→3.
+        use crate::motion_comp::chroma_idx_for_luma_subblock;
+        let groups: [&[usize]; 4] = [
+            &[0, 1, 4, 5],
+            &[2, 3, 6, 7],
+            &[8, 9, 12, 13],
+            &[10, 11, 14, 15],
+        ];
+        for (slot, group) in groups.iter().enumerate() {
+            for &b in *group {
+                assert_eq!(
+                    chroma_idx_for_luma_subblock(b),
+                    slot,
+                    "luma sub-block {} should map to chroma slot {}",
+                    b,
+                    slot
+                );
+            }
+        }
     }
 }

@@ -6,6 +6,90 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§16.4 SPLITMV per-sub-block motion-vector decoding + §18 SPLITMV
+  reconstruction path** — appended to `src/near_mv.rs` and
+  `src/motion_comp.rs`. The walk that turns a §16.2 `Split`
+  inter-mode resolution into sixteen Y-sub-block vectors plus the
+  matching §18.1-averaged chroma vectors, and the SPLITMV §18
+  reconstruction wired through them.
+
+  Decoder surface:
+
+  * `MvPartition` (`TopBottom` / `LeftRight` / `Quarters` / `Mv16`)
+    + `MV_PARTITIONS[4][16]` + `MV_PARTITION_TREE` (`{-3, 2, -2, 4,
+    -0, -1}`) + `MV_PARTITION_PROBS` (`{110, 111, 150}`) — the §20.13
+    `split_mv_tree` / `split_mv_probs` / `mv_partitions` tables.
+    `read_mv_partition(dec)` walks the tree.
+  * `SubMvRefMode` (`Left4x4` / `Above4x4` / `Zero4x4` / `New4x4`)
+    + `SUBMV_REF_TREE` + `SUBMV_REF_PROBS[5][3]` — the §20.13
+    `sub_mv_ref_tree` + context-keyed `submv_ref_probs2` table.
+    `submv_ref_context(left, above)` derives one of five contexts per
+    §16.4 `vp8_mvCont` (NORMAL / LEFT_ZED / ABOVE_ZED /
+    LEFT_ABOVE_SAME / LEFT_ABOVE_ZED); `submv_ref(dec, left, above)`
+    reads the tree under the context-selected probability row.
+  * `above_block_mv(this, above, b)` / `left_block_mv(this, left, b)`
+    — the §20.11 neighbour-sub-block MV lookups. Top-row / left-column
+    anchors consult the neighbour MB (SPLITMV → its bottom-row /
+    right-column sub-block; otherwise its whole-MB vector; intra → 0);
+    interior anchors read the current MB's already-filled sub-block.
+  * `decode_split_mv(dec, above, left, best, mv_ctx)` — the §16.4 /
+    §20.11 `decode_split_mv` partition walk. Reads the partition id,
+    then per group finds the anchor sub-block, runs `submv_ref`, picks
+    the partition vector (`LEFT4x4` / `ABOVE4x4` neighbour copy,
+    `ZERO4x4` zero, `NEW4x4`-adds-decoded-diff-to-`best`), and fills
+    every member sub-block. Returns `SplitMvResult { partition,
+    split_mvs }`.
+  * `MbInfo` gains `split_mvs: Option<[Mv; 16]>` — the §20.5
+    `mb_info.split.mvs` array; populated when a neighbour was coded
+    SPLITMV so the next MB's `above_block_mv` / `left_block_mv` can
+    borrow the correct sub-block vector.
+
+  Reconstruction surface (`src/motion_comp.rs`):
+
+  * `chroma_idx_for_luma_subblock(b)` — the §18.1 / §20.11
+    `(b>>1&1) + (b>>2&2)` luma→chroma mapping (`{0,1,4,5}→0`, etc.).
+  * `split_chroma_mvs(luma_mvs)` — the §18.1 chroma derivation:
+    averages the four luma (stored-doubled) vectors per chroma slot
+    via the §18.1 `avg()` primitive (sign-aware divide-by-8 with
+    rounding).
+  * `predict_split_mv(reference, mb_col, mb_row, split_luma_mvs,
+    full_pixel, filters)` — the SPLITMV §18.2/§18.3 prediction buffer:
+    sixteen luma sub-blocks each interpolated with their own
+    §18.1-doubled vector (per-sub-block `filter_block_4x4` dispatch),
+    four chroma sub-blocks under the §18.1 averaged vectors. No §18.1
+    secondary clamp (per §18.1 page 114 "secondary clamping is not
+    performed for SPLITMV macroblocks").
+  * `reconstruct_split_mv_mb(...)` — the SPLITMV analogue of
+    `reconstruct_inter_mb`. No Y2 / DC-in-Y residue (§14.2 "for
+    SPLITMV the 0th Y coefficients are part of the residue signal"),
+    so each Y sub-block's full 16 coefficients go straight through
+    the inverse DCT.
+
+  End-to-end driver:
+
+  * `decode_split_mv_mb(...)` — the SPLITMV analogue of
+    `decode_inter_mb`: runs the §16.3 census + §16.2 inter-mode tree,
+    asserts a `Split` resolution, runs `decode_split_mv`, then drives
+    `reconstruct_split_mv_mb`. Returns the reconstructed pixels +
+    `SplitMvResult` (caller stores `split_mvs[15]` as the MB's `mv`
+    per dixie `this->base.mv = this->split.mvs[15]` and
+    `Some(split_mvs)` as the next neighbour's `MbInfo::split_mvs`).
+
+  Twenty-eight new unit tests: spec-verbatim table / tree shape for
+  every new table, `submv_ref_context` bucket coverage, partition-tree
+  round-trip for every shape, sub-MV-ref tree round-trip for every
+  mode + every context, neighbour-MV lookup coverage (intra /
+  non-split / split / internal for both `above_block_mv` and
+  `left_block_mv`), all-ZERO4x4 `decode_split_mv` for every partition
+  shape, per-mode SPLITMV semantics (ZERO/NEW top-bottom, ABOVE4x4
+  top-bottom, LEFT4x4 left-right, per-sub-block NEW4x4 Mv16),
+  `chroma_idx_for_luma_subblock` grouping against the §18.1
+  enumeration, `split_chroma_mvs` reduces to `chroma_mv` on a uniform
+  field, and two byte-exact `decode_split_mv_mb` end-to-end
+  reconstructions (zero-split co-located copy, TopBottom distinct
+  halves with whole-pixel-after-doubling shift). Test count: 337
+  (was 309).
+
 * **§16.2 / §16.3 / §18.1 near/nearest motion-vector census + inter-mode
   tree** — new `src/near_mv.rs`, the inter-prediction slice that decides
   *which* vector a whole-MB inter macroblock uses. `find_near_mvs` is the

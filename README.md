@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 118)
+## Status — 2026-05-24 (round 119)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -18,21 +18,34 @@ partitions, and loop-filter levels 0 / 1 / 33 / 38 plus the simple-filter
 mode. Round 18 began inter-frame (§16) support with the §17 motion-vector
 component decoder. Round 19 added the first inter-prediction slice that
 *consumes* those vectors: §16.2 reference-frame selection and §18
-whole-pixel motion compensation + inter-MB reconstruction. **Round 117
+whole-pixel motion compensation + inter-MB reconstruction. Round 117
 adds §18.3 sub-pixel motion compensation: the sixtap (bicubic) and
 bilinear interpolation tap tables, the horizontal-then-vertical six-tap
 convolution, and the per-sub-block fractional-MV dispatch wired into the
 non-SPLITMV inter prediction path, so non-zero-fraction vectors
-reconstruct correctly.** **Round 118 adds the §16.2 / §16.3 / §18.1
+reconstruct correctly. Round 118 adds the §16.2 / §16.3 / §18.1
 near/nearest motion-vector census + inter-mode tree (`src/near_mv.rs`):
 the §16.3 `vp8_find_near_mvs` spatial census over the three neighbours,
 the §16.3 sign-bias correction, the §16.2 `mv_ref` tree resolving
 NEARESTMV / NEARMV / ZEROMV / NEWMV / SPLITMV, the §18.1 one-MB-border
 clamp, and the `decode_inter_mb` integration that drives the resolved
 vector through the §18 prediction path so a whole-MB inter macroblock
-decodes end-to-end (bitstream → census → mode → reconstructed pixels).**
-The §16.4 SPLITMV per-sub-block walk, the top-level interframe driver,
-and the encoder are not yet implemented.
+decodes end-to-end (bitstream → census → mode → reconstructed pixels).
+**Round 119 adds §16.4 SPLITMV per-sub-block motion-vector decoding:
+the §20.13 `mv_partitions` table + `mvpartition_tree` partition shape
+(`TopBottom` / `LeftRight` / `Quarters` / `MV_16`), the §20.13
+`sub_mv_ref_tree` + 5×3 context-keyed `submv_ref_probs2` table, the
+§16.4 `vp8_mvCont` left/above context derivation, the §20.11
+`above_block_mv` / `left_block_mv` neighbour-sub-block MV lookups with
+the SPLITMV-bottom-row / SPLITMV-right-column borrow rules, and the
+§16.4 `decode_split_mv` partition walk filling the sixteen
+per-sub-block vectors. Wired through to a §18 SPLITMV reconstruction
+path (`predict_split_mv` / `reconstruct_split_mv_mb` — per-sub-block
+luma vector + §18.1 four-luma-average chroma vector + no Y2 / DC-in-Y
+residue) and exposed as the end-to-end `decode_split_mv_mb` driver.**
+The top-level interframe `decode_vp8` driver (per-frame inter-MB
+census threading + reference-frame plumbing) and the encoder are not
+yet implemented.
 
 ### Landed
 
@@ -955,17 +968,87 @@ indexing, per-mode `resolve_inter_mb_mv`, and four byte-exact
 NEARESTMV neighbour vector, NEWMV best + differential, SPLITMV error
 surface). Total: 309 tests across fifteen modules.
 
+**Round 119 (2026-05-24).** §16.4 SPLITMV per-sub-block motion-vector
+decoding — the per-MB walk that turns a SPLITMV mode resolution into
+sixteen Y-sub-block vectors plus four §18.1-averaged chroma vectors —
+and the §18 SPLITMV reconstruction path. New surface:
+
+  * `MvPartition` (`TopBottom` / `LeftRight` / `Quarters` / `Mv16`) +
+    `MV_PARTITIONS[4][16]` (the §20.13 `mv_partitions` table) +
+    `MV_PARTITION_TREE` (`{-3, 2, -2, 4, -0, -1}`, the §20.13
+    `split_mv_tree`) + `MV_PARTITION_PROBS` (`{110, 111, 150}`).
+    `read_mv_partition(dec)` walks the tree.
+  * `SubMvRefMode` (`Left4x4` / `Above4x4` / `Zero4x4` / `New4x4`) +
+    `SUBMV_REF_TREE` + `SUBMV_REF_PROBS[5][3]` (the §20.13
+    `submv_ref_probs2`). `submv_ref_context(left, above)` derives one of
+    five contexts (NORMAL / LEFT_ZED / ABOVE_ZED / LEFT_ABOVE_SAME /
+    LEFT_ABOVE_ZED) per §16.4 `vp8_mvCont`; `submv_ref(dec, left, above)`
+    reads the tree against the context-selected probability row.
+  * `above_block_mv(this, above, b)` / `left_block_mv(this, left, b)` —
+    the §20.11 neighbour-sub-block MV lookups: for top-row / left-column
+    anchors look up the neighbour MB (SPLITMV neighbour → its bottom-row
+    or right-column sub-block; otherwise its whole-MB vector; intra → 0);
+    for interior anchors use the current MB's already-filled sub-block.
+  * `decode_split_mv(dec, above, left, best, mv_ctx)` — the §16.4 /
+    §20.11 `decode_split_mv` partition walk: reads the partition id,
+    then per group finds the anchor sub-block, runs `submv_ref`, picks
+    the partition vector (`LEFT4x4` / `ABOVE4x4` / `ZERO4x4` /
+    `NEW4x4`-adds-diff-to-best), and fills every member sub-block.
+    Returns `SplitMvResult { partition, split_mvs }`.
+  * `MbInfo::split_mvs: Option<[Mv; 16]>` — the §20.5 `mb_info.split.mvs`
+    array, populated when a neighbour was coded SPLITMV so the next MB's
+    `above_block_mv` / `left_block_mv` lookups can borrow the correct
+    sub-block vector.
+  * `chroma_idx_for_luma_subblock(b)` + `split_chroma_mvs(luma_mvs)` —
+    the §18.1 chroma derivation: maps each luma sub-block onto its
+    chroma slot (`{0,1,4,5}→0`, etc.) and averages the four luma
+    (stored-doubled) vectors per chroma slot via the §18.1 `avg()`
+    primitive (sign-aware divide-by-8).
+  * `predict_split_mv(reference, ...)` + `reconstruct_split_mv_mb(...)`
+    — the SPLITMV §18 prediction + reconstruction path: sixteen luma
+    sub-blocks each interpolated with their own §18.1-doubled vector
+    (per-sub-block `filter_block_4x4` dispatch), four chroma sub-blocks
+    interpolated with the §18.1 averaged vectors, no Y2 / DC-in-Y
+    residue (§14.2 "for SPLITMV the 0th Y coefficients are part of the
+    residue signal"). No §18.1 secondary clamp (per §18.1 page 114).
+  * `decode_split_mv_mb(...)` — the SPLITMV analogue of
+    `decode_inter_mb`: runs the §16.3 census + §16.2 inter-mode tree,
+    asserts a Split resolution, runs `decode_split_mv`, then drives
+    `reconstruct_split_mv_mb`. Returns the reconstructed pixels +
+    `SplitMvResult` (caller stores `split_mvs[15]` as the MB's `mv` and
+    `Some(split_mvs)` as the next neighbour's `MbInfo::split_mvs`).
+
+Twenty-eight new unit tests: spec-verbatim table / tree shape for
+`MV_PARTITIONS` / `MV_PARTITION_TREE` / `MV_PARTITION_PROBS` /
+`SUBMV_REF_TREE` / `SUBMV_REF_PROBS`, `submv_ref_context` bucket
+coverage, partition-tree round-trip across every shape, sub-MV-ref
+tree round-trip across every mode + every context, neighbour-MV lookup
+coverage (intra / non-split / split / internal for both `above_block_mv`
+and `left_block_mv`), all-ZERO4x4 `decode_split_mv` for every partition
+shape (verifies every group fills), per-mode SPLITMV semantics
+(ZERO/NEW top-bottom, ABOVE4x4 top-bottom, LEFT4x4 left-right,
+per-sub-block NEW4x4 Mv16), `chroma_idx_for_luma_subblock` grouping
+against the §18.1 enumeration, `split_chroma_mvs` reduces to `chroma_mv`
+on a uniform field, and two byte-exact `decode_split_mv_mb` end-to-end
+reconstructions (zero-split co-located copy, TopBottom distinct halves
+with whole-pixel-after-doubling shift). Total: 337 tests across sixteen
+modules.
+
 ### Not yet landed
 
-The §16.4 SPLITMV per-sub-block walk (`decode_inter_mb` surfaces
-`InterMbError::SplitNotSupported` with the clamped best base); the
-top-level interframe decode driver that threads the per-MB census +
-reconstruction across a frame; the encoder. §16.2 / §16.3 mode + MV
-resolution (round 118) and §18 motion compensation — whole-pixel
-(round 19) and §18.3 sub-pixel (round 117) — are now in place for the
-four whole-MB inter modes, decoding a single inter macroblock end-to-end
-at the slice level. `decode_vp8` still returns `DecodeError::Unsupported`
-for any non-key frame, and `encode_vp8_keyframe` still returns
+The top-level interframe `decode_vp8` driver — the per-MB census +
+SPLITMV / inter / intra dispatch threaded across a whole frame with the
+reference-frame plumbing (current `decode_vp8(&[u8])` decodes one frame
+in isolation; an interframe needs a previously decoded reference to
+predict against, requiring a multi-frame decoding-context API) — and the
+encoder. The slice-level building blocks are now complete: §16.2 / §16.3
+mode + MV resolution (round 118), §16.4 SPLITMV per-sub-block walk
+(round 119), §18 whole-pixel motion compensation (round 19), §18.3
+sub-pixel motion compensation (round 117), and SPLITMV §18
+reconstruction (round 119) — both whole-MB inter (`decode_inter_mb`) and
+SPLITMV (`decode_split_mv_mb`) macroblocks decode end-to-end at the
+slice level. `decode_vp8` still returns `DecodeError::Unsupported` for
+any non-key frame, and `encode_vp8_keyframe` still returns
 `Error::NotImplemented`.
 
 The round-16 `filter_frame` geometry targets the key-frame case (every

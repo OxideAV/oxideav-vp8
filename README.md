@@ -2,7 +2,7 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 17)
+## Status — 2026-05-24 (round 18)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
@@ -15,8 +15,10 @@ bitstream → dequant → reconstruct → loop-filter → I420 pixels — and is
 **byte-for-byte identical** to the libvpx/ffmpeg reference output on ten
 VP8 conformance fixtures spanning 16×16 … 128×128, one and four DCT
 partitions, and loop-filter levels 0 / 1 / 33 / 38 plus the simple-filter
-mode. Inter-frame (P-frame, §16) decoding and the encoder are not yet
-implemented.
+mode. **Round 18 begins inter-frame (§16) support with the §17
+motion-vector component decoder.** The full inter-prediction pipeline
+(§16 `mv_ref` census, SPLITMV, §18 sub-pixel interpolation) and the
+encoder are not yet implemented.
 
 ### Landed
 
@@ -750,15 +752,61 @@ inter-frame `Unsupported`, the tiny-keyframe decode through the trait API
 with pts round-trip, and registry enumeration). Total: 223 tests across
 twelve modules.
 
+**Round 18 (2026-05-24).** Lands the §17 motion-vector component decoder
+— the first element of the inter-frame (§16) prediction path (new
+`src/motion_vector.rs`). Motion vectors appear in both `NEWMV` (whole-MB)
+and `NEW4x4` (SPLITMV sub-block) modes with an identical wire format, so
+this is the shared primitive both call sites will consume:
+
+  * `read_mv_component(dec, ctx)` — §17.1 `read_mvcomponent`. Reads the
+    `mvpis_short` range selector; for the short form (`0 <= A <= 7`) walks
+    the §17.1 `small_mvtree` (transcribed as `SMALL_MVTREE`) reading
+    probabilities at `ctx[MVPshort + (node >> 1)]`; for the long form
+    (`8 <= A <= 1023`) reads bits 0–2 then 9–4 from `ctx[MVPbits + i]` and
+    applies the implicit-bit-3 rule (bit 3 is *not* coded when `A <= 15`,
+    since a long-coded value is `>= 8`); reads the sign at `ctx[MVPsign]`
+    only for a non-zero magnitude. Returns the signed quarter-pixel
+    component, `-1023..=1023`.
+  * `read_mv(dec, contexts)` — §17.2 `read_mv`: row component against
+    `contexts[0]` then column against `contexts[1]`, returning a raw
+    differential `Mv { row, col }`.
+  * `resolve_mv_contexts(base, updates)` — applies the round-4 §17.2
+    `mv_prob_update()` overlays (`Some(prob)` replaces, `None` keeps the
+    base) onto a base `MvContexts`, turning the parsed updates into the
+    live decoding tables. `default_mv_contexts()` seeds from
+    `DEFAULT_MV_CONTEXT` for the §17.2 "set to defaults every key frame"
+    rule; passing the previous frame's resolved contexts as `base` gives
+    the §17.2 cross-interframe persistence.
+  * New surface: `Mv`, `MvContext`, `MvContexts`, `SMALL_MVTREE`,
+    `read_mv_component`, `read_mv`, `resolve_mv_contexts`,
+    `default_mv_contexts`.
+
+The round stays at the component layer: the §16.2 `mv_ref` tree, the
+§16.3 `vp8_find_near_mvs` near/nearest/best census, the §16.4 SPLITMV
+sub-block walk, the §18.1 stored-luma doubling / range clamp / chroma
+averaging, and the §18 sub-pixel interpolation are explicitly **not** in
+scope — `read_mv` returns the raw differential vector the
+inter-prediction layer adds to a reference base.
+
+Fifteen new unit tests round-trip a test-side VP8 bool encoder (mirroring
+the proven `dct_tokens` / `bool_decoder` test encoder) through the §17
+routines: `SMALL_MVTREE` shape + the `MVPindices` offset arithmetic; all
+short values `-7..=7`; the zero-has-no-sign-bit short-circuit; long values
+at the boundaries (8, 15, 16, 31, 511, 512, 1023 and negatives); the
+implicit-bit-3 boundary (8..=15 with no coded bit 3, 16/17/24/25 with it);
+the ±1023 extremes; `read_mv` reading row-then-column contexts plus a
+load-bearing swapped-context negative control; `resolve_mv_contexts`
+identity / overlay / cross-frame persistence / round-trip-under-resolved-
+context; and the `Mv` default. Total: 238 tests across thirteen modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
-walk); motion-vector component decoding (§17.1) against the updated
-`MV_CONTEXT`s; the encoder. `decode_vp8` returns
-`DecodeError::Unsupported` for any non-key frame, and
-`encode_vp8_keyframe` still returns `Error::NotImplemented`.
+walk); the §18 inter-prediction buffer + sub-pixel interpolation; the
+encoder. `decode_vp8` returns `DecodeError::Unsupported` for any non-key
+frame, and `encode_vp8_keyframe` still returns `Error::NotImplemented`.
 
 The round-16 `filter_frame` geometry targets the key-frame case (every
 MB is intra / `CURRENT_FRAME`); the inter-frame mode/reference delta

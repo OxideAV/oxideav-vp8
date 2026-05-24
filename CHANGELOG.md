@@ -6,6 +6,30 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§17 motion-vector component decoder** — new `src/motion_vector.rs`,
+  the first element of the inter-frame (§16) prediction path. Motion
+  vectors share an identical wire format in `NEWMV` (whole-MB) and
+  `NEW4x4` (SPLITMV sub-block) modes, so this is the shared primitive both
+  call sites consume. `read_mv_component` implements §17.1
+  `read_mvcomponent`: the `mvpis_short` short-vs-long range selector, the
+  `small_mvtree` tree-coded short form (`0 <= A <= 7`, transcribed as
+  `SMALL_MVTREE`), the independent-bit long form (`8 <= A <= 1023`) with
+  the implicit-bit-3 rule, and the conditional sign — returning a signed
+  quarter-pixel component `-1023..=1023`. `read_mv` implements §17.2
+  `read_mv` (row context then column context → raw differential `Mv`).
+  `resolve_mv_contexts` applies the round-4 §17.2 `mv_prob_update()`
+  overlays onto a base `MvContexts` (key-frame default via
+  `default_mv_contexts`, cross-interframe persistence by passing the
+  previous resolved contexts as `base`), turning the parsed updates into
+  the live decoding tables. The §16.2 `mv_ref` tree, §16.3
+  `find_near_mvs` census, §16.4 SPLITMV walk, §18.1 doubling / clamp, and
+  §18 sub-pixel interpolation are deferred to later rounds — `read_mv`
+  returns the raw differential vector. New surface: `Mv`, `MvContext`,
+  `MvContexts`, `SMALL_MVTREE`, `read_mv_component`, `read_mv`,
+  `resolve_mv_contexts`, `default_mv_contexts`. Adds 15 tests
+  (round-tripping a test-side bool encoder through every §17.1/§17.2
+  branch); total 238.
+
 * **Top-level `decode_vp8` per-frame driver + `oxideav_core::Decoder`** —
   new `src/decoder.rs` wires the previously-isolated keyframe pieces into
   a single end-to-end entry point. `decode_vp8(bytes)` takes the raw bytes

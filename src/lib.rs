@@ -136,6 +136,20 @@
 //!   pixels from 127 / 129 fills. Consumes [`frame::MbCoeffs`]
 //!   (pre-dequantized) produced by the [`dequant`] layer. See [`frame`].
 //!
+//! * VP8 motion-vector component decoding (RFC 6386 §17) —
+//!   [`read_mv_component`] (§17.1 `read_mvcomponent`: the short-vs-long
+//!   range selector, the [`SMALL_MVTREE`] tree-coded `0..=7` short form,
+//!   the independent-bit long form with the implicit bit-3 rule, and the
+//!   conditional sign) and [`read_mv`] (§17.2 `read_mv`: row then column).
+//!   [`resolve_mv_contexts`] applies the round-4 §17.2 `mv_prob_update()`
+//!   overlays onto a base [`MvContexts`] (defaulting via
+//!   [`default_mv_contexts`] on key frames, carried-forward across
+//!   interframes), turning the parsed updates into the live decoding
+//!   tables. Returns the raw differential [`Mv`]; the §16.3 reference-base
+//!   addition, the §18.1 range clamp / stored-luma doubling, and the §16
+//!   `mv_ref` / SPLITMV machinery are deferred to later inter-prediction
+//!   rounds. See [`motion_vector`].
+//!
 //! * VP8 top-level per-frame decode driver ([`decode_vp8`]) and the
 //!   [`oxideav_core::Decoder`] integration ([`decoder::Vp8Decoder`],
 //!   gated on the default-on `registry` feature). [`decode_vp8`] takes
@@ -171,6 +185,7 @@ pub mod intra_predict;
 pub mod inverse_transform;
 pub mod loop_filter;
 pub mod macroblock;
+pub mod motion_vector;
 pub mod reconstruct;
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
@@ -209,6 +224,10 @@ pub use macroblock::{
     parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
     InterFrameIntraProbs, IntraBmode, IntraUvMode, IntraYMode, MacroblockError, MacroblockModes,
     IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
+};
+pub use motion_vector::{
+    default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,
+    MvContexts, SMALL_MVTREE,
 };
 pub use reconstruct::{
     decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,

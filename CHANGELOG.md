@@ -4,6 +4,30 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-vp8/compare/v0.1.13...v0.1.14) - 2026-05-24
+
+### Other
+
+- Add §17 motion-vector component decoder (inter-frame path start)
+- Wire top-level decode_vp8 driver + oxideav_core::Decoder (key frames)
+- §15.1 loop-filter frame geometry over decode_keyframe planes
+- §14.1 Y2/chroma dequant scaling + bitstream→dequant wrapper
+- §13.3 per-macroblock DCT-coefficient token walk
+- per-frame keyframe raster walker (RFC 6386 §12 / §14.2)
+- §11.3/§12.3 B_PRED macroblock reconstruction (per-sub-block intra walker)
+- §14.2 per-macroblock reconstruction orchestration (non-B_PRED)
+- §16.1 interframe intra-predicted macroblock mode decoding
+- loop-filter per-segment kernels (RFC 6386 §15)
+- dequantization + inverse transforms (RFC 6386 §14)
+- §13 DCT-coefficient token decode (coeff_tree walker + extra-bits)
+- §12 pixel-shape kernels (16×16 Y, 8×8 UV, 10× 4×4 sub-block)
+- key-frame §11 mode layer (Y / UV trees + sub-block modes)
+- add §9.10 inter-only tail + §17.2 mv_prob_update
+- clean-room rebuild round 3 — boolean-coded frame header (RFC 6386 §19.2)
+- clean-room rebuild round 2 — uncompressed frame header (RFC 6386 §9.1)
+- clean-room rebuild round 1 — boolean (range) entropy decoder
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **§17 motion-vector component decoder** — new `src/motion_vector.rs`,

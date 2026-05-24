@@ -6,6 +6,77 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 1: §9 frame-header writers + silent-keyframe
+  path (RFC 6386 §7.3 + §9.1–§9.11)** — new `src/encoder.rs` module
+  exposing the §7.3 `BoolEncoder` (a faithful Rust port of the
+  RFC-embedded reference `bool_encoder` / `write_bool` /
+  `flush_bool_encoder` listing) and the §9.x frame-header writer
+  subroutines:
+
+  * `write_frame_tag` — §9.1 3-byte tag + key-frame extension
+    (`0x9d 0x01 0x2a` start code + 14-bit width + 2-bit horizontal
+    scale + 14-bit height + 2-bit vertical scale, little-endian).
+  * `patch_first_partition_size` — back-patch the 19-bit
+    `first_partition_size` after the first partition is fully
+    written, preserving the frame_type / version / show_frame bits.
+  * `write_segment_update_flags` — §9.3 segment-update toggle (Phase 1
+    only supports the disabled path).
+  * `write_loop_filter` — §9.4 `filter_type` / `loop_filter_level (6)`
+    / `sharpness_level (3)` + the `mb_lf_adjustments()` enable bit
+    (Phase 1 only supports `loop_filter_adj_enable = false`).
+  * `write_token_partition_count` — §9.5 `log2_nbr_of_dct_partitions`,
+    accepting `count ∈ {1, 2, 4, 8}` and emitting `log2(count)`.
+  * `write_quant_indices` — §9.6 baseline `y_ac_qi (L7)` plus the five
+    presence-gated `L(4)+L(1)` deltas for ydc / y2dc / y2ac / uvdc /
+    uvac. Phase 1 emits the baseline with every delta omitted.
+  * `write_no_token_prob_updates` — the §9.9 / §13.4 1056-flag
+    "every flag = 0" path against the position-specific
+    `coeff_update_probs` table (NOT a flat 128), so the decoder
+    consumes exactly the bits the encoder writes.
+  * `write_mb_no_skip_coeff` — §9.10 / §9.11 toggle + optional
+    `prob_skip_false (L8)`.
+
+  And the top-level driver:
+
+  * `encode_silent_keyframe(SilentKeyframeParams)` — composes the
+    writers above plus a §11 macroblock-prediction loop that emits
+    `mb_skip_coeff = 1` / `y_mode = DC_PRED` / `uv_mode = DC_PRED`
+    for every MB, finishes with the §7.3 4-byte flush trailer for
+    the first partition, then emits the §9.5 size table + one §7.3
+    flush trailer per DCT partition. Output is a structurally-valid
+    VP8 key frame that decodes through the crate's own
+    `decode_vp8` and through `ffmpeg -c:v vp8` when wrapped in IVF.
+  * `oxideav_vp8::encoder::make_encoder()` — direct factory matching
+    the workspace's dual-API convention; pairs with the existing
+    `oxideav_core::register!` registry path.
+  * `oxideav_vp8::encode_vp8_keyframe` — now delegates to
+    `encode_silent_keyframe` instead of returning
+    `Error::NotImplemented`, so the legacy entry point starts producing
+    real bytes.
+
+  Validation: 15 new unit tests in `src/encoder.rs` (bool-encoder ↔
+  bool-decoder round-trip on a 1024-element pseudo-random sequence;
+  frame-tag round-trip through `Vp8FrameHeader::parse`;
+  patch-first-partition-size preservation; loop-filter / sharpness /
+  partition-count / quant-index validation; silent-keyframe
+  round-trip through `decode_vp8` at 16×16 / 32×32 / 48×16 / 16×48 /
+  32×24; round-trip at all four legal partition counts; coded-header
+  re-parse of the first partition asserting every §9.x field;
+  bit-budget upper-bound on the 16×16 frame). Plus 3 new
+  integration tests in `tests/encoder_external_decode.rs` that pipe
+  the emitted frame through `ffmpeg -c:v vp8 -f rawvideo` (16×16,
+  64×64, 48×32) and assert ffmpeg accepts the bitstream and produces
+  a YUV420P picture of the expected byte length. Test count rises
+  from 346 / 341 (lib default / standalone) to 361 / 356, plus 3
+  ffmpeg-external tests and the unchanged 5 public-error-surface
+  tests.
+
+  Out of scope for Phase 1 (deferred to subsequent rounds): pixel-aware
+  mode selection, DCT/WHT residual encoding (`§13`), rate-distortion
+  optimisation, inter-frame encoding (`§16` / `§17`), segmentation
+  (`§9.3`'s non-trivial path), per-MB loop-filter deltas (`§9.4`'s
+  non-trivial path), and the `§10` per-segment quantiser override.
+
 * **Public `Vp8Error` umbrella error at the crate root** — a new
   `pub enum Vp8Error { Decode(DecodeError), Encode(Error) }` exposed
   from `lib.rs`, with `Display` / `std::error::Error` (with `source()`

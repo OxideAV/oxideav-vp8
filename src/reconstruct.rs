@@ -309,7 +309,14 @@ pub fn decode_keyframe_mb_non_bpred(
 
     // Step 3 (done first because we always need it, even on skip MBs):
     // intra prediction into the output buffers.
-    let topleft_y = neighbors.y_topleft.unwrap_or(0); // unused except by TM
+    //
+    // The corner pixel (-1, -1) is read only by TM_PRED. A `None` here
+    // means the corner is off the top frame edge (the frame walker
+    // supplies `Some(129)` for the left-frame-edge corner and the genuine
+    // reconstructed pixel for interior macroblocks), so it defaults to the
+    // §12 `DEFAULT_ABOVE_PIXEL` (127) — the value §20.14 `fixup_above`
+    // assigns the off-top corner.
+    let topleft_y = neighbors.y_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_y16x16(
         &mut out.y,
         y_mode,
@@ -321,7 +328,7 @@ pub fn decode_keyframe_mb_non_bpred(
     // case; we've rejected B above, so this is always Some.
     .expect("y_mode rejected B_PRED at function entry");
 
-    let topleft_u = neighbors.u_topleft.unwrap_or(0);
+    let topleft_u = neighbors.u_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_uv8x8(
         &mut out.u,
         uv_mode,
@@ -329,7 +336,7 @@ pub fn decode_keyframe_mb_non_bpred(
         neighbors.u_left.as_ref(),
         topleft_u,
     );
-    let topleft_v = neighbors.v_topleft.unwrap_or(0);
+    let topleft_v = neighbors.v_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_uv8x8(
         &mut out.v,
         uv_mode,

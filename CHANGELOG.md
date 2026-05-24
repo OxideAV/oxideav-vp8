@@ -6,6 +6,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **Top-level `decode_vp8` per-frame driver + `oxideav_core::Decoder`** —
+  new `src/decoder.rs` wires the previously-isolated keyframe pieces into
+  a single end-to-end entry point. `decode_vp8(bytes)` takes the raw bytes
+  of one VP8 frame, parses the §9.1 uncompressed header and the §19.2
+  boolean-coded frame header, runs the §11 / §19.3 macroblock prediction
+  layer, carves the §9.5 DCT partitions (3-byte LE size table + the §20.4
+  round-robin row striping, one `BoolDecoder` per consumed partition with
+  a persistent cursor), decodes + §14.1-dequantizes each macroblock's §13
+  residuals, reconstructs via `decode_keyframe`, applies the §15.1
+  loop-filter post-pass, and crops to the §9.1 visible dimensions —
+  returning an I420 `Vp8DecodedFrame`. Non-key frames (§16 inter) return a
+  clean `DecodeError::Unsupported` (no stub-decode). The default-on
+  `registry` feature additionally exposes `Vp8Decoder` (an
+  `oxideav_core::Decoder` impl), `make_decoder`, and `register` /
+  `register_codecs` (registering codec id `"vp8"` with the `VP80` / `vp08`
+  / `V_VP8` container tags); `register` is wired through the
+  `oxideav_core::register!` dispatch hook in `lib.rs`. The keyframe decode
+  chain (bitstream → dequant → reconstruct → loop-filter → pixels) is now
+  **bit-exact** against the libvpx/ffmpeg black-box reference on ten VP8
+  conformance fixtures (16×16, 64×64, 32×32, 128×128; 1- and 4-partition;
+  loop-filter off / level-1 / level-33 / level-38; simple-filter mode),
+  vendored under `tests/fixtures/`. Two intra-prediction correctness fixes
+  landed alongside: the §20.14 `fixup_left` corner rule — a left-frame-edge
+  macroblock's `(-1,-1)` corner pixel is 129 (was defaulting to 127),
+  which `TM_PRED` / `B_TM_PRED` read — and the off-top corner default for
+  the non-`B_PRED` `TM_PRED` path (now 127, was 0). New surface:
+  `decode_vp8`, `DecodeError`, `Vp8DecodedFrame`, and (gated) `Vp8Decoder`
+  / `make_decoder` / `register` / `register_codecs` / `VP8_CODEC_ID`. Adds
+  17 tests (non-keyframe → Unsupported, truncation / zero-dimension error
+  paths, the partition-table carve, ten bit-exact fixture decodes, and the
+  `Decoder`-trait integration). The crate's prior placeholder
+  `decode_vp8`/`register` stubs and `Error::NotImplemented` decode path are
+  replaced; `encode_vp8_keyframe` remains scaffolded.
+
 * **§15.1 loop-filter frame geometry** — `filter_frame` in
   `src/loop_filter.rs`, the per-frame post-pass that applies the existing
   §15.2 simple / §15.3 normal kernels across a reconstructed

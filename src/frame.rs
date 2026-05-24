@@ -80,6 +80,7 @@
 //! filled. When they are filled, a convenience wrapper that decodes
 //! tokens + dequantizes per macroblock can feed this function.
 
+use crate::intra_predict::DEFAULT_LEFT_PIXEL;
 use crate::macroblock::{IntraYMode, MacroblockModes};
 use crate::reconstruct::{
     decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
@@ -327,8 +328,28 @@ fn gather_neighbors(planes: &KeyframePlanes, mb_row: usize, mb_col: usize) -> Mb
         n.v_left = Some(v_left);
     }
 
-    // --- Top-left corner pixels (row y0 - 1, col x0 - 1) -----------
-    if mb_row > 0 && mb_col > 0 {
+    // --- Top-left corner pixel (-1, -1) ----------------------------
+    // The corner is read only by TM_PRED (16×16 / 8×8) and B_TM_PRED
+    // (4×4). Its value follows RFC 6386 §20.14 `fixup_left` / the §12
+    // out-of-frame rules:
+    //
+    // * Top macroblock row (`mb_row == 0`): the corner is above the top
+    //   frame edge → 127 (`fixup_above` resets it to 127; and the §20.14
+    //   row-0/col-0 special case `*(img.y - stride - 1) = 127` keeps the
+    //   top-left corner at 127 too). Reported as `None` so the §12 kernels
+    //   substitute the 127 `DEFAULT_ABOVE_PIXEL`.
+    // * Left frame edge, non-top row (`mb_col == 0 && mb_row > 0`): the
+    //   corner is to the left of the leftmost column → 129. §20.14
+    //   `fixup_left`'s non-DC branch runs `for (i = -1; ...) *left = 129`,
+    //   and the `i == -1` iteration sets exactly this corner. (DC_PRED
+    //   never reads the corner, so the unconditional 129 here is safe.)
+    // * Interior (`mb_row > 0 && mb_col > 0`): the genuine reconstructed
+    //   pixel at `(-1, -1)`.
+    if mb_col == 0 && mb_row > 0 {
+        n.y_topleft = Some(DEFAULT_LEFT_PIXEL);
+        n.u_topleft = Some(DEFAULT_LEFT_PIXEL);
+        n.v_topleft = Some(DEFAULT_LEFT_PIXEL);
+    } else if mb_row > 0 && mb_col > 0 {
         n.y_topleft = Some(planes.y[(y_y0 - 1) * ys + (y_x0 - 1)]);
         n.u_topleft = Some(planes.u[(uv_y0 - 1) * cs + (uv_x0 - 1)]);
         n.v_topleft = Some(planes.v[(uv_y0 - 1) * cs + (uv_x0 - 1)]);

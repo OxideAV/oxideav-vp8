@@ -2,12 +2,21 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
-## Status — 2026-05-24 (round 16)
+## Status — 2026-05-24 (round 17)
 
 **Clean-room rebuild in progress.** The prior implementation was
 retired under the workspace clean-room policy after a provenance audit
 on 2026-05-20. Rebuild work tracks RFC 6386 exclusively, with
-black-box `ffmpeg` invocations as the only validator.
+black-box `ffmpeg` / `libvpx` invocations as the only validator.
+
+**Key-frame decode is complete and bit-exact.** As of round 17 the
+top-level `decode_vp8` driver decodes intra-only (key) frames end to end —
+bitstream → dequant → reconstruct → loop-filter → I420 pixels — and is
+**byte-for-byte identical** to the libvpx/ffmpeg reference output on ten
+VP8 conformance fixtures spanning 16×16 … 128×128, one and four DCT
+partitions, and loop-filter levels 0 / 1 / 33 / 38 plus the simple-filter
+mode. Inter-frame (P-frame, §16) decoding and the encoder are not yet
+implemented.
 
 ### Landed
 
@@ -696,14 +705,60 @@ simple-filter luma-only; the coeff-gated vs `B_PRED`-forced subblock
 steps; and the header→`FrameFilterConfig` resolution. Total: 206 tests
 across eleven modules.
 
+**Round 17 (2026-05-24).** Wires the top-level per-frame decode driver —
+`decode_vp8` and the `oxideav_core::Decoder` integration (new
+`src/decoder.rs`) — tying every prior round into one end-to-end key-frame
+decoder.
+
+  * `decode_vp8(bytes) -> Result<Vp8DecodedFrame, DecodeError>` — one
+    packet = one frame. Parses the §9.1 uncompressed header
+    (`Vp8FrameHeader`), rejects non-key frames as
+    `DecodeError::Unsupported`, parses the §19.2 boolean-coded header
+    (`Vp8CodedHeader`) and the §11 / §19.3 macroblock prediction layer
+    (`parse_key_frame_macroblock_modes`), carves the §9.5 DCT partitions
+    (the 3-byte little-endian size table + the §20.4 round-robin row
+    striping `row → partition r % n`, one `BoolDecoder` per consumed
+    partition with its cursor persisting across the rows that share it),
+    decodes + §14.1-dequantizes each macroblock's §13 residuals
+    (`decode_and_dequantize_mb`, with above/left non-zero predictor
+    threading and the per-segment dequant factors), reconstructs the frame
+    (`decode_keyframe`), runs the §15.1 loop-filter post-pass
+    (`filter_frame`), and crops to the §9.1 visible width / height,
+    emitting an I420 `Vp8DecodedFrame`.
+  * Behind the default-on `registry` feature: `Vp8Decoder` (an
+    `oxideav_core::Decoder` impl — `send_packet` queues, `receive_frame`
+    runs `decode_vp8` and yields a `Frame::Video`), `make_decoder`, and
+    `register` / `register_codecs` registering codec id `"vp8"` with the
+    `VP80` / `vp08` / `V_VP8` container tags. `register` is wired through
+    the `oxideav_core::register!` dispatch hook in `lib.rs`.
+  * **Bit-exact** against the libvpx/ffmpeg reference (RFC 6386 §2 makes
+    exact reconstructed pixels part of the spec) on ten conformance
+    fixtures vendored under `tests/fixtures/`: 16×16, 32×32, 64×64,
+    128×128; one- and four-DCT-partition; loop-filter off / level 1 /
+    level 33 / level 38; and the §15.2 simple-filter mode.
+  * Two intra-prediction corrections surfaced while reaching bit-exactness
+    on multi-macroblock frames: (a) the §20.14 `fixup_left` corner rule —
+    a left-frame-edge macroblock's `(-1,-1)` corner is 129 (the kernels
+    were defaulting it to 127), read by `TM_PRED` / `B_TM_PRED`; and (b)
+    the non-`B_PRED` `TM_PRED` off-top corner default, now 127 (was 0).
+
+Seventeen new tests: non-keyframe → `Unsupported`; the truncation /
+zero-dimension error paths; the §9.5 partition-table carve (single,
+two-partition, truncated-table, truncated-body); ten bit-exact fixture
+decodes; and the `Vp8Decoder` trait integration (NeedMore before a packet,
+inter-frame `Unsupported`, the tiny-keyframe decode through the trait API
+with pts round-trip, and registry enumeration). Total: 223 tests across
+twelve modules.
+
 ### Not yet landed
 
 The inter-predicted §16.2 / §16.3 / §16.4 branch of interframes
 (`mv_ref` tree, near/nearest/best census + the three-neighbour
 weighted score, motion-vector clamping, split-prediction sub-block
 walk); motion-vector component decoding (§17.1) against the updated
-`MV_CONTEXT`s; the encoder. All top-level entry points (`decode_vp8`,
-`encode_vp8_keyframe`) still return `Error::NotImplemented`.
+`MV_CONTEXT`s; the encoder. `decode_vp8` returns
+`DecodeError::Unsupported` for any non-key frame, and
+`encode_vp8_keyframe` still returns `Error::NotImplemented`.
 
 The round-16 `filter_frame` geometry targets the key-frame case (every
 MB is intra / `CURRENT_FRAME`); the inter-frame mode/reference delta
@@ -715,8 +770,9 @@ wired when the §16 inter-prediction branch lands.
 
 * RFC 6386 — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`).
-* Black-box invocations of the `ffmpeg` *binary* as an opaque
-  validator (no source consulted).
+* Black-box invocations of the `ffmpeg` / `libvpx` *binary* as an opaque
+  validator (no source consulted): the `tests/fixtures/*/expected.yuv`
+  reference pictures are that validator's output.
 
 No external library source — libvpx, libaom, libavcodec/vp8\*, etc. —
 is permitted as a reference under the workspace clean-room policy.

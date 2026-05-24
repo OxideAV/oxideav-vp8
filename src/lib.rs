@@ -136,23 +136,34 @@
 //!   pixels from 127 / 129 fills. Consumes [`frame::MbCoeffs`]
 //!   (pre-dequantized) produced by the [`dequant`] layer. See [`frame`].
 //!
-//! With the §13.3 per-MB token walk ([`dct_tokens::decode_mb_coeffs`]) and
-//! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]) now
-//! landed, the keyframe decode chain bitstream → dequant → reconstruct →
-//! pixels is complete at the per-macroblock granularity, and the §15.1
-//! loop-filter frame geometry ([`filter_frame`]) now runs as a
-//! post-reconstruction pass on top of [`decode_keyframe`]'s plane output.
-//! Motion-vector decoding (§17), the inter-predicted §16.2 / §16.3 /
-//! §16.4 branch (`mv_ref` tree, near/nearest/best census, split
-//! prediction), and the encoder are all still scaffolded — the top-level
-//! `decode_vp8` / `encode_vp8_*` entry points return
-//! [`Error::NotImplemented`].
+//! * VP8 top-level per-frame decode driver ([`decode_vp8`]) and the
+//!   [`oxideav_core::Decoder`] integration ([`decoder::Vp8Decoder`],
+//!   gated on the default-on `registry` feature). [`decode_vp8`] takes
+//!   the raw bytes of one VP8 frame, parses the §9.1 uncompressed header
+//!   and the §19.2 boolean-coded frame header, runs the §11 macroblock
+//!   prediction layer, carves the §9.5 DCT partitions (round-robin row
+//!   striping per §20.4), decodes + dequantizes each macroblock's §13
+//!   residuals, reconstructs the frame via [`decode_keyframe`], applies
+//!   the §15.1 loop-filter post-pass, and emits a visible-cropped I420
+//!   [`decoder::Vp8DecodedFrame`]. Interframes (§16) are surfaced as a
+//!   clean [`decoder::DecodeError::Unsupported`]. See [`decoder`].
+//!
+//! With the §13.3 per-MB token walk ([`dct_tokens::decode_mb_coeffs`]),
+//! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]), and
+//! the top-level [`decode_vp8`] driver now landed, the keyframe decode
+//! chain bitstream → dequant → reconstruct → loop-filter → pixels is
+//! complete end-to-end. Motion-vector decoding (§17), the inter-predicted
+//! §16.2 / §16.3 / §16.4 branch (`mv_ref` tree, near/nearest/best census,
+//! split prediction), and the encoder are all still scaffolded — the
+//! `encode_vp8_*` entry point returns [`Error::NotImplemented`] and
+//! interframes return [`decoder::DecodeError::Unsupported`].
 
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;
+pub mod decoder;
 pub mod dequant;
 pub mod frame;
 pub mod frame_header;
@@ -172,6 +183,7 @@ pub use dct_tokens::{
     DctTokenError, MbCoeffError, MbEntropyCtx, COEFF_BANDS, DEFAULT_COEFF_PROBS,
     MB_ENTROPY_CTX_LEN, ZIGZAG,
 };
+pub use decoder::{decode_vp8, DecodeError, Vp8DecodedFrame};
 pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{
@@ -203,43 +215,39 @@ pub use reconstruct::{
     ReconstructedMb,
 };
 
-#[cfg(feature = "registry")]
-use oxideav_core::RuntimeContext;
-
-/// Crate-local error type. Until the clean-room rebuild lands every
-/// public API path returns [`Error::NotImplemented`].
+/// Crate-local error type for the not-yet-implemented surfaces.
+///
+/// The decoder path (`decode_vp8`) has its own richer
+/// [`decoder::DecodeError`]; this type now only backs the encoder stub,
+/// which is still scaffolded pending the §13 / §14 encode round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// The crate has been reset to a scaffold pending clean-room
-    /// rebuild; no decoder or encoder functionality is wired up yet.
+    /// The requested operation is not wired up yet (currently: the
+    /// encoder). The decode path is implemented for key frames — see
+    /// [`decode_vp8`] / [`decoder::DecodeError`].
     NotImplemented,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "oxideav-vp8: orphan-rebuild scaffold — no decoder/encoder wired up"
-        )
+        write!(f, "oxideav-vp8: requested operation not implemented")
     }
 }
 
 impl std::error::Error for Error {}
 
-/// Decode a VP8 elementary stream.
-pub fn decode_vp8(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
-}
-
 /// Encode a VP8 keyframe.
+///
+/// Still scaffolded — the encoder has not been written yet (the §13 /
+/// §14 encode side is a future round). Returns [`Error::NotImplemented`].
 pub fn encode_vp8_keyframe(_pixels: &[u8], _width: u32, _height: u32) -> Result<Vec<u8>, Error> {
     Err(Error::NotImplemented)
 }
 
-/// No-op codec registration — the orphan-rebuild scaffold registers
-/// nothing into the runtime context.
+/// Install the VP8 codec (decoder) into a runtime context. Delegates to
+/// [`decoder::register`].
 #[cfg(feature = "registry")]
-pub fn register(_ctx: &mut RuntimeContext) {}
+pub use decoder::register;
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("vp8", register);

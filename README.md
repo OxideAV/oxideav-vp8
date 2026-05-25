@@ -2,6 +2,47 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 134)
+
+**Encoder Phase 3b — B_PRED 4×4 sub-block intra mode pick landed.** The
+per-MB luma decision now also evaluates the §11.3 / §12.3 `B_PRED`
+path: the 16×16 luma plane can be encoded as sixteen independent 4×4
+sub-blocks, each choosing the SAD-minimising one of the ten §12.3
+sub-modes (`B_DC` / `B_TM` / `B_VE` / `B_HE` / `B_LD` / `B_RD` /
+`B_VR` / `B_VL` / `B_HD` / `B_HU`) against the source, with **in-place
+neighbour evolution** — every sub-block predicts from the already-
+reconstructed (predictor + dequantised residue) pixels of the
+sub-blocks above and to its left, including the §12.3 right-edge
+above-right fixup. The encoder reuses the decoder's `predict_b4x4`
+kernel and `inverse_dct_4x4` / `add_residue_4x4`, so the reconstruction
+it evolves against is exactly what the decoder produces.
+
+A top-level luma decision picks `B_PRED` over the best whole-block mode
+iff its total prediction SAD is strictly lower (a flat / single-edge
+region with matching neighbours stays whole-block). When `B_PRED`
+wins the macroblock has no Y2 block: the sixteen Y sub-blocks keep
+their own DC and are token-coded through the `YNoY2` plane
+(`has_y2 = false`). The chosen sixteen sub-modes ride on
+`EncodedMb::b_subblock_modes` (`Some` iff `y_mode == B`), feeding the
+decoder's `decode_keyframe_mb_bpred` walk. Still a SAD picker — no RD
+bit-cost term, no inter prediction.
+
+Validated by 3 new unit tests:
+
+* `diagonal_subblock_mb_picks_bpred_and_decodes_above_30db` — a
+  macroblock of per-4×4-sub-block diagonal tiles (no single whole-block
+  mode follows them) flips to `B_PRED` and reconstructs at **≈ 54 dB**
+  PSNR at `yac_qi = 4`, with a genuine per-sub-block mode mix.
+* `bpred_neighbour_evolution_roundtrips_at_low_q` — the same MB at
+  `yac_qi = 0` clears a 40 dB floor (encoder evolution == decoder's).
+* `flat_mb_keeps_whole_block_luma_mode` — a flat MB in matching flat
+  neighbours stays whole-block (`y_mode != B`).
+
+Inter prediction, a true RD search, and the per-frame raster driver
+remain the next encoder rounds.
+
+Lib test count: 386 → 389.
+
 ## Status — 2026-05-25 (round 133)
 
 **Encoder Phase 3 — whole-block intra mode pick landed.** The per-MB

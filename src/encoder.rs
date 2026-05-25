@@ -1271,8 +1271,11 @@ impl TokenEncoder {
 use crate::dct_tokens::MbEntropyCtx;
 use crate::forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 use crate::frame::MbCoeffs;
-use crate::intra_predict::{predict_uv8x8, predict_y16x16};
-use crate::macroblock::{IntraUvMode, IntraYMode};
+use crate::intra_predict::{
+    predict_b4x4, predict_uv8x8, predict_y16x16, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL,
+};
+use crate::inverse_transform::{add_residue_4x4, inverse_dct_4x4};
+use crate::macroblock::{IntraBmode, IntraUvMode, IntraYMode};
 
 /// Round-half-away-from-zero integer division — the natural inverse of
 /// the §14.1 `q * factor` dequant multiply. Used by the encoder to
@@ -1336,18 +1339,21 @@ fn block_sad(pred: &[u8], src: &[u8]) -> u32 {
 /// are passed through to the shared [`predict_y16x16`] kernel so the
 /// picker scores exactly the prediction the decoder will reconstruct.
 ///
-/// Returns the chosen mode plus the 256-pixel prediction buffer for it
-/// (so the caller doesn't recompute it). `topleft` is the (-1,-1) corner
-/// pixel TM_PRED reads; supply [`crate::intra_predict::DEFAULT_ABOVE_PIXEL`]
-/// when the corner is off-frame, mirroring the decoder's
-/// `decode_keyframe_mb_non_bpred` convention.
+/// Returns the chosen mode, the 256-pixel prediction buffer for it (so
+/// the caller doesn't recompute it), and the winning SAD (so the
+/// top-level luma decision can compare it against the §12.3 B_PRED
+/// pass). `topleft` is the (-1,-1) corner pixel TM_PRED reads; supply
+/// [`crate::intra_predict::DEFAULT_ABOVE_PIXEL`] when the corner is
+/// off-frame, mirroring the decoder's `decode_keyframe_mb_non_bpred`
+/// convention.
 fn pick_y16x16_mode(
     src: &[u8; 256],
     above: Option<&[u8; 16]>,
     left: Option<&[u8; 16]>,
     topleft: u8,
-) -> (IntraYMode, [u8; 256]) {
-    // §12.2 whole-block modes only — B_PRED is out of scope this round.
+) -> (IntraYMode, [u8; 256], u32) {
+    // The four §12.2 whole-block modes; B_PRED is scored separately by
+    // `encode_bpred_luma` and compared against this winner's SAD.
     const CANDIDATES: [IntraYMode; 4] =
         [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
     let mut best_mode = IntraYMode::Dc;
@@ -1365,7 +1371,7 @@ fn pick_y16x16_mode(
             best_pred = pred;
         }
     }
-    (best_mode, best_pred)
+    (best_mode, best_pred, best_sad)
 }
 
 /// One chroma plane's source pixels plus its three §12 prediction
@@ -1410,6 +1416,188 @@ fn pick_uv8x8_mode(u: &ChromaPlane, v: &ChromaPlane) -> (IntraUvMode, [u8; 64], 
     (best_mode, best_u, best_v)
 }
 
+// ─────────────────────── §11.3 / §12.3 B_PRED luma picker ──────────────────────
+
+/// Stride (pixels per row) of the encoder's `B_PRED` working luma
+/// buffer — mirrors the decoder's `reconstruct::BPRED_STRIDE`:
+/// `[ left-border (1) | 16 columns | above-right extension (4) ]`.
+const ENC_BPRED_STRIDE: usize = 1 + 16 + 4;
+
+/// Number of rows in the working buffer: one top-border row plus the
+/// sixteen reconstruction rows.
+const ENC_BPRED_ROWS: usize = 1 + 16;
+
+/// Flat index of the working buffer's reconstruction origin `(0, 0)`.
+const ENC_BPRED_ORIGIN: usize = ENC_BPRED_STRIDE + 1;
+
+/// The ten §12.3 4×4 sub-block intra modes, in `intra_bmode` order.
+const BMODE_CANDIDATES: [IntraBmode; 10] = [
+    IntraBmode::Dc,
+    IntraBmode::Tm,
+    IntraBmode::Ve,
+    IntraBmode::He,
+    IntraBmode::Ld,
+    IntraBmode::Rd,
+    IntraBmode::Vr,
+    IntraBmode::Vl,
+    IntraBmode::Hd,
+    IntraBmode::Hu,
+];
+
+/// Outcome of the §12.3 B_PRED luma encode pass.
+struct BpredLuma {
+    /// The sixteen chosen 4×4 sub-block modes (raster order).
+    modes: [IntraBmode; 16],
+    /// The sixteen quantised 4×4 Y coefficient blocks (raster order).
+    /// Unlike the whole-block path these carry their **own** DC (no Y2
+    /// block exists for a `B_PRED` macroblock per §13 / §14.2).
+    y_coeffs: [[i16; 16]; 16],
+    /// Total SAD of the chosen sub-block predictions against the source,
+    /// summed over all sixteen sub-blocks — the metric the top-level
+    /// luma decision compares against the best whole-block SAD.
+    total_sad: u32,
+}
+
+/// Build the encoder's `B_PRED` working luma buffer with its border row
+/// / column pre-filled from the macroblock's neighbours, applying the
+/// §12.3 right-edge "above-right" fixup. Mirrors the decoder's
+/// `reconstruct::build_bpred_work_buffer` so the encoder evolves
+/// neighbours over the exact pixels the decoder will.
+fn build_enc_bpred_buffer(
+    neighbors: &crate::reconstruct::MbNeighbors,
+) -> [u8; ENC_BPRED_ROWS * ENC_BPRED_STRIDE] {
+    let mut buf = [0u8; ENC_BPRED_ROWS * ENC_BPRED_STRIDE];
+
+    // Top border row: col 0 = corner P, cols 1..=16 = 16 above pixels,
+    // cols 17..=20 = the 4 above-right pixels.
+    let above = neighbors.y_above.unwrap_or([DEFAULT_ABOVE_PIXEL; 16]);
+    let topleft = neighbors.y_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
+    buf[0] = topleft;
+    buf[1..17].copy_from_slice(&above);
+    let above_right = neighbors.y_above_right.unwrap_or([DEFAULT_ABOVE_PIXEL; 4]);
+    buf[17..21].copy_from_slice(&above_right);
+
+    // Left border column.
+    let left = neighbors.y_left.unwrap_or([DEFAULT_LEFT_PIXEL; 16]);
+    for (r, &v) in left.iter().enumerate() {
+        buf[(r + 1) * ENC_BPRED_STRIDE] = v;
+    }
+
+    // §12.3 right-edge fixup: the four above-right pixels are shared by
+    // sub-blocks 3, 7, 11, 15 — copy them above sub-block rows 1, 2, 3.
+    let extra = [buf[17], buf[18], buf[19], buf[20]];
+    for &recon_row_above in &[3usize, 7, 11] {
+        let buf_row = 1 + recon_row_above;
+        let base = buf_row * ENC_BPRED_STRIDE + 17;
+        buf[base..base + 4].copy_from_slice(&extra);
+    }
+
+    buf
+}
+
+/// Encode the luma plane as a §11.3 / §12.3 `B_PRED` macroblock:
+/// sixteen independent 4×4 sub-blocks, each choosing the SAD-minimising
+/// one of the ten §12.3 sub-modes against the source, with **in-place
+/// neighbour evolution** — every sub-block predicts from the already-
+/// reconstructed (predictor + dequantised residue) pixels of the
+/// sub-blocks above and to its left, exactly as the decoder's
+/// `decode_keyframe_mb_bpred` walk does. Sharing the decoder's
+/// `predict_b4x4` kernel and `inverse_dct_4x4` / `add_residue_4x4`
+/// guarantees the reconstruction the encoder evolves against is the one
+/// the decoder produces.
+///
+/// Returns the chosen modes, the sixteen quantised coefficient blocks
+/// (each carrying its own DC — a `B_PRED` MB has no Y2 block), and the
+/// total prediction SAD for the top-level luma decision.
+fn encode_bpred_luma(
+    src: &[u8; 256],
+    neighbors: &crate::reconstruct::MbNeighbors,
+    factors: &crate::dequant::MbDequantFactors,
+) -> BpredLuma {
+    let mut buf = build_enc_bpred_buffer(neighbors);
+    let mut modes = [IntraBmode::Dc; 16];
+    let mut y_coeffs = [[0i16; 16]; 16];
+    let mut total_sad = 0u32;
+
+    for i in 0..4 {
+        for j in 0..4 {
+            let idx = i * 4 + j;
+            let sb_base = ENC_BPRED_ORIGIN + (i * 4) * ENC_BPRED_STRIDE + (j * 4);
+
+            // Gather the §12.3 neighbour inputs from the evolving buffer.
+            let above_base = sb_base - ENC_BPRED_STRIDE;
+            let mut above = [0u8; 8];
+            above.copy_from_slice(&buf[above_base..above_base + 8]);
+            let mut left = [0u8; 4];
+            for (r, slot) in left.iter_mut().enumerate() {
+                *slot = buf[sb_base + r * ENC_BPRED_STRIDE - 1];
+            }
+            let p = buf[above_base - 1];
+
+            // Read the source 4×4 sub-block.
+            let mut sb_src = [0u8; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    sb_src[r * 4 + c] = src[(i * 4 + r) * 16 + (j * 4 + c)];
+                }
+            }
+
+            // Pick the SAD-minimising sub-mode against the source.
+            let mut best_mode = IntraBmode::Dc;
+            let mut best_pred = [0u8; 16];
+            let mut best_sad = u32::MAX;
+            for &mode in &BMODE_CANDIDATES {
+                let mut pred = [0u8; 16];
+                predict_b4x4(&mut pred, mode, &above, &left, p);
+                let sad = block_sad(&pred, &sb_src);
+                if sad < best_sad {
+                    best_sad = sad;
+                    best_mode = mode;
+                    best_pred = pred;
+                }
+            }
+            modes[idx] = best_mode;
+            total_sad += best_sad;
+
+            // Forward-transform + quantise the residual against the
+            // chosen prediction. A B_PRED sub-block carries its own DC,
+            // so we quantise with the Y1 factors and keep coeff[0].
+            let mut residual = [0i16; 16];
+            for k in 0..16 {
+                residual[k] = sb_src[k] as i16 - best_pred[k] as i16;
+            }
+            let mut coeffs = [0i16; 16];
+            forward_dct_4x4(&residual, &mut coeffs);
+            enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac);
+            y_coeffs[idx] = coeffs;
+
+            // Reconstruct this sub-block (predictor + dequantised
+            // residue) and write it back into the working buffer so it
+            // becomes a neighbour for the sub-blocks below / to its
+            // right — identical to the decoder's evolution step.
+            let mut dq = coeffs;
+            dq[0] = (dq[0] as i32 * factors.y1_dc as i32) as i16;
+            for c in dq.iter_mut().skip(1) {
+                *c = (*c as i32 * factors.y1_ac as i32) as i16;
+            }
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&dq, &mut residue);
+            let mut recon = [0u8; 16];
+            add_residue_4x4(&best_pred, &residue, &mut recon);
+            for r in 0..4 {
+                let dst = sb_base + r * ENC_BPRED_STRIDE;
+                buf[dst..dst + 4].copy_from_slice(&recon[r * 4..r * 4 + 4]);
+            }
+        }
+    }
+
+    BpredLuma {
+        modes,
+        y_coeffs,
+        total_sad,
+    }
+}
+
 /// Result of [`encode_mb_block_set`] — the per-MB raw-quantised
 /// coefficient bundle (for inspection / testing) plus the byte stream
 /// emitted by the token-encoder's underlying boolean encoder.
@@ -1430,14 +1618,21 @@ pub struct EncodedMb {
     /// The non-zero block count across the 25 residual blocks, useful
     /// as a regression knob and for assertions in tests.
     pub nonzero_block_count: usize,
-    /// The §12.2 whole-block 16×16 luma mode the picker chose for this
-    /// MB (DC / V / H / TM — never `B`, which is out of scope). The
-    /// caller writes this into the §11.2 mode layer and feeds it to the
-    /// decoder's reconstruction orchestrator so prediction matches.
+    /// The luma mode the picker chose for this MB. One of the four
+    /// §12.2 whole-block modes (DC / V / H / TM) when the whole-block
+    /// path wins, or [`IntraYMode::B`] (`B_PRED`) when the §11.3 / §12.3
+    /// per-4×4-sub-block path wins. The caller writes this into the §11.2
+    /// mode layer and feeds it to the decoder's reconstruction
+    /// orchestrator so prediction matches.
     pub y_mode: IntraYMode,
     /// The §12.2 whole-block 8×8 chroma mode the picker chose (shared by
     /// Cb and Cr per §11.4).
     pub uv_mode: IntraUvMode,
+    /// The sixteen §11.3 / §12.3 4×4 luma sub-block modes in raster
+    /// order (`i * 4 + j`), present **iff** `y_mode == IntraYMode::B`.
+    /// `None` for the four whole-block luma modes. Feeds the decoder's
+    /// `decode_keyframe_mb_bpred` `subblock_modes` argument.
+    pub b_subblock_modes: Option<[IntraBmode; 16]>,
 }
 
 /// Encode one macroblock's residual through the §13 / §14 block-set
@@ -1542,12 +1737,25 @@ pub fn encode_mb_block_set_with_neighbors(
     // defaults to the §12 `DEFAULT_ABOVE_PIXEL` (127) when off-frame,
     // mirroring `decode_keyframe_mb_non_bpred`.
     let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
-    let (y_mode, y_pred) = pick_y16x16_mode(
+    let (whole_mode, y_pred, whole_sad) = pick_y16x16_mode(
         &pixels.y,
         neighbors.y_above.as_ref(),
         neighbors.y_left.as_ref(),
         neighbors.y_topleft.unwrap_or(default_corner),
     );
+
+    // ---- 2b. Score the §11.3 / §12.3 B_PRED per-4×4-sub-block luma
+    //          pass and decide luma: B_PRED wins iff its total
+    //          prediction SAD is strictly lower than the best whole-block
+    //          SAD. A flat / single-edge MB is reproduced exactly by a
+    //          whole-block mode (SAD 0 there but never lower under
+    //          B_PRED), so the tie-break naturally keeps it whole-block;
+    //          a per-sub-block-structured MB (e.g. diagonal-edge blocks)
+    //          beats every whole-block mode and flips to B_PRED.
+    let bpred = encode_bpred_luma(&pixels.y, neighbors, &factors);
+    let use_bpred = bpred.total_sad < whole_sad;
+    let y_mode = if use_bpred { IntraYMode::B } else { whole_mode };
+
     let (uv_mode, u_pred, v_pred) = pick_uv8x8_mode(
         &ChromaPlane {
             src: &pixels.u,
@@ -1567,23 +1775,33 @@ pub fn encode_mb_block_set_with_neighbors(
     //         chosen prediction.
     let mut raw_coeffs = MbCoeffs::default();
 
-    // 16 Y sub-blocks: extract → FDCT into raster-order arrays.
-    // Y sub-block order matches §14.2: index `i*4 + j` for row i,
-    // column j of the 4×4 sub-block grid in a 16×16 plane.
-    for i in 0..4 {
-        for j in 0..4 {
-            let mut residual = [0i16; 16];
-            for r in 0..4 {
-                for c in 0..4 {
-                    let py = i * 4 + r;
-                    let px = j * 4 + c;
-                    let off = py * 16 + px;
-                    residual[r * 4 + c] = pixels.y[off] as i16 - y_pred[off] as i16;
+    // The luma plane is filled differently per decision:
+    //   * whole-block: §14.4 FDCT each sub-block off `y_pred`, then the
+    //     §14.3 Y2/WHT DC-collection step below;
+    //   * B_PRED: the sixteen sub-blocks were already predicted +
+    //     transformed + quantised (each carrying its own DC) by
+    //     `encode_bpred_luma`; no Y2 block exists.
+    if use_bpred {
+        raw_coeffs.y = bpred.y_coeffs;
+    } else {
+        // 16 Y sub-blocks: extract → FDCT into raster-order arrays.
+        // Y sub-block order matches §14.2: index `i*4 + j` for row i,
+        // column j of the 4×4 sub-block grid in a 16×16 plane.
+        for i in 0..4 {
+            for j in 0..4 {
+                let mut residual = [0i16; 16];
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let py = i * 4 + r;
+                        let px = j * 4 + c;
+                        let off = py * 16 + px;
+                        residual[r * 4 + c] = pixels.y[off] as i16 - y_pred[off] as i16;
+                    }
                 }
+                let mut coeffs = [0i16; 16];
+                forward_dct_4x4(&residual, &mut coeffs);
+                raw_coeffs.y[i * 4 + j] = coeffs;
             }
-            let mut coeffs = [0i16; 16];
-            forward_dct_4x4(&residual, &mut coeffs);
-            raw_coeffs.y[i * 4 + j] = coeffs;
         }
     }
 
@@ -1623,7 +1841,11 @@ pub fn encode_mb_block_set_with_neighbors(
         }
     }
 
-    // ---- 4. Collect the 16 Y DCs and run §14.3 forward WHT into Y2.
+    // ---- 4. Whole-block luma only: collect the 16 Y DCs and run §14.3
+    //         forward WHT into Y2. A B_PRED macroblock has no Y2 block
+    //         (§13 / §14.2) — its Y sub-blocks already carry their own
+    //         DC from `encode_bpred_luma`, so this step is skipped and
+    //         `raw_coeffs.y2` stays zero.
     //
     // §14.2 first paragraph (inverse direction): "the element of the
     // result at row i, column j is used as the 0th coefficient of the
@@ -1631,15 +1853,17 @@ pub fn encode_mb_block_set_with_neighbors(
     // DC. The encode-side inverse: take DC[i*4+j] from each Y
     // sub-block, build a 4×4 array, FWHT, then zero out each Y
     // sub-block's DC (since it now lives in Y2).
-    let mut y_dc_block = [0i16; 16];
-    for (slot, src) in y_dc_block.iter_mut().zip(raw_coeffs.y.iter()) {
-        *slot = src[0];
-    }
-    let mut y2_coeffs = [0i16; 16];
-    forward_wht_4x4(&y_dc_block, &mut y2_coeffs);
-    raw_coeffs.y2 = y2_coeffs;
-    for blk in raw_coeffs.y.iter_mut() {
-        blk[0] = 0;
+    if !use_bpred {
+        let mut y_dc_block = [0i16; 16];
+        for (slot, src) in y_dc_block.iter_mut().zip(raw_coeffs.y.iter()) {
+            *slot = src[0];
+        }
+        let mut y2_coeffs = [0i16; 16];
+        forward_wht_4x4(&y_dc_block, &mut y2_coeffs);
+        raw_coeffs.y2 = y2_coeffs;
+        for blk in raw_coeffs.y.iter_mut() {
+            blk[0] = 0;
+        }
     }
 
     // ---- 5. Quantise every block against its plane's §14.1 factors.
@@ -1647,12 +1871,15 @@ pub fn encode_mb_block_set_with_neighbors(
     // The encoder's quant step is the natural inverse of the
     // decoder's `MbDequantFactors::dequantize`: divide each
     // coefficient by the matching DC / AC factor with round-half-
-    // away-from-zero. The Y sub-blocks' DCs are zero (consumed by
-    // Y2 above), but we still pass `factors.y1_dc` for the divisor
-    // — round-half-away-from-zero of 0 stays 0.
-    enc_quantize_block(&mut raw_coeffs.y2, factors.y2_dc, factors.y2_ac);
-    for blk in raw_coeffs.y.iter_mut() {
-        enc_quantize_block(blk, factors.y1_dc, factors.y1_ac);
+    // away-from-zero. For the whole-block path the Y sub-blocks' DCs
+    // are zero (consumed by Y2 above). For B_PRED the Y2 block is zero
+    // and the Y sub-blocks were already quantised by `encode_bpred_luma`
+    // — so both Y2 and Y quantisation are skipped here.
+    if !use_bpred {
+        enc_quantize_block(&mut raw_coeffs.y2, factors.y2_dc, factors.y2_ac);
+        for blk in raw_coeffs.y.iter_mut() {
+            enc_quantize_block(blk, factors.y1_dc, factors.y1_ac);
+        }
     }
     for blk in raw_coeffs.u.iter_mut() {
         enc_quantize_block(blk, factors.uv_dc, factors.uv_ac);
@@ -1664,11 +1891,13 @@ pub fn encode_mb_block_set_with_neighbors(
     // ---- 6. Walk §13.3 residual order, encode each block in scan
     //         order against fresh above / left predictor contexts.
     //
-    // We use the same `decode_mb_coeffs` walk order:
-    //   1. Y2 (if has_y2)                          — block 24
-    //   2. 16 Y sub-blocks (YAfterY2 plane)        — blocks 0..15
-    //   3. 4 U sub-blocks (UV plane)               — blocks 16..19
-    //   4. 4 V sub-blocks (UV plane)               — blocks 20..23
+    // Walk order matches `decode_mb_coeffs`:
+    //   1. Y2 (only when has_y2 — i.e. NOT B_PRED)  — block 24
+    //   2. 16 Y sub-blocks                          — blocks 0..15
+    //        plane = YAfterY2 (DC in Y2) for whole-block modes,
+    //        plane = YNoY2   (own DC)    for B_PRED;
+    //   3. 4 U sub-blocks (UV plane)                — blocks 16..19
+    //   4. 4 V sub-blocks (UV plane)                — blocks 20..23
     //
     // The above / left predictor seeds for the first block are both
     // off-frame ("false") since this entry encodes a single isolated
@@ -1678,26 +1907,35 @@ pub fn encode_mb_block_set_with_neighbors(
     let mut left = MbEntropyCtx::default();
     let mut nonzero_block_count = 0usize;
 
-    let scan_y2 = raster_to_scan(&raw_coeffs.y2);
-    let nz = encode_block_with_ctx(
-        &mut enc,
-        24,
-        BlockType::Y2,
-        coeff_probs,
-        &scan_y2,
-        &mut above,
-        &mut left,
-    )?;
-    if nz != 0 {
-        nonzero_block_count += 1;
+    // Y2 is emitted only for the whole-block path; a B_PRED macroblock
+    // has no Y2 record at all (§13.3 skips block 24 when has_y2 is false).
+    if !use_bpred {
+        let scan_y2 = raster_to_scan(&raw_coeffs.y2);
+        let nz = encode_block_with_ctx(
+            &mut enc,
+            24,
+            BlockType::Y2,
+            coeff_probs,
+            &scan_y2,
+            &mut above,
+            &mut left,
+        )?;
+        if nz != 0 {
+            nonzero_block_count += 1;
+        }
     }
 
+    let y_block_type = if use_bpred {
+        BlockType::YNoY2
+    } else {
+        BlockType::YAfterY2
+    };
     for (i, y_block) in raw_coeffs.y.iter().enumerate() {
         let scan = raster_to_scan(y_block);
         let nz = encode_block_with_ctx(
             &mut enc,
             i,
-            BlockType::YAfterY2,
+            y_block_type,
             coeff_probs,
             &scan,
             &mut above,
@@ -1741,12 +1979,14 @@ pub fn encode_mb_block_set_with_neighbors(
     }
 
     let bytes = enc.finish();
+    let b_subblock_modes = if use_bpred { Some(bpred.modes) } else { None };
     Ok(EncodedMb {
         coeffs: raw_coeffs,
         bytes,
         nonzero_block_count,
         y_mode,
         uv_mode,
+        b_subblock_modes,
     })
 }
 
@@ -2463,35 +2703,14 @@ mod tests {
 
     use crate::dct_tokens::decode_mb_coeffs;
     use crate::dequant::MbDequantFactors;
-    use crate::frame::{decode_keyframe, MbCoeffs as FrameMbCoeffs};
-    use crate::macroblock::{IntraUvMode, IntraYMode, MacroblockModes};
-    use crate::reconstruct::{decode_keyframe_mb_non_bpred, MbNeighbors};
-
-    /// Build a single-macroblock frame with the supplied whole-block
-    /// intra modes + given pre-dequantized coefficients, and return the
-    /// reconstructed luma / Cb / Cr planes. The encoder records which
-    /// modes it picked in [`EncodedMb`]; the decoder must reconstruct
-    /// against the same modes for the residual to add back correctly.
-    fn decode_single_mb(
-        coeffs: FrameMbCoeffs,
-        y_mode: IntraYMode,
-        uv_mode: IntraUvMode,
-    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let modes = vec![MacroblockModes {
-            segment_id: None,
-            mb_skip_coeff: false,
-            y_mode,
-            subblock_modes: None,
-            uv_mode,
-        }];
-        let planes = decode_keyframe(1, 1, &modes, &[coeffs]).expect("decode_keyframe");
-        (planes.y, planes.u, planes.v)
-    }
+    use crate::macroblock::{IntraBmode, IntraUvMode, IntraYMode};
+    use crate::reconstruct::{decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors};
 
     /// Encode a flat-color MB through `encode_mb_block_set`, decode the
-    /// bytes back into the per-MB raw coefficients, dequantize, and run
-    /// the §14.2 reconstruction orchestrator — the recovered luma /
-    /// chroma planes must be within ≤ 1 LSB of the input.
+    /// bytes back through the mode-aware helper (off-frame neighbours may
+    /// favour B_PRED), dequantize, and run the §14.2 reconstruction —
+    /// the recovered luma / chroma planes must be within ≤ 1 LSB of the
+    /// input.
     #[test]
     fn mb_block_set_roundtrip_flat_color_recovers_within_one_lsb() {
         // Pick a uniform pixel value off 128 so the residual is
@@ -2506,44 +2725,15 @@ mod tests {
             };
 
             // yac_qi = 0 is the lossless flat-block case
-            // (`DC_QLOOKUP[0] = AC_QLOOKUP[0] = 4`).
-            let encoded =
-                encode_mb_block_set(&pixels, 0, &DEFAULT_COEFF_PROBS).expect("encode_mb_block_set");
-
-            // Decode the emitted bytes back into raw quantized coeffs
-            // through `decode_mb_coeffs` (same predictor seeds: fresh
-            // contexts since this is a single isolated MB).
-            let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
-            let mut above = MbEntropyCtx::default();
-            let mut left = MbEntropyCtx::default();
-            let mut recovered_raw = decode_mb_coeffs(
-                &mut dec,
-                true,
-                false,
-                &DEFAULT_COEFF_PROBS,
-                &mut above,
-                &mut left,
-            )
-            .expect("decode_mb_coeffs");
-
-            // The decoder's recovered raw coefficients must match what
-            // the encoder produced (the §13.3 byte-stream layer is the
-            // tight invariant; this is the same check the standalone
-            // `encode_coeff_block` test in this module exercises but
-            // composed across all 25 residual blocks).
-            assert_eq!(
-                recovered_raw, encoded.coeffs,
-                "encoded coeffs differ from decoded raw coeffs (pixel = {pixel})"
-            );
-
-            // Dequantize and reconstruct against the modes the encoder
-            // picked (a flat block off 128 favours V/H/TM over DC since
-            // those carry a non-128 default, but whichever wins must
-            // round-trip).
-            let factors = MbDequantFactors::from_base_and_deltas(0, 0, 0, 0, 0, 0);
-            factors.dequantize(&mut recovered_raw);
-            let (y_plane, u_plane, v_plane) =
-                decode_single_mb(recovered_raw, encoded.y_mode, encoded.uv_mode);
+            // (`DC_QLOOKUP[0] = AC_QLOOKUP[0] = 4`). Decode through the
+            // mode-aware helper: with off-frame neighbours the picker may
+            // legitimately choose B_PRED (the evolving sub-block
+            // neighbours converge on the flat value better than the
+            // off-frame whole-block fills), so the decode must follow the
+            // picked mode's has_y2 / reconstruction path. The helper also
+            // asserts the §13.3 byte-layer roundtrip (raw == coeffs).
+            let (_y_mode, _uv, _sub, y_plane, u_plane, v_plane) =
+                encode_decode_bpred_aware(&pixels, &MbNeighbors::default(), 0);
 
             // Verify every reconstructed pixel is within ≤ 1 LSB of the
             // input across all three planes. At yac_qi = 0 the chain is
@@ -2625,27 +2815,10 @@ mod tests {
             u: [120u8; 64],
             v: [140u8; 64],
         };
-        let encoded =
-            encode_mb_block_set(&pixels, 16, &DEFAULT_COEFF_PROBS).expect("encode_mb_block_set");
-
-        let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
-        let mut above = MbEntropyCtx::default();
-        let mut left = MbEntropyCtx::default();
-        let mut recovered_raw = decode_mb_coeffs(
-            &mut dec,
-            true,
-            false,
-            &DEFAULT_COEFF_PROBS,
-            &mut above,
-            &mut left,
-        )
-        .expect("decode_mb_coeffs");
-        assert_eq!(recovered_raw, encoded.coeffs);
-
-        let factors = MbDequantFactors::from_base_and_deltas(16, 0, 0, 0, 0, 0);
-        factors.dequantize(&mut recovered_raw);
-        let (y_plane, _u_plane, _v_plane) =
-            decode_single_mb(recovered_raw, encoded.y_mode, encoded.uv_mode);
+        // Mode-aware decode (off-frame neighbours may favour B_PRED); the
+        // helper asserts the byte-layer roundtrip internally.
+        let (_y_mode, _uv, _sub, y_plane, _u_plane, _v_plane) =
+            encode_decode_bpred_aware(&pixels, &MbNeighbors::default(), 16);
 
         // At yac_qi = 16 the §14 chain holds to ≤ 2 LSB on a flat
         // block (the WHT + DCT round-trip introduces at most a small
@@ -2732,6 +2905,231 @@ mod tests {
             recon.u.to_vec(),
             recon.v.to_vec(),
         )
+    }
+
+    /// Encode `pixels` against `neighbors`, decode the bytes back, and
+    /// run the reconstruction orchestrator that matches the picked luma
+    /// mode — `decode_keyframe_mb_bpred` (no Y2) when `y_mode == B`, or
+    /// `decode_keyframe_mb_non_bpred` (with Y2) otherwise. Returns the
+    /// picked modes (luma, chroma, optional 16 sub-modes) plus the
+    /// reconstructed planes. This is the §11.3 / §12.3 superset of
+    /// [`encode_decode_with_neighbors`] used by the B_PRED tests.
+    #[allow(clippy::type_complexity)]
+    fn encode_decode_bpred_aware(
+        pixels: &MbPixels,
+        neighbors: &MbNeighbors,
+        yac_qi: u8,
+    ) -> (
+        IntraYMode,
+        IntraUvMode,
+        Option<[IntraBmode; 16]>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    ) {
+        let encoded =
+            encode_mb_block_set_with_neighbors(pixels, neighbors, yac_qi, &DEFAULT_COEFF_PROBS)
+                .expect("encode_mb_block_set_with_neighbors");
+
+        let is_bpred = encoded.y_mode == IntraYMode::B;
+        // A B_PRED macroblock has no Y2 block, so `decode_mb_coeffs`
+        // must be told `has_y2 = false` to route the Y plane through the
+        // YNoY2 token plane and skip block 24.
+        let has_y2 = !is_bpred;
+
+        let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
+        let mut above = MbEntropyCtx::default();
+        let mut left = MbEntropyCtx::default();
+        let mut raw = decode_mb_coeffs(
+            &mut dec,
+            has_y2,
+            false,
+            &DEFAULT_COEFF_PROBS,
+            &mut above,
+            &mut left,
+        )
+        .expect("decode_mb_coeffs");
+        assert_eq!(raw, encoded.coeffs, "byte-layer roundtrip mismatch");
+
+        let factors = MbDequantFactors::from_base_and_deltas(yac_qi as i32, 0, 0, 0, 0, 0);
+        factors.dequantize(&mut raw);
+
+        let recon = if is_bpred {
+            decode_keyframe_mb_bpred(
+                encoded.b_subblock_modes.as_ref(),
+                encoded.uv_mode,
+                false,
+                neighbors,
+                &raw.y,
+                &raw.u,
+                &raw.v,
+            )
+            .expect("decode_keyframe_mb_bpred")
+        } else {
+            decode_keyframe_mb_non_bpred(
+                encoded.y_mode,
+                encoded.uv_mode,
+                false,
+                neighbors,
+                &raw.y2,
+                &raw.y,
+                &raw.u,
+                &raw.v,
+            )
+            .expect("decode_keyframe_mb_non_bpred")
+        };
+
+        (
+            encoded.y_mode,
+            encoded.uv_mode,
+            encoded.b_subblock_modes,
+            recon.y.to_vec(),
+            recon.u.to_vec(),
+            recon.v.to_vec(),
+        )
+    }
+
+    // ───────── §11.3 / §12.3 B_PRED luma mode-pick tests ─────────
+
+    /// A flat MB (every luma pixel equal) sitting in a flat region —
+    /// i.e. with neighbour strips equal to the same constant — is
+    /// reproduced **exactly** (SAD 0) by the whole-block V / H / DC
+    /// modes. The B_PRED pass can at best tie that SAD 0, never beat it,
+    /// so the `< whole_sad` decision keeps the macroblock on a
+    /// whole-block luma mode (`y_mode != B`) and carries no sub-modes.
+    /// (With *off-frame* neighbours a flat MB legitimately favours
+    /// B_PRED, because the off-frame whole-block fills disagree with the
+    /// interior while the evolving sub-block neighbours converge on the
+    /// true constant — so the realistic flat-region case uses matching
+    /// neighbours, which is how flat areas appear mid-frame.)
+    #[test]
+    fn flat_mb_keeps_whole_block_luma_mode() {
+        let pixels = MbPixels {
+            y: [120u8; 256],
+            u: [120u8; 64],
+            v: [120u8; 64],
+        };
+        // Matching flat reconstructed-neighbour strips (a flat region).
+        let neighbors = MbNeighbors {
+            y_above: Some([120u8; 16]),
+            y_left: Some([120u8; 16]),
+            y_topleft: Some(120),
+            y_above_right: Some([120u8; 4]),
+            u_above: Some([120u8; 8]),
+            u_left: Some([120u8; 8]),
+            u_topleft: Some(120),
+            v_above: Some([120u8; 8]),
+            v_left: Some([120u8; 8]),
+            v_topleft: Some(120),
+        };
+
+        let (y_mode, _uv, sub, ry, _ru, _rv) = encode_decode_bpred_aware(&pixels, &neighbors, 8);
+
+        assert_ne!(
+            y_mode,
+            IntraYMode::B,
+            "a flat MB must NOT flip to B_PRED — a whole-block mode reproduces it exactly"
+        );
+        assert!(
+            sub.is_none(),
+            "whole-block luma decision must carry no sub-block modes"
+        );
+        // Sanity: it still reconstructs the flat value at high PSNR.
+        let p_y = psnr(&pixels.y, &ry);
+        assert!(p_y >= 30.0, "flat luma PSNR {p_y:.2} dB < 30 dB");
+    }
+
+    /// A macroblock built from per-4×4-sub-block diagonal structure —
+    /// each 4×4 sub-block a 45° gradient that no single whole-block
+    /// 16×16 mode can follow — must flip the top-level luma decision to
+    /// `B_PRED`. The picked sub-modes drive the decoder's per-sub-block
+    /// walk and the reconstruction must clear ≥ 30 dB. This is the
+    /// black-box validation for the round's B_PRED pass.
+    #[test]
+    fn diagonal_subblock_mb_picks_bpred_and_decodes_above_30db() {
+        // Build a 16×16 luma plane whose every 4×4 sub-block carries a
+        // strong diagonal gradient: pixel value depends on (row + col)
+        // within the sub-block, repeating per sub-block so the global
+        // plane has 16 independent diagonal tiles. A whole-block V / H /
+        // DC / TM prediction smears across the tile boundaries; the
+        // per-sub-block B_PRED diagonal modes (B_LD / B_RD / …) fit each
+        // tile far better, so total B_PRED SAD beats every whole-block
+        // mode.
+        let mut y = [0u8; 256];
+        for r in 0..16usize {
+            for c in 0..16usize {
+                // Local coordinates inside the 4×4 sub-block.
+                let lr = r % 4;
+                let lc = c % 4;
+                // Diagonal ramp 30..=240 across the sub-block's
+                // anti-diagonal; alternate the slope direction per
+                // sub-block so neighbouring tiles differ.
+                let sb = (r / 4) * 4 + (c / 4);
+                let d = if sb % 2 == 0 { lr + lc } else { 6 - (lr + lc) };
+                y[r * 16 + c] = (30 + d * 35) as u8;
+            }
+        }
+        // Flat chroma — chroma always uses a whole-block mode regardless.
+        let pixels = MbPixels {
+            y,
+            u: [128u8; 64],
+            v: [128u8; 64],
+        };
+        let neighbors = MbNeighbors::default();
+
+        let (y_mode, _uv, sub, ry, _ru, _rv) = encode_decode_bpred_aware(&pixels, &neighbors, 4);
+
+        assert_eq!(
+            y_mode,
+            IntraYMode::B,
+            "a per-4×4-sub-block-structured MB must pick B_PRED"
+        );
+        let sub = sub.expect("B_PRED MB must carry sixteen sub-block modes");
+        assert_eq!(sub.len(), 16);
+
+        let p_y = psnr(&pixels.y, &ry);
+        assert!(
+            p_y >= 30.0,
+            "B_PRED luma reconstruction PSNR {p_y:.2} dB < 30 dB"
+        );
+    }
+
+    /// The encoder's in-place neighbour evolution must match the
+    /// decoder's: the bytes a B_PRED MB emits, fed back through
+    /// `decode_keyframe_mb_bpred` with the **same** sub-modes and
+    /// neighbours, must reconstruct the exact pixels the encoder's
+    /// internal working buffer held. We check this indirectly via the
+    /// byte-layer roundtrip assertion in the helper (raw == coeffs) plus
+    /// a tighter PSNR floor at a low quantiser on the same diagonal MB.
+    #[test]
+    fn bpred_neighbour_evolution_roundtrips_at_low_q() {
+        let mut y = [0u8; 256];
+        for r in 0..16usize {
+            for c in 0..16usize {
+                let lr = r % 4;
+                let lc = c % 4;
+                let sb = (r / 4) * 4 + (c / 4);
+                let d = if sb % 2 == 0 { lr + lc } else { 6 - (lr + lc) };
+                y[r * 16 + c] = (30 + d * 35) as u8;
+            }
+        }
+        let pixels = MbPixels {
+            y,
+            u: [128u8; 64],
+            v: [128u8; 64],
+        };
+        let neighbors = MbNeighbors::default();
+
+        // At yac_qi = 0 the §14 chain is near-lossless; the B_PRED
+        // reconstruction should clear a high PSNR floor.
+        let (y_mode, _uv, sub, ry, _ru, _rv) = encode_decode_bpred_aware(&pixels, &neighbors, 0);
+        assert_eq!(y_mode, IntraYMode::B);
+        assert!(sub.is_some());
+        let p_y = psnr(&pixels.y, &ry);
+        assert!(
+            p_y >= 40.0,
+            "B_PRED luma PSNR at q0 {p_y:.2} dB < 40 dB — neighbour evolution likely diverged"
+        );
     }
 
     /// A macroblock whose pixels are constant down each column but vary
@@ -2949,17 +3347,11 @@ mod tests {
         }
         let pixels = MbPixels { y, u, v };
 
-        let encoded =
-            encode_mb_block_set(&pixels, 8, &DEFAULT_COEFF_PROBS).expect("encode_mb_block_set");
-
-        let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
-        let mut a = MbEntropyCtx::default();
-        let mut l = MbEntropyCtx::default();
-        let mut raw = decode_mb_coeffs(&mut dec, true, false, &DEFAULT_COEFF_PROBS, &mut a, &mut l)
-            .expect("decode_mb_coeffs");
-        let factors = MbDequantFactors::from_base_and_deltas(8, 0, 0, 0, 0, 0);
-        factors.dequantize(&mut raw);
-        let (ry, ru, rv) = decode_single_mb(raw, encoded.y_mode, encoded.uv_mode);
+        // Mode-aware decode: a diagonal texture with off-frame neighbours
+        // may pick B_PRED for luma; either way the residual must
+        // reconstruct the texture above the PSNR floor.
+        let (_y_mode, _uv, _sub, ry, ru, rv) =
+            encode_decode_bpred_aware(&pixels, &MbNeighbors::default(), 8);
 
         let p_y = psnr(&pixels.y, &ry);
         let p_u = psnr(&pixels.u, &ru);

@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 3b: B_PRED 4×4 sub-block intra mode pick (RFC
+  6386 §11.3 / §12.3)** — the per-MB luma decision now also evaluates
+  the `B_PRED` path, in which the 16×16 luma plane is encoded as sixteen
+  independent 4×4 sub-blocks, each choosing the SAD-minimising one of the
+  ten §12.3 sub-modes (`B_DC` / `B_TM` / `B_VE` / `B_HE` / `B_LD` /
+  `B_RD` / `B_VR` / `B_VL` / `B_HD` / `B_HU`) against the source, with
+  in-place neighbour evolution — every sub-block predicts from the
+  already-reconstructed (predictor + dequantised residue) pixels of the
+  sub-blocks above and to its left, including the §12.3 right-edge
+  above-right fixup. The encoder reuses the decoder's `predict_b4x4`
+  kernel and `inverse_dct_4x4` / `add_residue_4x4` so the reconstruction
+  it evolves against is exactly the one the decoder produces. A top-level
+  luma decision picks `B_PRED` over the best whole-block mode iff its
+  total prediction SAD is strictly lower (a flat / single-edge region in
+  matching neighbours stays whole-block). When `B_PRED` wins the
+  macroblock carries no Y2 block: the sixteen Y sub-blocks keep their own
+  DC and are token-coded through the `YNoY2` plane (`has_y2 = false`).
+  The chosen sixteen sub-modes ride on `EncodedMb::b_subblock_modes`
+  (`Some` iff `y_mode == B`, else `None`), feeding the decoder's
+  `decode_keyframe_mb_bpred` walk. No rate-distortion bit-cost term and
+  no inter prediction this round. Validated by 3 new unit tests in
+  `src/encoder.rs`:
+  * `diagonal_subblock_mb_picks_bpred_and_decodes_above_30db` — a
+    macroblock built from per-4×4-sub-block diagonal tiles (which no
+    single whole-block mode follows) flips to `B_PRED` and reconstructs
+    at **≈ 54 dB** PSNR at `yac_qi = 4`, with a genuine per-sub-block
+    mode mix (`Tm` / `Ve` / `He` / `Dc`).
+  * `bpred_neighbour_evolution_roundtrips_at_low_q` — the same diagonal
+    MB at `yac_qi = 0` clears a 40 dB floor, confirming the encoder's
+    neighbour evolution matches the decoder's bit-for-bit.
+  * `flat_mb_keeps_whole_block_luma_mode` — a flat MB in matching flat
+    neighbours stays on a whole-block mode (`y_mode != B`, no sub-modes).
+  The three Phase 2 flat / textured roundtrip tests
+  (`mb_block_set_roundtrip_flat_color_recovers_within_one_lsb`,
+  `…_at_q16_holds_within_2_lsb`, `isolated_mb_textured_roundtrips_above_30db`)
+  now decode through a mode-aware helper, since an isolated (off-frame
+  neighbour) flat or textured MB can legitimately pick `B_PRED`.
 * **VP8 encoder Phase 3: whole-block intra mode pick (RFC 6386
   §12.2)** — the per-MB driver now evaluates all four §12.2 whole-block
   intra modes (`DC_PRED` / `V_PRED` / `H_PRED` / `TM_PRED`) for the

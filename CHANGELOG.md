@@ -6,6 +6,38 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 8: multi-frame keyframe stream driver
+  (RFC 6386 §4 / §9.1 / §9.7 / §9.8)** — new
+  `Vp8KeyframeStreamEncoder` consumes a sequence of `I420Frame`s and
+  emits a sequence of independently-decodable VP8 key frames, owning
+  the cross-frame state a real stream needs: a frame counter,
+  dimensions locked at the first `encode_frame` call, and the §9
+  three-slot reference-frame buffer (`LAST` / `GOLDEN` / `ALTREF`).
+  Every emitted frame implicitly refreshes all three slots per the §9.7
+  / §9.8 keyframe rule, mirroring `Vp8DecoderState::decode_key_frame`'s
+  slot-installation logic one-for-one. New
+  `encode_keyframe_with_reconstruction` companion to `encode_keyframe`
+  returns both the bytes and the macroblock-aligned post-§15
+  reconstructed planes, avoiding a re-decode on the slot-refresh path.
+  Mid-stream resize is surfaced as `StreamEncodeError::DimensionsChanged`
+  (failed calls leave the counter unchanged). Validated on a synthetic
+  5-frame I420 sequence at `qi = 32` on a 48×32 source: per-frame
+  self-decode PSNR through `Vp8DecoderState` ranges 45.36–48.53 dB
+  (mean 46.90 dB), comfortably above the 30 dB round target. New tests
+  in `tests/encoder_keyframe_stream.rs`:
+  `five_frame_keyframe_stream_mid_quant_meets_30db_per_frame` pins the
+  per-frame PSNR floor through `Vp8DecoderState`;
+  `every_emitted_frame_is_a_keyframe` confirms the §9.1
+  `key_frame == 0` bit + `0x9d 0x01 0x2a` start code on every emitted
+  frame and that each frame independently decodes from a fresh
+  `Vp8DecoderState`; `first_frame_matches_standalone_encode_keyframe_psnr`
+  pins byte-equality between the stream encoder's first frame and the
+  standalone `encode_keyframe`; `stream_rejects_mid_stream_resize`
+  pins the dimension-lock error path. Plus 4 unit tests inside
+  `stream.rs` covering the fresh-state contract, first-frame slot
+  population, slot replacement across frames, and dimension-change
+  rejection. Tests: 423 → 427.
+
 * **VP8 encoder Phase 7: §15 loop filter wired into the keyframe driver
   (RFC 6386 §9.4 / §15)** — `encode_keyframe` now honours a non-zero
   `KeyframeParams::loop_filter_level` (0..=63) and a matching

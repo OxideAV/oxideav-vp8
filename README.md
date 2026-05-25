@@ -2,6 +2,36 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 139)
+
+**Encoder Phase 8 — multi-frame keyframe stream driver.** New
+`Vp8KeyframeStreamEncoder` consumes a sequence of `I420Frame`s and
+emits a sequence of independently-decodable VP8 key frames, owning
+the cross-frame state a real stream needs: a frame counter, the
+dimensions locked at the first `encode_frame` call, and the §9
+three-slot reference-frame buffer (`LAST` / `GOLDEN` / `ALTREF`).
+Every emitted frame implicitly refreshes all three slots per RFC 6386
+§9.7 / §9.8's keyframe rule, mirroring `Vp8DecoderState`'s
+`decode_key_frame` slot-installation logic one-for-one so the
+inter-encoder round drops in without further plumbing. A new
+`encode_keyframe_with_reconstruction` returns both the bytes and the
+macroblock-aligned post-§15 reconstructed planes, avoiding a re-decode
+on the slot-refresh path. Mid-stream resize is surfaced as
+`StreamEncodeError::DimensionsChanged`; failed calls leave the
+counter unchanged.
+
+Round target validated: a synthetic 5-frame I420 sequence (per-frame
+shifted diagonal luma gradient + walking 128-flat square + per-frame
+chroma DC), encoded then decoded through `Vp8DecoderState`, hits
+**per-frame self-decode PSNR 45.36–48.53 dB (mean 46.90 dB)** at
+`qi = 32` on a 48×32 source, comfortably clearing the 30 dB bar. A
+companion test confirms every emitted frame has the §9.1
+`key_frame == 0` bit and the `0x9d 0x01 0x2a` start code, and that
+each frame independently decodes from a fresh `Vp8DecoderState`. A
+third test pins byte-equality between the stream encoder's first
+frame and the standalone `encode_keyframe`. Tests: 423 → 427 (+4 in
+the new `encoder_keyframe_stream.rs`, +4 in `stream.rs` unit tests).
+
 ## Status — 2026-05-26 (round 138)
 
 **Encoder Phase 7 — §15 loop filter wired into the keyframe driver.**

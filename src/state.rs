@@ -87,7 +87,7 @@ pub struct RefFrameSlot {
 }
 
 impl RefFrameSlot {
-    fn from_keyframe_planes(planes: &KeyframePlanes) -> Self {
+    pub(crate) fn from_keyframe_planes(planes: &KeyframePlanes) -> Self {
         RefFrameSlot {
             y: planes.y.clone(),
             u: planes.u.clone(),

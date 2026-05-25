@@ -2776,6 +2776,36 @@ impl Default for KeyframeParams {
 ///
 /// [`MbNeighbors`]: crate::reconstruct::MbNeighbors
 pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec<u8>, EncodeError> {
+    let (bytes, _planes) = encode_keyframe_with_reconstruction(frame, params)?;
+    Ok(bytes)
+}
+
+/// Encode a key frame and return both the bitstream bytes **and** the
+/// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`] the
+/// decoder will rebuild from those bytes.
+///
+/// This is the same machinery as [`encode_keyframe`] — the encoder
+/// already maintains a running reconstruction buffer internally so each
+/// macroblock can predict from genuine reconstructed neighbours, and
+/// the §15 post-walk loop filter pass mutates that buffer in place. The
+/// only difference is that here we hand the resulting buffer back to
+/// the caller instead of dropping it on return.
+///
+/// The returned planes are the **macroblock-aligned** post-§15 frame
+/// (width rounded up to `mb_cols * 16`, height to `mb_rows * 16`),
+/// matching the layout of [`crate::frame::KeyframePlanes`] and the
+/// per-slot storage of [`crate::state::RefFrameSlot`]. This is exactly
+/// the shape the §9 reference-frame buffer wants — a multi-frame
+/// keyframe driver can drop the planes straight into the LAST / GOLDEN
+/// / ALTREF slots that a subsequent inter frame would predict from.
+///
+/// The visible-cropped (`width × height`) picture suitable for display
+/// is what the crate's own [`crate::decode_vp8`] produces when handed
+/// the returned bytes.
+pub fn encode_keyframe_with_reconstruction(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
     if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
@@ -2951,11 +2981,11 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
         };
         crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
     }
-    // Suppress an unused-variable lint when the filter is skipped — the
-    // reconstruction buffer carries no further role on the encode path
-    // (the bitstream walks `modes` + `all_coeffs`), but keeping `planes`
-    // alive here documents the intent.
-    let _ = &planes;
+    // `planes` is the macroblock-aligned post-§15 reconstruction. It is
+    // returned to the caller alongside the bitstream below so a
+    // multi-frame keyframe driver can install it into the §9
+    // reference-frame buffer (LAST / GOLDEN / ALTREF) without paying the
+    // cost of re-decoding the bytes we just emitted.
 
     // ---- §19.2 first (control) partition --------------------------------
     let mut hdr = BoolEncoder::new();
@@ -3083,7 +3113,7 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
         out.extend_from_slice(part);
     }
 
-    Ok(out)
+    Ok((out, planes))
 }
 
 /// Clear the §13.3 non-zero predictor slots a skip macroblock touches.

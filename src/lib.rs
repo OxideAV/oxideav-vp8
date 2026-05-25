@@ -304,12 +304,13 @@ pub use dct_tokens::{
 pub use decoder::{decode_vp8, DecodeError, Vp8DecodedFrame};
 pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
 pub use encoder::{
-    classify_coeff_token, encode_coeff_block, encode_mb_block_set, encode_silent_keyframe,
-    make_encoder, patch_first_partition_size, write_frame_tag, write_loop_filter,
-    write_mb_no_skip_coeff, write_no_token_prob_updates, write_quant_indices,
-    write_segment_update_flags, write_token_partition_count, BoolEncoder, EncodeError, EncodedMb,
-    MbPixels, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams,
-    TokenEncodeError, TokenEncoder,
+    classify_coeff_token, encode_coeff_block, encode_mb_block_set,
+    encode_mb_block_set_with_neighbors, encode_silent_keyframe, make_encoder,
+    patch_first_partition_size, write_frame_tag, write_loop_filter, write_mb_no_skip_coeff,
+    write_no_token_prob_updates, write_quant_indices, write_segment_update_flags,
+    write_token_partition_count, BoolEncoder, EncodeError, EncodedMb, MbPixels,
+    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
+    TokenEncoder,
 };
 pub use forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};

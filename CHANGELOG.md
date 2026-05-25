@@ -6,6 +6,44 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 3: whole-block intra mode pick (RFC 6386
+  §12.2)** — the per-MB driver now evaluates all four §12.2 whole-block
+  intra modes (`DC_PRED` / `V_PRED` / `H_PRED` / `TM_PRED`) for the
+  16×16 luma plane and the 8×8 chroma planes, picking the SAD-minimising
+  mode independently for luma and chroma (no rate-distortion term yet),
+  and residual-codes the source against that mode's prediction instead
+  of a flat 128. Prediction uses the crate's shared `intra_predict`
+  kernels (`predict_y16x16` / `predict_uv8x8`) — the exact kernels the
+  decoder reconstructs with — so the residual the encoder subtracts is
+  the residue the decoder adds back. The picked `y_mode` / `uv_mode` are
+  surfaced on `EncodedMb`. New public surface:
+  `encode_mb_block_set_with_neighbors`, which scores the picker against
+  caller-supplied reconstructed-neighbour strips (`reconstruct::MbNeighbors`)
+  rather than off-frame defaults; `encode_mb_block_set` is now a thin
+  wrapper over it with all-off-frame neighbours. Validated by 4 new
+  unit tests in `src/encoder.rs`:
+  * `mode_pick_chooses_v_pred_for_column_constant_mb` — a
+    column-constant (horizontally-varying) MB whose `above` neighbour
+    equals the column pattern; the picker chooses `V_PRED` for luma and
+    chroma and the decode reconstructs **bit-exact** (∞ dB) at
+    `yac_qi = 8`.
+  * `mode_pick_chooses_h_pred_for_row_constant_mb` — a row-constant
+    (vertically-varying) MB with a matching `left` neighbour; picks
+    `H_PRED`, reconstructs bit-exact.
+  * `mode_pick_chooses_tm_pred_for_planar_ramp_mb` — a planar ramp
+    `clamp(L_i + A_j − P)` with matching above / left / corner; picks
+    `TM_PRED`, reconstructs bit-exact.
+  * `isolated_mb_textured_roundtrips_above_30db` — a textured MB with
+    off-frame neighbours through `encode_mb_block_set`; reconstructs at
+    ≈ 44–45 dB PSNR (luma / U / V) at `yac_qi = 8`.
+  The three flat-colour Phase 2 roundtrip tests were updated to
+  reconstruct against the picked modes (a flat block off 128 now favours
+  a non-DC default) and to additionally verify the chroma planes.
+  `B_PRED`, inter prediction, a true rate-distortion search, and the
+  per-frame raster driver remain deferred to subsequent rounds.
+
+  Lib test count: 382 → 386 (4 new in `encoder::tests`).
+
 * **VP8 encoder Phase 2: per-MB block-set wiring (RFC 6386 §13.3 /
   §14.2)** — new `encode_mb_block_set` driver in `src/encoder.rs` that
   takes a single 16×16 Y + 8×8 Cb + 8×8 Cr macroblock at known

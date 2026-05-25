@@ -2,6 +2,44 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 133)
+
+**Encoder Phase 3 — whole-block intra mode pick landed.** The per-MB
+driver now selects among the four §12.2 whole-block intra modes
+(`DC_PRED` / `V_PRED` / `H_PRED` / `TM_PRED`) instead of forcing
+`DC_PRED`. For each macroblock it evaluates every candidate's
+prediction (via the shared `intra_predict` kernels the decoder already
+uses), scores it by SAD against the source, and residual-codes against
+the lowest-SAD mode — independently for the 16×16 luma plane and the
+shared 8×8 chroma `uv_mode`. This is a SAD picker, not a
+rate-distortion search (no bit-cost term yet). The picked
+`y_mode` / `uv_mode` ride on `EncodedMb`.
+
+A new `encode_mb_block_set_with_neighbors` entry scores the picker
+against caller-supplied reconstructed-neighbour strips
+(`reconstruct::MbNeighbors`); `encode_mb_block_set` is now a thin
+wrapper that passes all-off-frame neighbours (the §12 127 / 129 / 128
+defaults), preserving its isolated-MB behaviour.
+
+Validated by 4 new unit tests:
+
+* `mode_pick_chooses_v_pred_for_column_constant_mb` — a
+  column-constant (horizontally-varying) MB whose `above` neighbour
+  matches the pattern; picks `V_PRED` for luma + chroma and decodes
+  **bit-exact** at `yac_qi = 8`.
+* `mode_pick_chooses_h_pred_for_row_constant_mb` — a row-constant
+  (vertically-varying) MB with matching `left`; picks `H_PRED`,
+  bit-exact.
+* `mode_pick_chooses_tm_pred_for_planar_ramp_mb` — a planar ramp
+  `clamp(L_i + A_j − P)`; picks `TM_PRED`, bit-exact.
+* `isolated_mb_textured_roundtrips_above_30db` — a textured isolated
+  MB through `encode_mb_block_set`; reconstructs at ≈ 44–45 dB PSNR.
+
+`B_PRED`, inter prediction, a true RD search, and the per-frame raster
+driver remain the next encoder rounds.
+
+Lib test count: 382 → 386.
+
 ## Status — 2026-05-25 (round 132)
 
 **Encoder Phase 2 — per-MB block-set wiring landed.** The crate now

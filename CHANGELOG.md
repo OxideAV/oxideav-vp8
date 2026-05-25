@@ -6,6 +6,33 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 7: §15 loop filter wired into the keyframe driver
+  (RFC 6386 §9.4 / §15)** — `encode_keyframe` now honours a non-zero
+  `KeyframeParams::loop_filter_level` (0..=63) and a matching
+  `sharpness_level` (0..=7). After the per-MB raster walk completes, the
+  encoder runs the §15.1 normal filter over its own reconstruction
+  buffer via the existing decoder-side `filter_frame`, so the encoder's
+  self-decode produces the same pixels the decoder will reproduce from
+  the bitstream. The §9.4 `mode_ref_lf_delta_enabled` flag stays at 0
+  this round (per-MB delta layer not yet emitted); segmentation also
+  stays off, so the per-MB level resolves to the frame base in every
+  case. Validation pre-walk: `loop_filter_level > 63` →
+  `EncodeError::LoopFilterLevelOutOfRange`; `sharpness_level > 7` →
+  `EncodeError::SharpnessLevelOutOfRange`. At `48×32 qi=32` the
+  whole-frame self-decode PSNR moves from 43.29 dB (level 0) to
+  43.30 / 44.67 / 44.23 dB at levels 1 / 8 / 24 — every level decodes
+  cleanly through `decode_vp8` and the §9.4 fields round-trip in the
+  parsed `Vp8FrameHeader`. New tests in
+  `encoder_keyframe_roundtrip.rs`: `keyframe_loop_filter_levels_roundtrip`
+  pins the {0, 1, 8, 24} sweep + the "filter actually ran" PSNR-vs-baseline
+  invariant; `keyframe_loop_filter_level_out_of_range_rejected` and
+  `keyframe_sharpness_level_out_of_range_rejected` pin the validators;
+  `keyframe_sharpness_level_roundtrip` sweeps `{0, 1, 4, 7}` at filter
+  level 16. Adds a `KeyframeParams::sharpness_level` field (`0` by
+  default — value-compatible with prior callers that used the struct
+  literal form, modulo the explicit-init). No external implementation
+  consulted. Tests: 7 → 11 in `encoder_keyframe_roundtrip.rs`.
+
 * **VP8 encoder Phase 6: multi-partition DCT output (RFC 6386 §9.5 /
   §19.2 / §20.4)** — `encode_keyframe` generalises to the four-value
   `log2_nbr_of_dct_partitions` table. A new

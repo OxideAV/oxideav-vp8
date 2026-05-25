@@ -2,6 +2,45 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 138)
+
+**Encoder Phase 7 — §15 loop filter wired into the keyframe driver.**
+`encode_keyframe` now honours a non-zero
+`KeyframeParams::loop_filter_level` (`0..=63`) and a matching
+`KeyframeParams::sharpness_level` (`0..=7`). The encoder runs the
+§15.1 normal filter over its own reconstruction buffer after the per-MB
+raster walk completes (§15 page 84 — *"After the predictor and residue
+have been summed for every macroblock, the filter is applied to the
+edges between adjacent macroblocks and the edges between adjacent
+subblocks"*), reusing the decoder-side `filter_frame` so the encoder's
+self-decode produces the same pixels the decoder will reproduce from
+the bitstream. The §9.4 `mode_ref_lf_delta_enabled` flag stays at 0 this
+round (per-MB delta layer not yet emitted); segmentation also stays
+off, so the per-MB level resolves to the frame base in every case.
+
+Pre-walk validators surface `EncodeError::LoopFilterLevelOutOfRange`
+for `loop_filter_level > 63` and
+`EncodeError::SharpnessLevelOutOfRange` for `sharpness_level > 7`. On a
+48×32 synthetic source at `qi = 32`, the whole-frame self-decode PSNR
+sweeps as:
+
+| `loop_filter_level` | self-decode PSNR (dB) |
+|---------------------|-----------------------|
+| 0                   | 43.29 |
+| 1                   | 43.30 |
+| 8                   | 44.67 |
+| 24                  | 44.22 |
+
+Every level decodes cleanly through `decode_vp8`; non-zero levels
+actually alter the reconstruction (a "filter actually ran" invariant
+test asserts the level-0 PSNR is not reproduced at any non-zero level).
+New tests in `encoder_keyframe_roundtrip.rs`:
+`keyframe_loop_filter_levels_roundtrip` pins the {0, 1, 8, 24} sweep;
+`keyframe_loop_filter_level_out_of_range_rejected` and
+`keyframe_sharpness_level_out_of_range_rejected` pin the validators;
+`keyframe_sharpness_level_roundtrip` sweeps `{0, 1, 4, 7}` at filter
+level 16. Tests: 7 → 11 in `encoder_keyframe_roundtrip.rs`.
+
 ## Status — 2026-05-26 (round 137)
 
 **Encoder Phase 6 — multi-partition DCT output landed.** `encode_keyframe`

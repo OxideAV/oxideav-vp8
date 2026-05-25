@@ -2685,11 +2685,25 @@ pub struct KeyframeParams {
     pub y_ac_qi: u8,
     /// §9.4 baseline loop filter level (0..=63). `0` triggers the §15
     /// whole-frame loop-filter skip — the encoder leaves the residual
-    /// reconstruction unfiltered, which is what the per-MB neighbour
-    /// evolution in this driver assumes. **Only level 0 is supported**;
-    /// a non-zero level would require the encoder to run the §15 filter
-    /// before gathering neighbours, which this round does not do.
+    /// reconstruction unfiltered. For any non-zero value the encoder
+    /// runs the §15 filter over its own reconstruction buffer after the
+    /// per-MB raster walk finishes, so the encoder's self-decode
+    /// produces the same pixels the decoder will (the per-MB neighbour
+    /// gather happens before the filter pass — §15.1 page 84 specifies
+    /// the filter is a post-reconstruction stage).
+    ///
+    /// The §9.4 `mode_ref_lf_delta_enabled` flag is held at 0 by this
+    /// encoder; the per-MB level therefore reduces to the frame base
+    /// (with no segmentation override either, since segmentation is
+    /// off). Values > 63 are rejected with
+    /// [`EncodeError::LoopFilterLevelOutOfRange`].
     pub loop_filter_level: u8,
+    /// §9.4 `sharpness_level` (0..=7). Feeds the §15.4 `interior_limit`
+    /// derivation alongside the per-MB `loop_filter_level`. Only
+    /// consulted when `loop_filter_level != 0` (the §15 skip path also
+    /// skips the §15.4 control derivation). Values > 7 are rejected with
+    /// [`EncodeError::SharpnessLevelOutOfRange`].
+    pub sharpness_level: u8,
     /// §9.5 DCT-coefficient partition count. Must be one of 1 / 2 / 4 / 8
     /// (the on-wire `log2_nbr_of_dct_partitions` field is two bits per
     /// the §9.5 table). Macroblock rows are distributed round-robin per
@@ -2705,6 +2719,7 @@ impl Default for KeyframeParams {
         KeyframeParams {
             y_ac_qi: 32,
             loop_filter_level: 0,
+            sharpness_level: 0,
             nbr_of_dct_partitions: 1,
         }
     }
@@ -2749,12 +2764,15 @@ impl Default for KeyframeParams {
 ///
 /// # Scope (this round)
 ///
-/// Single key frame, SAD-only mode pick, no rate-distortion bit-cost
-/// term, no inter prediction, loop filter level 0 only. The §9.5 DCT
-/// partition count is configurable (1 / 2 / 4 / 8) through
+/// Single key frame, RD intra mode pick, no inter prediction. The §9.5
+/// DCT partition count is configurable (1 / 2 / 4 / 8) through
 /// [`KeyframeParams::nbr_of_dct_partitions`]; the residual coding inside
 /// each partition is bit-identical to the 1-partition case (multi-
 /// partition output is a layout reorganisation, not a coding change).
+/// The §15 loop filter runs as a post-reconstruction stage when
+/// `KeyframeParams::loop_filter_level != 0`; the §9.4 reference / mode
+/// delta layer is disabled (the encoder writes
+/// `mode_ref_lf_delta_enabled = false`).
 ///
 /// [`MbNeighbors`]: crate::reconstruct::MbNeighbors
 pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec<u8>, EncodeError> {
@@ -2768,9 +2786,14 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
             value: params.y_ac_qi,
         });
     }
-    if params.loop_filter_level != 0 {
+    if params.loop_filter_level > 63 {
         return Err(EncodeError::LoopFilterLevelOutOfRange {
             value: params.loop_filter_level,
+        });
+    }
+    if params.sharpness_level > 7 {
+        return Err(EncodeError::SharpnessLevelOutOfRange {
+            value: params.sharpness_level,
         });
     }
     // §9.5 — the partition-count is validated here so a bad value is
@@ -2880,6 +2903,60 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
         }
     }
 
+    // ---- §15 loop-filter post-pass --------------------------------------
+    //
+    // RFC 6386 §15 page 84: "After the predictor and residue have been
+    // summed for every macroblock, the filter is applied to the edges
+    // between adjacent macroblocks and the edges between adjacent
+    // subblocks." We run the filter here, after the raster walk has
+    // completed and *before* the bitstream is assembled, so the encoder's
+    // reconstruction buffer ends up bit-identical to what the decoder
+    // will produce after its own §15.1 pass over the same frame.
+    //
+    // The per-MB neighbour gather inside the raster loop above
+    // intentionally runs against the *unfiltered* reconstruction (the
+    // §15.1 filter is a post-reconstruction stage — the predictors that
+    // feed each macroblock's intra prediction always sample the
+    // unfiltered neighbour). The filter only adjusts pixels at MB / sub-
+    // block edges after every MB has been reconstructed.
+    //
+    // `filter_frame` uses `MbCoeffs` only for the §15.1 page 86
+    // "any-coded-coefficient" test that gates the inter-subblock edges
+    // (steps 2 and 4); that test reduces to "any non-zero coefficient",
+    // which is invariant under dequantisation by the non-zero §14.1 Q
+    // steps, so we can pass the raw quantised `all_coeffs` directly.
+    if params.loop_filter_level != 0 {
+        let lf_config = crate::loop_filter::FrameFilterConfig {
+            // §15.3 normal filter — mirrors the `filter_type = false`
+            // bit we emit just below in `write_loop_filter`.
+            simple: false,
+            key_frame: true,
+            loop_filter_level: params.loop_filter_level,
+            sharpness_level: params.sharpness_level,
+            // Segmentation off (we emit `update_mb_segmentation_map =
+            // false`), so the segment override never applies.
+            segmentation_enabled: false,
+            segment_abs: false,
+            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+            // `mode_ref_lf_delta_enabled = false`, so every delta is 0.
+            delta_enabled: false,
+            ref_delta_current: 0,
+            bpred_mode_delta: 0,
+            ref_delta_last: 0,
+            ref_delta_golden: 0,
+            ref_delta_altref: 0,
+            zero_mv_mode_delta: 0,
+            other_mv_mode_delta: 0,
+            split_mv_mode_delta: 0,
+        };
+        crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
+    }
+    // Suppress an unused-variable lint when the filter is skipped — the
+    // reconstruction buffer carries no further role on the encode path
+    // (the bitstream walks `modes` + `all_coeffs`), but keeping `planes`
+    // alive here documents the intent.
+    let _ = &planes;
+
     // ---- §19.2 first (control) partition --------------------------------
     let mut hdr = BoolEncoder::new();
 
@@ -2888,8 +2965,19 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
     hdr.write_bool(128, false);
     // §9.3 — segmentation off.
     write_segment_update_flags(&mut hdr, false);
-    // §9.4 — loop filter (level 0 → whole-frame §15 skip).
-    write_loop_filter(&mut hdr, false, params.loop_filter_level, 0, false)?;
+    // §9.4 — loop filter. `filter_type = false` selects the §15.3 normal
+    // filter; `mode_ref_lf_delta_enabled = false` (per the
+    // [`KeyframeParams`] docs) so no per-MB delta layer is emitted.
+    // `loop_filter_level == 0` triggers the §15 whole-frame skip on the
+    // decoder side; any non-zero value is honoured by both ends of the
+    // round-trip via the post-walk filter pass above.
+    write_loop_filter(
+        &mut hdr,
+        false,
+        params.loop_filter_level,
+        params.sharpness_level,
+        false,
+    )?;
     // §9.5 — DCT partition count.
     write_token_partition_count(&mut hdr, params.nbr_of_dct_partitions)?;
     // §9.6 — quant indices (baseline only).
@@ -3186,6 +3274,7 @@ mod tests {
         let params = KeyframeParams {
             y_ac_qi: 32,
             loop_filter_level: 0,
+            sharpness_level: 0,
             nbr_of_dct_partitions: 1,
         };
         let bytes = encode_keyframe(&frame, &params).expect("encode");
@@ -3276,6 +3365,7 @@ mod tests {
             let params = KeyframeParams {
                 y_ac_qi: qi,
                 loop_filter_level: 0,
+                sharpness_level: 0,
                 nbr_of_dct_partitions: 1,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
@@ -3312,6 +3402,7 @@ mod tests {
             let params = KeyframeParams {
                 y_ac_qi: qi,
                 loop_filter_level: 0,
+                sharpness_level: 0,
                 nbr_of_dct_partitions: 1,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");

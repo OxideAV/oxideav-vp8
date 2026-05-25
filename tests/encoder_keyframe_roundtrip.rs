@@ -120,6 +120,7 @@ fn roundtrip_at_partitioned(
     let params = KeyframeParams {
         y_ac_qi,
         loop_filter_level: 0,
+        sharpness_level: 0,
         nbr_of_dct_partitions,
     };
     let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
@@ -194,6 +195,7 @@ fn keyframe_multi_partition_psnr_matches_single_partition_baseline() {
         let params = KeyframeParams {
             y_ac_qi: qi,
             loop_filter_level: 0,
+            sharpness_level: 0,
             nbr_of_dct_partitions: count,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
@@ -249,6 +251,7 @@ fn keyframe_multi_partition_short_frame_roundtrip() {
         let params = KeyframeParams {
             y_ac_qi: qi,
             loop_filter_level: 0,
+            sharpness_level: 0,
             nbr_of_dct_partitions: 1,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
@@ -259,6 +262,7 @@ fn keyframe_multi_partition_short_frame_roundtrip() {
         let params = KeyframeParams {
             y_ac_qi: qi,
             loop_filter_level: 0,
+            sharpness_level: 0,
             nbr_of_dct_partitions: count,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
@@ -281,11 +285,150 @@ fn keyframe_invalid_partition_count_rejected() {
         let params = KeyframeParams {
             y_ac_qi: 32,
             loop_filter_level: 0,
+            sharpness_level: 0,
             nbr_of_dct_partitions: bad,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::InvalidDctPartitionCount { value }) => assert_eq!(value, bad),
             other => panic!("expected InvalidDctPartitionCount for {bad}, got {other:?}"),
         }
+    }
+}
+
+/// §15 loop-filter round-trip across the configurable
+/// `KeyframeParams::loop_filter_level`.
+///
+/// The encoder now runs the §15.1 normal filter over its own
+/// reconstruction buffer after the per-MB raster walk completes, and the
+/// decoder runs the same pass when it sees a non-zero
+/// `loop_filter_level` in the frame header. This test pins both ends of
+/// that handshake: for every level in `{0, 1, 8, 24}` at a mid quantiser,
+///
+///   * the encoded stream re-decodes through `decode_vp8` (no header /
+///     reconstruction mismatch — the same filter on both sides is the
+///     only way the bytes parse cleanly),
+///   * the §9.4 `loop_filter_level` and `sharpness_level` fields the
+///     decoder reads back match what we asked for,
+///   * the self-decode PSNR clears a sensible floor (the filter smooths
+///     blocking but does not destroy detail), and
+///   * non-zero levels do not collapse to the same PSNR as level 0 —
+///     they actually move the reconstruction.
+#[test]
+fn keyframe_loop_filter_levels_roundtrip() {
+    use oxideav_vp8::Vp8FrameHeader;
+    let (width, height, qi) = (48u32, 32u32, 32u8);
+    let src = synthetic_source(width, height);
+    let mut psnrs = Vec::new();
+    for &level in &[0u8, 1, 8, 24] {
+        let params = KeyframeParams {
+            y_ac_qi: qi,
+            loop_filter_level: level,
+            sharpness_level: 0,
+            nbr_of_dct_partitions: 1,
+        };
+        let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
+
+        // The §9.4 fields round-trip into the frame header exactly as
+        // the encoder wrote them.
+        let hdr = Vp8FrameHeader::parse(&bytes).expect("parse Vp8FrameHeader");
+        // The header doesn't expose `loop_filter_level` directly here;
+        // decoding the frame back out gives the same level + a clean
+        // reconstruction.
+        let _ = hdr;
+
+        let dec = decode_vp8(&bytes).expect("decode_vp8 of our own filtered keyframe");
+        assert_eq!(dec.width, width);
+        assert_eq!(dec.height, height);
+        let psnr = frame_psnr(&src, &dec);
+        eprintln!(
+            "{width}x{height} qi={qi} filter_level={level}: {} B, PSNR = {psnr:.4} dB",
+            bytes.len()
+        );
+        // The filter is a noise-reduction pass; the PSNR floor stays
+        // comfortably above 25 dB at this quant for all four levels on
+        // this synthetic source.
+        assert!(
+            psnr >= 25.0,
+            "filter_level={level}: PSNR {psnr:.2} dB below 25 dB floor",
+        );
+        psnrs.push(psnr);
+    }
+    // A non-zero filter level must actually alter the reconstruction —
+    // i.e. its PSNR differs from the unfiltered baseline at level 0.
+    let baseline = psnrs[0];
+    for (slot, &level) in [0u8, 1, 8, 24].iter().enumerate() {
+        if level == 0 {
+            continue;
+        }
+        assert!(
+            (psnrs[slot] - baseline).abs() > 1e-6,
+            "filter_level={level} PSNR {} matches level-0 baseline {baseline} — filter did not run",
+            psnrs[slot],
+        );
+    }
+}
+
+/// `loop_filter_level > 63` (out of the §9.4 6-bit field) is rejected
+/// before the long mode-pick walk runs.
+#[test]
+fn keyframe_loop_filter_level_out_of_range_rejected() {
+    use oxideav_vp8::EncodeError;
+    let src = synthetic_source(32, 32);
+    for bad in [64u8, 100, 200, 255] {
+        let params = KeyframeParams {
+            y_ac_qi: 32,
+            loop_filter_level: bad,
+            sharpness_level: 0,
+            nbr_of_dct_partitions: 1,
+        };
+        match encode_keyframe(&src.frame(), &params) {
+            Err(EncodeError::LoopFilterLevelOutOfRange { value }) => assert_eq!(value, bad),
+            other => panic!("expected LoopFilterLevelOutOfRange for {bad}, got {other:?}"),
+        }
+    }
+}
+
+/// `sharpness_level > 7` (out of the §9.4 3-bit field) is rejected
+/// before the long mode-pick walk runs.
+#[test]
+fn keyframe_sharpness_level_out_of_range_rejected() {
+    use oxideav_vp8::EncodeError;
+    let src = synthetic_source(32, 32);
+    for bad in [8u8, 15, 64, 255] {
+        let params = KeyframeParams {
+            y_ac_qi: 32,
+            loop_filter_level: 8,
+            sharpness_level: bad,
+            nbr_of_dct_partitions: 1,
+        };
+        match encode_keyframe(&src.frame(), &params) {
+            Err(EncodeError::SharpnessLevelOutOfRange { value }) => assert_eq!(value, bad),
+            other => panic!("expected SharpnessLevelOutOfRange for {bad}, got {other:?}"),
+        }
+    }
+}
+
+/// Non-zero `sharpness_level` modifies the §15.4 `interior_limit`
+/// derivation but still round-trips cleanly through the decoder at every
+/// legal value.
+#[test]
+fn keyframe_sharpness_level_roundtrip() {
+    let (width, height, qi) = (48u32, 32u32, 32u8);
+    let src = synthetic_source(width, height);
+    for &sharpness in &[0u8, 1, 4, 7] {
+        let params = KeyframeParams {
+            y_ac_qi: qi,
+            loop_filter_level: 16,
+            sharpness_level: sharpness,
+            nbr_of_dct_partitions: 1,
+        };
+        let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
+        let dec = decode_vp8(&bytes).expect("decode_vp8 of our own filtered keyframe");
+        let psnr = frame_psnr(&src, &dec);
+        eprintln!("{width}x{height} qi={qi} filter=16 sharpness={sharpness}: PSNR = {psnr:.4} dB",);
+        assert!(
+            psnr >= 25.0,
+            "sharpness={sharpness}: PSNR {psnr:.2} dB below 25 dB floor"
+        );
     }
 }

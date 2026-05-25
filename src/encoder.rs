@@ -2690,6 +2690,14 @@ pub struct KeyframeParams {
     /// a non-zero level would require the encoder to run the §15 filter
     /// before gathering neighbours, which this round does not do.
     pub loop_filter_level: u8,
+    /// §9.5 DCT-coefficient partition count. Must be one of 1 / 2 / 4 / 8
+    /// (the on-wire `log2_nbr_of_dct_partitions` field is two bits per
+    /// the §9.5 table). Macroblock rows are distributed round-robin per
+    /// the §20.4 loop: row `r` is encoded into partition `r % N`. This
+    /// is a layout reorganisation only — the residual coding inside each
+    /// partition is bit-identical to the 1-partition case, so the
+    /// decoded picture is unchanged across all four choices.
+    pub nbr_of_dct_partitions: u8,
 }
 
 impl Default for KeyframeParams {
@@ -2697,6 +2705,7 @@ impl Default for KeyframeParams {
         KeyframeParams {
             y_ac_qi: 32,
             loop_filter_level: 0,
+            nbr_of_dct_partitions: 1,
         }
     }
 }
@@ -2723,20 +2732,29 @@ impl Default for KeyframeParams {
 ///
 /// After the walk it assembles the §9 frame header + §19.2 first
 /// (control) partition (with the §11 macroblock-mode layer threaded
-/// through the cross-macroblock `B_PRED` sub-block context buffers) and a
-/// single §19.2 DCT partition carrying every non-skipped macroblock's
-/// §13.3 token data, with the §13.3 above (per-column, frame-lived) /
-/// left (per-row) non-zero predictor contexts evolving exactly as the
-/// decoder reads them.
+/// through the cross-macroblock `B_PRED` sub-block context buffers) and
+/// `params.nbr_of_dct_partitions` §19.2 DCT partitions carrying every
+/// non-skipped macroblock's §13.3 token data, with the §13.3 above
+/// (per-column, frame-lived) / left (per-row) non-zero predictor contexts
+/// evolving exactly as the decoder reads them. Per the §20.4 row-loop,
+/// macroblock row `r` is encoded into partition `r % N`; each partition
+/// uses its own [`BoolEncoder`] and is finalised independently with the
+/// usual §7.3 4-byte flush trailer (§4 page 9 — "All partitions are
+/// decoded using separate instances of the boolean entropy decoder").
+/// A §9.5 size table of `(N - 1) * 3` little-endian bytes precedes the
+/// partition bodies when `N > 1`.
 ///
 /// The emitted bytes decode through the crate's own [`crate::decode_vp8`]
 /// and reproduce the source within the §14 quantiser's distortion.
 ///
 /// # Scope (this round)
 ///
-/// Single key frame, single DCT partition, SAD-only mode pick, no
-/// rate-distortion bit-cost term, no inter prediction, loop filter level
-/// 0 only.
+/// Single key frame, SAD-only mode pick, no rate-distortion bit-cost
+/// term, no inter prediction, loop filter level 0 only. The §9.5 DCT
+/// partition count is configurable (1 / 2 / 4 / 8) through
+/// [`KeyframeParams::nbr_of_dct_partitions`]; the residual coding inside
+/// each partition is bit-identical to the 1-partition case (multi-
+/// partition output is a layout reorganisation, not a coding change).
 ///
 /// [`MbNeighbors`]: crate::reconstruct::MbNeighbors
 pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec<u8>, EncodeError> {
@@ -2755,6 +2773,14 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
             value: params.loop_filter_level,
         });
     }
+    // §9.5 — the partition-count is validated here so a bad value is
+    // rejected before the long mode-pick / forward-transform walk runs.
+    // `write_token_partition_count` re-validates at the actual bitstream
+    // emission point.
+    let num_partitions = match params.nbr_of_dct_partitions {
+        1 | 2 | 4 | 8 => params.nbr_of_dct_partitions as usize,
+        other => return Err(EncodeError::InvalidDctPartitionCount { value: other }),
+    };
 
     let mb_cols = width.div_ceil(16) as usize;
     let mb_rows = height.div_ceil(16) as usize;
@@ -2864,8 +2890,8 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
     write_segment_update_flags(&mut hdr, false);
     // §9.4 — loop filter (level 0 → whole-frame §15 skip).
     write_loop_filter(&mut hdr, false, params.loop_filter_level, 0, false)?;
-    // §9.5 — single DCT partition.
-    write_token_partition_count(&mut hdr, 1)?;
+    // §9.5 — DCT partition count.
+    write_token_partition_count(&mut hdr, params.nbr_of_dct_partitions)?;
     // §9.6 — quant indices (baseline only).
     write_quant_indices(&mut hdr, params.y_ac_qi, None, None, None, None, None)?;
     // §9.7 (key frame) — refresh_entropy_probs.
@@ -2891,14 +2917,30 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
         });
     }
 
-    // ---- §19.2 single DCT partition: per-MB §13.3 token data -------------
-    let mut tok = BoolEncoder::new();
-    // One above-context per macroblock column, frame-lived (§13.3).
+    // ---- §19.2 DCT partition group: per-MB §13.3 token data --------------
+    //
+    // Macroblock rows are distributed round-robin across the §9.5
+    // partitions per the §20.4 row-loop: row `r` is encoded into
+    // partition `r % N`. Each partition gets its own [`BoolEncoder`]
+    // instance (§4 page 9 — "All partitions are decoded using separate
+    // instances of the boolean entropy decoder"), finalised independently
+    // with its own §7.3 4-byte flush trailer. The §13.3 above-context
+    // is column-wise and frame-lived — shared across partitions because
+    // the decoder's `decode_residuals` also keeps one above slot per
+    // column for the whole frame. The "left" context resets at every row
+    // start so it does not need to cross partitions.
+    let mut partitions: Vec<BoolEncoder> =
+        (0..num_partitions).map(|_| BoolEncoder::new()).collect();
+    // One above-context per macroblock column, frame-lived (§13.3),
+    // shared by every row irrespective of which partition that row routes
+    // to.
     let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
     for mb_row in 0..mb_rows {
         // §13.3 page 65: the "left" predictor resets at the start of
         // every macroblock row.
         let mut left_ctx = MbEntropyCtx::default();
+        let part_idx = mb_row % num_partitions;
+        let tok = &mut partitions[part_idx];
         for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
             let raster = mb_row * mb_cols + mb_col;
             let mb = &modes[raster];
@@ -2911,7 +2953,7 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
                 continue;
             }
             encode_mb_tokens(
-                &mut tok,
+                tok,
                 &all_coeffs[raster],
                 use_bpred,
                 &coeff_probs,
@@ -2921,10 +2963,13 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
             .map_err(EncodeError::Token)?;
         }
     }
-    let dct_partition = tok.finish();
+    let dct_partitions: Vec<Vec<u8>> = partitions.into_iter().map(|p| p.finish()).collect();
+    let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();
+    let size_table_len = (num_partitions - 1) * 3;
 
     // ---- §9.1 frame tag + key-frame extension + assembly ----------------
-    let mut out: Vec<u8> = Vec::with_capacity(10 + first_partition_size + dct_partition.len());
+    let mut out: Vec<u8> =
+        Vec::with_capacity(10 + first_partition_size + size_table_len + dct_total);
     write_frame_tag(
         &mut out,
         true,
@@ -2937,9 +2982,18 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
         ScaleCode::None,
     )?;
     out.extend_from_slice(&first_partition);
-    // Single DCT partition → no §9.5 size table; the partition follows
-    // the first partition directly.
-    out.extend_from_slice(&dct_partition);
+    // §9.5 size table: 3-byte little-endian length for every partition
+    // except the last (whose size the decoder infers from what is left
+    // in the frame). One partition → no table.
+    for part in dct_partitions.iter().take(num_partitions - 1) {
+        let sz = part.len();
+        out.push((sz & 0xff) as u8);
+        out.push(((sz >> 8) & 0xff) as u8);
+        out.push(((sz >> 16) & 0xff) as u8);
+    }
+    for part in &dct_partitions {
+        out.extend_from_slice(part);
+    }
 
     Ok(out)
 }
@@ -3132,6 +3186,7 @@ mod tests {
         let params = KeyframeParams {
             y_ac_qi: 32,
             loop_filter_level: 0,
+            nbr_of_dct_partitions: 1,
         };
         let bytes = encode_keyframe(&frame, &params).expect("encode");
 
@@ -3221,6 +3276,7 @@ mod tests {
             let params = KeyframeParams {
                 y_ac_qi: qi,
                 loop_filter_level: 0,
+                nbr_of_dct_partitions: 1,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
             let p = keyframe_luma_psnr(&bytes, &y, w as usize, h as usize);
@@ -3256,6 +3312,7 @@ mod tests {
             let params = KeyframeParams {
                 y_ac_qi: qi,
                 loop_filter_level: 0,
+                nbr_of_dct_partitions: 1,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
             let p = keyframe_luma_psnr(&bytes, &y, w as usize, h as usize);

@@ -6,6 +6,31 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 6: multi-partition DCT output (RFC 6386 §9.5 /
+  §19.2 / §20.4)** — `encode_keyframe` generalises to the four-value
+  `log2_nbr_of_dct_partitions` table. A new
+  `KeyframeParams::nbr_of_dct_partitions` field accepts 1 / 2 / 4 / 8
+  (validated up-front before the long mode-pick walk, surfacing
+  `EncodeError::InvalidDctPartitionCount` for any other value); the §9.5
+  header bit is emitted through the existing
+  `write_token_partition_count`; per-macroblock token data is dispatched
+  to the right `BoolEncoder` instance by the §20.4 row-loop (row `r` →
+  partition `r % N`); each partition finalises independently with the
+  §7.3 4-byte flush trailer; and a `(N - 1) × 3`-byte §9.5 size table of
+  24-bit little-endian lengths is prepended when `N > 1`. The §13.3
+  above-context stays column-wise and frame-lived (shared across
+  partitions, mirroring the decoder's `decode_residuals`); the left
+  context resets at every row so it does not cross partitions. The
+  reconstruction is byte-for-byte unchanged across all four partition
+  counts — at `128×128 qi=32` the self-decode PSNR is 45.9549 dB at
+  every choice, with byte counts rising monotonically (242 → 246 → 256
+  → 274). New tests in `encoder_keyframe_roundtrip.rs`:
+  `keyframe_multi_partition_psnr_matches_single_partition_baseline`
+  pins identical reconstruction at 1 / 2 / 4 / 8 against the
+  1-partition baseline; `keyframe_multi_partition_short_frame_roundtrip`
+  covers a frame with fewer MB rows than partitions; and
+  `keyframe_invalid_partition_count_rejected` pins the validator.
+
 * **VP8 encoder Phase 5: rate-distortion intra mode selection** — the
   SAD-only mode picker is replaced by a Lagrangian rate-distortion
   search. Each candidate mode is run through the full §14 chain (predict

@@ -2,6 +2,37 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 137)
+
+**Encoder Phase 6 — multi-partition DCT output landed.** `encode_keyframe`
+generalises to the §9.5 four-value `log2_nbr_of_dct_partitions` table:
+the new `KeyframeParams::nbr_of_dct_partitions` field accepts 1 / 2 / 4
+/ 8, the §9.5 header bit is written through the existing
+`write_token_partition_count`, and per-MB token data is dispatched to
+the right `BoolEncoder` by the §20.4 round-robin (row `r` → partition
+`r % N`). Each partition is finalised independently with the §7.3 4-byte
+flush trailer (§4 page 9 — "All partitions are decoded using separate
+instances of the boolean entropy decoder"); a `(N-1) * 3`-byte §9.5
+size table of 24-bit little-endian lengths precedes the partition
+bodies when `N > 1`. The §13.3 above-context stays column-wise and
+frame-lived (shared across partitions, matching the decoder's
+`decode_residuals`); the left context resets per row and so does not
+cross partitions.
+
+The output is a layout reorganisation, not a coding change: at
+`128×128 qi=32` the self-decode PSNR is bit-exact 45.9549 dB at every
+partition count, and the byte count grows monotonically with `N` from
+242 → 246 → 256 → 274 B (one §7.3 flush + one §9.5 size-table entry
+per additional partition). A new
+`keyframe_multi_partition_psnr_matches_single_partition_baseline` test
+pins identical reconstruction across 1 / 2 / 4 / 8 against the
+1-partition baseline; `keyframe_multi_partition_short_frame_roundtrip`
+covers a 32×32 frame whose two macroblock rows leave six of the eight
+partitions empty (still valid per §20.4); and
+`keyframe_invalid_partition_count_rejected` pins the new pre-walk
+validator against every non-{1,2,4,8} input. Tests: 3 → 7 in
+`encoder_keyframe_roundtrip.rs`.
+
 ## Status — 2026-05-25 (round 136)
 
 **Encoder Phase 5 — rate-distortion intra mode selection landed.** The

@@ -103,10 +103,24 @@ fn frame_psnr(src: &Source, dec: &oxideav_vp8::Vp8DecodedFrame) -> f64 {
 /// given quantiser, asserting the dimensions round-trip and the PSNR
 /// clears `min_psnr`.
 fn roundtrip_at(width: u32, height: u32, y_ac_qi: u8, min_psnr: f64) -> f64 {
+    roundtrip_at_partitioned(width, height, y_ac_qi, 1, min_psnr)
+}
+
+/// Encode → decode → PSNR for a `width × height` synthetic frame at the
+/// given quantiser and §9.5 DCT-partition count, asserting the
+/// dimensions round-trip and the PSNR clears `min_psnr`.
+fn roundtrip_at_partitioned(
+    width: u32,
+    height: u32,
+    y_ac_qi: u8,
+    nbr_of_dct_partitions: u8,
+    min_psnr: f64,
+) -> f64 {
     let src = synthetic_source(width, height);
     let params = KeyframeParams {
         y_ac_qi,
         loop_filter_level: 0,
+        nbr_of_dct_partitions,
     };
     let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
     let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -155,4 +169,123 @@ fn keyframe_non_multiple_of_16_dimensions_roundtrip() {
     // the partial right / bottom macroblock edge-replication padding.
     let psnr = roundtrip_at(40, 24, 32, 30.0);
     eprintln!("40x24 qi=32 whole-frame PSNR = {psnr:.2} dB");
+}
+
+/// §9.5 multi-partition self-decode round-trip.
+///
+/// The §9.5 DCT-coefficient partition count is a layout-only choice:
+/// the residual coding inside each partition is bit-identical to the
+/// 1-partition case, the decoder rebuilds the same reconstruction
+/// regardless of how rows were distributed (§20.4 round-robin), and the
+/// decoded picture matches across all four legal values 1 / 2 / 4 / 8.
+/// This test pins that invariant by encoding the same source at every
+/// partition count and asserting the self-decode PSNR is identical
+/// against the 1-partition baseline.
+#[test]
+fn keyframe_multi_partition_psnr_matches_single_partition_baseline() {
+    // A frame tall enough that every partition count routes work to
+    // every partition (mb_rows = 8 ≥ 8). 128×128 keeps the test fast.
+    let (width, height, qi) = (128u32, 128u32, 32u8);
+    let src = synthetic_source(width, height);
+
+    let mut measured = [0f64; 4];
+    let mut byte_lens = [0usize; 4];
+    for (slot, &count) in [1u8, 2, 4, 8].iter().enumerate() {
+        let params = KeyframeParams {
+            y_ac_qi: qi,
+            loop_filter_level: 0,
+            nbr_of_dct_partitions: count,
+        };
+        let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
+        let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
+        assert_eq!(dec.width, width);
+        assert_eq!(dec.height, height);
+        let psnr = frame_psnr(&src, &dec);
+        eprintln!(
+            "{width}x{height} qi={qi} partitions={count}: {} B, PSNR = {psnr:.4} dB",
+            bytes.len()
+        );
+        measured[slot] = psnr;
+        byte_lens[slot] = bytes.len();
+    }
+
+    // The 1-partition number is the baseline; the other three must match
+    // it exactly. Multi-partition is a byte-layout reorganisation, not a
+    // residual-coding change — the reconstructed sample values cannot
+    // differ.
+    let baseline = measured[0];
+    for (slot, &count) in [1u8, 2, 4, 8].iter().enumerate() {
+        let psnr = measured[slot];
+        assert!(
+            (psnr - baseline).abs() < 1e-9,
+            "partitions={count} PSNR {psnr} differs from 1-partition baseline {baseline}",
+        );
+    }
+
+    // Each additional partition pays a §7.3 4-byte flush trailer plus a
+    // 3-byte §9.5 size-table entry (the last partition's size is implied),
+    // so the encoded length grows monotonically with partition count
+    // (since the residual data is the same).
+    for w in byte_lens.windows(2) {
+        assert!(
+            w[1] >= w[0],
+            "byte length must not shrink as partition count grows: {byte_lens:?}",
+        );
+    }
+}
+
+/// §9.5 short-frame coverage: a frame with fewer macroblock rows than
+/// partitions still encodes and round-trips. With 32×32 the frame has
+/// 2 macroblock rows; at `nbr_of_dct_partitions = 8`, six of the eight
+/// partitions are never written to (the §20.4 round-robin only reaches
+/// partitions 0 and 1). The encoder must still emit a valid frame whose
+/// unused partitions are minimal §7.3 flush trailers — the decoder leaves
+/// them untouched per the §13.3 row-walk.
+#[test]
+fn keyframe_multi_partition_short_frame_roundtrip() {
+    let (width, height, qi) = (32u32, 32u32, 32u8);
+    let src = synthetic_source(width, height);
+    let baseline = {
+        let params = KeyframeParams {
+            y_ac_qi: qi,
+            loop_filter_level: 0,
+            nbr_of_dct_partitions: 1,
+        };
+        let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
+        let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
+        frame_psnr(&src, &dec)
+    };
+    for count in [2u8, 4, 8] {
+        let params = KeyframeParams {
+            y_ac_qi: qi,
+            loop_filter_level: 0,
+            nbr_of_dct_partitions: count,
+        };
+        let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
+        let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
+        let psnr = frame_psnr(&src, &dec);
+        assert!(
+            (psnr - baseline).abs() < 1e-9,
+            "short-frame partitions={count} PSNR {psnr} differs from baseline {baseline}",
+        );
+    }
+}
+
+/// The encoder rejects partition counts outside the §9.5 four-value
+/// table (1, 2, 4, 8) before running the long mode-pick walk.
+#[test]
+fn keyframe_invalid_partition_count_rejected() {
+    use oxideav_vp8::EncodeError;
+    let src = synthetic_source(32, 32);
+    for bad in [0u8, 3, 5, 6, 7, 9, 16, 255] {
+        let params = KeyframeParams {
+            y_ac_qi: 32,
+            loop_filter_level: 0,
+            nbr_of_dct_partitions: bad,
+        };
+        match encode_keyframe(&src.frame(), &params) {
+            Err(EncodeError::InvalidDctPartitionCount { value }) => assert_eq!(value, bad),
+            other => panic!("expected InvalidDctPartitionCount for {bad}, got {other:?}"),
+        }
+    }
 }

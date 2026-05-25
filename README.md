@@ -2,6 +2,33 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 128)
+
+**Encoder Phase 2 — §13 DCT-token block encoder landed.** The crate
+now exposes `encode_coeff_block` + `TokenEncoder` in `src/encoder.rs`:
+a Phase-2 §13.2 / §13.3 inverse of `dct_tokens::decode_block` that
+walks the §13.2 `coeff_tree` against the resolved
+`coeff_probs[4][8][3][11]` table and emits a single 16-coefficient
+sub-block through the existing §7.3 `BoolEncoder`. Per coefficient
+the encoder classifies the magnitude into the twelve-symbol DCT
+alphabet (Dct0..Dct4, Cat1..Cat6, Eob), records the bit path the
+decoder will read for that leaf (entering the tree at index 2 to
+bypass the EOB branch when the previous coefficient was a literal
+`DCT_0`), writes any Cat extra bits against `PCAT1..PCAT6`, and
+emits the universal sign bit at probability 128; `ctx3` rolls to
+the coefficient's magnitude class on the way to the next position.
+EOB is emitted explicitly after the last non-zero coefficient unless
+all 16 (or 15 for `YAfterY2`) positions are non-zero, in which case
+§13.2's "implicit EOB" rule applies. This is the bitstream-side
+prerequisite for the §14 quant + RD-driven encode path; this round
+ships the entropy coder only — no quant policy, no RD search, no
+per-MB block-set wiring yet. Validated by 8 new unit tests that
+encode → decode → byte-compare at the coefficient layer across the
+full §13.2 alphabet, every `BlockType`, every position, every
+neighbour-predictor combination, and a 64-trial pseudo-random
+sweep. Lib test count: 363 → 371; standalone (no-default-features):
+358 → 366.
+
 ## Status — 2026-05-25 (round 125)
 
 **Encoder Phase 1 (frame-header writers + silent-keyframe path)

@@ -6,6 +6,54 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 2: §13 DCT-token block encoder (RFC 6386
+  §13.2 / §13.3)** — new `encode_coeff_block` + `TokenEncoder` API in
+  `src/encoder.rs` that walks the §13.2 `coeff_tree` over the existing
+  §7.3 `BoolEncoder` to emit a single 16-coefficient sub-block at a
+  caller-supplied resolved `coeff_probs[4][8][3][11]` table.
+  Surface:
+  * `classify_coeff_token(abs_value: u16) -> DctToken` — the §13.2
+    alphabet classifier (Dct0..Dct4, Cat1..Cat6) shared by every
+    per-coefficient encode site.
+  * `encode_coeff_block(enc, block_type, coeff_probs, above_has_nonzero,
+    left_has_nonzero, coeffs) -> Result<usize, TokenEncodeError>` —
+    the free-function entry. Walks `coeffs[first_coeff..16]` in scan
+    order, picks each position's token, emits the boolean-coded tree
+    path against `coeff_probs[plane][band][ctx3]`, writes any Cat extra
+    bits (PCAT1..PCAT6) + the universal sign bit at probability 128,
+    rolls `ctx3` to the new coefficient's magnitude class and tracks
+    `prev_was_zero` for the §13.2 EOB-branch-skip rule. Emits an
+    explicit `Eob` token after the last non-zero coefficient unless
+    the block is fully populated (the §13.2 "implicit EOB after the
+    last coefficient" rule).
+  * `TokenEncoder` struct — stateful wrapper that owns a
+    `BoolEncoder` + resolved `CoeffProbs` table, exposing
+    `encode_block` / `finish` / `bytes_written`. Intended for the
+    later round that will stream many blocks into a single DCT
+    partition.
+  * `TokenEncodeError::CoefficientOutOfRange { index, value }` —
+    rejects coefficients whose magnitude exceeds the §13.2 Cat6
+    maximum (`67 + 2047 = 2114`).
+
+  Validation: 8 new unit tests in `src/encoder.rs` covering the
+  full §13.2 alphabet classifier, all-zero blocks at every
+  `BlockType`, single non-zero coefficient at every position and
+  every plane, one value inside every Cat1..Cat6 range with both
+  signs, a fully-populated 16-entry block exercising the implicit
+  EOB rule, sparse interior-zero patterns exercising the
+  `prev_was_zero` EOB-branch-skip, all four (above × left)
+  neighbour-predictor combinations, the out-of-range rejection
+  path, the `TokenEncoder` wrapper byte-for-byte matches the
+  free-function path, and a 64-trial pseudo-random sweep of
+  block-type / coefficient pattern / neighbour combinations. Each
+  test encodes the block into bytes with the production
+  `BoolEncoder`, hands the bytes back to the matching
+  `dct_tokens::decode_block` walk, and asserts the recovered
+  `[i16; 16]` equals the input — i.e. byte-identical at the
+  coefficient layer per the round goal. No RD search, no quant
+  policy, no per-MB block-set wiring (deferred to a subsequent
+  round). Lib test count: 363 → 371.
+
 * **VP8 encoder Phase 1: §9 frame-header writers + silent-keyframe
   path (RFC 6386 §7.3 + §9.1–§9.11)** — new `src/encoder.rs` module
   exposing the §7.3 `BoolEncoder` (a Rust port of the `bool_encoder` /

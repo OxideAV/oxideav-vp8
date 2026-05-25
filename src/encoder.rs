@@ -927,6 +927,345 @@ const COEFF_UPDATE_PROBS: [[[[u8; 11]; 3]; 8]; 4] = [
     ],
 ];
 
+// ───────────────────────── Phase 2: §13 DCT-token encoder ─────────────────────
+
+use crate::dct_tokens::{BlockType, CoeffProbs, DctToken, COEFF_BANDS};
+
+/// §13.2 `coeff_tree` — duplicated here for the encoder's tree walk so
+/// the inverse mapping (`token -> bit path`) can be computed against
+/// the exact same eleven-internal-node, twelve-leaf structure the
+/// decoder traverses. Values follow the decoder's convention: entry
+/// `2*i` is the left child of internal node `i`, entry `2*i + 1` is
+/// the right child; non-negative entries point to the next internal
+/// node, non-positive entries `-t` denote leaf `DctToken` with
+/// discriminant `t`.
+const ENC_COEFF_TREE: [i8; 22] = [
+    -(DctToken::Eob as i8),
+    2,
+    -(DctToken::Dct0 as i8),
+    4,
+    -(DctToken::Dct1 as i8),
+    6,
+    8,
+    12,
+    -(DctToken::Dct2 as i8),
+    10,
+    -(DctToken::Dct3 as i8),
+    -(DctToken::Dct4 as i8),
+    14,
+    16,
+    -(DctToken::Cat1 as i8),
+    -(DctToken::Cat2 as i8),
+    18,
+    20,
+    -(DctToken::Cat3 as i8),
+    -(DctToken::Cat4 as i8),
+    -(DctToken::Cat5 as i8),
+    -(DctToken::Cat6 as i8),
+];
+
+/// §13.2 `Pcat1..Pcat6` extra-bits probability lists (terminator
+/// removed; mirrors the decoder copy in `dct_tokens.rs`).
+const ENC_PCAT1: &[u8] = &[159];
+const ENC_PCAT2: &[u8] = &[165, 145];
+const ENC_PCAT3: &[u8] = &[173, 148, 140];
+const ENC_PCAT4: &[u8] = &[176, 155, 140, 135];
+const ENC_PCAT5: &[u8] = &[180, 157, 141, 134, 130];
+const ENC_PCAT6: &[u8] = &[254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129];
+
+/// §13.2 `categoryBase[6]` — first value in each cat1..cat6 range.
+const ENC_CAT_BASE: [u16; 6] = [5, 7, 11, 19, 35, 67];
+
+/// Classify the absolute value of a single coefficient into its
+/// RFC 6386 §13.2 DCT-token alphabet entry. Caller is responsible for
+/// the sign bit (which is emitted separately by the encoder at fixed
+/// probability 128).
+///
+/// Returns `DctToken::Dct0` for the literal zero value (not `Eob` —
+/// EOB is a separate decision made by the surrounding block-encoder
+/// based on whether any non-zero coefficient follows).
+pub fn classify_coeff_token(abs_value: u16) -> DctToken {
+    match abs_value {
+        0 => DctToken::Dct0,
+        1 => DctToken::Dct1,
+        2 => DctToken::Dct2,
+        3 => DctToken::Dct3,
+        4 => DctToken::Dct4,
+        5..=6 => DctToken::Cat1,
+        7..=10 => DctToken::Cat2,
+        11..=18 => DctToken::Cat3,
+        19..=34 => DctToken::Cat4,
+        35..=66 => DctToken::Cat5,
+        _ => DctToken::Cat6,
+    }
+}
+
+/// Errors surfaced by the §13 token-block encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenEncodeError {
+    /// A coefficient magnitude exceeded the §13.2 alphabet's largest
+    /// representable value (`67 + (2^11 - 1) = 2114`). The encoder
+    /// makes no attempt to clamp; the caller is expected to have run
+    /// the §14 quantizer and have its results in range. Surfaces the
+    /// offending raster index and value so the caller can pin the
+    /// quantizer bug.
+    CoefficientOutOfRange { index: usize, value: i16 },
+}
+
+impl core::fmt::Display for TokenEncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TokenEncodeError::CoefficientOutOfRange { index, value } => write!(
+                f,
+                "vp8 token encode: coefficient[{index}]={value} exceeds the §13.2 alphabet maximum (±2114)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokenEncodeError {}
+
+/// Walk [`ENC_COEFF_TREE`] starting at internal node `start_index` and
+/// record the `(prob_index, bit)` sequence that lands at the leaf for
+/// `target`. Mirrors the decoder's `treed_read_coef` traversal but
+/// runs backwards from a known leaf.
+///
+/// Returns the list of `(i_half, bit)` pairs in the exact order the
+/// decoder will read them. The `start_index` distinguishes the §13.2
+/// "may emit EOB" case (`0`) from the "previous coefficient was DCT_0"
+/// case (`2`, EOB branch bypassed).
+fn token_to_bit_path(token: DctToken, start_index: i8) -> Vec<(usize, bool)> {
+    let target = token as i8;
+
+    fn descend(i: i8, target: i8, path: &mut Vec<(usize, bool)>) -> bool {
+        for &bit in &[false, true] {
+            let child = ENC_COEFF_TREE[i as usize + bit as usize];
+            if child <= 0 {
+                if -child == target {
+                    path.push(((i as usize) >> 1, bit));
+                    return true;
+                }
+            } else {
+                path.push(((i as usize) >> 1, bit));
+                if descend(child, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+        false
+    }
+
+    let mut out = Vec::with_capacity(8);
+    let ok = descend(start_index, target, &mut out);
+    debug_assert!(
+        ok,
+        "token {token:?} not reachable from coeff_tree index {start_index}"
+    );
+    out
+}
+
+/// Look up the cat-token's `(base, prob_list)` pair. Returns `None`
+/// for the non-cat tokens (Dct0..Dct4, Eob) where there are no
+/// trailing extra bits.
+fn cat_extras(token: DctToken) -> Option<(u16, &'static [u8])> {
+    match token {
+        DctToken::Cat1 => Some((ENC_CAT_BASE[0], ENC_PCAT1)),
+        DctToken::Cat2 => Some((ENC_CAT_BASE[1], ENC_PCAT2)),
+        DctToken::Cat3 => Some((ENC_CAT_BASE[2], ENC_PCAT3)),
+        DctToken::Cat4 => Some((ENC_CAT_BASE[3], ENC_PCAT4)),
+        DctToken::Cat5 => Some((ENC_CAT_BASE[4], ENC_PCAT5)),
+        DctToken::Cat6 => Some((ENC_CAT_BASE[5], ENC_PCAT6)),
+        _ => None,
+    }
+}
+
+/// Encode one 16-coefficient sub-block per RFC 6386 §13.3 into `enc`.
+///
+/// `coeffs` is a 16-entry array in **scan (zig-zag) order** — i.e. the
+/// exact order the §13.3 token loop visits positions. Position
+/// `block_type.first_coeff()` is the first slot read; earlier slots
+/// are ignored (for `YAfterY2` the DC is part of the Y2 block and
+/// `coeffs[0]` is unused by the encoder).
+///
+/// `block_type` selects the §13.3 plane index and the `firstCoeff`
+/// value. `coeff_probs` is the resolved `coeff_probs[4][8][3][11]`
+/// from [`merge_default_token_probs`](crate::merge_default_token_probs).
+/// `above_has_nonzero` / `left_has_nonzero` are the §13.3 neighbour
+/// non-zero predictors that seed `ctx3` for the very first
+/// coefficient (off-frame neighbours pass `false`).
+///
+/// Returns `Ok(non_zero_count)` — the number of non-zero coefficients
+/// emitted. The encoder always concludes with an `Eob` token unless
+/// all 16 (or 15 for `YAfterY2`) coefficients are non-zero, in which
+/// case §13.2's "implicit eob after the last coefficient" rule
+/// applies and the encoder omits the explicit `Eob`.
+///
+/// This is the Phase-2 inverse of [`crate::decode_block`]. The unit
+/// tests in this module prove byte-exact round-trip at the coefficient
+/// layer: encode the block, hand the resulting bytes to a
+/// `BoolDecoder`, walk `decode_block` with the same `block_type` /
+/// `coeff_probs` / neighbour predictors, and assert the recovered
+/// `coeffs` array equals the input.
+pub fn encode_coeff_block(
+    enc: &mut BoolEncoder,
+    block_type: BlockType,
+    coeff_probs: &CoeffProbs,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> Result<usize, TokenEncodeError> {
+    let plane = block_type.plane_index();
+    let first_coeff = block_type.first_coeff();
+
+    // Validate range up front — §13.2 Cat6 maxes out at 67 + 2047 = 2114.
+    for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
+        let abs = v.unsigned_abs();
+        if abs > 2114 {
+            return Err(TokenEncodeError::CoefficientOutOfRange { index: i, value: v });
+        }
+    }
+
+    // Find the last non-zero coefficient so the encoder knows where
+    // (if anywhere) to emit the explicit EOB token. If the entire
+    // block is zero the EOB lands at `first_coeff` immediately.
+    let mut last_non_zero: i32 = -1;
+    for (i, &v) in coeffs.iter().enumerate() {
+        if i >= first_coeff && v != 0 {
+            last_non_zero = i as i32;
+        }
+    }
+
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let mut prev_was_zero = false;
+    let mut non_zero_count = 0usize;
+
+    let mut i = first_coeff;
+    while i < 16 {
+        let band = COEFF_BANDS[i];
+        let probs = &coeff_probs[plane][band][ctx3];
+
+        // Decide what token to emit at this position.
+        let emit_eob = (i as i32) > last_non_zero;
+        let (token, abs_value, sign) = if emit_eob {
+            (DctToken::Eob, 0u16, false)
+        } else {
+            let v = coeffs[i];
+            let abs = v.unsigned_abs();
+            (classify_coeff_token(abs), abs, v < 0)
+        };
+
+        // The §13.2 "skip EOB branch" optimisation: enter the tree at
+        // internal node 1 (raw index 2) when the previous coefficient
+        // was a literal `DCT_0` — the decoder will not have read the
+        // EOB-vs-rest split bit, so neither must we write it.
+        let start = if prev_was_zero { 2i8 } else { 0i8 };
+
+        for (i_half, bit) in token_to_bit_path(token, start) {
+            enc.write_bool(probs[i_half], bit);
+        }
+
+        if token == DctToken::Eob {
+            break;
+        }
+
+        // Cat tokens carry a fixed-width little-endian extra-bits
+        // suffix (MSB-first within the suffix per the decoder's
+        // `read_extra_bits` loop), then the universal sign bit at
+        // probability 128.
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_value - base;
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                enc.write_bool(p, bit);
+            }
+        }
+
+        if abs_value != 0 {
+            enc.write_bool(128, sign);
+            non_zero_count += 1;
+        }
+
+        // §13.3 rollover of `ctx3` to the token's magnitude class.
+        ctx3 = if abs_value == 0 {
+            0
+        } else if abs_value == 1 {
+            1
+        } else {
+            2
+        };
+        prev_was_zero = token == DctToken::Dct0;
+
+        i += 1;
+    }
+
+    Ok(non_zero_count)
+}
+
+/// Phase-2 token-block encoder handle.
+///
+/// A thin wrapper around the §13 `encode_coeff_block` free function
+/// that owns its own [`BoolEncoder`] + resolved `coeff_probs` table
+/// and exposes a stateful `encode_block` method. Useful for the
+/// higher-level encoder rounds that will emit many blocks into the
+/// same partition.
+///
+/// The encoder is **stateless across blocks** in the §13.3 sense —
+/// the `ctx3` rollover lives entirely inside `encode_coeff_block` and
+/// the neighbour predictors are passed in per call. What the wrapper
+/// owns is the underlying entropy-coder byte stream + the (large)
+/// probability table.
+#[derive(Debug)]
+pub struct TokenEncoder {
+    enc: BoolEncoder,
+    coeff_probs: CoeffProbs,
+}
+
+impl TokenEncoder {
+    /// Build an encoder against the supplied resolved coefficient
+    /// probabilities. Pass [`crate::DEFAULT_COEFF_PROBS`] (or the
+    /// `merge_default_token_probs(&updates)` result) to match the
+    /// `decode_block` path callers go through on the other side.
+    pub fn new(coeff_probs: CoeffProbs) -> Self {
+        TokenEncoder {
+            enc: BoolEncoder::new(),
+            coeff_probs,
+        }
+    }
+
+    /// Encode one 16-coefficient sub-block. See
+    /// [`encode_coeff_block`] for the parameter semantics.
+    pub fn encode_block(
+        &mut self,
+        block_type: BlockType,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+        coeffs: &[i16; 16],
+    ) -> Result<usize, TokenEncodeError> {
+        encode_coeff_block(
+            &mut self.enc,
+            block_type,
+            &self.coeff_probs,
+            above_has_nonzero,
+            left_has_nonzero,
+            coeffs,
+        )
+    }
+
+    /// Finalise the underlying [`BoolEncoder`] and return the byte
+    /// stream the decoder should consume.
+    pub fn finish(self) -> Vec<u8> {
+        self.enc.finish()
+    }
+
+    /// Number of bytes committed so far (excludes the §7.3 4-byte
+    /// flush trailer that [`finish`](Self::finish) will append).
+    pub fn bytes_written(&self) -> usize {
+        self.enc.bytes_written()
+    }
+}
+
 // ───────────────────────── factory + dual-API surface ─────────────────────────
 
 /// Direct factory entry — paired with the workspace's "dual API"
@@ -1257,5 +1596,329 @@ mod tests {
         // Lower-bounded by the 10-byte key-frame header + 4-byte
         // first-partition flush + 4-byte DCT-partition flush.
         assert!(bytes.len() >= 10 + 4 + 4);
+    }
+
+    // ───────── Phase 2 §13 token-encoder round-trip tests ─────────
+
+    use crate::dct_tokens::{decode_block, DEFAULT_COEFF_PROBS};
+
+    /// Encode one block with `encode_coeff_block`, then decode the
+    /// emitted bytes with `decode_block`. Returns the recovered
+    /// `[i16; 16]`. Used as the central round-trip helper for the
+    /// Phase 2 token-encoder tests below.
+    fn encode_then_decode_block(
+        block_type: BlockType,
+        coeffs: &[i16; 16],
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+    ) -> [i16; 16] {
+        let mut enc = BoolEncoder::new();
+        let nonzeros = encode_coeff_block(
+            &mut enc,
+            block_type,
+            &DEFAULT_COEFF_PROBS,
+            above_has_nonzero,
+            left_has_nonzero,
+            coeffs,
+        )
+        .expect("encode_coeff_block should accept in-range coefficients");
+        // The non-zero count returned by the encoder must equal the
+        // population-count of non-zero entries in the input (modulo
+        // the first_coeff skip slot, which is unread on either side).
+        let first = block_type.first_coeff();
+        let expected_nz = coeffs
+            .iter()
+            .enumerate()
+            .filter(|(i, &v)| *i >= first && v != 0)
+            .count();
+        assert_eq!(nonzeros, expected_nz, "non-zero count mismatch");
+        let bytes = enc.finish();
+
+        let mut dec = BoolDecoder::init(&bytes).expect("encoder emits ≥ 2 bytes");
+        let mut recovered = [0i16; 16];
+        let nz = decode_block(
+            &mut dec,
+            block_type,
+            &DEFAULT_COEFF_PROBS,
+            above_has_nonzero,
+            left_has_nonzero,
+            &mut recovered,
+        )
+        .expect("decode_block should consume the encoded byte stream");
+        assert_eq!(nz, expected_nz);
+        recovered
+    }
+
+    /// Token classifier — exercises the full §13.2 alphabet.
+    #[test]
+    fn classify_coeff_token_covers_full_alphabet() {
+        assert_eq!(classify_coeff_token(0), DctToken::Dct0);
+        assert_eq!(classify_coeff_token(1), DctToken::Dct1);
+        assert_eq!(classify_coeff_token(2), DctToken::Dct2);
+        assert_eq!(classify_coeff_token(3), DctToken::Dct3);
+        assert_eq!(classify_coeff_token(4), DctToken::Dct4);
+        // Cat1: 5..=6
+        assert_eq!(classify_coeff_token(5), DctToken::Cat1);
+        assert_eq!(classify_coeff_token(6), DctToken::Cat1);
+        // Cat2: 7..=10
+        assert_eq!(classify_coeff_token(7), DctToken::Cat2);
+        assert_eq!(classify_coeff_token(10), DctToken::Cat2);
+        // Cat3: 11..=18
+        assert_eq!(classify_coeff_token(11), DctToken::Cat3);
+        assert_eq!(classify_coeff_token(18), DctToken::Cat3);
+        // Cat4: 19..=34
+        assert_eq!(classify_coeff_token(19), DctToken::Cat4);
+        assert_eq!(classify_coeff_token(34), DctToken::Cat4);
+        // Cat5: 35..=66
+        assert_eq!(classify_coeff_token(35), DctToken::Cat5);
+        assert_eq!(classify_coeff_token(66), DctToken::Cat5);
+        // Cat6: 67..=2114
+        assert_eq!(classify_coeff_token(67), DctToken::Cat6);
+        assert_eq!(classify_coeff_token(2114), DctToken::Cat6);
+    }
+
+    /// All-zero block — every plane / first_coeff combination should
+    /// round-trip a 16-entry all-zero coefficient vector exactly. The
+    /// encoder emits a single immediate EOB token at position
+    /// `first_coeff`; the decoder leaves the rest at zero.
+    #[test]
+    fn encode_coeff_block_all_zero_round_trips() {
+        let coeffs = [0i16; 16];
+        for &bt in &[
+            BlockType::YAfterY2,
+            BlockType::Y2,
+            BlockType::UV,
+            BlockType::YNoY2,
+        ] {
+            let recovered = encode_then_decode_block(bt, &coeffs, false, false);
+            assert_eq!(recovered, coeffs, "all-zero round-trip failed for {bt:?}");
+        }
+    }
+
+    /// A single non-zero coefficient at every position round-trips
+    /// for every plane type. Exercises the `last_non_zero` EOB
+    /// placement, the §13.2 leaf walk for each of the small literal
+    /// tokens, and the universal sign bit.
+    #[test]
+    fn encode_coeff_block_single_nonzero_at_each_position() {
+        for &bt in &[BlockType::Y2, BlockType::UV, BlockType::YNoY2] {
+            let first = bt.first_coeff();
+            for pos in first..16 {
+                for &value in &[1i16, -1, 2, -3, 4, -4] {
+                    let mut coeffs = [0i16; 16];
+                    coeffs[pos] = value;
+                    let recovered = encode_then_decode_block(bt, &coeffs, false, false);
+                    assert_eq!(
+                        recovered, coeffs,
+                        "single-nonzero round-trip failed at {bt:?} pos={pos} value={value}"
+                    );
+                }
+            }
+        }
+        // YAfterY2 separately, because coeffs[0] is ignored (DC lives
+        // in the Y2 block) — only positions 1..16 are meaningful.
+        let bt = BlockType::YAfterY2;
+        for pos in 1..16 {
+            let mut coeffs = [0i16; 16];
+            coeffs[pos] = 3;
+            let recovered = encode_then_decode_block(bt, &coeffs, false, false);
+            assert_eq!(
+                recovered, coeffs,
+                "single-nonzero round-trip failed at YAfterY2 pos={pos}"
+            );
+        }
+    }
+
+    /// Each `Cat1..Cat6` token exercises a different extra-bits
+    /// probability list (§13.2 `Pcat1..Pcat6`). This test pins one
+    /// value inside every cat range — verified by encode + decode at
+    /// the coefficient layer.
+    #[test]
+    fn encode_coeff_block_each_cat_range_round_trips() {
+        // (value, category index) pairs spanning every Pcat list.
+        let cases: &[i16] = &[
+            5, 6, // Cat1
+            7, 8, 10, // Cat2
+            11, 15, 18, // Cat3
+            19, 27, 34, // Cat4
+            35, 50, 66, // Cat5
+            67, 200, 1000, 2114, // Cat6
+        ];
+        for &v in cases {
+            for &sign in &[1i16, -1] {
+                let mut coeffs = [0i16; 16];
+                // Place at position 3 — well inside all planes' visit
+                // range and inside band-1 to avoid the all-128
+                // pathological first-plane band-0 row.
+                coeffs[3] = v * sign;
+                let recovered = encode_then_decode_block(BlockType::UV, &coeffs, true, false);
+                assert_eq!(
+                    recovered, coeffs,
+                    "cat-range round-trip failed for value {v}*{sign}"
+                );
+            }
+        }
+    }
+
+    /// A fully-populated 16-entry block (every position non-zero) —
+    /// exercises the §13.2 "implicit EOB after the last coefficient"
+    /// rule, where the encoder omits the explicit `Eob` token because
+    /// there is nothing past position 15. Decoder must still recover
+    /// the full vector.
+    #[test]
+    fn encode_coeff_block_fully_populated_block_round_trips_with_implicit_eob() {
+        let mut coeffs = [0i16; 16];
+        // Mix of magnitudes covering every token bucket; sign
+        // alternates so the universal sign bit gets exercised.
+        let values = [1, -2, 3, -4, 5, -7, 11, -19, 35, -67, 1, -1, 2, -3, 4, -5];
+        coeffs.copy_from_slice(&values);
+        // YNoY2 reads all 16 positions; perfect for the "no implicit
+        // EOB slot wasted" path.
+        let recovered = encode_then_decode_block(BlockType::YNoY2, &coeffs, false, false);
+        assert_eq!(recovered, coeffs);
+    }
+
+    /// Sparse pattern with interior zeros — exercises the §13.2
+    /// "previous coefficient was DCT_0" branch that bypasses the EOB
+    /// tree edge. The pattern `[3, 0, 0, 5, 0, 0, 0, 2, 0, …]`
+    /// transitions through `Dct0` multiple times so the encoder's
+    /// `prev_was_zero` tracking is exercised.
+    #[test]
+    fn encode_coeff_block_interior_zeros_round_trip() {
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 3;
+        coeffs[3] = 5;
+        coeffs[7] = 2;
+        coeffs[12] = -8;
+        let recovered = encode_then_decode_block(BlockType::Y2, &coeffs, false, false);
+        assert_eq!(recovered, coeffs);
+    }
+
+    /// Neighbour-predictor combinations seed `ctx3` for the first
+    /// coefficient — exercising the §13.3 page 65 rule. All four
+    /// (above × left) combinations must produce a self-consistent
+    /// byte stream the matching `decode_block` call recovers.
+    #[test]
+    fn encode_coeff_block_neighbour_predictor_combinations() {
+        let coeffs = {
+            let mut c = [0i16; 16];
+            c[0] = 4;
+            c[1] = -1;
+            c[5] = 2;
+            c
+        };
+        for above in &[false, true] {
+            for left in &[false, true] {
+                let recovered = encode_then_decode_block(BlockType::YNoY2, &coeffs, *above, *left);
+                assert_eq!(
+                    recovered, coeffs,
+                    "neighbour predictor combination ({above}, {left}) failed"
+                );
+            }
+        }
+    }
+
+    /// Out-of-range coefficient is rejected. The §13.2 alphabet caps
+    /// at 67 + 2047 = 2114; anything larger surfaces as
+    /// `CoefficientOutOfRange`.
+    #[test]
+    fn encode_coeff_block_rejects_out_of_range_coefficient() {
+        let mut coeffs = [0i16; 16];
+        coeffs[2] = 2115;
+        let mut enc = BoolEncoder::new();
+        let err = encode_coeff_block(
+            &mut enc,
+            BlockType::YNoY2,
+            &DEFAULT_COEFF_PROBS,
+            false,
+            false,
+            &coeffs,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TokenEncodeError::CoefficientOutOfRange {
+                index: 2,
+                value: 2115
+            }
+        ));
+    }
+
+    /// `TokenEncoder` wrapper produces the same byte stream as the
+    /// free-function path. Locks the wrapper's stateful API to the
+    /// stateless one — any future refactor that splits one and not
+    /// the other will trip this immediately.
+    #[test]
+    fn token_encoder_wrapper_matches_free_function_bytes() {
+        let mut coeffs = [0i16; 16];
+        coeffs[0] = 2;
+        coeffs[4] = -7;
+        coeffs[9] = 15;
+
+        let mut free_enc = BoolEncoder::new();
+        encode_coeff_block(
+            &mut free_enc,
+            BlockType::YNoY2,
+            &DEFAULT_COEFF_PROBS,
+            false,
+            false,
+            &coeffs,
+        )
+        .unwrap();
+        let free_bytes = free_enc.finish();
+
+        let mut wrapper = TokenEncoder::new(DEFAULT_COEFF_PROBS);
+        wrapper
+            .encode_block(BlockType::YNoY2, false, false, &coeffs)
+            .unwrap();
+        let wrapper_bytes = wrapper.finish();
+
+        assert_eq!(free_bytes, wrapper_bytes);
+    }
+
+    /// Pseudo-random sweep — encode 64 random blocks at randomised
+    /// quant magnitudes, decode them back, assert byte-identical at
+    /// the coefficient layer. Catches an algorithmic regression that
+    /// individual-case tests above might miss.
+    #[test]
+    fn encode_coeff_block_pseudo_random_sweep_round_trips() {
+        let mut state: u32 = 0xDEAD_BEEF;
+        let mut next = || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            state
+        };
+
+        for trial in 0..64 {
+            let bt = match trial % 4 {
+                0 => BlockType::YAfterY2,
+                1 => BlockType::Y2,
+                2 => BlockType::UV,
+                _ => BlockType::YNoY2,
+            };
+            let first = bt.first_coeff();
+            let mut coeffs = [0i16; 16];
+            // Sparse fill — at most ~half the positions populated, so
+            // both the "implicit EOB at 16" and "explicit EOB partway
+            // through" branches get exercised.
+            for (i, c) in coeffs.iter_mut().enumerate().skip(first) {
+                let r = next();
+                // Roughly 1 in 4 positions populated; fewer at high
+                // index (so EOB usually triggers before the end).
+                if (r & 0x3) != 0 || i > 10 {
+                    continue;
+                }
+                // Magnitude up to 100 — exercises Dct1..Dct4 + Cat1..Cat5.
+                let mag = ((r >> 8) % 100) as i16;
+                let sign = if (r >> 16) & 1 == 0 { 1 } else { -1 };
+                *c = mag * sign;
+            }
+            let above = (next() & 1) != 0;
+            let left = (next() & 1) != 0;
+            let recovered = encode_then_decode_block(bt, &coeffs, above, left);
+            assert_eq!(
+                recovered, coeffs,
+                "pseudo-random round-trip failed at trial {trial}, bt={bt:?}, above={above}, left={left}"
+            );
+        }
     }
 }

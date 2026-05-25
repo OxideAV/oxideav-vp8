@@ -2,6 +2,42 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 131)
+
+**Encoder Phase 2 begin — §14 forward 4×4 DCT + WHT primitives landed
+and wired into `TokenEncoder`.** A new `src/forward_transform.rs`
+module ships `forward_dct_4x4`, `forward_wht_4x4`, and
+`raster_to_scan` — the encoder-side partners of the §14.3 / §14.4
+inverse transforms and the §20.16 zig-zag reorder. The two forward
+transforms are mechanically derived as the transpose of the §14.3 /
+§14.4 inverse listings (the §14.4 preamble itself notes the transform
+is *"a classical 2-D inverse discrete cosine transform"*); both reuse
+the same `COSPI8_SQRT2_MINUS1 = 20091` / `SINPI8_SQRT2 = 35468`
+fixed-point constants the §14.4 inverse uses, so the forward / inverse
+rounding shapes track each other. The module-level docstring records
+the matrix algebra (`M * M^T = 4 * I`, `T_inv * T_inv^T = 4 * I`,
+hence `FDCT(p) = round((T_fwd * p * T_fwd^T) / 2)` and
+`FWHT(p) = round((M * p * M) / 2)`) so the derivation is part of the
+crate's clean-room provenance.
+
+The new integration test `tests/encoder_transform_roundtrip.rs`
+proves the chain end-to-end on a synthetic flat-color 4×4 block:
+FDCT → quantize (§14.1 Y1 factors) → raster-to-scan →
+`TokenEncoder::encode_block` → finish → `BoolDecoder::init` →
+`decode_block` → scan-to-raster → `dequant_block` →
+`inverse_dct_4x4`. The recovered residual hits **48.13 dB PSNR** at
+`yac_qi = 32` on a flat-12 residual (well above the round-131 ≥ 35 dB
+target); at `yac_qi = 0` (where the DC lookup is 4 and the dequant
+exactly inverts the quant) the chain is bit-exact lossless across the
+full `0..=64` flat-value sweep.
+
+What lands this round is the §14 *primitives* + the per-block roundtrip
+proof — the per-MB block-set wiring (Y2 DC seeding across the sixteen Y
+sub-blocks, the 24/25-block walk, the RD-driven mode + quant-step
+selection) is the next encoder round. Lib test count: 371 → 379;
+standalone (no-default-features): 366 → 374; integration tests grow
+by 7 (the new `encoder_transform_roundtrip.rs`).
+
 ## Status — 2026-05-25 (round 128)
 
 **Encoder Phase 2 — §13 DCT-token block encoder landed.** The crate

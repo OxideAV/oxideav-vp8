@@ -6,6 +6,42 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 2 begin: §14 forward 4×4 DCT and WHT
+  primitives (RFC 6386 §14.3 / §14.4)** — new `src/forward_transform.rs`
+  module exposing `forward_dct_4x4`, `forward_wht_4x4`, and
+  `raster_to_scan`, the encoder partners of the §14.3 / §14.4 inverse
+  transforms and the §20.16 zig-zag reorder. The two transforms are
+  mechanically derived as the transpose of the §14.3 / §14.4 inverse
+  listings (the §14.4 preamble itself notes the transform is *"a
+  classical 2-D inverse discrete cosine transform"*); both reuse the
+  same `COSPI8_SQRT2_MINUS1 = 20091` / `SINPI8_SQRT2 = 35468`
+  fixed-point constants the §14.4 inverse uses so the forward /
+  inverse rounding shapes track each other. Module-level docs walk
+  through the matrix derivation (`M * M^T = 4*I`, `T_inv * T_inv^T =
+  4*I`, hence `FDCT(p) = round((T_fwd * p * T_fwd^T) / 2)`) so the
+  algebraic provenance is recorded inline. Validated by 8 new unit
+  tests covering uniform-block DC concentration, FDCT↔IDCT round-trip
+  on uniform + gradient + random small inputs, FWHT↔IWHT round-trip on
+  uniform inputs, the all-zero block, and the `raster_to_scan`
+  zig-zag inverse. A new integration test
+  `tests/encoder_transform_roundtrip.rs` (7 tests) ties these
+  primitives into the existing §13 `TokenEncoder`: FDCT → quantize
+  (§14.1 Y1 factors) → raster-to-scan → `TokenEncoder::encode_block`
+  → finish → `BoolDecoder::init` → `decode_block` → scan-to-raster →
+  §14.1 `dequant_block` → `inverse_dct_4x4`, recovering the per-MB
+  residual pixels. The synthetic flat-color 4×4 (pixel value = 128,
+  residual = 12) round-trips at **48.13 dB PSNR** at `yac_qi = 32`,
+  well above the round-131 ≥ 35 dB target; at `yac_qi = 0` the chain
+  is lossless across the full `0..=64` flat-value sweep. The per-MB
+  block-set wiring (Y2 DC seeding, 24/25-block walk, RD-driven mode
+  + quant selection) is the next encoder round; this round lands only
+  the primitive transforms + the per-block roundtrip proof.
+
+  Lib test count: 371 → 379 (8 new in `forward_transform`).
+  Standalone (no-default-features) lib tests: 366 → 374.
+  Integration test count grows by 7 (new
+  `tests/encoder_transform_roundtrip.rs`).
+
 * **VP8 encoder Phase 2: §13 DCT-token block encoder (RFC 6386
   §13.2 / §13.3)** — new `encode_coeff_block` + `TokenEncoder` API in
   `src/encoder.rs` that walks the §13.2 `coeff_tree` over the existing

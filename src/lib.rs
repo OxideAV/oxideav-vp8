@@ -251,6 +251,24 @@
 //!   frame the crate's own [`decode_vp8`] consumes and that
 //!   `ffmpeg -c:v vp8` accepts when wrapped in an IVF container. The
 //!   §13 / §14 rate-distortion encode side is future work.
+//!
+//! * **VP8 encoder Phase 2 begin: §14 forward 4×4 DCT + WHT
+//!   primitives** ([`forward_transform`]) — [`forward_dct_4x4`],
+//!   [`forward_wht_4x4`], and [`raster_to_scan`], the encoder partners
+//!   of the §14.3 / §14.4 inverse transforms and the §20.16 zig-zag
+//!   reorder. Mechanically derived as the transpose of the §14.3 /
+//!   §14.4 inverse listings (the §14.4 preamble itself notes the
+//!   transform is *"a classical 2-D inverse discrete cosine
+//!   transform"*); both reuse the same `COSPI8_SQRT2_MINUS1 = 20091`
+//!   / `SINPI8_SQRT2 = 35468` fixed-point constants so the
+//!   forward / inverse rounding shapes match. Wired through the
+//!   existing [`encoder::TokenEncoder`] for a per-MB roundtrip proof
+//!   (FDCT → quantize → raster-to-scan → encode → decode → scan-to-
+//!   raster → dequant → IDCT) at 48.13 dB PSNR on a synthetic flat
+//!   block at `yac_qi = 32` (lossless at `yac_qi = 0`); see
+//!   `tests/encoder_transform_roundtrip.rs`. The per-MB block-set
+//!   wiring (Y2 DC seeding, 24/25-block walk, RD-driven mode +
+//!   quant-step selection) is the next encoder round.
 
 #![warn(missing_debug_implementations)]
 
@@ -260,6 +278,7 @@ pub mod dct_tokens;
 pub mod decoder;
 pub mod dequant;
 pub mod encoder;
+pub mod forward_transform;
 pub mod frame;
 pub mod frame_header;
 pub mod intra_predict;
@@ -291,6 +310,7 @@ pub use encoder::{
     write_token_partition_count, BoolEncoder, EncodeError, ScaleCode as EncoderScaleCode,
     SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError, TokenEncoder,
 };
+pub use forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{
     FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,

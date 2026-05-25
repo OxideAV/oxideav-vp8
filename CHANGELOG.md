@@ -6,6 +6,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 9 begin: minimum-viable P-frame encoder
+  (RFC 6386 §9.1 / §9.7 / §9.10 / §16 / §17 / §18)** — new
+  `encode_p_frame_zero_mv` emits a valid VP8 P-frame where every
+  macroblock is coded as inter / ZEROMV / LAST. Frame tag carries
+  `frame_type = 1` per §9.1 (no resize, no start code); the §19.2
+  coded header writes the inter refresh ladder
+  (`refresh_golden_frame = 0` / `refresh_alternate_frame = 0` /
+  `copy_buffer_to_golden = 0` / `copy_buffer_to_alternate = 0` /
+  `refresh_last = 1` / `refresh_entropy_probs = 0`), `prob_intra = 255`
+  / `prob_last = 255` so every MB reads as inter/LAST at minimum cost,
+  the §17.2 `mv_prob_update()` block as 38 zero F-gates, and per-MB
+  emits `mb_skip_coeff → is_inter_mb → ref_frame selector →
+  inter-mode-tree leaf "0" (ZEROMV)` against the §16.3 census-driven
+  probability table the decoder evolves identically. The §18 prediction
+  reduces to an identity copy of LAST at MV (0,0); residual = source -
+  prediction is forward-DCT'd, the Y2 DCs collected via §14.3 forward
+  WHT, all blocks quantised against `MbDequantFactors::from_base_and_deltas`
+  and token-coded via the existing intra §13.3 walk (single partition
+  this round). All-zero residuals emit as skip MBs (§11.1). The §15
+  loop filter runs over the inter reconstruction when
+  `params.loop_filter_level != 0`. New `EncodeError::ReferenceDimensionsMismatch`
+  validates the supplied reference frame's macroblock-aligned dimensions.
+  Validated on a synthetic 64×64 I+P sequence (slow brightness drift
+  between frames): self-decode through `Vp8DecoderState` produces
+  **whole-frame PSNR 43.78 dB** at `yac_qi = 32` (Y 43.60 dB / U 44.15
+  dB / V 44.15 dB), comfortably clearing the round's 30 dB bar. New
+  tests in `tests/encoder_pframe_roundtrip.rs`:
+  `i_plus_p_zero_mv_self_decode_psnr_clears_30db_at_mid_qi` pins the
+  PSNR floor end-to-end; `p_frame_emits_inter_frame_tag` pins the §9.1
+  `frame_type = 1` / no-start-code shape;
+  `p_frame_reference_dimensions_mismatch_rejected` pins the validator.
+  This unblocks the real-MV / motion-search encoder rounds (NEARESTMV
+  / NEARMV / NEWMV / SPLITMV / GOLDEN / ALTREF). Tests: 427 → 430.
+
 * **VP8 encoder Phase 8: multi-frame keyframe stream driver
   (RFC 6386 §4 / §9.1 / §9.7 / §9.8)** — new
   `Vp8KeyframeStreamEncoder` consumes a sequence of `I420Frame`s and

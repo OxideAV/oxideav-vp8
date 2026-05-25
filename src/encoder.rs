@@ -90,6 +90,16 @@ pub enum EncodeError {
     /// reused to evolve neighbours) rejected the encoder's per-MB inputs.
     /// Surfaces the underlying [`crate::reconstruct::ReconstructError`].
     Reconstruct(crate::reconstruct::ReconstructError),
+    /// The reference frame supplied to a P-frame encode does not match
+    /// the source frame's macroblock-aligned dimensions
+    /// (`mb_cols * 16 × mb_rows * 16`). Surfaced by
+    /// [`encode_p_frame_zero_mv`].
+    ReferenceDimensionsMismatch {
+        /// `(width, height)` of the source frame's macroblock-aligned grid.
+        source: (u32, u32),
+        /// `(width, height)` of the reference [`crate::frame::KeyframePlanes`].
+        reference: (u32, u32),
+    },
 }
 
 impl core::fmt::Display for EncodeError {
@@ -122,6 +132,12 @@ impl core::fmt::Display for EncodeError {
             ),
             EncodeError::Token(inner) => write!(f, "vp8 encode: {inner}"),
             EncodeError::Reconstruct(inner) => write!(f, "vp8 encode: {inner}"),
+            EncodeError::ReferenceDimensionsMismatch { source, reference } => write!(
+                f,
+                "vp8 encode: P-frame source frame {}x{} (macroblock-aligned) does \
+                 not match the supplied reference frame {}x{}",
+                source.0, source.1, reference.0, reference.1
+            ),
         }
     }
 }
@@ -3219,6 +3235,504 @@ fn write_mode_layer(
         }
     }
 }
+
+// ─────────────────── P-frame encoder (ZERO_MV / LAST only) ───────────────────
+//
+// RFC 6386 §9 / §16 / §17 / §18 minimum-viable inter-frame encoder.
+//
+// Every emitted macroblock is coded as inter, with reference frame =
+// LAST (§16.2 `prob_last`-selected) and inter-mode = ZEROMV (§16.2
+// `mv_ref_tree` leaf "0"). The §18 motion-compensation prediction
+// therefore reduces to an identity copy of the LAST reference at the
+// macroblock's own position (motion vector (0,0) — no §18.3 sub-pixel
+// interpolation, no §16.3 census-driven `mv_ref` selection, no §17
+// differential MV bits). The §14 residual = source - prediction is
+// quantised and §13.3-token-coded through the existing intra pipeline.
+//
+// Per §17 the §17.2 `mv_prob_update()` block is still emitted (with
+// every `F` flag set to 0 — "no update", matching the no-token-prob-
+// update pattern) so the decoder's MV-decode infrastructure runs
+// against the defaults; no MV component bits ever follow on the wire
+// because every MB picks ZEROMV at the §16.2 tree.
+
+/// Encode one VP8 P-frame whose every macroblock is ZERO_MV inter
+/// from the LAST reference frame.
+///
+/// This is the minimum-viable inter encoder: no motion search, no
+/// non-zero MVs, no SPLITMV, no GOLDEN/ALTREF source — just the §18
+/// identity copy from `reference` at each MB's own position, the
+/// §14 quantised residual, and the §13.3 token coding. Each MB on the
+/// wire is one §19.3 `macroblock_header()` plus its §13.3 residual
+/// (or just the skip bit when the residual is all-zero).
+///
+/// Returns the emitted bytes alongside the macroblock-aligned post-§15
+/// reconstruction the decoder will rebuild. The reconstruction is the
+/// same shape as the §9 reference-frame buffer slot
+/// ([`crate::state::RefFrameSlot`]); a multi-frame inter driver can
+/// install it as the next frame's LAST without paying the cost of a
+/// re-decode.
+///
+/// `reference` must be the macroblock-aligned reconstruction the
+/// decoder produced for the previous frame (i.e. its `mb_cols * 16` /
+/// `mb_rows * 8` planes), matching the source frame's macroblock-grid
+/// dimensions. A mismatch is surfaced as
+/// [`EncodeError::ReferenceDimensionsMismatch`].
+///
+/// # Scope (this round)
+///
+/// * **Every MB is inter / ZEROMV / LAST.** No motion search, no
+///   `NEARESTMV` / `NEARMV` / `NEWMV` / `SPLITMV`, no `GOLDEN` /
+///   `ALTREF` reference selection.
+/// * **`prob_intra` is 255**, so the decoder reads every MB as
+///   inter without a bit on the wire wasted on intra-vs-inter
+///   classification. Token-prob and intra-mode-prob update blocks
+///   carry no updates; the §17.2 `mv_prob_update()` block is
+///   emitted with every F-gate set to 0 so the MV-decode
+///   infrastructure runs against the §17.2 defaults.
+/// * **§9.7 refresh ladder**: `refresh_last = 1`,
+///   `refresh_golden_frame = 0`, `refresh_alternate_frame = 0`,
+///   `copy_buffer_to_golden = 0`, `copy_buffer_to_alternate = 0`,
+///   `refresh_entropy_probs = 0`. The post-§15 reconstruction
+///   replaces LAST; GOLDEN / ALTREF stay as the caller left them.
+/// * **§15 loop filter**: runs over the encoder's own reconstruction
+///   when `params.loop_filter_level != 0`, mirroring the
+///   keyframe-encoder pattern. The §9.4 `mode_ref_lf_delta_enabled`
+///   flag is held at 0 (the per-MB delta layer is not emitted),
+///   matching `encode_keyframe_with_reconstruction`.
+/// * **§9.5 partition count** is fixed at 1 this round. Multi-
+///   partition output for inter is the same layout reorganisation as
+///   for keyframes; it can be wired in by a follow-up.
+///
+/// Self-decode validation: the emitted bytes decode through
+/// [`crate::state::Vp8DecoderState`] (after the I-frame the LAST slot
+/// holds) and reproduce the source within the §14 quantiser's
+/// distortion (≥ 30 dB whole-frame PSNR at a mid quantiser on a
+/// slow-motion synthetic source).
+pub fn encode_p_frame_zero_mv(
+    frame: &I420Frame,
+    reference: &crate::frame::KeyframePlanes,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let width = frame.width;
+    let height = frame.height;
+    if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
+        return Err(EncodeError::InvalidDimensions { width, height });
+    }
+    if params.y_ac_qi > 127 {
+        return Err(EncodeError::QuantIndexOutOfRange {
+            value: params.y_ac_qi,
+        });
+    }
+    if params.loop_filter_level > 63 {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: params.loop_filter_level,
+        });
+    }
+    if params.sharpness_level > 7 {
+        return Err(EncodeError::SharpnessLevelOutOfRange {
+            value: params.sharpness_level,
+        });
+    }
+
+    let mb_cols = width.div_ceil(16) as usize;
+    let mb_rows = height.div_ceil(16) as usize;
+    if reference.mb_cols != mb_cols || reference.mb_rows != mb_rows {
+        return Err(EncodeError::ReferenceDimensionsMismatch {
+            source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+            reference: (
+                (reference.mb_cols * 16) as u32,
+                (reference.mb_rows * 16) as u32,
+            ),
+        });
+    }
+
+    // The decoder keeps the §13.5 default token-probability table for
+    // this frame (we emit `refresh_entropy_probs = 0` and every §13.4
+    // update flag = false), so the encoder must code tokens against
+    // the same defaults.
+    let coeff_probs = crate::dct_tokens::DEFAULT_COEFF_PROBS;
+    let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
+        params.y_ac_qi as i32,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+
+    // The frame raster driver shares a single ReferencePlanes borrow.
+    let reference_planes = crate::motion_comp::ReferencePlanes {
+        y: &reference.y,
+        u: &reference.u,
+        v: &reference.v,
+        y_stride: reference.y_stride,
+        uv_stride: reference.uv_stride,
+        mb_cols: reference.mb_cols,
+        mb_rows: reference.mb_rows,
+    };
+    // §18.3 filter set (the version=0 default tap-set is fine — every
+    // MB has a (0,0) MV, so the convolution collapses to whole-pixel
+    // copy and the chosen tap set never runs).
+    let filters = crate::motion_comp::filter_set_for_version(0).taps();
+
+    // Running reconstruction buffer — same shape `decode_keyframe`
+    // produces. The §18 prediction for the NEXT MB does not depend on
+    // the current frame's already-reconstructed pixels (ZEROMV always
+    // samples LAST, not the current frame), but we still fill this so
+    // the §15 loop filter pass can operate on a single picture.
+    let mut planes = crate::frame::KeyframePlanes {
+        y: vec![0u8; mb_cols * 16 * mb_rows * 16],
+        u: vec![0u8; mb_cols * 8 * mb_rows * 8],
+        v: vec![0u8; mb_cols * 8 * mb_rows * 8],
+        y_stride: mb_cols * 16,
+        uv_stride: mb_cols * 8,
+        mb_cols,
+        mb_rows,
+    };
+
+    let mut modes: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
+    let mut all_coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
+    let mut ref_frames_out: Vec<Option<crate::motion_comp::RefFrame>> =
+        Vec::with_capacity(mb_rows * mb_cols);
+    let mut inter_modes_out: Vec<Option<crate::near_mv::InterMode>> =
+        Vec::with_capacity(mb_rows * mb_cols);
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let pixels = frame.extract_mb(mb_row, mb_col);
+
+            // §18 prediction at zero MV — identity copy of LAST at the
+            // same position. `predict_inter_mb` with `Mv::default()` and
+            // the §18.3 filter set collapses to whole-pixel copy because
+            // the fractional bits of (0,0) are zero.
+            let pred = crate::motion_comp::predict_inter_mb(
+                &reference_planes,
+                mb_col,
+                mb_row,
+                crate::motion_vector::Mv::default(),
+                false,
+                filters,
+            );
+
+            // §14 forward transform + quant against the prediction.
+            // Inter non-SPLITMV MBs carry a Y2 block (§14.2 page 76),
+            // exactly like the whole-block intra DC / V / H / TM modes.
+            let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, &factors);
+            let u_quant = transform_chroma_plane(&pixels.u, &pred.u, &factors);
+            let v_quant = transform_chroma_plane(&pixels.v, &pred.v, &factors);
+
+            let raw_coeffs = MbCoeffs {
+                y: y_quant,
+                y2: y2_quant,
+                u: u_quant,
+                v: v_quant,
+            };
+
+            // Count non-zero residual blocks so we can emit a skip-MB
+            // (§11.1) when the residual is exactly zero. Block walk
+            // order matches §13.3: Y2 + 16 Y + 4 U + 4 V.
+            let mut nonzero_block_count = 0usize;
+            if raw_coeffs.y2.iter().any(|&v| v != 0) {
+                nonzero_block_count += 1;
+            }
+            for blk in raw_coeffs.y.iter() {
+                if blk.iter().skip(1).any(|&v| v != 0) {
+                    nonzero_block_count += 1;
+                }
+            }
+            for blk in raw_coeffs.u.iter() {
+                if blk.iter().any(|&v| v != 0) {
+                    nonzero_block_count += 1;
+                }
+            }
+            for blk in raw_coeffs.v.iter() {
+                if blk.iter().any(|&v| v != 0) {
+                    nonzero_block_count += 1;
+                }
+            }
+            let mb_skip_coeff = nonzero_block_count == 0;
+
+            // Reconstruct through the decoder's own §18 + §14 path so
+            // the encoder's running buffer is bit-identical to what the
+            // decoder produces from the bytes we are about to emit.
+            // (`reconstruct_inter_mb` dequantises and adds residue
+            // internally; `mb_skip_coeff` short-circuits to pure
+            // prediction.)
+            let recon = crate::motion_comp::reconstruct_inter_mb(
+                &reference_planes,
+                mb_col,
+                mb_row,
+                crate::motion_vector::Mv::default(),
+                false,
+                filters,
+                mb_skip_coeff,
+                &raw_coeffs.y2,
+                &raw_coeffs.y,
+                &raw_coeffs.u,
+                &raw_coeffs.v,
+            );
+            // Note: `reconstruct_inter_mb` does its own internal
+            // dequantization of the residual (factor multiplies inside
+            // the inverse-WHT / inverse-DCT pipeline). It expects the
+            // *quantised* coefficients we just stored.
+            crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
+
+            // Per the §15 loop-filter geometry, an inter MB carries
+            // `y_mode = DC_PRED` for the §15.1 page-86 skip rule
+            // (filter_subblocks ← B_PRED || any-coded-coeff). SPLITMV
+            // is the only inter mode that maps to `y_mode = B_PRED`,
+            // and we never emit SPLITMV.
+            modes.push(MacroblockModes {
+                segment_id: None,
+                mb_skip_coeff,
+                y_mode: IntraYMode::Dc,
+                subblock_modes: None,
+                uv_mode: IntraUvMode::Dc,
+            });
+            all_coeffs.push(raw_coeffs);
+            ref_frames_out.push(Some(crate::motion_comp::RefFrame::Last));
+            inter_modes_out.push(Some(crate::near_mv::InterMode::Zero));
+        }
+    }
+
+    // ---- §15 loop-filter post-pass --------------------------------------
+    if params.loop_filter_level != 0 {
+        let lf_config = crate::loop_filter::FrameFilterConfig {
+            simple: false,
+            key_frame: false,
+            loop_filter_level: params.loop_filter_level,
+            sharpness_level: params.sharpness_level,
+            segmentation_enabled: false,
+            segment_abs: false,
+            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+            delta_enabled: false,
+            ref_delta_current: 0,
+            bpred_mode_delta: 0,
+            ref_delta_last: 0,
+            ref_delta_golden: 0,
+            ref_delta_altref: 0,
+            zero_mv_mode_delta: 0,
+            other_mv_mode_delta: 0,
+            split_mv_mode_delta: 0,
+        };
+        crate::loop_filter::filter_inter_frame(
+            &mut planes,
+            &modes,
+            &all_coeffs,
+            &ref_frames_out,
+            &inter_modes_out,
+            &lf_config,
+        );
+    }
+
+    // ---- §19.2 first (control) partition --------------------------------
+    let mut hdr = BoolEncoder::new();
+
+    // Inter frames do NOT emit color_space / clamping_type (those are
+    // key-frame-only per §9.2).
+    // §9.3 — segmentation off.
+    write_segment_update_flags(&mut hdr, false);
+    // §9.4 — loop filter. `filter_type = false` (normal),
+    // `mode_ref_lf_delta_enabled = false`.
+    write_loop_filter(
+        &mut hdr,
+        false,
+        params.loop_filter_level,
+        params.sharpness_level,
+        false,
+    )?;
+    // §9.5 — partition count (1 this round).
+    write_token_partition_count(&mut hdr, 1)?;
+    // §9.6 — quant indices (baseline only).
+    write_quant_indices(&mut hdr, params.y_ac_qi, None, None, None, None, None)?;
+
+    // §9.7 (inter) — refresh / sign-bias / entropy ladder.
+    // refresh_golden_frame = 0, refresh_alternate_frame = 0,
+    // copy_buffer_to_golden = 0 (2-bit), copy_buffer_to_alternate = 0,
+    // sign_bias_golden = 0, sign_bias_alternate = 0,
+    // refresh_entropy_probs = 0, refresh_last = 1.
+    hdr.write_bool(128, false); // refresh_golden_frame
+    hdr.write_bool(128, false); // refresh_alternate_frame
+    hdr.write_literal(0, 2); // copy_buffer_to_golden (gated on refresh_golden_frame == 0)
+    hdr.write_literal(0, 2); // copy_buffer_to_alternate (gated on refresh_alternate_frame == 0)
+    hdr.write_bool(128, false); // sign_bias_golden
+    hdr.write_bool(128, false); // sign_bias_alternate
+    hdr.write_bool(128, false); // refresh_entropy_probs
+    hdr.write_bool(128, true); // refresh_last = 1
+
+    // §13 / §9.9 — token-prob update sub-block: every flag false.
+    write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT);
+
+    // §9.11 — mb_no_skip_coeff enabled with a balanced prob_skip_false.
+    let prob_skip_false = 128u8;
+    write_mb_no_skip_coeff(&mut hdr, true, prob_skip_false);
+
+    // §9.10 — inter-only tail:
+    //   prob_intra (L8), prob_last (L8), prob_gf (L8),
+    //   intra_y_mode_prob_update gate (F? L8 × 4),
+    //   intra_uv_mode_prob_update gate (F? L8 × 3),
+    //   mv_prob_update() (38 F? L7 entries).
+    //
+    // prob_intra = 255 forces every MB to read as inter (the decoder
+    // does `dec.read_bool(prob_intra)` and `prob_intra = 255` makes the
+    // result "true" almost-always for the bool we'll emit). We emit
+    // `is_inter_mb = true` for every MB, which against `prob_intra = 255`
+    // costs essentially zero bits.
+    //
+    // prob_last = 255 makes the read of the LAST-vs-not-LAST bit also
+    // map to "false" (i.e. LAST) at minimum cost. We emit `false` so
+    // the decoder routes to LAST.
+    //
+    // prob_gf is irrelevant (never read because every MB picks LAST).
+    let prob_intra: u8 = 255;
+    let prob_last: u8 = 255;
+    let prob_gf: u8 = 128;
+    hdr.write_literal(prob_intra as u32, 8);
+    hdr.write_literal(prob_last as u32, 8);
+    hdr.write_literal(prob_gf as u32, 8);
+    // intra_y_mode_prob_update gate: no update.
+    hdr.write_bool(128, false);
+    // intra_uv_mode_prob_update gate: no update.
+    hdr.write_bool(128, false);
+    // mv_prob_update(): every F flag = 0, against the §17.2
+    // MV_UPDATE_PROBS table. The encoder mirrors the decoder's
+    // `parse_mv_prob_update` walk.
+    for ctx in MV_UPDATE_PROBS_FLAT.iter() {
+        hdr.write_bool(*ctx, false);
+    }
+
+    // ---- §11 / §16 macroblock-mode layer --------------------------------
+    //
+    // For each MB we emit (in §19.3 order):
+    //   1. mb_skip_coeff (when mb_no_skip_coeff = 1)
+    //   2. is_inter_mb (against prob_intra)
+    //   3. ref_frame selector (against prob_last; LAST = false)
+    //   4. inter-mode tree walk (ZEROMV = "0" against probs[0])
+    //
+    // The §16.3 census determines the four probabilities the inter-
+    // mode tree's bool reads, and depends on the already-decoded
+    // neighbours. For a frame whose every MB is ZEROMV with LAST,
+    // every neighbour has `ref_frame = Some(LAST)` and `mv = (0,0)`
+    // — i.e. every non-border neighbour is an inter MB with a zero
+    // vector, which the §16.3 census records as `cnt[CNT_BEST] += w`
+    // (weights 2/2/1 for above/left/above-left). The §16.3 sort then
+    // produces `cnt = [w_total, 0, 0, 0]` and `mv_ref_probs` reads
+    // `MV_COUNTS_TO_PROBS[cnt_best][0]` for the ZEROMV-vs-rest bit.
+    //
+    // We mirror the same census/probability evolution the decoder
+    // performs (so the bit we write is consumed at the same
+    // probability the decoder reads it at).
+    let mut above_mb: Vec<crate::near_mv::MbInfo> = vec![crate::near_mv::MbInfo::border(); mb_cols];
+
+    for mb_row in 0..mb_rows {
+        let mut left_mb = crate::near_mv::MbInfo::border();
+        let mut aboveleft_mb = crate::near_mv::MbInfo::border();
+        for (mb_col, above_slot) in above_mb.iter_mut().enumerate() {
+            let raster = mb_row * mb_cols + mb_col;
+            let mb = &modes[raster];
+
+            // 1. mb_skip_coeff (mb_no_skip_coeff = 1).
+            hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
+            // 2. is_inter_mb (every MB is inter).
+            hdr.write_bool(prob_intra, true);
+            // 3. ref_frame selector — LAST is "false" against prob_last.
+            hdr.write_bool(prob_last, false);
+
+            // 4. Inter-mode tree — ZEROMV is leaf 0, path "0", read
+            //    against probs[0] from the §16.3 census.
+            let near = crate::near_mv::find_near_mvs(
+                above_slot,
+                &left_mb,
+                &aboveleft_mb,
+                crate::motion_comp::RefFrame::Last,
+                crate::near_mv::SignBias::default(),
+            );
+            let probs = crate::near_mv::mv_ref_probs(&near.cnt);
+            // Walk MV_REF_TREE: at the root, ZEROMV (leaf 0) is the
+            // "false" branch against probs[0].
+            hdr.write_bool(probs[0], false);
+
+            // Update neighbour records for the next MB.
+            let cur = crate::near_mv::MbInfo {
+                ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                mv: crate::motion_vector::Mv::default(),
+                is_split: false,
+                split_mvs: None,
+            };
+            aboveleft_mb = *above_slot;
+            left_mb = cur;
+            *above_slot = cur;
+        }
+    }
+
+    let first_partition = hdr.finish();
+    let first_partition_size = first_partition.len();
+    if first_partition_size > 0x7_FFFF {
+        return Err(EncodeError::FirstPartitionTooLarge {
+            bytes: first_partition_size,
+        });
+    }
+
+    // ---- §19.2 DCT partition: §13.3 residual tokens ---------------------
+    //
+    // Single partition this round. Walks every non-skipped MB in
+    // raster order, threading the §13.3 above (per-column, frame-
+    // lived) / left (per-row) non-zero predictor contexts exactly as
+    // the decoder reads them. Skip MBs clear their predictor slots
+    // (§13.1) so the next non-skip neighbour sees `has_coeffs = false`.
+    let mut tok = BoolEncoder::new();
+    let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
+    for mb_row in 0..mb_rows {
+        let mut left_ctx = MbEntropyCtx::default();
+        for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
+            let raster = mb_row * mb_cols + mb_col;
+            let mb = &modes[raster];
+            if mb.mb_skip_coeff {
+                clear_skip_ctx(false, above_col, &mut left_ctx);
+                continue;
+            }
+            // Inter non-SPLITMV MBs always have Y2 (use_bpred = false).
+            encode_mb_tokens(
+                &mut tok,
+                &all_coeffs[raster],
+                false,
+                &coeff_probs,
+                above_col,
+                &mut left_ctx,
+            )
+            .map_err(EncodeError::Token)?;
+        }
+    }
+    let dct_partition = tok.finish();
+    let dct_total = dct_partition.len();
+
+    // ---- §9.1 inter frame tag + assembly --------------------------------
+    let mut out: Vec<u8> = Vec::with_capacity(3 + first_partition_size + dct_total);
+    write_frame_tag(
+        &mut out,
+        false, // inter frame
+        0,     // version 0 — full-pel chroma off, version 0 §18.3 6-tap filters
+        true,  // show_frame
+        first_partition_size as u32,
+        width,
+        height,
+        ScaleCode::None,
+        ScaleCode::None,
+    )?;
+    out.extend_from_slice(&first_partition);
+    out.extend_from_slice(&dct_partition);
+
+    Ok((out, planes))
+}
+
+/// Flattened §17.2 MV update-probability table (`2 * MV_PROB_COUNT = 38`
+/// entries, `[row..; column..]`). Each entry is the probability the
+/// encoder writes the corresponding "no update" F-gate at, matching the
+/// decoder's per-position `read_bool(MV_UPDATE_PROBS[i][j])`.
+const MV_UPDATE_PROBS_FLAT: [u8; 38] = [
+    237, 246, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 250, 250, 252, 254, 254,
+    231, 243, 245, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 251, 251, 254, 254, 254,
+];
 
 // ───────────────────────── factory + dual-API surface ─────────────────────────
 

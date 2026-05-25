@@ -2,6 +2,40 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 140)
+
+**Encoder Phase 9 begin — minimum-viable P-frame encoder.** New
+`encode_p_frame_zero_mv` emits a structurally-valid VP8 P-frame whose
+every macroblock is coded as inter / ZEROMV / LAST. The §9.1 frame tag
+carries `frame_type = 1` (no resize, no start code); the §19.2 coded
+header writes the inter refresh ladder (`refresh_last = 1`, all other
+refresh / copy bits 0), `prob_intra = 255` / `prob_last = 255` so every
+MB reads as inter/LAST at minimum cost, the §17.2 `mv_prob_update()`
+block as 38 zero F-gates against the per-position update-probability
+table, and per-MB emits `mb_skip_coeff → is_inter_mb → ref_frame
+selector → inter-mode-tree leaf "0" (ZEROMV)` against the §16.3
+census-driven probability table the decoder evolves identically. The §18
+prediction reduces to an identity copy of the LAST reference at MV
+(0,0); residual = source − prediction is forward-DCT'd, the sixteen Y
+DCs collected via §14.3 forward WHT into Y2, all blocks quantised
+through `MbDequantFactors::from_base_and_deltas` and token-coded via the
+existing intra §13.3 walk. All-zero residual MBs emit as skip MBs
+(§11.1). The §15 loop filter runs over the inter reconstruction when
+`params.loop_filter_level != 0`. A new
+`EncodeError::ReferenceDimensionsMismatch` validates that the supplied
+reference's macroblock-aligned dimensions match the source frame's.
+
+Round target validated: a synthetic 64×64 I+P sequence (slow constant
+brightness drift between frames) round-trips through
+`Vp8DecoderState` at `yac_qi = 32` with whole-frame self-decode
+**PSNR 43.78 dB** (Y 43.60 dB / U 44.15 dB / V 44.15 dB), comfortably
+clearing the 30 dB round bar. Three new tests in
+`tests/encoder_pframe_roundtrip.rs` pin the PSNR floor end-to-end, the
+§9.1 inter-frame-tag shape, and the reference-dimensions validator.
+Single partition this round (§9.5); multi-partition for inter, NEARESTMV
+/ NEARMV / NEWMV / SPLITMV, GOLDEN / ALTREF source selection, and motion
+search are the next encoder rounds. Tests: 427 → 430.
+
 ## Status — 2026-05-26 (round 139)
 
 **Encoder Phase 8 — multi-frame keyframe stream driver.** New

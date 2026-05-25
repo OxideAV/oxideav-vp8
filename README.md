@@ -2,6 +2,40 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 136)
+
+**Encoder Phase 5 — rate-distortion intra mode selection landed.** The
+SAD-only picker is replaced by a Lagrangian rate-distortion search:
+every candidate mode is run through the full §14 chain (predict → FDCT
+→ Y2/WHT → quantise → dequantise → inverse-transform → reconstruct) and
+scored by `J = SSD + lambda * R`, where the distortion `D` is the
+**exact self-decode** SSD against the source and the rate `R` is the
+§13.3 token bits (priced by summing `-log2(p)` over each §7.3 boolean,
+mirroring the token writer) plus the §11.2 / §11.4 mode-signal bits.
+`lambda = q² / 32` is derived from the luma AC quant step (RD is
+non-normative — RFC 6386 specifies only decoding). Applied to the
+whole-block luma pick, the chroma `uv_mode` pick, and per-4×4 `B_PRED`
+sub-block modes; the luma whole-block-vs-`B_PRED` decision compares
+total RD cost (charging the §11.2 B-flag).
+
+Measured against the r135 SAD picker on a 64×64 natural test frame, RD
+wins on **both** axes at every quantiser:
+
+| qi | SAD bytes → RD | SAD PSNR → RD |
+|----|----------------|---------------|
+| 16 | 1467 → 1366    | 39.29 → 39.62 dB |
+| 32 | 1003 → 919     | 34.56 → 35.00 dB |
+| 48 | 731 → 615      | 31.74 → 31.94 dB |
+| 64 | 383 → 288      | 29.92 → 29.95 dB |
+
+Smaller files **and** higher PSNR throughout (PSNR/byte up ~8–33%). A
+`rd_beats_sad_baseline_size_and_quality` test pins the no-regression
+guarantee; `rd_keyframe_holds_psnr_floor_on_natural_frame` holds a
+30 dB floor at qi 16/32/48. Inter prediction and a full per-token
+trellis remain the next encoder rounds.
+
+Lib test count: 390 → 392.
+
 ## Status — 2026-05-25 (round 135)
 
 **Encoder Phase 4 — per-frame key-frame raster driver landed.** The

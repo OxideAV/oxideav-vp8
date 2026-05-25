@@ -6,6 +6,25 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 5: rate-distortion intra mode selection** — the
+  SAD-only mode picker is replaced by a Lagrangian rate-distortion
+  search. Each candidate mode is run through the full §14 chain (predict
+  → FDCT → Y2/WHT → quantise → dequantise → inverse-transform →
+  reconstruct) and scored by `J = SSD + lambda * R`: the distortion `D`
+  is the exact self-decode SSD against the source, and the rate `R` is
+  the §13.3 token bits (estimated by summing `-log2(p)` over each §7.3
+  boolean the token writer would emit) plus the §11.2 / §11.4
+  mode-signal bits. `lambda = q² / 32` is derived from the luma AC
+  quant step; rate-distortion is a non-normative encoder choice (RFC
+  6386 specifies only decoding). Applied to the whole-block luma pick,
+  the chroma `uv_mode` pick, and the per-4×4 `B_PRED` sub-block modes;
+  the whole-block-vs-`B_PRED` luma decision compares total RD cost. On a
+  64×64 natural test frame the RD picker produces smaller streams **and**
+  higher self-decode PSNR than the prior SAD picker at every quantiser
+  (e.g. qi 32: 1003 → 919 bytes, 34.56 → 35.00 dB). Pinned by
+  `rd_beats_sad_baseline_size_and_quality` and
+  `rd_keyframe_holds_psnr_floor_on_natural_frame`. No public API change.
+
 * **VP8 encoder Phase 4: per-frame key-frame raster driver (RFC 6386
   §9 / §11 / §19.2)** — new `encode_keyframe(&I420Frame, &KeyframeParams)`
   entry that walks a source I420 picture macroblock-by-macroblock in

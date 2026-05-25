@@ -6,6 +6,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 2: per-MB block-set wiring (RFC 6386 §13.3 /
+  §14.2)** — new `encode_mb_block_set` driver in `src/encoder.rs` that
+  takes a single 16×16 Y + 8×8 Cb + 8×8 Cr macroblock at known
+  quantiser index and produces a §13.3 token-coded byte stream that
+  decodes (via the crate's own `decode_mb_coeffs` +
+  `MbDequantFactors::dequantize` + `decode_keyframe`) back to within
+  ≤ 1 LSB of the input pixels on a flat-colour MB at `yac_qi = 0`.
+  The driver implements the encode-side inverse of §14.2:
+  * §12.2 `DC_PRED` constant 128 prediction (no above / left
+    neighbours, matching the single-MB test fixture);
+  * §14.4 forward DCT per Y / U / V 4×4 sub-block (16 + 4 + 4 = 24);
+  * Collection of the 16 Y DCs into a Y2 block + §14.3 forward WHT;
+  * Zeroing of each Y sub-block's DC (now carried by Y2);
+  * §14.1 / §20.4 quantisation (round-half-away-from-zero) against
+    the six `MbDequantFactors` (`y1_dc/y1_ac/y2_dc/y2_ac/uv_dc/uv_ac`);
+  * §13.3 token-walk in residual order Y2 → 16 Y (`YAfterY2`) →
+    4 U (`UV`) → 4 V (`UV`), threaded through fresh above / left
+    `MbEntropyCtx` with the §20.16 `left_context_index` /
+    `above_context_index` slot mapping so the per-block first-position
+    probability index matches what `decode_mb_coeffs` reads.
+  Returned [`EncodedMb`] carries the raw-quantised `MbCoeffs` (for
+  fixture inspection / roundtrip tests), the finished bool-encoder
+  byte stream, and the non-zero block count. New public surface:
+  `MbPixels`, `EncodedMb`, `encode_mb_block_set`. Validated by 3 new
+  unit tests in `src/encoder.rs`:
+  * `mb_block_set_roundtrip_flat_color_recovers_within_one_lsb` —
+    sweeps flat pixel values 100/110/128/140/160/200 at `yac_qi = 0`;
+    every reconstructed luma pixel is within ≤ 1 LSB of the input.
+  * `mb_block_set_constant_128_emits_all_eob_blocks` — proves that
+    a zero-residual MB (constant 128) produces zero non-zero blocks
+    and the bytes decode to all-zero coefficients.
+  * `mb_block_set_roundtrip_flat_color_at_q16_holds_within_2_lsb` —
+    same flat-MB roundtrip at `yac_qi = 16`, recovered within ≤ 2 LSB.
+  RD-driven mode selection / quantiser-step picks, non-DC prediction
+  modes, B_PRED / SPLITMV, inter prediction, and the per-frame raster
+  driver that threads `MbEntropyCtx` columns across an N-MB frame
+  are the next encoder rounds; this round lands only the per-MB
+  block-set walker.
+
+  Lib test count: 379 → 382 (3 new in `encoder::tests`).
+  Standalone (no-default-features) lib tests: 374 → 377.
+
 * **VP8 encoder Phase 2 begin: §14 forward 4×4 DCT and WHT
   primitives (RFC 6386 §14.3 / §14.4)** — new `src/forward_transform.rs`
   module exposing `forward_dct_4x4`, `forward_wht_4x4`, and

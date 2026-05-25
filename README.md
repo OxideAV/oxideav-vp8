@@ -2,6 +2,54 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 132)
+
+**Encoder Phase 2 — per-MB block-set wiring landed.** The crate now
+exposes `encode_mb_block_set` in `src/encoder.rs`: a per-macroblock
+encoder driver that takes a single 16×16 Y + 8×8 Cb + 8×8 Cr
+macroblock (`MbPixels`) at a chosen quantiser index and produces an
+`EncodedMb` carrying the raw-quantised `MbCoeffs` plus the §13.3
+token-coded byte stream the existing `decode_mb_coeffs` consumes.
+
+The driver implements the encode-side inverse of the §14.2 / §12.2
+reconstruction orchestrator:
+
+1. **Prediction**: §12.2 `DC_PRED` with no above / left neighbours →
+   flat 128 across every plane; residual is `pixel - 128`.
+2. **Forward transforms**: §14.4 forward DCT per 4×4 sub-block (16 Y,
+   4 U, 4 V); the 16 Y DCs are collected into a Y2 block and §14.3
+   forward-WHT'd. Each Y sub-block's DC is then zeroed (now carried by
+   Y2).
+3. **Quantisation**: §14.1 / §20.4 round-half-away-from-zero division
+   by the six `MbDequantFactors` (`y1_dc/y1_ac/y2_dc/y2_ac/uv_dc/uv_ac`)
+   — the natural inverse of `MbDequantFactors::dequantize`.
+4. **Token coding**: §13.3 walk in residual order Y2 → 16 Y
+   (`YAfterY2`) → 4 U (`UV`) → 4 V (`UV`), threaded through fresh
+   above / left `MbEntropyCtx` with the §20.16 `left_context_index` /
+   `above_context_index` slot mapping so the per-block first-position
+   probability index matches what `decode_mb_coeffs` reads on the
+   other side.
+
+Validated by 3 new unit tests:
+
+* `mb_block_set_roundtrip_flat_color_recovers_within_one_lsb` —
+  sweeps flat pixel values 100/110/128/140/160/200 at `yac_qi = 0`;
+  every reconstructed luma pixel is within **≤ 1 LSB** of the input.
+* `mb_block_set_constant_128_emits_all_eob_blocks` — a zero-residual
+  MB (constant 128) emits zero non-zero blocks and round-trips to
+  all-zero coefficients.
+* `mb_block_set_roundtrip_flat_color_at_q16_holds_within_2_lsb` —
+  same flat-MB roundtrip at `yac_qi = 16`; recovered within ≤ 2 LSB.
+
+What lands this round is the per-MB block-set walker. RD-driven mode
+selection / quantiser-step picks, non-DC prediction modes (V / H /
+TM / B_PRED for luma, V / H / TM for chroma), inter prediction, and
+the per-frame raster driver that threads `MbEntropyCtx` columns
+through an N-MB frame are the next encoder rounds.
+
+Lib test count: 379 → 382; standalone (no-default-features) lib
+tests: 374 → 377.
+
 ## Status — 2026-05-25 (round 131)
 
 **Encoder Phase 2 begin — §14 forward 4×4 DCT + WHT primitives landed

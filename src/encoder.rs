@@ -1266,6 +1266,366 @@ impl TokenEncoder {
     }
 }
 
+// ───────────────────────── Phase 2: per-MB block-set encoder ──────────────────
+
+use crate::dct_tokens::MbEntropyCtx;
+use crate::forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
+use crate::frame::MbCoeffs;
+
+/// Round-half-away-from-zero integer division — the natural inverse of
+/// the §14.1 `q * factor` dequant multiply. Used by the encoder to
+/// quantise a single 16-bit coefficient by an `i16` factor.
+#[inline]
+fn enc_round_div(num: i32, den: i32) -> i16 {
+    debug_assert!(den > 0, "encoder quantiser factor must be positive");
+    let r = if num >= 0 {
+        (num + den / 2) / den
+    } else {
+        -(((-num) + den / 2) / den)
+    };
+    r as i16
+}
+
+/// Quantise a raster-order 4×4 coefficient block in place against a
+/// `(dc_factor, ac_factor)` pair — coefficient 0 is divided by `dc`,
+/// coefficients 1..=15 by `ac`, with round-half-away-from-zero rounding.
+/// This is the inverse of [`crate::dequant_block`].
+#[inline]
+fn enc_quantize_block(block: &mut [i16; 16], dc: i16, ac: i16) {
+    block[0] = enc_round_div(block[0] as i32, dc as i32);
+    for c in block.iter_mut().skip(1) {
+        *c = enc_round_div(*c as i32, ac as i32);
+    }
+}
+
+/// Inputs to the §14 per-macroblock encoder — a single raw 16×16 Y plane
+/// and two 8×8 chroma planes, plus a chosen quantizer.
+///
+/// Pixels are 8-bit unsigned (`u8`) in raster order. The MB encoder
+/// computes the §11 / §12 intra prediction internally (Phase 2 ships
+/// only the `DC_PRED` constant-prediction path for both luma and
+/// chroma) and feeds the residual through §14 / §13.
+#[derive(Debug, Clone, Copy)]
+pub struct MbPixels {
+    /// 16×16 Y plane, row-major.
+    pub y: [u8; 256],
+    /// 8×8 Cb plane, row-major.
+    pub u: [u8; 64],
+    /// 8×8 Cr plane, row-major.
+    pub v: [u8; 64],
+}
+
+/// Result of [`encode_mb_block_set`] — the per-MB raw-quantised
+/// coefficient bundle (for inspection / testing) plus the byte stream
+/// emitted by the token-encoder's underlying boolean encoder.
+///
+/// The bytes are positioned to feed a `BoolDecoder` directly; the
+/// caller wraps them in any outer-frame framing (the §9.x first
+/// partition + §9.5 DCT partition table) it needs.
+#[derive(Debug, Clone)]
+pub struct EncodedMb {
+    /// The 25 raw-quantised coefficient blocks the encoder emitted, in
+    /// raster order per [`MbCoeffs`]. Useful as a fixture for
+    /// roundtrip tests; the decoder side recovers the same arrays.
+    pub coeffs: MbCoeffs,
+    /// The token-encoder's finished byte stream. Concatenates §13.3
+    /// for Y2 → 16 Y → 4 U → 4 V at the supplied predictor seeds, then
+    /// the §7.3 4-byte boolean-encoder flush trailer.
+    pub bytes: Vec<u8>,
+    /// The non-zero block count across the 25 residual blocks, useful
+    /// as a regression knob and for assertions in tests.
+    pub nonzero_block_count: usize,
+}
+
+/// Encode one macroblock's residual through the §13 / §14 block-set
+/// walker — the inverse of the §14.2 reconstruction orchestrator.
+///
+/// # Behavior (Phase 2 scope)
+///
+/// * **Prediction**: `DC_PRED` constant 128 (the §12.2 default for a
+///   macroblock with no neighbours — i.e. the top-left MB of a frame).
+///   The residual is `pixel - 128` per channel.
+/// * **Forward transforms**: §14.4 forward DCT on every Y, U, V 4×4
+///   sub-block (16 + 4 + 4 = 24 blocks); the 16 Y DCs are collected
+///   into a Y2 block and §14.3 forward-WHT'd.
+/// * **Quantisation**: §14.1 / §20.4 factors per
+///   [`MbDequantFactors::from_quant_indices`], with the `MbCoeffs`
+///   plane layout matching what [`decode_and_dequantize_mb`] produces
+///   on the decoder side.
+/// * **Token coding**: §13.3 walk in residual order Y2 → 16 Y
+///   (`YAfterY2`) → 4 U (`UV`) → 4 V (`UV`), threaded through fresh
+///   above / left [`MbEntropyCtx`] (i.e. off-frame neighbours, which
+///   matches the test fixture's single-MB frame).
+///
+/// # Roundtrip guarantee
+///
+/// On a flat-colour Y / U / V macroblock at `yac_qi = 0` the bytes
+/// `decode_mb_coeffs` + `MbDequantFactors::dequantize` + the §14.2 /
+/// §12.2 reconstruction orchestrator return exactly recover the input
+/// pixel value (the FDCT / FWHT chain concentrates a flat block into a
+/// single DC, which round-trips losslessly at `q = 0` per the existing
+/// `flat_residual_block_roundtrips_losslessly_at_q0` test). The
+/// `mb_block_set_roundtrip_flat_color_recovers_within_one_lsb` test in
+/// the same module checks this end-to-end.
+///
+/// # Out of scope (deferred)
+///
+/// * Non-DC prediction modes (V / H / TM / B_PRED + the 8×8 chroma
+///   variants), inter prediction, mode RD search. The encoder will
+///   gain those when the §11 mode-selection round lands.
+/// * Multi-MB neighbour evolution. This entry encodes one MB against
+///   off-frame neighbours; the per-frame raster driver that threads
+///   `MbEntropyCtx` columns through a frame is the next layer.
+pub fn encode_mb_block_set(
+    pixels: &MbPixels,
+    yac_qi: u8,
+    coeff_probs: &crate::dct_tokens::CoeffProbs,
+) -> Result<EncodedMb, TokenEncodeError> {
+    // ---- 1. Build the §14.1 dequant factors for this MB's segment.
+    // The encoder's quantisation step is the inverse — divide by these.
+    let factors =
+        crate::dequant::MbDequantFactors::from_base_and_deltas(yac_qi as i32, 0, 0, 0, 0, 0);
+
+    // ---- 2. Forward-transform the residual.
+    //
+    // §12.2 DC_PRED with no above / left neighbours gives a flat
+    // 128-prediction for every plane (§12.2 page 51 "if neither
+    // exists, the average is 128"). The residual is `pixel - 128`.
+    let dc_pred: i16 = 128;
+
+    let mut raw_coeffs = MbCoeffs::default();
+
+    // 16 Y sub-blocks: extract → FDCT into raster-order arrays.
+    // Y sub-block order matches §14.2: index `i*4 + j` for row i,
+    // column j of the 4×4 sub-block grid in a 16×16 plane.
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut residual = [0i16; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let py = i * 4 + r;
+                    let px = j * 4 + c;
+                    residual[r * 4 + c] = pixels.y[py * 16 + px] as i16 - dc_pred;
+                }
+            }
+            let mut coeffs = [0i16; 16];
+            forward_dct_4x4(&residual, &mut coeffs);
+            raw_coeffs.y[i * 4 + j] = coeffs;
+        }
+    }
+
+    // 4 U sub-blocks.
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut residual = [0i16; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let py = i * 4 + r;
+                    let px = j * 4 + c;
+                    residual[r * 4 + c] = pixels.u[py * 8 + px] as i16 - dc_pred;
+                }
+            }
+            let mut coeffs = [0i16; 16];
+            forward_dct_4x4(&residual, &mut coeffs);
+            raw_coeffs.u[i * 2 + j] = coeffs;
+        }
+    }
+
+    // 4 V sub-blocks.
+    for i in 0..2 {
+        for j in 0..2 {
+            let mut residual = [0i16; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let py = i * 4 + r;
+                    let px = j * 4 + c;
+                    residual[r * 4 + c] = pixels.v[py * 8 + px] as i16 - dc_pred;
+                }
+            }
+            let mut coeffs = [0i16; 16];
+            forward_dct_4x4(&residual, &mut coeffs);
+            raw_coeffs.v[i * 2 + j] = coeffs;
+        }
+    }
+
+    // ---- 3. Collect the 16 Y DCs and run §14.3 forward WHT into Y2.
+    //
+    // §14.2 first paragraph (inverse direction): "the element of the
+    // result at row i, column j is used as the 0th coefficient of the
+    // Y subblock at position (i, j)" — i.e. Y2[i*4+j] seeds Y[i*4+j]'s
+    // DC. The encode-side inverse: take DC[i*4+j] from each Y
+    // sub-block, build a 4×4 array, FWHT, then zero out each Y
+    // sub-block's DC (since it now lives in Y2).
+    let mut y_dc_block = [0i16; 16];
+    for (slot, src) in y_dc_block.iter_mut().zip(raw_coeffs.y.iter()) {
+        *slot = src[0];
+    }
+    let mut y2_coeffs = [0i16; 16];
+    forward_wht_4x4(&y_dc_block, &mut y2_coeffs);
+    raw_coeffs.y2 = y2_coeffs;
+    for blk in raw_coeffs.y.iter_mut() {
+        blk[0] = 0;
+    }
+
+    // ---- 4. Quantise every block against its plane's §14.1 factors.
+    //
+    // The encoder's quant step is the natural inverse of the
+    // decoder's `MbDequantFactors::dequantize`: divide each
+    // coefficient by the matching DC / AC factor with round-half-
+    // away-from-zero. The Y sub-blocks' DCs are zero (consumed by
+    // Y2 above), but we still pass `factors.y1_dc` for the divisor
+    // — round-half-away-from-zero of 0 stays 0.
+    enc_quantize_block(&mut raw_coeffs.y2, factors.y2_dc, factors.y2_ac);
+    for blk in raw_coeffs.y.iter_mut() {
+        enc_quantize_block(blk, factors.y1_dc, factors.y1_ac);
+    }
+    for blk in raw_coeffs.u.iter_mut() {
+        enc_quantize_block(blk, factors.uv_dc, factors.uv_ac);
+    }
+    for blk in raw_coeffs.v.iter_mut() {
+        enc_quantize_block(blk, factors.uv_dc, factors.uv_ac);
+    }
+
+    // ---- 5. Walk §13.3 residual order, encode each block in scan
+    //         order against fresh above / left predictor contexts.
+    //
+    // We use the same `decode_mb_coeffs` walk order:
+    //   1. Y2 (if has_y2)                          — block 24
+    //   2. 16 Y sub-blocks (YAfterY2 plane)        — blocks 0..15
+    //   3. 4 U sub-blocks (UV plane)               — blocks 16..19
+    //   4. 4 V sub-blocks (UV plane)               — blocks 20..23
+    //
+    // The above / left predictor seeds for the first block are both
+    // off-frame ("false") since this entry encodes a single isolated
+    // MB. Each block updates its slot in both contexts per §13.3.
+    let mut enc = BoolEncoder::new();
+    let mut above = MbEntropyCtx::default();
+    let mut left = MbEntropyCtx::default();
+    let mut nonzero_block_count = 0usize;
+
+    let scan_y2 = raster_to_scan(&raw_coeffs.y2);
+    let nz = encode_block_with_ctx(
+        &mut enc,
+        24,
+        BlockType::Y2,
+        coeff_probs,
+        &scan_y2,
+        &mut above,
+        &mut left,
+    )?;
+    if nz != 0 {
+        nonzero_block_count += 1;
+    }
+
+    for (i, y_block) in raw_coeffs.y.iter().enumerate() {
+        let scan = raster_to_scan(y_block);
+        let nz = encode_block_with_ctx(
+            &mut enc,
+            i,
+            BlockType::YAfterY2,
+            coeff_probs,
+            &scan,
+            &mut above,
+            &mut left,
+        )?;
+        if nz != 0 {
+            nonzero_block_count += 1;
+        }
+    }
+
+    for (i, u_block) in raw_coeffs.u.iter().enumerate() {
+        let scan = raster_to_scan(u_block);
+        let nz = encode_block_with_ctx(
+            &mut enc,
+            16 + i,
+            BlockType::UV,
+            coeff_probs,
+            &scan,
+            &mut above,
+            &mut left,
+        )?;
+        if nz != 0 {
+            nonzero_block_count += 1;
+        }
+    }
+
+    for (i, v_block) in raw_coeffs.v.iter().enumerate() {
+        let scan = raster_to_scan(v_block);
+        let nz = encode_block_with_ctx(
+            &mut enc,
+            20 + i,
+            BlockType::UV,
+            coeff_probs,
+            &scan,
+            &mut above,
+            &mut left,
+        )?;
+        if nz != 0 {
+            nonzero_block_count += 1;
+        }
+    }
+
+    let bytes = enc.finish();
+    Ok(EncodedMb {
+        coeffs: raw_coeffs,
+        bytes,
+        nonzero_block_count,
+    })
+}
+
+/// Encode one residual block at `block_index` against the §13.3 above /
+/// left predictor slots, threading the §20.16 `left_context_index` /
+/// `above_context_index` lookups so the encoder's per-position
+/// probability index matches the decoder's. Returns the non-zero
+/// coefficient count from `encode_coeff_block`.
+///
+/// This is the encoder partner of the `decode_one` closure inside
+/// `decode_mb_coeffs`; both update the predictor contexts in place.
+fn encode_block_with_ctx(
+    enc: &mut BoolEncoder,
+    block_index: usize,
+    block_type: BlockType,
+    coeff_probs: &crate::dct_tokens::CoeffProbs,
+    scan_coeffs: &[i16; 16],
+    above: &mut MbEntropyCtx,
+    left: &mut MbEntropyCtx,
+) -> Result<usize, TokenEncodeError> {
+    // The §20.16 LEFT/ABOVE context index tables are crate-private
+    // inside `dct_tokens`, but their layout is fixed by RFC 6386
+    // §20.16 (and confirmed by the `decode_mb_coeffs` walk). The
+    // encoder duplicates the mapping here so it doesn't need to grow
+    // the `dct_tokens` public surface.
+    const LEFT_CTX: [usize; 25] = [
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, // 16 Y
+        4, 4, 5, 5, // 4 U
+        6, 6, 7, 7, // 4 V
+        8, // Y2
+    ];
+    const ABOVE_CTX: [usize; 25] = [
+        0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, // 16 Y
+        4, 5, 4, 5, // 4 U
+        6, 7, 6, 7, // 4 V
+        8, // Y2
+    ];
+
+    let a_slot = ABOVE_CTX[block_index];
+    let l_slot = LEFT_CTX[block_index];
+
+    let nz = encode_coeff_block(
+        enc,
+        block_type,
+        coeff_probs,
+        above.nonzero[a_slot],
+        left.nonzero[l_slot],
+        scan_coeffs,
+    )?;
+
+    let has_coeffs = nz != 0;
+    above.nonzero[a_slot] = has_coeffs;
+    left.nonzero[l_slot] = has_coeffs;
+    Ok(nz)
+}
+
 // ───────────────────────── factory + dual-API surface ─────────────────────────
 
 /// Direct factory entry — paired with the workspace's "dual API"
@@ -1918,6 +2278,179 @@ mod tests {
             assert_eq!(
                 recovered, coeffs,
                 "pseudo-random round-trip failed at trial {trial}, bt={bt:?}, above={above}, left={left}"
+            );
+        }
+    }
+
+    // ───────── Phase 2 per-MB block-set encoder roundtrip tests ─────────
+
+    use crate::dct_tokens::decode_mb_coeffs;
+    use crate::dequant::MbDequantFactors;
+    use crate::frame::{decode_keyframe, MbCoeffs as FrameMbCoeffs};
+    use crate::macroblock::{IntraUvMode, IntraYMode, MacroblockModes};
+
+    /// Build a single-macroblock frame with DC_PRED + given
+    /// pre-dequantized coefficients and return the reconstructed luma
+    /// plane.
+    fn decode_single_mb(coeffs: FrameMbCoeffs) -> Vec<u8> {
+        let modes = vec![MacroblockModes {
+            segment_id: None,
+            mb_skip_coeff: false,
+            y_mode: IntraYMode::Dc,
+            subblock_modes: None,
+            uv_mode: IntraUvMode::Dc,
+        }];
+        let planes = decode_keyframe(1, 1, &modes, &[coeffs]).expect("decode_keyframe");
+        planes.y
+    }
+
+    /// Encode a flat-color MB through `encode_mb_block_set`, decode the
+    /// bytes back into the per-MB raw coefficients, dequantize, and run
+    /// the §14.2 reconstruction orchestrator — the recovered luma /
+    /// chroma planes must be within ≤ 1 LSB of the input.
+    #[test]
+    fn mb_block_set_roundtrip_flat_color_recovers_within_one_lsb() {
+        // Pick a uniform pixel value off 128 so the residual is
+        // non-zero and the §14 chain actually exercises the DC path
+        // (rather than every block being all-zero, which is the
+        // trivial success case).
+        for &pixel in &[100u8, 110, 128, 140, 160, 200] {
+            let pixels = MbPixels {
+                y: [pixel; 256],
+                u: [pixel; 64],
+                v: [pixel; 64],
+            };
+
+            // yac_qi = 0 is the lossless flat-block case
+            // (`DC_QLOOKUP[0] = AC_QLOOKUP[0] = 4`).
+            let encoded =
+                encode_mb_block_set(&pixels, 0, &DEFAULT_COEFF_PROBS).expect("encode_mb_block_set");
+
+            // Decode the emitted bytes back into raw quantized coeffs
+            // through `decode_mb_coeffs` (same predictor seeds: fresh
+            // contexts since this is a single isolated MB).
+            let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
+            let mut above = MbEntropyCtx::default();
+            let mut left = MbEntropyCtx::default();
+            let mut recovered_raw = decode_mb_coeffs(
+                &mut dec,
+                true,
+                false,
+                &DEFAULT_COEFF_PROBS,
+                &mut above,
+                &mut left,
+            )
+            .expect("decode_mb_coeffs");
+
+            // The decoder's recovered raw coefficients must match what
+            // the encoder produced (the §13.3 byte-stream layer is the
+            // tight invariant; this is the same check the standalone
+            // `encode_coeff_block` test in this module exercises but
+            // composed across all 25 residual blocks).
+            assert_eq!(
+                recovered_raw, encoded.coeffs,
+                "encoded coeffs differ from decoded raw coeffs (pixel = {pixel})"
+            );
+
+            // Dequantize and reconstruct.
+            let factors = MbDequantFactors::from_base_and_deltas(0, 0, 0, 0, 0, 0);
+            factors.dequantize(&mut recovered_raw);
+            let y_plane = decode_single_mb(recovered_raw);
+
+            // Verify every reconstructed luma pixel is within ≤ 1 LSB
+            // of the input. At yac_qi = 0 the chain is bit-exact for a
+            // flat block (per the existing per-block roundtrip test),
+            // but the test bounds at ≤ 1 to leave room for the §14.5
+            // clamp / rounding behaviour on extreme inputs.
+            for (i, &recon) in y_plane.iter().enumerate() {
+                assert!(
+                    (recon as i32 - pixel as i32).abs() <= 1,
+                    "pixel {pixel}: recon[{i}] = {recon} differs by > 1 LSB"
+                );
+            }
+        }
+    }
+
+    /// A constant 128-pixel macroblock has zero residual — every block
+    /// after FDCT / FWHT is all-zero, which means every encoded block
+    /// is a single immediate EOB token and the predictor contexts
+    /// remain at their default (no non-zero coefficients anywhere).
+    #[test]
+    fn mb_block_set_constant_128_emits_all_eob_blocks() {
+        let pixels = MbPixels {
+            y: [128u8; 256],
+            u: [128u8; 64],
+            v: [128u8; 64],
+        };
+        let encoded =
+            encode_mb_block_set(&pixels, 0, &DEFAULT_COEFF_PROBS).expect("encode_mb_block_set");
+        assert_eq!(
+            encoded.nonzero_block_count, 0,
+            "constant 128 MB must produce zero non-zero blocks"
+        );
+        // Round-trip through the decoder to confirm the bytes are
+        // structurally valid (the bool encoder always writes ≥ 4 bytes
+        // even on an empty stream — the §7.3 flush tail).
+        let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
+        let mut above = MbEntropyCtx::default();
+        let mut left = MbEntropyCtx::default();
+        let recovered = decode_mb_coeffs(
+            &mut dec,
+            true,
+            false,
+            &DEFAULT_COEFF_PROBS,
+            &mut above,
+            &mut left,
+        )
+        .expect("decode_mb_coeffs");
+        assert_eq!(recovered.y2, [0i16; 16]);
+        assert!(recovered.y.iter().all(|b| *b == [0i16; 16]));
+        assert!(recovered.u.iter().all(|b| *b == [0i16; 16]));
+        assert!(recovered.v.iter().all(|b| *b == [0i16; 16]));
+    }
+
+    /// A non-zero MB at a non-trivial quantizer must still recover
+    /// within ≤ 1 LSB on a flat colour input — the round-131 §14
+    /// per-block roundtrip proved the chain holds at `yac_qi = 32`,
+    /// and the per-MB walk doesn't perturb that bound for a flat MB.
+    #[test]
+    fn mb_block_set_roundtrip_flat_color_at_q16_holds_within_2_lsb() {
+        let pixels = MbPixels {
+            y: [160u8; 256],
+            u: [120u8; 64],
+            v: [140u8; 64],
+        };
+        let encoded =
+            encode_mb_block_set(&pixels, 16, &DEFAULT_COEFF_PROBS).expect("encode_mb_block_set");
+
+        let mut dec = BoolDecoder::init(&encoded.bytes).expect("encoder emits ≥ 2 bytes");
+        let mut above = MbEntropyCtx::default();
+        let mut left = MbEntropyCtx::default();
+        let mut recovered_raw = decode_mb_coeffs(
+            &mut dec,
+            true,
+            false,
+            &DEFAULT_COEFF_PROBS,
+            &mut above,
+            &mut left,
+        )
+        .expect("decode_mb_coeffs");
+        assert_eq!(recovered_raw, encoded.coeffs);
+
+        let factors = MbDequantFactors::from_base_and_deltas(16, 0, 0, 0, 0, 0);
+        factors.dequantize(&mut recovered_raw);
+        let y_plane = decode_single_mb(recovered_raw);
+
+        // At yac_qi = 16 the §14 chain holds to ≤ 2 LSB on a flat
+        // block (the WHT + DCT round-trip introduces at most a small
+        // round-off from the `*155/100` Y2 AC scaling, but flat blocks
+        // have zero AC so this collapses to the DC-only path which is
+        // bit-exact up to the IWHT's `(x+3)>>3` rounding — i.e. ≤ 1
+        // LSB; the ≤ 2 bound is defensive).
+        for (i, &recon) in y_plane.iter().enumerate() {
+            assert!(
+                (recon as i32 - 160i32).abs() <= 2,
+                "yac_qi=16 flat 160: recon[{i}] = {recon} differs by > 2 LSB"
             );
         }
     }

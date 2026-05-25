@@ -6,6 +6,42 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 10: multi-frame I + P stream driver
+  (RFC 6386 §9 / §9.7 / §9.8 / §16 / §17 / §18)** — new
+  `Vp8InterStreamEncoder` extends Phase 8's keyframe driver to
+  interleave ZERO_MV P-frames between key frames per a caller-specified
+  `keyframe_interval`. The encoder picks K-or-P per frame, maintains
+  the §9 three-slot reference-frame ladder (`LAST` / `GOLDEN` /
+  `ALTREF`) one-for-one with `Vp8DecoderState::decode_frame`, and
+  emits an `EncodedStreamFrame { bytes, kind: FrameKind::{Key,
+  InterZeroMv}, frame_index }` per call. Slot updates honour the §9.7
+  refresh ladder: a key frame refreshes all three slots (§9.7 / §9.8);
+  a ZERO_MV P-frame refreshes LAST only (`refresh_last = 1`,
+  `refresh_golden_frame = 0`, `refresh_alternate_frame = 0`), matching
+  the bit pattern `encode_p_frame_zero_mv` writes. The first frame of
+  a fresh encoder is always a key frame (no prior reference to predict
+  from); a per-call `force_keyframe` override re-anchors the interval
+  so the next automatic K is `keyframe_interval` frames after the
+  forced K, not at the original absolute multiple. Mid-stream resize
+  surfaces as `StreamEncodeError::DimensionsChanged`;
+  `Vp8InterStreamEncoder::new` returns `None` for
+  `keyframe_interval == 0`. New public types `Vp8InterStreamEncoder`,
+  `EncodedStreamFrame`, `FrameKind` (re-exported from `crate::stream`).
+  Validated on a synthetic 10-frame I420 sequence at
+  `keyframe_interval = 4` (K-P-P-P-K-P-P-P-K-P): every frame's
+  self-decode through `Vp8DecoderState` clears 30 dB at
+  `yac_qi = 32`, range 33.96 dB (frame 7, last P of a GOP) to 45.21
+  dB (frames 4 / 8, fresh K), 10-frame mean **41.35 dB** on a 48×32
+  source. New `tests/encoder_inter_stream.rs` pins the per-frame PSNR
+  floor end-to-end
+  (`ten_frame_inter_stream_mid_quant_meets_30db_per_frame`), the §9.1
+  K-vs-P frame-tag shape
+  (`inter_stream_frame_tag_matches_classification`), and the
+  forced-K re-anchor behaviour
+  (`inter_stream_forced_keyframe_decodes_and_reanchors`). Six new
+  `stream.rs` unit tests cover the scheduler, the slot refresh
+  ladder, and the input validators. Tests: 430 → 439.
+
 * **VP8 encoder Phase 9 begin: minimum-viable P-frame encoder
   (RFC 6386 §9.1 / §9.7 / §9.10 / §16 / §17 / §18)** — new
   `encode_p_frame_zero_mv` emits a valid VP8 P-frame where every

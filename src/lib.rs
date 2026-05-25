@@ -364,7 +364,10 @@ pub use reconstruct::{
     ReconstructedMb,
 };
 pub use state::{RefFrameSlot, Vp8DecoderState};
-pub use stream::{StreamEncodeError, Vp8KeyframeStreamEncoder};
+pub use stream::{
+    EncodedStreamFrame, FrameKind, StreamEncodeError, Vp8InterStreamEncoder,
+    Vp8KeyframeStreamEncoder,
+};
 
 /// Crate-local error type for the not-yet-implemented surfaces.
 ///

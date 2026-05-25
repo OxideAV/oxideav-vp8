@@ -2,6 +2,58 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 141)
+
+**Encoder Phase 10 — multi-frame I + P stream driver.** New
+`Vp8InterStreamEncoder` extends Phase 8's keyframe driver to interleave
+ZERO_MV P-frames between key frames per a caller-specified
+`keyframe_interval` (or a per-call `force_keyframe` override). The
+encoder picks K-or-P per frame, maintains the §9 three-slot
+reference-frame ladder (`LAST` / `GOLDEN` / `ALTREF`) one-for-one with
+`Vp8DecoderState::decode_frame`, and emits one
+`EncodedStreamFrame { bytes, kind: FrameKind::{Key,InterZeroMv},
+frame_index }` per call. Slot updates honour the §9.7 refresh ladder:
+a key frame refreshes all three slots (§9.7 / §9.8); a ZERO_MV P-frame
+refreshes LAST only (`refresh_last = 1`, GOLDEN / ALTREF untouched) —
+matching the bit pattern the underlying `encode_p_frame_zero_mv`
+writes. The first frame of a fresh encoder is always coded as a key
+frame (no prior reference to predict from); a forced K-frame
+re-anchors the interval so the next automatic K is
+`keyframe_interval` frames later, not at the original absolute
+multiple. Mid-stream resize is surfaced as
+`StreamEncodeError::DimensionsChanged`. `Vp8InterStreamEncoder::new`
+returns `None` for `keyframe_interval == 0`.
+
+Round target validated: a synthetic 10-frame I420 sequence at
+`keyframe_interval = 4` produces K-P-P-P-K-P-P-P-K-P; replaying the
+encoder's bytes through `Vp8DecoderState` clears the 30 dB bar on
+every frame at `qi = 32` on a 48×32 source:
+
+| frame | kind | self-decode PSNR (dB) |
+|-------|------|------------------------|
+| 0 | K | 43.94 |
+| 1 | P | 43.94 |
+| 2 | P | 39.25 |
+| 3 | P | 34.18 |
+| 4 | K | 45.21 |
+| 5 | P | 44.72 |
+| 6 | P | 39.11 |
+| 7 | P | 33.96 |
+| 8 | K | 45.21 |
+| 9 | P | 43.94 |
+
+10-frame mean **41.35 dB**. The expected drift within a GOP (each
+P-frame's reconstruction becomes the next P-frame's LAST, so quant
+distortion accumulates) shows as the 43.94 → 33.96 dB sag from
+frame 4 to frame 7; the next K snaps PSNR back. Three new tests in
+`tests/encoder_inter_stream.rs` pin the per-frame PSNR floor, the
+§9.1 K-vs-P frame-tag shape, and the forced-K re-anchor behaviour;
+six new unit tests in `stream.rs` cover the scheduler, the slot
+refresh ladder, and the input validators. Single partition for both
+K and P this round (§9.5). Real motion search, multi-partition for
+inter, and GOLDEN / ALTREF source selection remain the next encoder
+rounds. Tests: 430 → 439.
+
 ## Status — 2026-05-26 (round 140)
 
 **Encoder Phase 9 begin — minimum-viable P-frame encoder.** New

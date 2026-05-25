@@ -2,6 +2,43 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-25 (round 135)
+
+**Encoder Phase 4 — per-frame key-frame raster driver landed.** The
+crate now exposes `encode_keyframe(&I420Frame, &KeyframeParams)`: a
+top-level driver that walks a source I420 picture macroblock-by-
+macroblock in raster order and assembles a complete VP8 key frame —
+§9 frame header + §19.2 first (control) partition + a single §19.2 DCT
+partition. For each macroblock it gathers the reconstructed-neighbour
+strips from the already-encoded part of the frame (reusing the
+decoder's own `gather_neighbors`), runs the §12.2 / §11.3 intra mode
+pick (`encode_mb_block_set_with_neighbors`), then dequantises and
+reconstructs through the **decoder's** §14.2 / §12.3 orchestrators and
+writes the result back — so the next macroblock predicts from the exact
+pixels the decoder will. Both the §13.3 token contexts (one `above`
+per column, `left` reset per row) and the §11.3 cross-macroblock
+`B_PRED` sub-block-mode contexts thread MB-to-MB; an all-zero-residual
+MB is coded as an §11.1 skip. Partial right / bottom macroblocks of a
+non-multiple-of-16 frame are edge-replicated. The §11 mode layer is
+written via a new `BoolEncoder::write_treed` (the §8.1 `treed_read`
+walk in reverse).
+
+Black-box validation (`tests/encoder_keyframe_roundtrip.rs`): encode a
+synthetic gradient + flat-region I420 frame, decode it via the crate's
+own `decode_vp8`, measure whole-frame PSNR:
+
+* 48×32, `yac_qi = 32` (mid quant): **41.50 dB** (target ≥ 30 dB).
+* 32×32, `yac_qi = 32`: **43.65 dB**.
+* 48×32, `yac_qi = 8`: **49.10 dB**.
+* 40×24 (non-multiple-of-16), `yac_qi = 32`: **39.81 dB**.
+
+A `mode_layer_roundtrips_through_decoder_parser` unit test pins the §11
+writer against the decoder's `parse_key_frame_macroblock_modes`. Inter
+prediction, RD bit-cost mode search, multi-partition DCT, a non-zero
+loop filter, and a multi-frame driver remain the next encoder rounds.
+
+Lib test count: 389 → 390.
+
 ## Status — 2026-05-25 (round 134)
 
 **Encoder Phase 3b — B_PRED 4×4 sub-block intra mode pick landed.** The

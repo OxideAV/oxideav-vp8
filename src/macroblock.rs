@@ -136,11 +136,27 @@ pub enum IntraBmode {
     Hu,
 }
 
+impl IntraUvMode {
+    /// `uv_mode_tree` leaf code (RFC 6386 §11.4): the value
+    /// `treed_read` recovers and the encoder writes via
+    /// [`UV_MODE_TREE`]. `Dc` = 0 … `Tm` = 3.
+    #[inline]
+    pub(crate) fn leaf(self) -> u8 {
+        match self {
+            IntraUvMode::Dc => 0,
+            IntraUvMode::V => 1,
+            IntraUvMode::H => 2,
+            IntraUvMode::Tm => 3,
+        }
+    }
+}
+
 impl IntraBmode {
     /// 0..=9 — the enum's spec-defined integer code. Used as the
-    /// outer / middle index into `KF_BMODE_PROB`.
+    /// outer / middle index into `KF_BMODE_PROB` and as the
+    /// `bmode_tree` leaf the encoder writes.
     #[inline]
-    fn idx(self) -> usize {
+    pub(crate) fn idx(self) -> usize {
         match self {
             IntraBmode::Dc => 0,
             IntraBmode::Tm => 1,
@@ -157,13 +173,27 @@ impl IntraBmode {
 }
 
 impl IntraYMode {
+    /// `kf_ymode_tree` leaf code (RFC 6386 §11.2): the value
+    /// `treed_read` recovers and the encoder writes via
+    /// [`KF_YMODE_TREE`]. `Dc` = 0 … `B` = 4.
+    #[inline]
+    pub(crate) fn leaf(self) -> u8 {
+        match self {
+            IntraYMode::Dc => 0,
+            IntraYMode::V => 1,
+            IntraYMode::H => 2,
+            IntraYMode::Tm => 3,
+            IntraYMode::B => 4,
+        }
+    }
+
     /// §11.3 item 4 projection from a 16×16 luma mode onto the
     /// sub-block mode used as the context predictor for the
     /// neighbouring macroblock's edge sub-blocks. Note this is only
     /// invoked for non-`B_PRED` macroblocks; [`IntraYMode::B`]
     /// macroblocks store the actual sub-block modes themselves.
     #[inline]
-    fn project_to_subblock_context(self) -> IntraBmode {
+    pub(crate) fn project_to_subblock_context(self) -> IntraBmode {
         match self {
             IntraYMode::Dc => IntraBmode::Dc,
             IntraYMode::V => IntraBmode::Ve,
@@ -237,7 +267,7 @@ impl From<BoolDecoderError> for MacroblockError {
 /// signed entries — negative values are leaf-mode codes (negated to
 /// recover the [`IntraYMode`] index) and positive values are
 /// child-pair offsets to descend to.
-const KF_YMODE_TREE: [i8; 8] = [
+pub(crate) const KF_YMODE_TREE: [i8; 8] = [
     // -B_PRED, 2 — root: B_PRED = "0", "1" subtree at [2..=3]
     -4, 2, // 4, 6 — "1" subtree has two descendant subtrees
     4, 6, // -DC_PRED, -V_PRED — "10" subtree
@@ -246,10 +276,10 @@ const KF_YMODE_TREE: [i8; 8] = [
 ];
 
 /// `kf_ymode_prob` per §11.2.
-const KF_YMODE_PROB: [u8; 4] = [145, 156, 163, 128];
+pub(crate) const KF_YMODE_PROB: [u8; 4] = [145, 156, 163, 128];
 
 /// `uv_mode_tree` from RFC 6386 §11.4. Six signed entries.
-const UV_MODE_TREE: [i8; 6] = [
+pub(crate) const UV_MODE_TREE: [i8; 6] = [
     // -DC_PRED, 2
     0, 2, // -V_PRED, 4
     -1, 4, // -H_PRED, -TM_PRED
@@ -257,12 +287,12 @@ const UV_MODE_TREE: [i8; 6] = [
 ];
 
 /// `kf_uv_mode_prob` per §11.4.
-const KF_UV_MODE_PROB: [u8; 3] = [142, 114, 183];
+pub(crate) const KF_UV_MODE_PROB: [u8; 3] = [142, 114, 183];
 
 /// `bmode_tree` from RFC 6386 §11.2. Eighteen signed entries —
 /// `2 * (num_intra_bmodes - 1) = 18`. The leaves cover all ten
 /// [`IntraBmode`] values.
-const BMODE_TREE: [i8; 18] = [
+pub(crate) const BMODE_TREE: [i8; 18] = [
     // -B_DC_PRED, 2
     0, 2, // -B_TM_PRED, 4
     -1, 4, // -B_VE_PRED, 6
@@ -765,7 +795,7 @@ pub fn parse_inter_frame_intra_macroblock_modes(
 /// sub-block to the left; inner array is the nine internal-node
 /// probabilities for the `bmode_tree` walk (the leaves naturally
 /// produce one of `num_intra_bmodes = 10` values).
-const KF_BMODE_PROB: [[[u8; 9]; 10]; 10] = [
+pub(crate) const KF_BMODE_PROB: [[[u8; 9]; 10]; 10] = [
     // above = B_DC_PRED
     [
         [231, 120, 48, 89, 115, 113, 120, 152, 112],

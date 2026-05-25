@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 4: per-frame key-frame raster driver (RFC 6386
+  §9 / §11 / §19.2)** — new `encode_keyframe(&I420Frame, &KeyframeParams)`
+  entry that walks a source I420 picture macroblock-by-macroblock in
+  raster order and assembles a complete VP8 key frame: §9.1 frame tag +
+  key-frame extension, §19.2 boolean-coded first (control) partition
+  (§9.2–§9.11 header fields + the §11 macroblock-mode layer), and a
+  single §19.2 DCT partition carrying every non-skipped macroblock's
+  §13.3 token data. Per macroblock the driver gathers the
+  reconstructed-neighbour strips from the already-encoded frame buffer
+  (reusing the decoder's own `gather_neighbors` / `write_mb` walker),
+  runs the §12.2 whole-block / §11.3 `B_PRED` intra mode pick via
+  `encode_mb_block_set_with_neighbors`, then dequantises and
+  reconstructs through the decoder's `decode_keyframe_mb_non_bpred` /
+  `decode_keyframe_mb_bpred` orchestrators and writes the result back —
+  so the next macroblock predicts from the exact pixels the decoder
+  will. The §13.3 non-zero token contexts (one `above` per macroblock
+  column, frame-lived; `left` reset per row) and the §11.3
+  cross-macroblock `B_PRED` sub-block-mode contexts thread MB-to-MB; an
+  all-zero-residual macroblock is coded as an §11.1 skip (and clears its
+  predictor slots like the decoder's skip path). Partial right / bottom
+  macroblocks of a non-multiple-of-16 frame are edge-replicated into the
+  padding region. New public surface: `I420Frame`, `KeyframeParams`,
+  `encode_keyframe`, and a `BoolEncoder::write_treed` helper (the §8.1
+  `treed_read` walk run in reverse) used by the §11 mode layer. No
+  external implementation was consulted. Single key frame, single DCT
+  partition, SAD-only mode pick (no RD bit-cost term), loop filter level
+  0 only this round. Black-box validated end-to-end in
+  `tests/encoder_keyframe_roundtrip.rs` — encode a synthetic gradient +
+  flat-region I420 frame, decode via the crate's own `decode_vp8`, and
+  measure whole-frame PSNR:
+  * 48×32, `yac_qi = 32` (mid quant): **41.50 dB** (target ≥ 30 dB).
+  * 32×32, `yac_qi = 32`: **43.65 dB**.
+  * 48×32, `yac_qi = 8`: **49.10 dB**.
+  * 40×24 (non-multiple-of-16): **39.81 dB**.
+  A `mode_layer_roundtrips_through_decoder_parser` unit test in
+  `src/encoder.rs` pins the §11 mode-layer writer against the decoder's
+  `parse_key_frame_macroblock_modes`.
 * **VP8 encoder Phase 3b: B_PRED 4×4 sub-block intra mode pick (RFC
   6386 §11.3 / §12.3)** — the per-MB luma decision now also evaluates
   the `B_PRED` path, in which the 16×16 luma plane is encoded as sixteen

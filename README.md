@@ -2,6 +2,71 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 155)
+
+**Encoder §13.4 `token_prob_update()` infrastructure exposed.** Round
+154 (`9e866fc`) added the `KeyframeParams::filter_type` knob; round 155
+follows up on the second item of the round-154 next-step ladder:
+"§13.4 token-prob context-update fitting from observed counts". This
+round lands the **caller-driven layer** (the on-wire and merged-table
+plumbing) so a future round can drop in an observed-counts fitter on
+top.
+
+Through round 154 the keyframe encoder hardwired the §13.4 sub-block to
+1056 zero update-flags every frame (`write_no_token_prob_updates`). The
+decoder happily accepts that, but it also accepts a per-position
+"replace this `coeff_probs[i][j][k][t]` value" override read against
+the §13.4 `coeff_update_probs` flag-probability table — and a
+non-trivial override is the only path through which a frame can drop
+below the §13.5 default token-bit floor.
+
+Three new pieces:
+
+  * **`write_token_prob_updates(enc, updates, &flag_probs)`** — the
+    1056-position writer parallel to the parser in
+    `Vp8CodedHeader::parse`. Walks `[i][j][k][t]` in §13.4's nested
+    `do/while` order, writing one flag at `coeff_update_probs[i][j][k][t]`
+    per position and an `L(8)` literal carrying the replacement value
+    whenever the slot is `Some(prob)`. All-`None` input emits the same
+    bytes `write_no_token_prob_updates` does (strict superset of the
+    old contract).
+  * **`encode_keyframe_with_token_prob_updates(frame, params, updates)`** —
+    a new keyframe entry-point that merges the supplied
+    `TokenProbUpdates` onto the §13.5 defaults via
+    `merge_default_token_probs` and threads the merged `coeff_probs`
+    table into BOTH the picker's RD estimate and the §13.3 token-encode
+    pass, then writes the §13.4 layer through the new writer so the
+    decoder rebuilds the same merged table.
+  * **`encode_keyframe_with_reconstruction_and_token_updates`** — the
+    same machinery exposing the post-§15 reconstruction planes
+    alongside the bytes, for a future stream encoder seeding its
+    reference slots from a token-prob-updated keyframe.
+
+`encode_keyframe_with_reconstruction` becomes a thin wrapper over the
+new function with `token_updates = None`, so every pre-r155 caller
+keeps the round-154 wire byte-for-byte.
+
+Validation: a new `tests/encoder_token_prob_updates.rs` integration
+test (4 tests) pins (a) an all-`None` updates array reproduces the
+round-154 wire byte-for-byte (no-op equivalence); (b) a non-trivial
+`Some(prob)` payload produces an observably-different wire AND still
+round-trips through `decode_vp8` to a sound picture clearing 25 dB
+whole-frame PSNR on a 32×32 synthetic; (c) round-tripping the §19.2
+header through `Vp8CodedHeader::parse` on the new wire recovers the
+exact `TokenProbUpdates` array the encoder transmitted (per-position
+`Some(p)` / `None` shape preserved across all 1056 positions); (d) the
+free `write_token_prob_updates` writer agrees with
+`write_no_token_prob_updates` on the all-`None` payload. Tests:
+500 → 504 (+4 in `encoder_token_prob_updates.rs`).
+
+The next-step ladder for the encoder is now: (1) intra-within-inter
+MB picking (§11 RD against the inter J at `prob_intra < 255`), (2)
+§13.4 observed-counts fitter that drives the new entry-point from
+per-frame branch-frequency stats, (3) inter-frame integration of the
+new entry-point (the keyframe stream encoder is r155's scope), (4)
+§9.3 segmentation support, (5) end-to-end libvpx black-box
+cross-decode validation.
+
 ## Status — 2026-05-26 (round 154)
 
 **Encoder §9.4 `filter_type` knob exposed.** Round 152b (`8ebab4b`)

@@ -6,6 +6,31 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.4 `token_prob_update()` caller-driven layer for the keyframe
+  encoder (RFC 6386 §13.4 / §13.5)** — three new public surfaces wire
+  the encoder up for caller-supplied per-position
+  `coeff_probs[i][j][k][t]` replacements. `write_token_prob_updates`
+  is the 1056-position writer paired with the existing parser in
+  `Vp8CodedHeader::parse`; it walks `[i][j][k][t]` in §13.4's nested
+  `do/while` order and emits one flag at
+  `coeff_update_probs[i][j][k][t]` per position plus an `L(8)` value
+  whenever the slot is `Some(prob)`. `encode_keyframe_with_token_prob_updates`
+  is a new keyframe entry-point that merges the supplied
+  `TokenProbUpdates` onto the §13.5 defaults via
+  `merge_default_token_probs` and threads the merged `coeff_probs`
+  table into both the picker's RD estimate and the §13.3 token-encode
+  pass, then writes the §13.4 layer so the decoder rebuilds the same
+  merged table. `encode_keyframe_with_reconstruction_and_token_updates`
+  exposes the same machinery alongside the post-§15 reconstruction
+  planes. An all-`None` updates array reproduces the round-154 wire
+  byte-for-byte (the no-op path retains the §13.5 defaults verbatim).
+  New regression test `encoder_token_prob_updates.rs` (4 tests) pins
+  (a) no-op equivalence to the round-154 wire; (b) non-trivial wire
+  divergence + sound round-trip through `decode_vp8` clearing 25 dB
+  PSNR; (c) per-position recovery through `Vp8CodedHeader::parse`;
+  (d) writer-level agreement with `write_no_token_prob_updates` on
+  the all-`None` payload.
+
 * **`KeyframeParams::filter_type` exposes the §9.4 `filter_type` knob
   to the encoder (RFC 6386 §9.4 / §15.2 / §15.3)** — the §9.4 1-bit
   field selecting the §15.3 normal vs §15.2 simple loop filter was

@@ -60,6 +60,7 @@
 //!   header layouts).
 //! * RFC 6386 §11 (key-frame macroblock prediction records).
 
+use crate::coded_header::TokenProbUpdates;
 use crate::frame_header::KEY_FRAME_START_CODE;
 
 /// Errors surfaced by the encoder.
@@ -916,6 +917,51 @@ pub fn write_mb_no_skip_coeff(enc: &mut BoolEncoder, enabled: bool, prob_skip_fa
 pub fn write_no_token_prob_updates(enc: &mut BoolEncoder, flag_probs: &[u8; 1056]) {
     for &p in flag_probs.iter() {
         enc.write_bool(p, false);
+    }
+}
+
+/// Write a §13.4 `token_prob_update()` block from a [`TokenProbUpdates`]
+/// array. Each of the 1056 `[i][j][k][t]` positions gets a single
+/// "is this position being replaced?" flag written at
+/// `coeff_update_probs[i][j][k][t]` (the same per-position probability
+/// the decoder reads against); when the slot is `Some(prob)` an
+/// additional `L(8)` literal carrying the replacement value follows.
+///
+/// The walk order matches RFC 6386 §13.4's four nested `do/while` loops
+/// (`i` outermost over `0..4` planes, then `j` over `0..8` bands, then
+/// `k` over `0..3` previous-token classes, then `t` over `0..11` token
+/// positions). The decoder's
+/// [`crate::coded_header::Vp8CodedHeader::parse`] consumes the same
+/// order; encoder + decoder loops are byte-paired.
+///
+/// `flag_probs` is a flat 1056-entry view of the §13.4 table — pass the
+/// crate-local [`COEFF_UPDATE_PROBS_FLAT`]. `updates` is the
+/// `[plane][band][prev_ctx][pos]` array (each entry `Some(prob)` to
+/// replace or `None` to keep the §13.5 default). An all-`None` `updates`
+/// produces the same bytes [`write_no_token_prob_updates`] does, so the
+/// two writers are byte-equivalent in that special case.
+pub fn write_token_prob_updates(
+    enc: &mut BoolEncoder,
+    updates: &TokenProbUpdates,
+    flag_probs: &[u8; 1056],
+) {
+    for i in 0..4 {
+        for j in 0..8 {
+            for k in 0..3 {
+                for t in 0..11 {
+                    let p = flag_probs[i * 8 * 3 * 11 + j * 3 * 11 + k * 11 + t];
+                    match updates[i][j][k][t] {
+                        Some(new_prob) => {
+                            enc.write_bool(p, true);
+                            enc.write_literal(new_prob as u32, 8);
+                        }
+                        None => {
+                            enc.write_bool(p, false);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3144,6 +3190,38 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
     Ok(bytes)
 }
 
+/// Encode a key frame with a caller-supplied §13.4 `token_prob_update()`
+/// payload. The 4×8×3×11 `updates` array carries `Some(prob)` for each
+/// `coeff_probs[i][j][k][t]` position the caller wants to replace and
+/// `None` for the positions the §13.5 defaults should keep. The encoder
+/// merges `updates` onto the §13.5 defaults via
+/// [`merge_default_token_probs`](crate::merge_default_token_probs)
+/// before its picker / token-encode passes, so both the rate-distortion
+/// token-bit estimates and the emitted bitstream use the same merged
+/// table the decoder will rebuild after reading the same updates.
+///
+/// When every entry of `updates` is `None`, the emitted bytes match
+/// [`encode_keyframe`] byte-for-byte (the §13.4 sub-block reduces to
+/// the 1056 zero-flag wire and the merged `coeff_probs` is identical to
+/// the defaults). Otherwise the §13.4 sub-block carries the changed
+/// positions and downstream token decoding uses the merged table for
+/// the lifetime of the frame (and beyond, since key frames also set
+/// `refresh_entropy_probs = 1`).
+///
+/// Returns the bitstream bytes only; pair with the underlying
+/// [`encode_keyframe_with_reconstruction_and_token_updates`] when the
+/// post-§15 reconstruction planes are also needed (e.g. by a stream
+/// encoder seeding its reference slots).
+pub fn encode_keyframe_with_token_prob_updates(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    updates: &TokenProbUpdates,
+) -> Result<Vec<u8>, EncodeError> {
+    let (bytes, _planes) =
+        encode_keyframe_with_reconstruction_and_token_updates(frame, params, Some(updates))?;
+    Ok(bytes)
+}
+
 /// Encode a key frame and return both the bitstream bytes **and** the
 /// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`] the
 /// decoder will rebuild from those bytes.
@@ -3169,6 +3247,29 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
 pub fn encode_keyframe_with_reconstruction(
     frame: &I420Frame,
     params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_with_reconstruction_and_token_updates(frame, params, None)
+}
+
+/// Encode a key frame and return both the bitstream bytes **and** the
+/// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`],
+/// optionally threading a §13.4 `token_prob_update()` payload through
+/// the encode.
+///
+/// `token_updates = None` is the round-154 wire (every §13.4 flag = 0,
+/// §13.5 defaults retained); `token_updates = Some(u)` writes the
+/// per-position replacement layer and uses the merged `coeff_probs` for
+/// both the picker's RD estimate and the §13.3 token-encode pass. The
+/// emitted bitstream decodes through the crate's own [`crate::decode_vp8`]
+/// and through any compliant VP8 decoder under either path.
+///
+/// See [`encode_keyframe_with_token_prob_updates`] for the no-plane
+/// variant and [`encode_keyframe_with_reconstruction`] for the
+/// no-updates variant.
+pub fn encode_keyframe_with_reconstruction_and_token_updates(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    token_updates: Option<&TokenProbUpdates>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
@@ -3202,10 +3303,18 @@ pub fn encode_keyframe_with_reconstruction(
     let mb_cols = width.div_ceil(16) as usize;
     let mb_rows = height.div_ceil(16) as usize;
 
-    // The decoder retains the §13.5 default token-probability table for
-    // this frame (we write every §13.4 update flag false), so the encoder
-    // must code tokens against the same defaults.
-    let coeff_probs = crate::dct_tokens::DEFAULT_COEFF_PROBS;
+    // §13.4 token-prob update: when the caller supplies a non-empty
+    // `token_updates` array, the encoder writes its replacement layer
+    // through `write_token_prob_updates` below AND uses the merged
+    // `coeff_probs` table for both the picker's RD estimate and the
+    // §13.3 token-encode pass. The decoder reads the same updates and
+    // rebuilds the same merged table, so the bitstream stays sound on
+    // either path. `None` (or an all-`None` array) preserves the
+    // round-154 wire byte-for-byte.
+    let coeff_probs = match token_updates {
+        Some(u) => crate::dct_tokens::merge_default_token_probs(u),
+        None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
+    };
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -3381,9 +3490,16 @@ pub fn encode_keyframe_with_reconstruction(
     write_quant_indices(&mut hdr, params.y_ac_qi, None, None, None, None, None)?;
     // §9.7 (key frame) — refresh_entropy_probs.
     hdr.write_bool(128, true);
-    // §13 / §9.9 — token-prob update sub-block: every flag false → keep
-    // §13.5 defaults.
-    write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT);
+    // §13 / §9.9 — token-prob update sub-block. With `token_updates =
+    // Some(u)` the per-position replacement layer is written and the
+    // merged `coeff_probs` above is what the encoder's tokens are coded
+    // against (and what the decoder will rebuild after reading the same
+    // updates). With `None`, every flag is 0 and the §13.5 defaults
+    // stay in force — byte-identical to the round-154 wire.
+    match token_updates {
+        Some(u) => write_token_prob_updates(&mut hdr, u, &COEFF_UPDATE_PROBS_FLAT),
+        None => write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT),
+    }
     // §9.11 — mb_no_skip_coeff enabled with a balanced prob so skip and
     // non-skip macroblocks both code cheaply.
     let prob_skip_false = 128u8;

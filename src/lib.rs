@@ -307,15 +307,16 @@ pub use decoder::{decode_vp8, DecodeError, Vp8DecodedFrame};
 pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
 pub use encoder::{
     classify_coeff_token, encode_coeff_block, encode_keyframe, encode_keyframe_with_reconstruction,
+    encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_with_refresh, encode_p_frame_multi_ref_with_refresh_and_lf_deltas,
     encode_p_frame_zero_mv, encode_silent_keyframe, make_encoder, patch_first_partition_size,
     write_frame_tag, write_loop_filter, write_loop_filter_with_deltas, write_mb_no_skip_coeff,
     write_no_token_prob_updates, write_quant_indices, write_segment_update_flags,
-    write_token_partition_count, BoolEncoder, CopyBufferSelector, EncodeError, EncodedMb,
-    I420Frame, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
-    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
-    TokenEncoder,
+    write_token_partition_count, write_token_prob_updates, BoolEncoder, CopyBufferSelector,
+    EncodeError, EncodedMb, I420Frame, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas,
+    MbPixels, RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder,
+    SilentKeyframeParams, TokenEncodeError, TokenEncoder,
 };
 pub use forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};

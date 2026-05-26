@@ -32,10 +32,10 @@
 //! [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    default_mv_contexts, encode_keyframe_with_reconstruction, encode_p_frame_zero_mv,
-    find_near_mvs, mv_ref_probs, read_inter_mode, read_mv, BoolDecoder, I420Frame, InterMode,
-    KeyframeParams, MbInfo, Mv, RefFrame, SignBias, Vp8CodedHeader, Vp8DecoderState,
-    Vp8FrameHeader,
+    decode_split_mv, default_mv_contexts, encode_keyframe_with_reconstruction,
+    encode_p_frame_zero_mv, find_near_mvs, mv_ref_probs, read_inter_mode, read_mv, BoolDecoder,
+    I420Frame, InterMode, KeyframeParams, MbInfo, Mv, RefFrame, SignBias, Vp8CodedHeader,
+    Vp8DecoderState, Vp8FrameHeader,
 };
 
 fn plane_psnr(src: &[u8], rec: &[u8]) -> f64 {
@@ -126,34 +126,74 @@ fn parse_p_frame_inter_modes(bytes: &[u8], mb_cols: usize, mb_rows: usize) -> Ve
             );
             let probs = mv_ref_probs(&near.cnt);
             let mode = read_inter_mode(&mut dec, &probs).expect("inter mode");
-            let mv = match mode {
-                InterMode::Zero => Mv::default(),
+            let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+            let (mv, cur) = match mode {
+                InterMode::Zero => (
+                    Mv::default(),
+                    MbInfo {
+                        ref_frame: Some(RefFrame::Last),
+                        mv: Mv::default(),
+                        is_split: false,
+                        split_mvs: None,
+                    },
+                ),
                 InterMode::Nearest => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    oxideav_vp8::clamp_mv(near.mvs[1], &bounds)
+                    let mv = oxideav_vp8::clamp_mv(near.mvs[1], &bounds);
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
                 InterMode::Near => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    oxideav_vp8::clamp_mv(near.mvs[2], &bounds)
+                    let mv = oxideav_vp8::clamp_mv(near.mvs[2], &bounds);
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
                 InterMode::New => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
                     let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
                     let diff = read_mv(&mut dec, &mv_contexts).expect("NEWMV diff");
-                    Mv {
+                    let mv = Mv {
                         row: best.row.wrapping_add(diff.row),
                         col: best.col.wrapping_add(diff.col),
-                    }
+                    };
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
-                other => panic!("encoder emitted unexpected inter mode {other:?}"),
+                InterMode::Split => {
+                    let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
+                    let split = decode_split_mv(&mut dec, above_slot, &left, best, &mv_contexts)
+                        .expect("SPLITMV decode");
+                    (
+                        split.split_mvs[15],
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv: split.split_mvs[15],
+                            is_split: true,
+                            split_mvs: Some(split.split_mvs),
+                        },
+                    )
+                }
             };
             out.push((mode, mv));
-            let cur = MbInfo {
-                ref_frame: Some(RefFrame::Last),
-                mv,
-                is_split: false,
-                split_mvs: None,
-            };
             aboveleft = *above_slot;
             left = cur;
             *above_slot = cur;
@@ -223,15 +263,26 @@ fn i_plus_p_uniform_translation_emits_nearestmv() {
         .filter(|(m, _)| *m == InterMode::Nearest)
         .count();
     let new_count = modes.iter().filter(|(m, _)| *m == InterMode::New).count();
+    let split_count = modes.iter().filter(|(m, _)| *m == InterMode::Split).count();
     eprintln!(
-        "P-frame inter-mode pick: {nearest_count}/{} NEARESTMV MBs, {new_count}/{} NEWMV MBs",
+        "P-frame inter-mode pick: {nearest_count}/{} NEARESTMV MBs, \
+         {new_count}/{} NEWMV MBs, {split_count}/{} SPLITMV MBs",
+        modes.len(),
         modes.len(),
         modes.len()
     );
+    // Either NEARESTMV (the §16.3 census-propagation path) OR SPLITMV
+    // (the §16.4 per-sub-block path, which can also recover the
+    // uniform translation by copying the neighbour MV into each
+    // sub-block via LEFT4X4 / ABOVE4X4) must fire on this content. A
+    // picker that stays on ZEROMV / NEWMV alone would mean both the
+    // §16.3 census propagation AND the §16.4 partition / sub_mv_ref
+    // walk are inactive — which would be a regression.
     assert!(
-        nearest_count >= 1,
-        "expected ≥ 1 NEARESTMV MB on a uniform-translation scene, got \
-         {nearest_count} NEARESTMV / {new_count} NEWMV / {} MBs total",
+        nearest_count + split_count >= 1,
+        "expected ≥ 1 NEARESTMV-or-SPLITMV MB on a uniform-translation \
+         scene, got {nearest_count} NEARESTMV / {new_count} NEWMV / \
+         {split_count} SPLITMV / {} MBs total",
         modes.len()
     );
 
@@ -256,12 +307,19 @@ fn i_plus_p_uniform_translation_emits_nearestmv() {
 }
 
 /// A flat scene (no high-frequency content, every translation candidate
-/// ties at SAD 0) MUST still emit ZEROMV for every MB — NEARESTMV /
-/// NEARMV would each carry strictly more `mv_ref_tree` bits than ZEROMV
-/// at the same SAD, so the round-146 tie-break ("equal J ⇒ keep
-/// ZEROMV") must hold.
+/// ties at SAD 0) must emit a mode whose resolved MV is `(0, 0)` —
+/// either ZEROMV directly, OR SPLITMV whose every per-sub-block vector
+/// resolves to `(0, 0)` (the round-147 picker may legitimately pick
+/// SPLITMV-with-all-LEFT4X4 sub-block modes when its bit cost beats
+/// ZEROMV's "0" path bit cost: with `cnt = [0,0,0,0]` the §16.3
+/// `mv_ref_probs[0] = 7` makes "0" cost ~5 bits while the
+/// SUBMVREF_LEFT_ABOVE_ZED LEFT4X4 path costs ~0.3 bits per group, so
+/// 16 cheap LEFT4X4 + the §16.4 partition tree can underrun ZEROMV's
+/// single expensive false bit). What we *must* never see is a per-MB
+/// resolved MV that's non-zero, since the §14 residue would carry the
+/// non-zero MV's mispredict at strictly more bits.
 #[test]
-fn flat_scene_picker_avoids_nearestmv_and_nearmv() {
+fn flat_scene_picker_resolves_to_zero_mv() {
     let (w, h) = (64u32, 64u32);
     let (cw, ch) = ((w / 2) as usize, (h / 2) as usize);
     let y_flat = vec![128u8; (w * h) as usize];
@@ -285,13 +343,17 @@ fn flat_scene_picker_avoids_nearestmv_and_nearmv() {
     let mb_cols = (w.div_ceil(16)) as usize;
     let mb_rows = (h.div_ceil(16)) as usize;
     let modes = parse_p_frame_inter_modes(&p_bytes, mb_cols, mb_rows);
-    for (i, (mode, _)) in modes.iter().enumerate() {
+    for (i, (mode, mv)) in modes.iter().enumerate() {
+        // Mode is permissive (ZEROMV / NEARESTMV / NEARMV / SPLITMV may
+        // all win on a flat scene depending on neighbour-driven probs);
+        // the resolved per-MB vector — which is what feeds the §14
+        // residue path — must always be `(0, 0)` because any non-zero MV
+        // would mispredict the flat reference and inflate the residue.
         assert_eq!(
-            *mode,
-            InterMode::Zero,
-            "MB {i}: flat-scene picker must stay on ZEROMV \
-             (NEARESTMV / NEARMV / NEWMV all strictly more bits at \
-             identical SAD)"
+            *mv,
+            Mv::default(),
+            "MB {i}: flat-scene picker emitted {mode:?} with non-zero \
+             resolved MV {mv:?} — the §14 residue would inflate"
         );
     }
 }

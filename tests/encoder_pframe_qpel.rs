@@ -29,10 +29,11 @@
 //! [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    default_mv_contexts, encode_keyframe_with_reconstruction, encode_p_frame_zero_mv,
-    filter_block_4x4, filter_set_for_version, find_near_mvs, mv_ref_probs, read_inter_mode,
-    read_mv, stored_luma_mv, BoolDecoder, I420Frame, InterMode, KeyframeParams, MbInfo, Mv,
-    RefFrame, SignBias, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader, QUARTER_PIXEL_STEP,
+    decode_split_mv, default_mv_contexts, encode_keyframe_with_reconstruction,
+    encode_p_frame_zero_mv, filter_block_4x4, filter_set_for_version, find_near_mvs, mv_ref_probs,
+    read_inter_mode, read_mv, stored_luma_mv, BoolDecoder, I420Frame, InterMode, KeyframeParams,
+    MbInfo, Mv, RefFrame, SignBias, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader,
+    QUARTER_PIXEL_STEP,
 };
 
 fn plane_psnr(src: &[u8], rec: &[u8]) -> f64 {
@@ -135,34 +136,74 @@ fn parse_p_frame_inter_modes(bytes: &[u8], mb_cols: usize, mb_rows: usize) -> Ve
             );
             let probs = mv_ref_probs(&near.cnt);
             let mode = read_inter_mode(&mut dec, &probs).expect("inter mode");
-            let mv = match mode {
-                InterMode::Zero => Mv::default(),
+            let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+            let (mv, cur) = match mode {
+                InterMode::Zero => (
+                    Mv::default(),
+                    MbInfo {
+                        ref_frame: Some(RefFrame::Last),
+                        mv: Mv::default(),
+                        is_split: false,
+                        split_mvs: None,
+                    },
+                ),
                 InterMode::Nearest => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    oxideav_vp8::clamp_mv(near.mvs[1], &bounds)
+                    let mv = oxideav_vp8::clamp_mv(near.mvs[1], &bounds);
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
                 InterMode::Near => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    oxideav_vp8::clamp_mv(near.mvs[2], &bounds)
+                    let mv = oxideav_vp8::clamp_mv(near.mvs[2], &bounds);
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
                 InterMode::New => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
                     let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
                     let diff = read_mv(&mut dec, &mv_contexts).expect("NEWMV diff");
-                    Mv {
+                    let mv = Mv {
                         row: best.row.wrapping_add(diff.row),
                         col: best.col.wrapping_add(diff.col),
-                    }
+                    };
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
-                other => panic!("encoder emitted unexpected inter mode {other:?}"),
+                InterMode::Split => {
+                    let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
+                    let split = decode_split_mv(&mut dec, above_slot, &left, best, &mv_contexts)
+                        .expect("SPLITMV decode");
+                    (
+                        split.split_mvs[15],
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv: split.split_mvs[15],
+                            is_split: true,
+                            split_mvs: Some(split.split_mvs),
+                        },
+                    )
+                }
             };
             out.push((mode, mv));
-            let cur = MbInfo {
-                ref_frame: Some(RefFrame::Last),
-                mv,
-                is_split: false,
-                split_mvs: None,
-            };
             aboveleft = *above_slot;
             left = cur;
             *above_slot = cur;
@@ -244,7 +285,14 @@ fn i_plus_p_quarter_pixel_shift_emits_quarter_pixel_newmv_and_clears_44db() {
         "quarter-pixel P-frame Y-plane self-decode PSNR {y_psnr:.2} dB < 44 dB"
     );
 
-    // ---- Verify at least one quarter-pixel-only NEWMV was emitted ---
+    // ---- Verify at least one quarter-pixel-only MV was emitted ---
+    //
+    // Same rationale as the half-pixel test: the round-147 SPLITMV
+    // picker may propagate a quarter-pixel NEWMV neighbour vector
+    // through LEFT4X4 / ABOVE4X4 modes, so we accept either a
+    // quarter-pixel-only NEWMV or a quarter-pixel-only SPLITMV
+    // `split_mvs[15]`. A picker stuck on whole-pixel-grid MVs would
+    // not clear the 44 dB bar that this test enforces.
     let mb_cols = w.div_ceil(16);
     let mb_rows = h.div_ceil(16);
     let modes = parse_p_frame_inter_modes(&p_bytes, mb_cols, mb_rows);
@@ -255,14 +303,23 @@ fn i_plus_p_quarter_pixel_shift_emits_quarter_pixel_newmv_and_clears_44db() {
         .iter()
         .filter(|(mode, mv)| *mode == InterMode::New && ((mv.row & 1) != 0 || (mv.col & 1) != 0))
         .count();
+    let quarter_pixel_only_split_count = modes
+        .iter()
+        .filter(|(mode, mv)| *mode == InterMode::Split && ((mv.row & 1) != 0 || (mv.col & 1) != 0))
+        .count();
     eprintln!(
-        "P-frame inter-mode pick: {quarter_pixel_only_newmv_count}/{} quarter-pixel-only NEWMV MBs",
+        "P-frame inter-mode pick: {quarter_pixel_only_newmv_count}/{} \
+         quarter-pixel-only NEWMV MBs, {quarter_pixel_only_split_count}/{} \
+         quarter-pixel-only SPLITMV MBs",
+        modes.len(),
         modes.len()
     );
     assert!(
-        quarter_pixel_only_newmv_count >= 1,
-        "expected at least 1 quarter-pixel-only NEWMV on a +1/4 px shifted scene, got {}/{}",
+        quarter_pixel_only_newmv_count + quarter_pixel_only_split_count >= 1,
+        "expected at least 1 quarter-pixel-only NEWMV-or-SPLITMV on a +1/4 px \
+         shifted scene, got {} NEWMV / {} SPLITMV / {} MBs total",
         quarter_pixel_only_newmv_count,
+        quarter_pixel_only_split_count,
         modes.len()
     );
 

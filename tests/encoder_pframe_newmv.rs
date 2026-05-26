@@ -31,10 +31,10 @@
 //! [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    default_mv_contexts, encode_keyframe_with_reconstruction, encode_p_frame_zero_mv,
-    find_near_mvs, mv_ref_probs, read_inter_mode, read_mv, BoolDecoder, I420Frame, InterMode,
-    KeyframeParams, MbInfo, Mv, RefFrame, SignBias, Vp8CodedHeader, Vp8DecoderState,
-    Vp8FrameHeader,
+    decode_split_mv, default_mv_contexts, encode_keyframe_with_reconstruction,
+    encode_p_frame_zero_mv, find_near_mvs, mv_ref_probs, read_inter_mode, read_mv, BoolDecoder,
+    I420Frame, InterMode, KeyframeParams, MbInfo, Mv, RefFrame, SignBias, Vp8CodedHeader,
+    Vp8DecoderState, Vp8FrameHeader,
 };
 
 /// Build a 64×64 I420 frame: smooth diagonal background + one distinct
@@ -134,34 +134,74 @@ fn parse_p_frame_inter_modes(bytes: &[u8], mb_cols: usize, mb_rows: usize) -> Ve
             );
             let probs = mv_ref_probs(&near.cnt);
             let mode = read_inter_mode(&mut dec, &probs).expect("inter mode");
-            let mv = match mode {
-                InterMode::Zero => Mv::default(),
+            let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+            let (mv, cur) = match mode {
+                InterMode::Zero => (
+                    Mv::default(),
+                    MbInfo {
+                        ref_frame: Some(RefFrame::Last),
+                        mv: Mv::default(),
+                        is_split: false,
+                        split_mvs: None,
+                    },
+                ),
                 InterMode::Nearest => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    oxideav_vp8::clamp_mv(near.mvs[1], &bounds)
+                    let mv = oxideav_vp8::clamp_mv(near.mvs[1], &bounds);
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
                 InterMode::Near => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    oxideav_vp8::clamp_mv(near.mvs[2], &bounds)
+                    let mv = oxideav_vp8::clamp_mv(near.mvs[2], &bounds);
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
                 InterMode::New => {
-                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
                     let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
                     let diff = read_mv(&mut dec, &mv_contexts).expect("NEWMV diff");
-                    Mv {
+                    let mv = Mv {
                         row: best.row.wrapping_add(diff.row),
                         col: best.col.wrapping_add(diff.col),
-                    }
+                    };
+                    (
+                        mv,
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv,
+                            is_split: false,
+                            split_mvs: None,
+                        },
+                    )
                 }
-                other => panic!("encoder emitted unexpected inter mode {other:?}"),
+                InterMode::Split => {
+                    let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
+                    let split = decode_split_mv(&mut dec, above_slot, &left, best, &mv_contexts)
+                        .expect("SPLITMV decode");
+                    (
+                        split.split_mvs[15],
+                        MbInfo {
+                            ref_frame: Some(RefFrame::Last),
+                            mv: split.split_mvs[15],
+                            is_split: true,
+                            split_mvs: Some(split.split_mvs),
+                        },
+                    )
+                }
             };
             out.push((mode, mv));
-            let cur = MbInfo {
-                ref_frame: Some(RefFrame::Last),
-                mv,
-                is_split: false,
-                split_mvs: None,
-            };
             aboveleft = *above_slot;
             left = cur;
             *above_slot = cur;
@@ -222,13 +262,22 @@ fn i_plus_p_translated_feature_emits_newmv_and_clears_30db() {
     assert_eq!(modes.len(), mb_cols * mb_rows);
 
     let newmv_count = modes.iter().filter(|(m, _)| *m == InterMode::New).count();
+    let split_count = modes.iter().filter(|(m, _)| *m == InterMode::Split).count();
     eprintln!(
-        "P-frame inter-mode pick: {newmv_count}/{} NEWMV MBs",
+        "P-frame inter-mode pick: {newmv_count}/{} NEWMV MBs, \
+         {split_count}/{} SPLITMV MBs",
+        modes.len(),
         modes.len()
     );
+    // Either NEWMV (the whole-MB §17 motion-search path) or SPLITMV
+    // (the round-147 §16.4 per-sub-block path, which can also recover
+    // a translated feature via per-group whole-pixel searches) must
+    // fire. A picker stuck on ZEROMV / NEARESTMV / NEARMV alone would
+    // mean both the §17 search and the §16.4 walk are inactive.
     assert!(
-        newmv_count >= 1,
-        "expected ≥ 1 NEWMV MB on a translated-feature scene, got {newmv_count}/{}",
+        newmv_count + split_count >= 1,
+        "expected ≥ 1 NEWMV-or-SPLITMV MB on a translated-feature scene, \
+         got {newmv_count} NEWMV / {split_count} SPLITMV / {} MBs total",
         modes.len()
     );
 
@@ -252,8 +301,14 @@ fn i_plus_p_translated_feature_emits_newmv_and_clears_30db() {
 }
 
 /// A flat scene (no motion possible) must still emit a decodable P-frame
-/// with every MB selected as ZEROMV by the picker — the ZEROMV vs NEWMV
-/// trade with `sad_zero == 0` always picks ZEROMV.
+/// whose per-MB resolved MV is always `(0, 0)` — the picker may legitimately
+/// pick ZEROMV or SPLITMV-with-all-zero-sub-blocks (which can underrun
+/// ZEROMV's bit cost when `cnt = [0,0,0,0]` makes `mv_ref_probs[0] = 7`
+/// turn the "0" path into a ~5-bit emission, see
+/// `flat_scene_picker_resolves_to_zero_mv` in
+/// `tests/encoder_pframe_nearestmv.rs`). What the picker must NEVER do is
+/// emit a non-zero resolved MV on a flat scene — that would inflate the
+/// §14 residue.
 #[test]
 fn flat_scene_picker_stays_on_zeromv_path() {
     let (w, h) = (64u32, 64u32);
@@ -285,19 +340,20 @@ fn flat_scene_picker_stays_on_zeromv_path() {
         "flat-scene P-frame Y PSNR {y_psnr:.2} dB < 40 dB"
     );
 
-    // Every MB must be ZEROMV (flat ⇒ search SAD == 0 at MV (0, 0); no
-    // neighbour improves, and even if it did the tie-breaker prefers
-    // ZEROMV — fewer bits).
+    // The resolved per-MB MV must always be `(0, 0)` on a flat scene
+    // (the §14 residue would inflate under any non-zero MV); the mode
+    // may be ZEROMV or SPLITMV-with-zero-sub-blocks depending on the
+    // §16.2 / §16.4 bit-cost trade.
     let mb_cols = (w.div_ceil(16)) as usize;
     let mb_rows = (h.div_ceil(16)) as usize;
     let modes = parse_p_frame_inter_modes(&p_bytes, mb_cols, mb_rows);
     for (i, (mode, mv)) in modes.iter().enumerate() {
         assert_eq!(
-            *mode,
-            InterMode::Zero,
-            "MB {i}: flat scene must pick ZEROMV"
+            *mv,
+            Mv::default(),
+            "MB {i}: flat-scene picker emitted {mode:?} with non-zero \
+             resolved MV {mv:?} — the §14 residue would inflate"
         );
-        assert_eq!(*mv, Mv::default(), "MB {i}: ZEROMV must carry MV (0, 0)");
     }
 }
 

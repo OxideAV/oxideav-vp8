@@ -100,12 +100,12 @@ pub enum EncodeError {
         /// `(width, height)` of the reference [`crate::frame::KeyframePlanes`].
         reference: (u32, u32),
     },
-    /// The Phase-11 inter-mode picker emits `ZEROMV` / `NEARESTMV` /
-    /// `NEARMV` / `NEWMV` against `LAST`; any other resolved
-    /// [`crate::near_mv::InterMode`] (i.e. `SPLITMV`) reaching the §16 /
-    /// §17 emit layer is an internal bug. Surfaces as an error rather
-    /// than panicking so a future picker that produces `SPLITMV` can be
-    /// rolled out incrementally without an unrecoverable assert.
+    /// Reserved for inter-mode picker fall-throughs. The Phase-11
+    /// `encode_p_frame_zero_mv` picker now emits all five §16.2
+    /// `mv_ref_tree` leaves (ZEROMV / NEARESTMV / NEARMV / NEWMV /
+    /// SPLITMV); this variant is retained for forward-compatibility with
+    /// a future picker that may surface an InterMode not handled by the
+    /// emit layer (e.g. an `Intra` fallback in a mixed-mode inter pass).
     UnsupportedInterMode {
         /// The resolved mode the picker handed the emit layer.
         mode: crate::near_mv::InterMode,
@@ -150,8 +150,8 @@ impl core::fmt::Display for EncodeError {
             ),
             EncodeError::UnsupportedInterMode { mode } => write!(
                 f,
-                "vp8 encode: inter-mode {mode:?} is not supported by the Phase-11 \
-                 ZEROMV / NEARESTMV / NEARMV / NEWMV picker"
+                "vp8 encode: inter-mode {mode:?} is not supported by the \
+                 Phase-11 ZEROMV / NEARESTMV / NEARMV / NEWMV / SPLITMV picker"
             ),
         }
     }
@@ -3251,13 +3251,13 @@ fn write_mode_layer(
     }
 }
 
-// ─── P-frame encoder (ZEROMV / NEARESTMV / NEARMV / NEWMV / LAST) ────────────
+// ─── P-frame encoder (ZEROMV / NEARESTMV / NEARMV / NEWMV / SPLITMV / LAST) ──
 //
 // RFC 6386 §9 / §16 / §17 / §18 inter-frame encoder. Every emitted
 // macroblock is inter against the LAST reference (§16.2
 // `prob_last`-selected); the per-MB inter mode is picked between the
-// four whole-MB §16.2 `mv_ref_tree` leaves via a non-normative
-// §-not-specified rate-distortion trade:
+// five §16.2 `mv_ref_tree` leaves via a non-normative §-not-specified
+// rate-distortion trade:
 //
 //   J(zero)    = SAD_at_(0,0)
 //                + lambda * mv_ref_tree("0")     bits
@@ -3267,33 +3267,577 @@ fn write_mode_layer(
 //                + lambda * mv_ref_tree("110")   bits
 //   J(new)     = SAD_at_searched_mv
 //                + lambda * (mv_ref_tree("1110") bits + §17 mv bits)
+//   J(split)   = min over the four §16.4 partitions of
+//                  (sum_groups group_SAD
+//                   + lambda * (mv_ref_tree("1111") + mvpartition_tree(p)
+//                               + sum_groups sub_mv_ref_tree + NEW4X4 bits))
 //
-// Lower J wins; `SPLITMV` is out of scope this round. The §17 motion
-// search is the whole-pixel `small_diamond_search_luma` primitive
-// followed by a §18.3 `half_pixel_refine_luma` probe of the 8
-// half-pixel offsets around the whole-pixel result, and then a §18.3
-// `quarter_pixel_refine_luma` probe of the 8 quarter-pixel offsets
-// around the half-pixel result — all clamped to `[-1023, +1023]` per
-// §17.1. When the chosen MV is sub-pixel-aligned the §18 prediction
-// runs the §18.3 six-tap synthesis (`version == 0` bicubic tap-set,
-// indexed by `(stored_luma_mv(mv) & 7)`); at a whole-pixel MV it
-// collapses to the §18.2 / §18.3 copy path. The §16.3
-// NEARESTMV / NEARMV candidates are the §16.3 census `near.mvs[1]` /
-// `near.mvs[2]` slots clamped through the per-MB `MvClampRect`, scored
-// at the clamped MV the decoder will reconstruct from (so the
-// SAD-evaluator is the §18.3 sixtap-aware `mb_luma_sad_at_mv`).
+// Lower J wins. The whole-MB §17 motion search is the whole-pixel
+// `small_diamond_search_luma` primitive followed by a §18.3
+// `half_pixel_refine_luma` probe of the 8 half-pixel offsets around
+// the whole-pixel result, and then a §18.3 `quarter_pixel_refine_luma`
+// probe of the 8 quarter-pixel offsets around the half-pixel result
+// — all clamped to `[-1023, +1023]` per §17.1. When the chosen MV is
+// sub-pixel-aligned the §18 prediction runs the §18.3 six-tap
+// synthesis (`version == 0` bicubic tap-set, indexed by
+// `(stored_luma_mv(mv) & 7)`); at a whole-pixel MV it collapses to the
+// §18.2 / §18.3 copy path. The §16.3 NEARESTMV / NEARMV candidates are
+// the §16.3 census `near.mvs[1]` / `near.mvs[2]` slots clamped through
+// the per-MB `MvClampRect`, scored at the clamped MV the decoder will
+// reconstruct from (so the SAD-evaluator is the §18.3 sixtap-aware
+// `mb_luma_sad_at_mv`).
+//
+// The §16.4 SPLITMV picker evaluates each of the four partition shapes
+// (TopBottom / LeftRight / Quarters / Mv16); for each partition group
+// it runs a whole-pixel sub-block diamond search around the clamped
+// `near.mvs[0]` "best" predictor (no §18.1 secondary clamp per §18.1
+// page 114) and prices the four §16.4 `sub_mv_ref` modes (LEFT4X4 /
+// ABOVE4X4 / ZERO4X4 / NEW4X4) at the group anchor's left / above
+// neighbour vectors. The lowest-J group SAD + sub_mv_ref bits wins;
+// the partition with the smallest summed J — added to the partition
+// tree bits and the §16.2 SPLITMV path bits — is the SPLITMV
+// candidate. When J(split) < J(other-four), SPLITMV emits.
 //
 // The §14 residual = source - prediction is quantised and §13.3-token-
-// coded through the existing intra pipeline regardless of which mode
-// was picked. Per §17 the §17.2 `mv_prob_update()` block is still
-// emitted with every `F` flag set to 0 — "no update", matching the
-// no-token-prob-update pattern — so the decoder's MV-decode runs
-// against the §17.2 defaults; the same `MvContexts` is used encoder-
-// side to write the NEWMV differential.
+// coded through the existing pipeline regardless of which mode was
+// picked. SPLITMV has no Y2 block (§14.2 page 76); its luma sub-blocks
+// code from coefficient 0 like B_PRED. Per §17 the §17.2
+// `mv_prob_update()` block is still emitted with every `F` flag set
+// to 0 — "no update", matching the no-token-prob-update pattern — so
+// the decoder's MV-decode runs against the §17.2 defaults; the same
+// `MvContexts` is used encoder-side to write the NEWMV / NEW4X4
+// differentials.
+
+// ─── §16.4 SPLITMV picker helpers ───────────────────────────────────────────
+//
+// All four §16.4 partition shapes (`MvPartition::TopBottom`,
+// `LeftRight`, `Quarters`, `Mv16`) are evaluated per MB. For each
+// partition group we pick a vector by combining a whole-pixel diamond
+// search (around the clamped `near.mvs[0]` "best" predictor) with a
+// §16.4 `sub_mv_ref` mode choice (LEFT4X4 / ABOVE4X4 / ZERO4X4 /
+// NEW4X4) priced by `sub_mv_ref_tree` + §17.2 NEW4X4 component bits.
+// The SPLITMV picker is intentionally whole-pixel-only this round
+// (matching the §16.4 `MAX_DIAMOND_ITERS` bound below) so its
+// per-group search cost stays linear in partition count without an
+// extra §18.3 sixtap pass per sub-block.
+
+/// One §16.4 SPLITMV picker result: the chosen partition, the sixteen
+/// per-sub-block vectors, the per-group `sub_mv_ref` modes, the
+/// per-group NEW4X4 differentials (zero when the mode is not NEW4X4),
+/// and the total rate-distortion cost the partition scored at.
+///
+/// The picker walks `[TopBottom, LeftRight, Quarters, Mv16]` and keeps
+/// whichever shape produces the smallest `j`; `j` then competes with
+/// the whole-MB picker's `J(zero/nearest/near/new)`.
+#[derive(Debug, Clone)]
+struct SplitMvCandidate {
+    /// The §16.4 partition shape this candidate scored under.
+    partition: crate::near_mv::MvPartition,
+    /// `this->split.mvs[16]` — the resolved per-sub-block quarter-pixel
+    /// vectors, in raster order (matching `MV_PARTITIONS` layout).
+    split_mvs: [crate::motion_vector::Mv; 16],
+    /// The per-partition-group `sub_mv_ref` mode (indexed in partition-id
+    /// order: group 0 first, then 1, …). Length is the partition's group
+    /// count (2 for TopBottom/LeftRight, 4 for Quarters, 16 for Mv16).
+    submv_modes: Vec<crate::near_mv::SubMvRefMode>,
+    /// The per-group NEW4X4 differential (zero `Mv` for groups whose
+    /// `sub_mv_ref` mode is not NEW4X4). Same length as `submv_modes`.
+    submv_new_diffs: Vec<crate::motion_vector::Mv>,
+    /// Total `J = sum_groups group_SAD + lambda * (mv_ref_tree("1111") +
+    /// mvpartition_tree(p) + sum_groups sub_mv_ref_tree + NEW4X4 bits)`
+    /// for this partition. Lower wins.
+    j: f64,
+}
+
+/// `MAX_DIAMOND_ITERS` for the SPLITMV per-group sub-block search.
+/// Smaller than the whole-MB MAX_DIAMOND_ITERS = 8 (line ~3535) since
+/// SPLITMV evaluates up to 16 groups per MB across 4 partition shapes
+/// and the per-group region is small (≤ 8 sub-blocks).
+const SPLIT_MV_MAX_DIAMOND_ITERS: u32 = 4;
+
+/// 4×4 luma block SAD — sum |src[i] - pred[i]|, i in 0..16. The
+/// SPLITMV per-group score sums [`sub_block_sad_4x4`] across the group's
+/// member sub-blocks.
+#[inline]
+fn sub_block_sad_4x4(src: &[u8; 16], pred: &[u8; 16]) -> u32 {
+    let mut sad: u32 = 0;
+    for i in 0..16 {
+        sad += (src[i] as i32 - pred[i] as i32).unsigned_abs();
+    }
+    sad
+}
+
+/// Extract one 4×4 source sub-block (raster sub-block index `b`, b in
+/// 0..=15) from a 16×16 luma source MB.
+#[inline]
+fn extract_src_subblock_4x4(src: &[u8; 256], b: usize) -> [u8; 16] {
+    let sb_row = b >> 2; // 0..=3
+    let sb_col = b & 3; // 0..=3
+    let mut out = [0u8; 16];
+    for r in 0..4 {
+        let dst_off = r * 4;
+        let src_off = (sb_row * 4 + r) * 16 + sb_col * 4;
+        out[dst_off..dst_off + 4].copy_from_slice(&src[src_off..src_off + 4]);
+    }
+    out
+}
+
+/// Sum the 4×4 SADs across the partition group `[group_subblocks]` for
+/// a whole-pixel candidate vector `mv`. Uses
+/// [`crate::motion_comp::fetch_block_whole_pixel`] for each member
+/// sub-block (whole-pixel ⇒ the §18.3 sixtap collapses to the copy
+/// path); §18.1 page 114 says no secondary clamp applies to SPLITMV
+/// sub-block MVs.
+fn group_sad_at_whole_mv(
+    luma_ref: crate::motion_search::LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    group_subblocks: &[usize],
+    mv: crate::motion_vector::Mv,
+) -> u32 {
+    // §18.1 stored_luma_mv doubles the §17 quarter-pixel vector into
+    // the §18 eighth-pixel resolution `fetch_block_whole_pixel` uses.
+    let mv_eighth = crate::motion_comp::stored_luma_mv(mv);
+    let mb_x0 = mb_col * 16;
+    let mb_y0 = mb_row * 16;
+    let mut sad: u32 = 0;
+    for &b in group_subblocks {
+        let sb_row = b >> 2;
+        let sb_col = b & 3;
+        let blk_x = mb_x0 + sb_col * 4;
+        let blk_y = mb_y0 + sb_row * 4;
+        let patch = crate::motion_comp::fetch_block_whole_pixel(
+            luma_ref.plane,
+            luma_ref.stride,
+            luma_ref.width,
+            luma_ref.height,
+            blk_x,
+            blk_y,
+            mv_eighth,
+        );
+        let src_sb = extract_src_subblock_4x4(src_y, b);
+        sad += sub_block_sad_4x4(&src_sb, &patch);
+    }
+    sad
+}
+
+/// Small whole-pixel diamond search for ONE SPLITMV partition group —
+/// per-sub-block analogue of [`crate::motion_search::small_diamond_search_luma`].
+///
+/// Sums [`group_sad_at_whole_mv`] over the group's member sub-blocks
+/// for each candidate MV and follows a 4-neighbour diamond descent
+/// from `center` (which should be the clamped `near.mvs[0]` "best"
+/// predictor, the same base the decoder's NEW4X4 differential adds
+/// to). Returns the best (mv, sad) pair found.
+///
+/// Each step clamps candidates to §17.1's `[MV_MIN, MV_MAX]`; SPLITMV
+/// sub-block MVs themselves are not §18.1-secondary-clamped per §18.1
+/// page 114.
+fn group_small_diamond_search(
+    luma_ref: crate::motion_search::LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    group_subblocks: &[usize],
+    center: crate::motion_vector::Mv,
+    max_iters: u32,
+) -> (crate::motion_vector::Mv, u32) {
+    use crate::motion_search::{MV_MAX, MV_MIN, WHOLE_PIXEL_STEP};
+    // Snap to whole-pixel grid then clamp into §17.1 range.
+    let snap = |v: i16| -> i16 {
+        let q = (v / WHOLE_PIXEL_STEP) * WHOLE_PIXEL_STEP;
+        q.clamp(MV_MIN, MV_MAX)
+    };
+    let mut best_mv = crate::motion_vector::Mv {
+        row: snap(center.row),
+        col: snap(center.col),
+    };
+    let mut best_sad =
+        group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group_subblocks, best_mv);
+    let offsets: [(i16, i16); 4] = [
+        (-WHOLE_PIXEL_STEP, 0),
+        (WHOLE_PIXEL_STEP, 0),
+        (0, -WHOLE_PIXEL_STEP),
+        (0, WHOLE_PIXEL_STEP),
+    ];
+    for _ in 0..max_iters {
+        let mut improved = false;
+        for (dr, dc) in offsets {
+            let cand_row = (best_mv.row as i32 + dr as i32).clamp(MV_MIN as i32, MV_MAX as i32);
+            let cand_col = (best_mv.col as i32 + dc as i32).clamp(MV_MIN as i32, MV_MAX as i32);
+            let cand_mv = crate::motion_vector::Mv {
+                row: cand_row as i16,
+                col: cand_col as i16,
+            };
+            if cand_mv == best_mv {
+                continue;
+            }
+            let cand_sad =
+                group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group_subblocks, cand_mv);
+            if cand_sad < best_sad {
+                best_sad = cand_sad;
+                best_mv = cand_mv;
+                improved = true;
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    (best_mv, best_sad)
+}
+
+/// The §16.4 sub-block index ordering — `MV_PARTITIONS` is indexed by
+/// sub-block raster id and stores group ids, but the partition decode
+/// emits groups in `partition_id` order with the anchor as the first
+/// sub-block carrying that group id. This helper precomputes
+/// `groups[g] = [list of sub-block indices belonging to group g]` for
+/// a given partition.
+fn partition_groups(p: crate::near_mv::MvPartition) -> Vec<Vec<usize>> {
+    let pid = crate::near_mv::partition_id(p);
+    let table = &crate::near_mv::MV_PARTITIONS[pid];
+    let num_groups = match p {
+        crate::near_mv::MvPartition::TopBottom | crate::near_mv::MvPartition::LeftRight => 2,
+        crate::near_mv::MvPartition::Quarters => 4,
+        crate::near_mv::MvPartition::Mv16 => 16,
+    };
+    let mut groups: Vec<Vec<usize>> = (0..num_groups).map(|_| Vec::new()).collect();
+    for (idx, &g) in table.iter().enumerate() {
+        groups[g as usize].push(idx);
+    }
+    groups
+}
+
+/// Per-group `sub_mv_ref` mode cost in fractional bits — the
+/// `sub_mv_ref_tree` path bits at `SUBMV_REF_PROBS[ctx]`.
+///
+/// Tree paths per §16.4 / §20.13:
+///   LEFT4X4  = "0"   → bool_bits(probs[0], false)
+///   ABOVE4X4 = "10"  → bool_bits(probs[0], true) + bool_bits(probs[1], false)
+///   ZERO4X4  = "110" → bool_bits(probs[0..=1], true) + bool_bits(probs[2], false)
+///   NEW4X4   = "111" → bool_bits(probs[0..=2], true)
+fn submv_ref_bits(probs: &[u8; 3], mode: crate::near_mv::SubMvRefMode) -> f64 {
+    use crate::near_mv::SubMvRefMode as M;
+    match mode {
+        M::Left4x4 => bool_bits(probs[0], false),
+        M::Above4x4 => bool_bits(probs[0], true) + bool_bits(probs[1], false),
+        M::Zero4x4 => {
+            bool_bits(probs[0], true) + bool_bits(probs[1], true) + bool_bits(probs[2], false)
+        }
+        M::New4x4 => {
+            bool_bits(probs[0], true) + bool_bits(probs[1], true) + bool_bits(probs[2], true)
+        }
+    }
+}
+
+/// `mvpartition_tree` path bits — RFC 6386 §16.4 / §20.13.
+///
+/// Mv16        = "0"   → bool_bits(MV_PARTITION_PROBS[0], false)
+/// Quarters    = "10"  → bool_bits([0], true) + bool_bits([1], false)
+/// TopBottom   = "110" → bool_bits([0..=1], true) + bool_bits([2], false)
+/// LeftRight   = "111" → bool_bits([0..=2], true)
+fn mv_partition_bits(p: crate::near_mv::MvPartition) -> f64 {
+    let probs = &crate::near_mv::MV_PARTITION_PROBS;
+    use crate::near_mv::MvPartition as P;
+    match p {
+        P::Mv16 => bool_bits(probs[0], false),
+        P::Quarters => bool_bits(probs[0], true) + bool_bits(probs[1], false),
+        P::TopBottom => {
+            bool_bits(probs[0], true) + bool_bits(probs[1], true) + bool_bits(probs[2], false)
+        }
+        P::LeftRight => {
+            bool_bits(probs[0], true) + bool_bits(probs[1], true) + bool_bits(probs[2], true)
+        }
+    }
+}
+
+/// Score one §16.4 partition: walk its groups in partition-id order,
+/// search whole-pixel SAD per group, evaluate the four §16.4
+/// `sub_mv_ref` modes (LEFT4X4 / ABOVE4X4 / ZERO4X4 / NEW4X4) for the
+/// group anchor, and assemble the (`split_mvs[16]`, group modes, group
+/// new-diffs, total J) candidate.
+///
+/// Mirrors `decode_split_mv`'s "find the first sub-block whose
+/// partition entry is `j`, look up its left/above neighbours, run
+/// `sub_mv_ref`, fill every member of the group with the resolved
+/// vector" walk so the encoder's per-group choice is exactly what the
+/// decoder will reconstruct from the emitted bits.
+///
+/// Returns `None` if no in-range candidate is found (every NEW4X4
+/// differential overflowed §17.1 and the LEFT/ABOVE/ZERO modes were
+/// all dominated by SAD).
+#[allow(clippy::too_many_arguments)] // each parameter is a distinct §16.4 input.
+fn score_split_partition(
+    partition: crate::near_mv::MvPartition,
+    luma_ref: crate::motion_search::LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    best_predictor: crate::motion_vector::Mv,
+    above_mb: &crate::near_mv::MbInfo,
+    left_mb: &crate::near_mv::MbInfo,
+    mv_contexts: &crate::motion_vector::MvContexts,
+    lambda: f64,
+) -> Option<SplitMvCandidate> {
+    let groups = partition_groups(partition);
+    let num_groups = groups.len();
+    let mut split_mvs = [crate::motion_vector::Mv::default(); 16];
+    let mut submv_modes: Vec<crate::near_mv::SubMvRefMode> = Vec::with_capacity(num_groups);
+    let mut submv_new_diffs: Vec<crate::motion_vector::Mv> = Vec::with_capacity(num_groups);
+    let mut total_sad: u32 = 0;
+    let mut total_submv_bits: f64 = 0.0;
+
+    for group in groups.iter() {
+        // The anchor is the smallest sub-block index in the group
+        // (§16.4 / §20.11 "find the first sub-block whose partition
+        // entry is j" — `partition_groups` already collects in raster
+        // order, so `group[0]` is the anchor).
+        let anchor = group[0];
+        let left_neighbour_mv = crate::near_mv::left_block_mv(&split_mvs, left_mb, anchor);
+        let above_neighbour_mv = crate::near_mv::above_block_mv(&split_mvs, above_mb, anchor);
+        let ctx = crate::near_mv::submv_ref_context(left_neighbour_mv, above_neighbour_mv);
+        let probs = &crate::near_mv::SUBMV_REF_PROBS[ctx];
+
+        // Whole-pixel search for a per-group NEW4X4 candidate (the
+        // only mode that costs bits for a custom vector). The diamond
+        // descents from the clamped near.mvs[0] "best" predictor — same
+        // base the decoder's NEW4X4 will add the differential onto.
+        let (search_mv, search_sad) = group_small_diamond_search(
+            luma_ref,
+            mb_col,
+            mb_row,
+            src_y,
+            group,
+            best_predictor,
+            SPLIT_MV_MAX_DIAMOND_ITERS,
+        );
+
+        // Score each of the four §16.4 sub_mv_ref modes.
+        use crate::near_mv::SubMvRefMode as M;
+        let mut best_mode: M = M::Zero4x4;
+        let mut best_group_mv = crate::motion_vector::Mv::default();
+        let mut best_group_diff = crate::motion_vector::Mv::default();
+        let mut best_group_j: f64 = f64::INFINITY;
+
+        // Helper: probe one candidate (mode, resolved-mv, diff) and
+        // update the best slot in place. SAD is recomputed at
+        // `mv` so each candidate scores against the same evaluator.
+        let mut try_cand = |mode: M,
+                            mv: crate::motion_vector::Mv,
+                            diff: crate::motion_vector::Mv,
+                            diff_bits: f64| {
+            let sad = group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group, mv) as f64;
+            let mode_bits = submv_ref_bits(probs, mode);
+            let j = sad + lambda * (mode_bits + diff_bits);
+            if j < best_group_j {
+                best_group_j = j;
+                best_mode = mode;
+                best_group_mv = mv;
+                best_group_diff = diff;
+            }
+        };
+
+        // LEFT4X4 — the resolved MV is the left neighbour, no diff bits.
+        try_cand(
+            M::Left4x4,
+            left_neighbour_mv,
+            crate::motion_vector::Mv::default(),
+            0.0,
+        );
+        // ABOVE4X4 — the above neighbour, no diff bits.
+        try_cand(
+            M::Above4x4,
+            above_neighbour_mv,
+            crate::motion_vector::Mv::default(),
+            0.0,
+        );
+        // ZERO4X4 — zero MV, no diff bits.
+        try_cand(
+            M::Zero4x4,
+            crate::motion_vector::Mv::default(),
+            crate::motion_vector::Mv::default(),
+            0.0,
+        );
+        // NEW4X4 — searched MV, diff = search_mv - best_predictor.
+        //
+        // §17.1: each component of the diff fits in [-1023, +1023] — the
+        // §17.2 component coder's range. An out-of-range diff is priced
+        // at +inf so this candidate is dropped.
+        let diff_row = (search_mv.row as i32) - (best_predictor.row as i32);
+        let diff_col = (search_mv.col as i32) - (best_predictor.col as i32);
+        let diff_in_range =
+            (-1023..=1023).contains(&diff_row) && (-1023..=1023).contains(&diff_col);
+        if diff_in_range {
+            let diff = crate::motion_vector::Mv {
+                row: diff_row as i16,
+                col: diff_col as i16,
+            };
+            let diff_bits = crate::motion_vector::mv_component_bits(&mv_contexts[0], diff_row)
+                + crate::motion_vector::mv_component_bits(&mv_contexts[1], diff_col);
+            // SAD at `search_mv` is already known.
+            let mode_bits = submv_ref_bits(probs, M::New4x4);
+            let j = search_sad as f64 + lambda * (mode_bits + diff_bits);
+            if j < best_group_j {
+                best_group_j = j;
+                best_mode = M::New4x4;
+                best_group_mv = search_mv;
+                best_group_diff = diff;
+            }
+        }
+
+        if !best_group_j.is_finite() {
+            // No viable candidate (shouldn't be reachable — Zero4x4 is
+            // always in-range — but guard for completeness).
+            return None;
+        }
+
+        // Fill every member sub-block of this group with the chosen MV
+        // and accumulate its SAD into the partition total. The SAD
+        // re-evaluation uses the same evaluator each candidate scored
+        // against, so the total matches the picker's running sum.
+        let group_sad =
+            group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group, best_group_mv);
+        for &b in group {
+            split_mvs[b] = best_group_mv;
+        }
+        total_sad += group_sad;
+        total_submv_bits += submv_ref_bits(probs, best_mode);
+        if matches!(best_mode, M::New4x4) {
+            total_submv_bits += crate::motion_vector::mv_bits(mv_contexts, best_group_diff);
+        }
+        submv_modes.push(best_mode);
+        submv_new_diffs.push(best_group_diff);
+    }
+
+    // Total J adds the partition's §16.4 `mvpartition_tree` bits to
+    // the per-group `sub_mv_ref` totals (the §16.2 SPLITMV
+    // `mv_ref_tree` path bits are added by the caller once across all
+    // four partition candidates).
+    let partition_bits = mv_partition_bits(partition);
+    let j = total_sad as f64 + lambda * (partition_bits + total_submv_bits);
+
+    Some(SplitMvCandidate {
+        partition,
+        split_mvs,
+        submv_modes,
+        submv_new_diffs,
+        j,
+    })
+}
+
+/// Build the §13.3 raw-coefficient (no Y2) `MbCoeffs` for one SPLITMV
+/// macroblock: per-sub-block luma forward DCT + quantise (no WHT —
+/// SPLITMV has no Y2), and the standard chroma path (4 sub-blocks per
+/// plane). Mirrors the `B_PRED` luma transform path (`transform_b_pred_luma`
+/// would, if it existed; we inline it here since the SPLITMV picker is
+/// the only inter caller that needs no-Y2 luma).
+fn transform_split_mv_mb(
+    src: &[u8; 256],
+    pred: &[u8; 256],
+    chroma_src_u: &[u8; 64],
+    chroma_pred_u: &[u8; 64],
+    chroma_src_v: &[u8; 64],
+    chroma_pred_v: &[u8; 64],
+    factors: &crate::dequant::MbDequantFactors,
+) -> MbCoeffs {
+    // Per-sub-block luma forward DCT + Y1 quantisation. SPLITMV codes
+    // every coefficient (0..=15) of each Y sub-block — no Y2, so the
+    // DC is *not* extracted into a separate WHT block.
+    let mut y = [[0i16; 16]; 16];
+    for i in 0..4 {
+        for j in 0..4 {
+            let mut residual = [0i16; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let off = (i * 4 + r) * 16 + (j * 4 + c);
+                    residual[r * 4 + c] = src[off] as i16 - pred[off] as i16;
+                }
+            }
+            let mut coeffs = [0i16; 16];
+            forward_dct_4x4(&residual, &mut coeffs);
+            // No DC extraction — every coefficient is quantised in
+            // place under the Y1 (dc, ac) factors. The decoder's
+            // `BlockType::YNoY2` path reads them the same way.
+            enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac);
+            y[i * 4 + j] = coeffs;
+        }
+    }
+
+    // Chroma uses the same path the whole-MB encoder uses.
+    let u = transform_chroma_plane(chroma_src_u, chroma_pred_u, factors);
+    let v = transform_chroma_plane(chroma_src_v, chroma_pred_v, factors);
+
+    MbCoeffs {
+        y,
+        y2: [0i16; 16], // unused (no Y2 for SPLITMV); the emitter
+        // skips block 24 via `use_bpred = true` below.
+        u,
+        v,
+    }
+}
+
+/// Write the §16.4 `mvpartition_tree` path for `partition` — RFC 6386
+/// §16.4 / §20.13. Mirrors the encoder side of [`crate::near_mv::read_mv_partition`].
+///
+/// `Mv16 = "0"`, `Quarters = "10"`, `TopBottom = "110"`,
+/// `LeftRight = "111"`, all coded against `MV_PARTITION_PROBS`.
+fn write_split_mv_partition(enc: &mut BoolEncoder, partition: crate::near_mv::MvPartition) {
+    let probs = &crate::near_mv::MV_PARTITION_PROBS;
+    use crate::near_mv::MvPartition as P;
+    match partition {
+        P::Mv16 => {
+            enc.write_bool(probs[0], false);
+        }
+        P::Quarters => {
+            enc.write_bool(probs[0], true);
+            enc.write_bool(probs[1], false);
+        }
+        P::TopBottom => {
+            enc.write_bool(probs[0], true);
+            enc.write_bool(probs[1], true);
+            enc.write_bool(probs[2], false);
+        }
+        P::LeftRight => {
+            enc.write_bool(probs[0], true);
+            enc.write_bool(probs[1], true);
+            enc.write_bool(probs[2], true);
+        }
+    }
+}
+
+/// Write one §16.4 `sub_mv_ref_tree` mode bit-path against `probs`
+/// (a row of `SUBMV_REF_PROBS` selected by [`crate::near_mv::submv_ref_context`]).
+///
+/// `Left4x4 = "0"`, `Above4x4 = "10"`, `Zero4x4 = "110"`,
+/// `New4x4 = "111"`. The §17.2 NEW4X4 component differential is *not*
+/// written here — the caller emits it after this routine returns.
+fn write_submv_ref(enc: &mut BoolEncoder, probs: &[u8; 3], mode: crate::near_mv::SubMvRefMode) {
+    use crate::near_mv::SubMvRefMode as M;
+    match mode {
+        M::Left4x4 => {
+            enc.write_bool(probs[0], false);
+        }
+        M::Above4x4 => {
+            enc.write_bool(probs[0], true);
+            enc.write_bool(probs[1], false);
+        }
+        M::Zero4x4 => {
+            enc.write_bool(probs[0], true);
+            enc.write_bool(probs[1], true);
+            enc.write_bool(probs[2], false);
+        }
+        M::New4x4 => {
+            enc.write_bool(probs[0], true);
+            enc.write_bool(probs[1], true);
+            enc.write_bool(probs[2], true);
+        }
+    }
+}
 
 /// Encode one VP8 P-frame whose every macroblock is inter against the
 /// LAST reference, with per-MB `ZEROMV` / `NEARESTMV` / `NEARMV` /
-/// `NEWMV` chosen by a non-normative rate-distortion trade.
+/// `NEWMV` / `SPLITMV` chosen by a non-normative rate-distortion trade.
 ///
 /// Each MB on the wire is one §19.3 `macroblock_header()` (mb-skip /
 /// is_inter / ref_frame selector / inter-mode tree walk / optional
@@ -3340,8 +3884,26 @@ fn write_mode_layer(
 ///   [`crate::motion_search::mb_luma_sad_at_mv`] evaluator (neighbour
 ///   MVs can land at any §17 quarter-pixel position), at the clamped
 ///   MV the decoder's [`crate::near_mv::resolve_inter_mb_mv`] will
-///   reconstruct from. `SPLITMV` is deferred to later rounds, as is
-///   `GOLDEN` / `ALTREF` source selection.
+///   reconstruct from.
+/// * **§16.4 SPLITMV with per-sub-block whole-pixel motion search.**
+///   For each MB we additionally score all four
+///   [`MvPartition`](crate::near_mv::MvPartition) shapes (`TopBottom`,
+///   `LeftRight`, `Quarters`, `Mv16`); each partition's per-group MV
+///   is the lowest-J among the four §16.4 `sub_mv_ref` modes
+///   ([`Left4x4`](crate::near_mv::SubMvRefMode::Left4x4) — the group
+///   anchor's left neighbour MV; [`Above4x4`] — its above neighbour;
+///   [`Zero4x4`] — `(0, 0)`; [`New4x4`] — a per-group small whole-
+///   pixel diamond search around the clamped `near.mvs[0]` predictor,
+///   coded as a §17.2 differential added to that same `best`). The
+///   §16.4 partition + sub_mv_ref + per-group NEW4X4 component bits
+///   are summed with the §16.2 SPLITMV path bits ("1111") to give the
+///   total `J(split)`; when smaller than the whole-MB picker's J the
+///   SPLITMV path emits. `GOLDEN` / `ALTREF` source selection remains
+///   deferred to a later round.
+///
+///   [`Above4x4`]: crate::near_mv::SubMvRefMode::Above4x4
+///   [`Zero4x4`]: crate::near_mv::SubMvRefMode::Zero4x4
+///   [`New4x4`]: crate::near_mv::SubMvRefMode::New4x4
 /// * **`prob_intra` is 255**, so the decoder reads every MB as
 ///   inter without a bit on the wire wasted on intra-vs-inter
 ///   classification. Token-prob and intra-mode-prob update blocks
@@ -3461,7 +4023,18 @@ pub fn encode_p_frame_zero_mv(
     // emit loop below and (for NEWMV) by the §17.2 component writer.
     // For ZEROMV MBs this is `Mv::default()`; for NEWMV MBs it is the
     // search-resolved whole-pixel MV (snapped + clamped to §17.1).
+    // For SPLITMV MBs this is `split_mvs[15]` (the §16.3 `MbInfo::mv`
+    // convention).
     let mut chosen_mvs: Vec<crate::motion_vector::Mv> = Vec::with_capacity(mb_rows * mb_cols);
+    // For SPLITMV MBs, the per-MB candidate the picker resolved (so
+    // the mode-emit loop can re-emit the partition tree + per-group
+    // sub_mv_ref + NEW4X4 diffs without re-running the picker). `None`
+    // for non-SPLITMV MBs.
+    let mut split_candidates: Vec<Option<SplitMvCandidate>> = Vec::with_capacity(mb_rows * mb_cols);
+    // Per-MB `use_bpred` flag for the §13.3 token emit loop. SPLITMV
+    // MBs have no Y2 block (§14.2 page 76) so they thread through
+    // `encode_mb_tokens(use_bpred = true)`, mirroring the B_PRED path.
+    let mut use_bpred_per_mb: Vec<bool> = Vec::with_capacity(mb_rows * mb_cols);
 
     // §17.2 MV-component contexts the encoder writes NEWMV diffs
     // against. We emit every `mv_prob_update()` F-gate as 0 (no update)
@@ -3688,37 +4261,125 @@ pub fn encode_p_frame_zero_mv(
             if new_eligible && j_new < chosen_j {
                 chosen_mode = crate::near_mv::InterMode::New;
                 chosen_mv = search.mv;
+                chosen_j = j_new;
+            }
+
+            // ---- §16.4 SPLITMV picker --------------------------------------
+            //
+            // Score each of the four §16.4 partition shapes and keep the
+            // lowest-J candidate. `bits_mode_split` is the §16.2
+            // `mv_ref_tree` path "1111" cost (4 bool reads against
+            // probs[0..=3], every read returning `true`); the §16.4
+            // `mvpartition_tree` + `sub_mv_ref_tree` + NEW4X4 bits are
+            // already inside each candidate's `j`.
+            let bits_mode_split = bool_bits(mv_ref_probs[0], true)
+                + bool_bits(mv_ref_probs[1], true)
+                + bool_bits(mv_ref_probs[2], true)
+                + bool_bits(mv_ref_probs[3], true);
+            let mut best_split: Option<SplitMvCandidate> = None;
+            for &partition in &[
+                crate::near_mv::MvPartition::TopBottom,
+                crate::near_mv::MvPartition::LeftRight,
+                crate::near_mv::MvPartition::Quarters,
+                crate::near_mv::MvPartition::Mv16,
+            ] {
+                if let Some(cand) = score_split_partition(
+                    partition,
+                    luma_ref,
+                    mb_col,
+                    mb_row,
+                    &pixels.y,
+                    best_predictor,
+                    above_slot,
+                    &left_mb,
+                    &mv_contexts,
+                    lambda,
+                ) {
+                    let total_j = cand.j + lambda * bits_mode_split;
+                    if best_split
+                        .as_ref()
+                        .map(|b| total_j < b.j + lambda * bits_mode_split)
+                        .unwrap_or(true)
+                    {
+                        best_split = Some(SplitMvCandidate {
+                            // Re-store with the §16.2 path bits folded
+                            // into the candidate's `j` so the picker
+                            // comparison stays a direct `j` < `chosen_j`.
+                            partition: cand.partition,
+                            split_mvs: cand.split_mvs,
+                            submv_modes: cand.submv_modes,
+                            submv_new_diffs: cand.submv_new_diffs,
+                            j: total_j,
+                        });
+                    }
+                }
+            }
+
+            // SPLITMV wins only if its total J is strictly lower than
+            // the best whole-MB candidate's. Ties go to the whole-MB
+            // path — SPLITMV carries strictly more bits at identical
+            // distortion than ZEROMV would, so a tie would waste bits.
+            let mut chosen_split: Option<SplitMvCandidate> = None;
+            if let Some(cand) = best_split {
+                if cand.j < chosen_j {
+                    chosen_mode = crate::near_mv::InterMode::Split;
+                    chosen_mv = cand.split_mvs[15];
+                    chosen_split = Some(cand);
+                }
             }
 
             // ---- §18 / §14 prediction + residual at the chosen MV --------
-            let pred = crate::motion_comp::predict_inter_mb(
-                &reference_planes,
-                mb_col,
-                mb_row,
-                chosen_mv,
-                false,
-                filters,
-            );
-            let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, &factors);
-            let u_quant = transform_chroma_plane(&pixels.u, &pred.u, &factors);
-            let v_quant = transform_chroma_plane(&pixels.v, &pred.v, &factors);
-
-            let raw_coeffs = MbCoeffs {
-                y: y_quant,
-                y2: y2_quant,
-                u: u_quant,
-                v: v_quant,
+            //
+            // SPLITMV: per-sub-block luma prediction via `predict_split_mv`
+            // + sub-block forward DCT (no Y2). Whole-MB: the existing
+            // `predict_inter_mb` + `transform_whole_block_luma` path.
+            let (raw_coeffs, use_bpred, recon) = if let Some(ref cand) = chosen_split {
+                let pred = crate::motion_comp::predict_split_mv(
+                    &reference_planes,
+                    mb_col,
+                    mb_row,
+                    &cand.split_mvs,
+                    false,
+                    filters,
+                );
+                let raw_coeffs = transform_split_mv_mb(
+                    &pixels.y, &pred.y, &pixels.u, &pred.u, &pixels.v, &pred.v, &factors,
+                );
+                (raw_coeffs, true, pred)
+            } else {
+                let pred = crate::motion_comp::predict_inter_mb(
+                    &reference_planes,
+                    mb_col,
+                    mb_row,
+                    chosen_mv,
+                    false,
+                    filters,
+                );
+                let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, &factors);
+                let u_quant = transform_chroma_plane(&pixels.u, &pred.u, &factors);
+                let v_quant = transform_chroma_plane(&pixels.v, &pred.v, &factors);
+                let raw_coeffs = MbCoeffs {
+                    y: y_quant,
+                    y2: y2_quant,
+                    u: u_quant,
+                    v: v_quant,
+                };
+                (raw_coeffs, false, pred)
             };
 
             // Count non-zero residual blocks so we can emit a skip-MB
             // (§11.1) when the residual is exactly zero. Block walk
-            // order matches §13.3: Y2 + 16 Y + 4 U + 4 V.
+            // order matches §13.3: optional Y2 + 16 Y + 4 U + 4 V.
+            // SPLITMV has no Y2 and its Y blocks code from coefficient 0
+            // (no DC carve-out), so a non-zero DC counts as a non-zero
+            // block — mirrors the B_PRED skip-detection path.
             let mut nonzero_block_count = 0usize;
-            if raw_coeffs.y2.iter().any(|&v| v != 0) {
+            if !use_bpred && raw_coeffs.y2.iter().any(|&v| v != 0) {
                 nonzero_block_count += 1;
             }
             for blk in raw_coeffs.y.iter() {
-                if blk.iter().skip(1).any(|&v| v != 0) {
+                let first = if use_bpred { 0 } else { 1 };
+                if blk.iter().skip(first).any(|&v| v != 0) {
                     nonzero_block_count += 1;
                 }
             }
@@ -3736,31 +4397,58 @@ pub fn encode_p_frame_zero_mv(
 
             // Reconstruct through the decoder's own §18 + §14 path so
             // the encoder's running buffer is bit-identical to what the
-            // decoder produces from the bytes we are about to emit.
-            let recon = crate::motion_comp::reconstruct_inter_mb(
-                &reference_planes,
-                mb_col,
-                mb_row,
-                chosen_mv,
-                false,
-                filters,
-                mb_skip_coeff,
-                &raw_coeffs.y2,
-                &raw_coeffs.y,
-                &raw_coeffs.u,
-                &raw_coeffs.v,
-            );
+            // decoder produces from the bytes we are about to emit. The
+            // `recon` tuple's third slot above already carries the §18
+            // prediction; we now finish the reconstruction with the
+            // appropriate §14 inverse path.
+            let _ = recon; // bound to silence the unused-variable lint
+                           // when `chosen_split` is `None` below.
+            let recon = if let Some(ref cand) = chosen_split {
+                crate::motion_comp::reconstruct_split_mv_mb(
+                    &reference_planes,
+                    mb_col,
+                    mb_row,
+                    &cand.split_mvs,
+                    false,
+                    filters,
+                    mb_skip_coeff,
+                    &raw_coeffs.y,
+                    &raw_coeffs.u,
+                    &raw_coeffs.v,
+                )
+            } else {
+                crate::motion_comp::reconstruct_inter_mb(
+                    &reference_planes,
+                    mb_col,
+                    mb_row,
+                    chosen_mv,
+                    false,
+                    filters,
+                    mb_skip_coeff,
+                    &raw_coeffs.y2,
+                    &raw_coeffs.y,
+                    &raw_coeffs.u,
+                    &raw_coeffs.v,
+                )
+            };
             crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
 
-            // Per the §15 loop-filter geometry, an inter MB carries
-            // `y_mode = DC_PRED` for the §15.1 page-86 skip rule
-            // (filter_subblocks ← B_PRED || any-coded-coeff). SPLITMV
-            // is the only inter mode that maps to `y_mode = B_PRED`,
-            // and we never emit SPLITMV.
+            // Per the §15 loop-filter geometry, a whole-MB inter MB
+            // carries `y_mode = DC_PRED` for the §15.1 page-86 skip rule
+            // (filter_subblocks ← B_PRED || any-coded-coeff); a SPLITMV
+            // MB maps to `y_mode = B_PRED` so the §15 "filter internal
+            // edges" rule fires the way the spec wants. See
+            // `state.rs::Vp8DecoderState` for the matching decoder-side
+            // mapping.
+            let y_mode_for_lf = if chosen_split.is_some() {
+                IntraYMode::B
+            } else {
+                IntraYMode::Dc
+            };
             modes.push(MacroblockModes {
                 segment_id: None,
                 mb_skip_coeff,
-                y_mode: IntraYMode::Dc,
+                y_mode: y_mode_for_lf,
                 subblock_modes: None,
                 uv_mode: IntraUvMode::Dc,
             });
@@ -3768,15 +4456,29 @@ pub fn encode_p_frame_zero_mv(
             ref_frames_out.push(Some(crate::motion_comp::RefFrame::Last));
             inter_modes_out.push(Some(chosen_mode));
             chosen_mvs.push(chosen_mv);
+            use_bpred_per_mb.push(use_bpred);
 
             // Update the neighbour records for the next MB in the row /
             // for the next row, mirroring the decoder's per-MB walk.
-            let cur = crate::near_mv::MbInfo {
-                ref_frame: Some(crate::motion_comp::RefFrame::Last),
-                mv: chosen_mv,
-                is_split: false,
-                split_mvs: None,
+            // SPLITMV neighbours feed `above_block_mv` / `left_block_mv`
+            // (§20.11) with their per-sub-block detail, so we record the
+            // full `split_mvs[16]` for the next census.
+            let cur = if let Some(ref cand) = chosen_split {
+                crate::near_mv::MbInfo {
+                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    mv: cand.split_mvs[15],
+                    is_split: true,
+                    split_mvs: Some(cand.split_mvs),
+                }
+            } else {
+                crate::near_mv::MbInfo {
+                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    mv: chosen_mv,
+                    is_split: false,
+                    split_mvs: None,
+                }
             };
+            split_candidates.push(chosen_split);
             aboveleft_mb = *above_slot;
             left_mb = cur;
             *above_slot = cur;
@@ -3895,19 +4597,24 @@ pub fn encode_p_frame_zero_mv(
     //   1. mb_skip_coeff (when mb_no_skip_coeff = 1)
     //   2. is_inter_mb (against prob_intra)
     //   3. ref_frame selector (against prob_last; LAST = false)
-    //   4. inter-mode tree walk (ZEROMV = "0", NEWMV = "1110")
-    //   5. NEWMV only: §17.2 row + column MV differential, written
-    //      against the §17.2 default MV contexts (the same defaults
-    //      the decoder reads with because we emit `mv_prob_update()`
-    //      with every F-gate = 0 above).
+    //   4. inter-mode tree walk (ZEROMV = "0", NEWMV = "1110",
+    //      SPLITMV = "1111")
+    //   5. NEWMV: §17.2 row + column MV differential, written against
+    //      the §17.2 default MV contexts (the same defaults the
+    //      decoder reads with because we emit `mv_prob_update()` with
+    //      every F-gate = 0 above).
+    //      SPLITMV: §16.4 `mvpartition_tree` partition id, then for
+    //      each partition group the §16.4 `sub_mv_ref_tree` mode at
+    //      the group anchor's left/above context, with NEW4X4 modes
+    //      followed by their §17.2 component differential.
     //
     // The §16.3 census determines the four probabilities the inter-
     // mode tree's bool reads, and depends on the already-decoded
-    // neighbours' resolved `ref_frame` + `mv`. We re-run the census
-    // here against the SAME neighbour state the search loop walked
-    // above (using each MB's `chosen_mv` as its resolved vector), so
-    // the bits we write are consumed at exactly the probabilities the
-    // decoder reads them at.
+    // neighbours' resolved `ref_frame` + `mv` (+ `is_split` /
+    // `split_mvs` for SPLITMV neighbours). We re-run the census here
+    // against the SAME neighbour state the search loop walked above,
+    // so the bits we write are consumed at exactly the probabilities
+    // the decoder reads them at.
     let mut above_mb: Vec<crate::near_mv::MbInfo> = vec![crate::near_mv::MbInfo::border(); mb_cols];
 
     for mb_row in 0..mb_rows {
@@ -3931,7 +4638,7 @@ pub fn encode_p_frame_zero_mv(
             //    NEARESTMV = leaf 1, path "10"
             //    NEARMV    = leaf 2, path "110"
             //    NEWMV     = leaf 3, path "1110"
-            //    SPLITMV   = leaf 4, path "1111"  (not emitted this round)
+            //    SPLITMV   = leaf 4, path "1111"
             let near = crate::near_mv::find_near_mvs(
                 above_slot,
                 &left_mb,
@@ -3979,21 +4686,84 @@ pub fn encode_p_frame_zero_mv(
                     };
                     crate::motion_vector::write_mv(&mut hdr, &mv_contexts, diff);
                 }
-                other => {
-                    // The round-146 picker emits ZEROMV / NEARESTMV /
-                    // NEARMV / NEWMV; SPLITMV remains a follow-up. Any
-                    // other resolved mode reaching the emit layer is an
-                    // internal bug.
-                    return Err(EncodeError::UnsupportedInterMode { mode: other });
+                crate::near_mv::InterMode::Split => {
+                    // "1111": four true bits at probs[0..=3]. Pinned by
+                    // `MV_REF_TREE`.
+                    hdr.write_bool(probs[0], true);
+                    hdr.write_bool(probs[1], true);
+                    hdr.write_bool(probs[2], true);
+                    hdr.write_bool(probs[3], true);
+
+                    // §16.4 partition + per-group sub_mv_ref walk. The
+                    // candidate carries the picker's resolved partition,
+                    // group modes, and NEW4X4 diffs from the search-and-RD
+                    // pass; we re-emit each in order against the same
+                    // probability tables.
+                    let cand = split_candidates[raster]
+                        .as_ref()
+                        .expect("split_candidates populated for InterMode::Split");
+                    write_split_mv_partition(&mut hdr, cand.partition);
+
+                    // For each partition group, re-resolve the anchor's
+                    // left / above neighbours against the SAME running
+                    // split_mvs buffer the decoder will rebuild, look up
+                    // the §16.4 `sub_mv_ref` context, and emit the
+                    // group's mode + (NEW4X4 only) §17.2 differential.
+                    let groups = partition_groups(cand.partition);
+                    let mut running_split = [crate::motion_vector::Mv::default(); 16];
+                    for (g_idx, group) in groups.iter().enumerate() {
+                        let anchor = group[0];
+                        let left_nb =
+                            crate::near_mv::left_block_mv(&running_split, &left_mb, anchor);
+                        let above_nb =
+                            crate::near_mv::above_block_mv(&running_split, above_slot, anchor);
+                        let ctx = crate::near_mv::submv_ref_context(left_nb, above_nb);
+                        let sub_probs = &crate::near_mv::SUBMV_REF_PROBS[ctx];
+
+                        let mode = cand.submv_modes[g_idx];
+                        write_submv_ref(&mut hdr, sub_probs, mode);
+
+                        if matches!(mode, crate::near_mv::SubMvRefMode::New4x4) {
+                            // §16.4: NEW4X4 differential is added to
+                            // `best_mv` (the clamped near.mvs[0]); the
+                            // picker computed and stored the diff.
+                            crate::motion_vector::write_mv(
+                                &mut hdr,
+                                &mv_contexts,
+                                cand.submv_new_diffs[g_idx],
+                            );
+                        }
+
+                        // Fill the running split buffer with the
+                        // group's resolved vector so subsequent groups'
+                        // left/above neighbour lookups see exactly what
+                        // the decoder will see.
+                        for &b in group {
+                            running_split[b] = cand.split_mvs[b];
+                        }
+                    }
                 }
             }
 
-            // Update neighbour records for the next MB.
-            let cur = crate::near_mv::MbInfo {
-                ref_frame: Some(crate::motion_comp::RefFrame::Last),
-                mv: chosen_mv,
-                is_split: false,
-                split_mvs: None,
+            // Update neighbour records for the next MB. SPLITMV
+            // neighbours feed the §20.11 per-sub-block lookups, so we
+            // record the full `split_mvs[16]` (the same layout the
+            // decoder writes into `MbInfo`).
+            let cur = if matches!(chosen_mode, crate::near_mv::InterMode::Split) {
+                let cand = split_candidates[raster].as_ref().expect("split candidate");
+                crate::near_mv::MbInfo {
+                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    mv: cand.split_mvs[15],
+                    is_split: true,
+                    split_mvs: Some(cand.split_mvs),
+                }
+            } else {
+                crate::near_mv::MbInfo {
+                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    mv: chosen_mv,
+                    is_split: false,
+                    split_mvs: None,
+                }
             };
             aboveleft_mb = *above_slot;
             left_mb = cur;
@@ -4023,15 +4793,21 @@ pub fn encode_p_frame_zero_mv(
         for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
             let raster = mb_row * mb_cols + mb_col;
             let mb = &modes[raster];
+            // SPLITMV MBs clear the Y2 predictor context like B_PRED
+            // (§13.1 / §20.16); `has_y2` reflects whether a Y2 block
+            // is on the wire for this MB.
+            let use_bpred = use_bpred_per_mb[raster];
             if mb.mb_skip_coeff {
-                clear_skip_ctx(false, above_col, &mut left_ctx);
+                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
                 continue;
             }
-            // Inter non-SPLITMV MBs always have Y2 (use_bpred = false).
+            // SPLITMV / B_PRED have no Y2 (§14.2 page 76); the §13.3
+            // walker skips block 24 and routes the 16 Y blocks through
+            // `BlockType::YNoY2` instead of `YAfterY2`.
             encode_mb_tokens(
                 &mut tok,
                 &all_coeffs[raster],
-                false,
+                use_bpred,
                 &coeff_probs,
                 above_col,
                 &mut left_ctx,

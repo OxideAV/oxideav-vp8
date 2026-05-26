@@ -2,6 +2,69 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 147)
+
+**Encoder Phase 11 — §16.4 SPLITMV per-sub-block motion-vector walk in
+the rate-distortion picker.** The round-146 P-frame picker scored the
+four whole-MB `mv_ref_tree` leaves (ZEROMV / NEARESTMV / NEARMV /
+NEWMV); round 147 widens the trade to all five leaves by adding
+SPLITMV — for each MB the picker evaluates the four §16.4 partition
+shapes (`TopBottom`, `LeftRight`, `Quarters`, `Mv16`):
+
+```
+J(split, p) = sum_groups group_SAD
+            + λ · (mv_ref_tree("1111") bits
+                 + mvpartition_tree(p) bits
+                 + sum_groups (sub_mv_ref_tree mode bits
+                             + NEW4X4 §17.2 component bits))
+```
+
+Each partition's per-group MV is the lowest-J among the four §16.4
+`sub_mv_ref` modes (LEFT4X4 — copy the group anchor's left neighbour
+MV; ABOVE4X4 — copy its above neighbour; ZERO4X4 — zero MV; NEW4X4 —
+a per-group whole-pixel diamond search around the clamped `near.mvs[0]`
+predictor, coded as a §17.2 differential added to that same `best`).
+The lowest-J partition across the four shapes is the SPLITMV candidate;
+it wins the per-MB picker when its total J is strictly lower than the
+best whole-MB candidate's (ties go to the whole-MB path — SPLITMV
+carries strictly more bits at identical distortion).
+
+The §18 / §14 reconstruction routes through `predict_split_mv` +
+`reconstruct_split_mv_mb` (already in place since the decoder side
+landed); a new encoder-local `transform_split_mv_mb` runs the
+per-sub-block luma forward DCT (no Y2 carve-out per §14.2 page 76 —
+every Y sub-block codes coefficient 0..=15 under the Y1 quantiser,
+mirroring B_PRED). The §13.3 token-emit pass routes SPLITMV MBs through
+`encode_mb_tokens(use_bpred = true)` so block 24 is skipped and the
+§13.1 / §20.16 predictor contexts thread the same way B_PRED does. The
+§15 loop-filter geometry records SPLITMV MBs with `y_mode = B_PRED` so
+the §15.1 "filter internal edges" rule fires per spec. On the wire the
+encoder emits the §16.2 "1111" path + the §16.4 `mvpartition_tree`
+partition id + per-group `sub_mv_ref_tree` mode + NEW4X4 §17.2 diff;
+SPLITMV neighbours feed the §20.11 per-sub-block lookups via
+`MbInfo::is_split = true` + `MbInfo::split_mvs = Some([Mv; 16])`.
+
+Validation: a new `tests/encoder_pframe_splitmv.rs` integration test
+encodes a 2-frame I+P sequence with a **divergent per-quadrant
+translation** (each 16×16 MB's four 8×8 quadrants each shift by their
+own whole-pixel vector — TL `(+2, +2)`, TR `(-2, +2)`, BL `(-2, -2)`,
+BR `(+2, -2)`). No single whole-MB MV can simultaneously align all
+four quadrants, so the §16.4 `Quarters` partition cleanly wins. The
+picker emits **16 of 16 SPLITMV MBs** and the self-decode Y-PSNR clears
+**39.65 dB** at `yac_qi = 32`. The round-146 uniform-translation test
+now emits **15 of 24 NEARESTMV + 9 of 24 SPLITMV** (was 23 of 24
+NEARESTMV) with self-decode Y-PSNR **48.43 dB** (was 48.14 dB — modest
+gain). The round-145 quarter-pixel test picks 2 of 16 NEWMV + 1 of 16
+SPLITMV at **48.93 dB**, the round-144 half-pixel test still picks 1
+of 16 NEWMV at **58.19 dB**, and the round-143 whole-pixel
+translated-feature test picks 1 of 16 NEWMV + 1 of 16 SPLITMV at
+**50.34 dB** — the SPLITMV picker is selectively engaged on content
+that benefits and stays out of the way on whole-MB-friendly content.
+Tests: 474 → 475 (+1 in `encoder_pframe_splitmv.rs`).
+
+`GOLDEN` / `ALTREF` source selection, multi-partition inter, and the
+per-MB §9.4 mode / ref delta layer remain follow-up rounds.
+
 ## Status — 2026-05-26 (round 146)
 
 **Encoder Phase 11 — §16.2 NEARESTMV / NEARMV candidates in the

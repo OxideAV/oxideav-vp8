@@ -2,6 +2,109 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 159)
+
+**§13.4 fitter threaded into the multi-frame stream drivers (RFC 6386
+§13.4 / §13.5 / §9.7).** Round 157 (`769dda2`) landed the keyframe
+observed-counts fitter; round 158 (`365752a`) mirrored it on the inter
+(P-frame) path; round 159 closes the explicit follow-up they both
+called out — "thread the fitter into `Vp8KeyframeStreamEncoder` /
+`Vp8InterStreamEncoder.encode_frame`" — so the multi-frame stream
+drivers benefit from the §13.4 layer without the caller having to
+reach into the bare-encoder entry points.
+
+Three new public surfaces stack on top of the existing fitter
+entries:
+
+  * **`encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(frame,
+    params)`** — the planes-returning companion of round 157's
+    `encode_keyframe_with_fitted_token_prob_updates`, shaped the same
+    way `encode_keyframe_with_reconstruction` relates to
+    `encode_keyframe`. The bytes are byte-identical to the no-
+    reconstruction fitter and the returned planes are the
+    macroblock-aligned post-§15 reconstruction the §9 reference-frame
+    buffer wants for the `LAST` / `GOLDEN` / `ALTREF` ladder. The
+    round-158 "matching reconstruction planes on safety-guard
+    fall-back" guarantee is preserved end-to-end: a streaming caller's
+    next-frame LAST slot is always consistent with the emitted wire,
+    on either fitter outcome.
+  * **`Vp8KeyframeStreamEncoder::encode_frame_with_fitted_token_prob_updates(frame)`**
+    — drop-in fitted companion to `encode_frame` on the keyframe
+    driver. Same K-frame scheduling rule (every emitted frame is a
+    key frame), same dimension-lock semantics, same §9.7 / §9.8
+    three-slot refresh — only the bitstream differs.
+  * **`Vp8InterStreamEncoder::encode_frame_with_fitted_token_prob_updates(frame)`**
+    and its `force_keyframe`-aware partner
+    **`encode_frame_with_force_and_fitted_token_prob_updates(frame,
+    force_keyframe)`** — drop-in fitted companions to `encode_frame` /
+    `encode_frame_with_force` on the I + P driver. The K/P scheduler
+    is reused unchanged (so the fitter has zero effect on which
+    frames are coded as K vs P, and `force_keyframe` re-anchors the
+    interval the same way); only the per-frame bitstream emission
+    swaps to the appropriate round-157 or round-158 fitter
+    entry-point.
+
+The new surfaces compose orthogonally with the existing stream-driver
+methods. Callers that need the bare-encoder fitter for one-off frames
+(e.g. for an analysis pass) still have direct access; callers driving
+a multi-frame stream now have a single entry-point that fits §13.4
+per frame.
+
+Wire shrinkage on the new
+`tests/encoder_stream_fitted_token_prob_updates.rs` integration test
+at `y_ac_qi = 32` (synthetic source, the same gradient + moving
+flat-square pattern the r127 `encoder_keyframe_stream.rs` test uses):
+
+| Source                                 | Default | Fitted | Δ          |
+| -------------------------------------- | ------- | ------ | ---------- |
+| Keyframe stream, 64×64 ramp, frame 0   | 118 B   | 115 B  | **-3 B**   |
+| Keyframe stream, 64×64 ramp, frame 1   | 103 B   | 103 B  | ±0 B       |
+| Keyframe stream, 64×64 ramp, frame 2   | 115 B   | 110 B  | **-5 B**   |
+| Keyframe stream, 64×64 ramp, frame 3   | 105 B   | 105 B  | ±0 B       |
+| Inter stream K0, 64×64 ramp            | 118 B   | 115 B  | **-3 B**   |
+| Inter stream P1, 64×64 ramp            | 220 B   | 206 B  | **-14 B**  |
+| Inter stream P2, 64×64 ramp            | 207 B   | 193 B  | **-14 B**  |
+| Inter stream K3, 64×64 ramp            | 105 B   | 105 B  | ±0 B       |
+| Inter stream P4, 64×64 ramp            | 220 B   | 168 B  | **-52 B**  |
+| Inter stream P5, 64×64 ramp            | 303 B   | 265 B  | **-38 B**  |
+
+Inter-path P-frames benefit the most: the keyframe scheduler keeps the
+fitter's per-frame `[4 plane][8 band][3 ctx][11 pos]` header cost
+amortised across the inter residual mass, and the P-frame's small
+absolute coefficient mass lets a single fitted slot pay for itself in
+short order. The keyframe stream falls back to "no updates win" on
+the simpler frames (`±0 B`) — exactly the safety-guard behaviour
+round 157 pinned for the bare-encoder fitter.
+
+Decoder side: zero changes. The stream-encoder entry-points all emit
+bitstreams that re-enter `Vp8DecoderState::decode_frame` on a fresh
+decoder state — the same path the (existing) round-156 / round-158
+inter wire used. The new tests pin the full I + P round-trip ≥ 30 dB
+per frame at mid quantiser.
+
+Validation: a new
+`tests/encoder_stream_fitted_token_prob_updates.rs` integration test
+(6 tests) pins (a) `Vp8KeyframeStreamEncoder::encode_frame_with_fitted_token_prob_updates`
+never grows the wire relative to `encode_frame` on any frame of a
+4-frame sequence; (b) the fitted-keyframe-stream bytes replay through
+`Vp8DecoderState::decode_frame` at PSNR ≥ 30 dB / frame on a 5-frame
+mid-quantiser target; (c) the §9.7 / §9.8 keyframe slot-refresh
+invariant survives the fitter (all three slots byte-equal after a
+fitted K); (d) `Vp8InterStreamEncoder::encode_frame_with_fitted_token_prob_updates`
+never grows the wire relative to `encode_frame` across a 6-frame
+I + P interleave at keyframe interval 3 (kind matches default frame-
+by-frame — fitter has zero effect on scheduling); (e) the same
+self-decode ≥ 30 dB target holds on the inter path's I + P sequence;
+(f) `force_keyframe = true` re-anchors the interval the same way as
+the non-fitted entry-point. Tests: 523 → 529 (+6 in
+`encoder_stream_fitted_token_prob_updates.rs`).
+
+The next-step ladder for the encoder is now: (1) intra-within-inter
+MB picking (§11 RD against the inter J at `prob_intra < 255`), (2)
+§9.3 segmentation support, (3) end-to-end libvpx / vpxdec black-box
+cross-decode validation, (4) deeper §18.3 sub-pel ME / RD
+refinement, (5) §11 intra-mode RD picks (UV first then Y).
+
 ## Status — 2026-05-27 (round 158)
 
 **Encoder §13.4 `token_prob_update()` observed-counts fitter mirrored

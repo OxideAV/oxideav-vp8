@@ -3681,6 +3681,79 @@ pub fn encode_keyframe_with_fitted_token_prob_updates(
     }
 }
 
+/// Encode a key frame with an automatically-fitted §13.4
+/// `token_prob_update()` payload **and** return the post-§15
+/// reconstructed [`crate::frame::KeyframePlanes`] alongside the wire.
+///
+/// Planes-returning companion to
+/// [`encode_keyframe_with_fitted_token_prob_updates`] (round 157),
+/// shaped the same way [`encode_keyframe_with_reconstruction`] relates
+/// to [`encode_keyframe`]. The bytes are byte-identical to the no-
+/// reconstruction fitter and the returned planes are the **macroblock-
+/// aligned** post-§15 frame the decoder would rebuild from those bytes —
+/// the exact shape the §9 three-slot reference-frame buffer wants for
+/// `LAST` / `GOLDEN` / `ALTREF` installation.
+///
+/// Round 159 wires this into
+/// [`crate::stream::Vp8KeyframeStreamEncoder::encode_frame_with_fitted_token_prob_updates`]
+/// so the multi-frame keyframe stream driver can fit the §13.4 payload
+/// per frame while keeping a sound LAST slot for the (currently-unused
+/// for the keyframe driver, but populated for symmetry with the §9
+/// three-slot ladder) downstream frame to predict from. The bytes-only
+/// variant remains available for callers that don't need the planes.
+///
+/// The two-pass fitter + safety-guard semantics mirror
+/// [`encode_keyframe_with_fitted_token_prob_updates`] exactly: pass 1
+/// encodes with §13.5 defaults and records branch counts; pass 2
+/// re-encodes with the fitted payload; if pass 2 isn't strictly smaller
+/// the default-pass bytes **and** default-pass planes are returned so
+/// the caller's downstream LAST slot stays consistent with the wire
+/// (mirrors the round-158 inter fitter's matching-planes guarantee).
+pub fn encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    // Pass 1 — defaults + observed branch counts.
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) =
+        encode_keyframe_inner(frame, params, None, Some(&mut counts))?;
+
+    // Fit. 2.0 bits of slack matches the round-157/158 fitter shape.
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+
+    // No slot crossed the threshold ⇒ default encode wins trivially
+    // (all-`None` path is byte-identical to the round-154 wire).
+    let any_update = fitted.iter().any(|p| {
+        p.iter()
+            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
+    });
+    if !any_update {
+        return Ok((bytes_default, planes_default));
+    }
+
+    // Pass 2 — re-encode with the fitted updates AND keep the matching
+    // reconstruction. The picker re-runs against the merged probabilities
+    // (RD estimator uses the merged table), so the chosen coefficients
+    // may shift relative to pass 1; the encoder remains self-consistent
+    // because the decoder rebuilds the same merged table from the on-
+    // wire updates and reconstructs the same picture as `planes_fitted`.
+    let (bytes_fitted, planes_fitted) =
+        encode_keyframe_with_reconstruction_and_token_updates(frame, params, Some(&fitted))?;
+
+    // Guard against the cost-model overstating the saving: only ship
+    // the fitted bytes when they actually shrink the wire. On the
+    // fall-back path we MUST also return the default-pass planes,
+    // otherwise a streaming caller's next-frame LAST slot would not
+    // match what the decoder will hold (the two passes' picker outputs
+    // differ when the merged table differs). Mirrors the round-158
+    // inter fitter's matching-planes guarantee.
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
+}
+
 /// Encode a key frame and return both the bitstream bytes **and** the
 /// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`] the
 /// decoder will rebuild from those bytes.

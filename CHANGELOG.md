@@ -6,6 +6,53 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.4 fitter threaded into the multi-frame stream drivers (RFC 6386
+  §13.4 / §13.5 / §9.7)** — round 159 closes the round-157 / round-158
+  follow-up ("Out of round-158 scope: threading the fitter into
+  `Vp8KeyframeStreamEncoder` / `Vp8InterStreamEncoder`"). Three new
+  surfaces stack on top of the existing fitter entries:
+  `encode_keyframe_with_reconstruction_and_fitted_token_prob_updates`
+  (the planes-returning companion of
+  `encode_keyframe_with_fitted_token_prob_updates`, shaped the same way
+  `encode_keyframe_with_reconstruction` relates to `encode_keyframe` —
+  bytes byte-identical to the no-reconstruction fitter, planes are the
+  post-§15 macroblock-aligned reconstruction the §9 reference-frame
+  buffer wants for the `LAST` / `GOLDEN` / `ALTREF` ladder),
+  `Vp8KeyframeStreamEncoder::encode_frame_with_fitted_token_prob_updates`,
+  and the inter pair
+  `Vp8InterStreamEncoder::encode_frame_with_fitted_token_prob_updates` /
+  `encode_frame_with_force_and_fitted_token_prob_updates`. The stream
+  drivers reuse the K/P scheduler unchanged — only the per-frame
+  bitstream emission swaps to the fitter; the §9.7 / §9.8 three-slot
+  refresh and §9.4 across-frame delta carry stay identical to the
+  caller-driven path. Round 158's fitter "matching reconstruction
+  planes on safety-guard fall-back" guarantee is honoured by both new
+  entries so a streaming caller's next-frame `LAST` slot stays
+  consistent with the wire on either fitter outcome.
+
+  Wire shrinkage on the new
+  `tests/encoder_stream_fitted_token_prob_updates.rs` integration test
+  at y_ac_qi = 32 (synthetic source, 6-frame I + P sequence,
+  keyframe interval 3):
+
+    * K-frame stream, 4 frames: -3 / +0 / -5 / +0 B (one fitted slot
+      crosses the threshold on three of four frames).
+    * I + P stream, 6 frames: K(-3) / P(-14) / P(-14) / K(+0) / P(-52)
+      / P(-38) — every emitted P-frame's residual amortises the §13.4
+      header cost.
+
+  Tests: 523 → 529 (+6) — pin (a) fitted-keyframe-stream never grows
+  the wire frame-by-frame relative to the default-stream wire, (b)
+  fitted-keyframe-stream bytes replay through `Vp8DecoderState` at
+  PSNR ≥ 30 dB / frame on the 5-frame mid-quantiser target, (c) the
+  §9.7 / §9.8 keyframe slot-refresh invariant survives the fitter
+  (all three slots byte-equal after a fitted K), (d) fitted-inter-
+  stream wire is `<=` default-inter-stream wire on every frame of an
+  I + P interleave (kind matches default frame-by-frame — fitter has
+  zero effect on scheduling), (e) the same self-decode ≥ 30 dB target
+  holds on the inter path, (f) `force_keyframe` re-anchors the
+  interval the same way as the non-fitted entry-point.
+
 * **§13.4 `token_prob_update()` observed-counts fitter for the inter
   (P-frame) encoder (RFC 6386 §13.4 / §13.5)** — round 158's mirror of
   the round-157 keyframe fitter, closing the natural symmetry between

@@ -63,7 +63,9 @@
 
 use crate::coded_header::TokenProbUpdates;
 use crate::encoder::{
-    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref, EncodeError, I420Frame,
+    encode_keyframe_with_reconstruction,
+    encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
+    encode_p_frame_multi_ref_with_fitted_token_prob_updates, EncodeError, I420Frame,
     KeyframeParams, LoopFilterDeltas, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
@@ -224,6 +226,65 @@ impl Vp8KeyframeStreamEncoder {
         // §9.7 / §9.8 keyframe slot refresh — all three slots take a
         // clone of the post-§15 macroblock-aligned reconstruction.
         // Mirrors `Vp8DecoderState::decode_key_frame`'s slot installation.
+        let slot = RefFrameSlot::from_keyframe_planes(&planes);
+        self.last = Some(slot.clone());
+        self.golden = Some(slot.clone());
+        self.altref = Some(slot);
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(bytes)
+    }
+
+    /// Encode one frame of the stream as a VP8 key frame, with an
+    /// automatically-fitted §13.4 `token_prob_update()` payload per
+    /// [`crate::encoder::encode_keyframe_with_reconstruction_and_fitted_token_prob_updates`].
+    ///
+    /// Drop-in fitted companion to [`Self::encode_frame`]: same K/P
+    /// scheduling rules (every emitted frame is a key frame on this
+    /// driver), same dimension-lock semantics, same §9.7 / §9.8
+    /// three-slot refresh — only the bitstream differs (the fitter is
+    /// allowed to *shrink* the wire by overlaying observed-counts
+    /// probabilities on the §13.5 defaults, with the round-157 fitter's
+    /// safety guard that never *grows* the wire relative to the
+    /// caller-driven `None` baseline).
+    ///
+    /// The returned bytes always decode through
+    /// [`crate::state::Vp8DecoderState::decode_frame`] and every
+    /// compliant VP8 decoder; the §9 reference-frame slots are refreshed
+    /// with the matching reconstruction (the round-157 safety-guard
+    /// fall-back returns the **default-pass** planes alongside the
+    /// default-pass bytes, so the slot state stays consistent with the
+    /// wire on both fitter outcomes).
+    ///
+    /// Closes the round-157 / round-158 follow-up identified in
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    /// ("Out of round-158 scope: threading the fitter into
+    /// `Vp8KeyframeStreamEncoder` / `Vp8InterStreamEncoder`").
+    pub fn encode_frame_with_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<Vec<u8>, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let (bytes, planes) =
+            encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(frame, &self.params)?;
+
+        // §9.7 / §9.8 keyframe slot refresh — identical to
+        // `Self::encode_frame`: a key frame refreshes all three slots
+        // with the post-§15 reconstruction. The fitter's matching-planes
+        // guarantee means `planes` is the reconstruction that matches
+        // the emitted `bytes` regardless of which pass (default or
+        // fitted) won the safety-guard comparison.
         let slot = RefFrameSlot::from_keyframe_planes(&planes);
         self.last = Some(slot.clone());
         self.golden = Some(slot.clone());
@@ -605,6 +666,130 @@ impl Vp8InterStreamEncoder {
                 // unchanged (the scheduler-driven path emits
                 // `loop_filter_adj_enable = 0`, so this frame's effective
                 // deltas are all 0 and we have no fresh values to carry).
+                self.last = Some(new_slot);
+            }
+        }
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind,
+            frame_index,
+        })
+    }
+
+    /// Encode one frame using the configured keyframe interval to pick
+    /// K vs P, with an automatically-fitted §13.4 `token_prob_update()`
+    /// payload on every emitted frame.
+    ///
+    /// Drop-in fitted companion to [`Self::encode_frame`] / the K-frame
+    /// arm of [`Self::encode_frame_with_force`]: scheduling, dimension-
+    /// lock semantics, and the §9.7 reference-slot ladder are identical;
+    /// only the bitstream differs. Each emitted frame independently
+    /// runs the round-157 (keyframe) or round-158 (inter) two-pass
+    /// fitter — the §13.4 payload is decided per frame from that frame's
+    /// observed counts, never carried over to the next.
+    ///
+    /// Wire compatibility: on a frame where no §13.4 slot crosses the
+    /// fitter's saving threshold, the safety-guard fall-back returns
+    /// the bytes [`Self::encode_frame_with_force`] would have emitted
+    /// for the same kind of frame.
+    ///
+    /// **Carried-base assumption.** The inter fitter assumes the prior
+    /// key frame was emitted with the §13.5 defaults (i.e. an
+    /// `encode_keyframe`-equivalent base table). This entry-point is
+    /// the closure of that loop: K-frames go through
+    /// [`encode_keyframe_with_reconstruction_and_fitted_token_prob_updates`]
+    /// which itself emits a fitted-on-defaults wire — the decoder
+    /// rebuilds `coeff_probs[4][8][3][11]` from defaults overlaid with
+    /// the K-frame's payload, then the next P-frame's fitter again
+    /// overlays its own payload on top of the §13.5 defaults. This
+    /// matches what [`crate::state::Vp8DecoderState::decode_inter_frame`]
+    /// does (`overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`
+    /// where `self.coeff_probs` was reset to §13.5 defaults by the prior
+    /// key frame).
+    pub fn encode_frame_with_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_frame_with_force_and_fitted_token_prob_updates(frame, false)
+    }
+
+    /// Encode one frame, with an optional `force_keyframe` override and
+    /// the round-157 / round-158 fitter applied to every emitted frame.
+    ///
+    /// Companion to [`Self::encode_frame_with_force`] /
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`]. The
+    /// `force_keyframe` semantics (re-anchoring the interval) match
+    /// [`Self::encode_frame_with_force`] exactly.
+    pub fn encode_frame_with_force_and_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        force_keyframe: bool,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let scheduled = self.next_frame_is_keyframe();
+        let must_be_key = scheduled == FrameKind::Key || force_keyframe;
+        let emit_key = must_be_key || self.last.is_none();
+
+        let (bytes, planes, kind) = if emit_key {
+            let (b, p) = encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(
+                frame,
+                &self.params,
+            )?;
+            (b, p, FrameKind::Key)
+        } else {
+            // Mirrors the non-fitted arm exactly — same LAST/GOLDEN/ALTREF
+            // plane harvesting, same multi-ref picker, only the fitted
+            // inter entry-point swapped in.
+            let last_planes = ref_slot_to_keyframe_planes(
+                self.last.as_ref().expect("LAST slot present for P-frame"),
+            );
+            let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+            let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+            let (b, p) = encode_p_frame_multi_ref_with_fitted_token_prob_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+            )?;
+            (b, p, FrameKind::InterZeroMv)
+        };
+
+        let frame_index = self.frame_count;
+
+        // ---- Reference-slot update (§9.7) — identical to
+        // `encode_frame_with_force`. The fitter does NOT affect the
+        // §9.7 ladder; the fitter's matching-planes guarantee means
+        // `planes` is the reconstruction that matches `bytes` regardless
+        // of which pass won.
+        let new_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        match kind {
+            FrameKind::Key => {
+                self.last = Some(new_slot.clone());
+                self.golden = Some(new_slot.clone());
+                self.altref = Some(new_slot);
+                self.last_keyframe_index = Some(frame_index);
+                // §9.4 — key frames start a fresh delta sequence.
+                self.carried_ref_deltas = [0; 4];
+                self.carried_mode_deltas = [0; 4];
+            }
+            FrameKind::InterZeroMv => {
+                // §9.7 inter refresh ladder used by the multi-ref
+                // P-frame encoder's default `RefreshControls`:
+                // refresh_last = 1 only.
                 self.last = Some(new_slot);
             }
         }

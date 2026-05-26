@@ -4528,6 +4528,15 @@ fn pick_mb_for_ref(
     }
     let mb_skip_coeff = nonzero_block_count == 0;
 
+    // §14.1: the `reconstruct_inter_mb` / `reconstruct_split_mv_mb`
+    // orchestrators consume *dequantised* coefficients (the keyframe
+    // raster loop above performs the same dequant on a copy before
+    // calling its decoder reconstructor). Keep `raw_coeffs` quantised
+    // for the later §13 token-emit path on the same call site; mirror
+    // the keyframe pattern by dequantising a separate copy purely for
+    // the §14.2/§14.5 reconstruction step.
+    let mut dq = raw_coeffs;
+    factors.dequantize(&mut dq);
     let recon = if let Some(ref cand) = chosen_split {
         crate::motion_comp::reconstruct_split_mv_mb(
             reference_planes,
@@ -4537,9 +4546,9 @@ fn pick_mb_for_ref(
             false,
             filters,
             mb_skip_coeff,
-            &raw_coeffs.y,
-            &raw_coeffs.u,
-            &raw_coeffs.v,
+            &dq.y,
+            &dq.u,
+            &dq.v,
         )
     } else {
         crate::motion_comp::reconstruct_inter_mb(
@@ -4550,10 +4559,10 @@ fn pick_mb_for_ref(
             false,
             filters,
             mb_skip_coeff,
-            &raw_coeffs.y2,
-            &raw_coeffs.y,
-            &raw_coeffs.u,
-            &raw_coeffs.v,
+            &dq.y2,
+            &dq.y,
+            &dq.u,
+            &dq.v,
         )
     };
 

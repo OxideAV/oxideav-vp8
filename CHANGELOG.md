@@ -4,6 +4,31 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+* **Encoder inter MB picker now dequantises forward-transform output
+  before reconstruction (RFC 6386 §14.1)** — the `pick_mb_for_ref`
+  picker handed still-quantised coefficients to
+  `motion_comp::reconstruct_inter_mb` /
+  `motion_comp::reconstruct_split_mv_mb`, both of which document that
+  they consume *dequantised* coefficients (the keyframe encoder path
+  performs the same dequant on a copy of `MbCoeffs` before calling
+  its keyframe-mode reconstructor). The defect made the encoder's
+  stored P-frame reconstruction diverge from the decoder's
+  self-decode by the §14.1 dequant factor on every coded sub-block,
+  so the next P-frame's reference and the decoder's reference were
+  the same buffer-shape but different pixels — leaving downstream
+  `_p_reconstruction` consumers (loop-filter post-walk pre-image,
+  reference-slot refresh) out of sync. The fix mirrors the keyframe
+  pattern: dequantise a separate copy of `raw_coeffs` purely for the
+  §14.2 / §14.5 reconstruction step, keep the original quantised
+  `raw_coeffs` for the §13 token-emit path on the same call site.
+  New regression test (`encoder_pframe_loop_filter_recon.rs`) pins
+  encoder-recon == decoder-recon byte-for-byte at
+  `loop_filter_level = 0` (isolates the §14 recon path) and at
+  `loop_filter_level = 32` (ensures §15 runs against the same
+  pre-filter pixels on both ends).
+
 ### Added
 
 * **VP8 encoder Phase 11: §9.4 caller-driven per-reference /

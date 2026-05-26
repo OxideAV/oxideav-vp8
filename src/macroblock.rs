@@ -574,7 +574,7 @@ pub fn parse_key_frame_macroblock_modes(
 /// [`KF_YMODE_TREE`] but the root left-leaf is `DC_PRED` (the most
 /// common mode on interframes) rather than `B_PRED`, so the tree
 /// shape and the per-mode bitcost are different.
-const IF_YMODE_TREE: [i8; 8] = [
+pub(crate) const IF_YMODE_TREE: [i8; 8] = [
     // -DC_PRED, 2 — root: DC_PRED = "0", "1" subtree at [2..=3]
     0, 2, // 4, 6 — "1" subtree has two descendant subtrees
     4, 6, // -V_PRED, -H_PRED — "10" subtree

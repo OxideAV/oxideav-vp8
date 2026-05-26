@@ -2,6 +2,90 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 160)
+
+**§11 / §12.2 intra-within-inter MB picking — first cut (DC_PRED Y +
+DC_PRED UV).** Round 159 closed out the §13.4-fitter ladder by
+threading it into the multi-frame stream drivers; the next-step list
+called out "(1) intra-within-inter MB picking (§11 RD against the inter
+J at `prob_intra < 255`)" as the natural follow-up. Round 160 lands the
+opt-in bit of that ladder: the per-MB picker, when called through the
+new entry-point, additionally scores a §12.2 DC_PRED intra candidate
+against the running in-frame neighbours and picks whichever of (best
+inter pick, intra DC) wins on `J + lambda * is_inter_mb-bit`. When at
+least one MB picks intra the §9.10 `prob_intra` byte drops below 255
+and the §16.1 intra-mode-tree path emits on those MBs.
+
+Two new public entry-points (mirroring r155 `RefreshControls` opt-in
+shape, so no existing entry-point's wire byte changes):
+
+  * **`encode_p_frame_multi_ref_with_intra_pick(frame, last, golden,
+    altref, params)`** — drop-in replacement for
+    `encode_p_frame_multi_ref` with the round-160 picker engaged. The
+    decoder side is unchanged: the bytes re-enter
+    `Vp8DecoderState::decode_frame`'s existing inter path; the §16.1
+    `parse_inter_frame_intra_macroblock_modes` walker + the keyframe
+    per-MB reconstructor handle the intra-on-interframe branch the
+    same way they handle a key frame's intra MBs.
+  * **`encode_p_frame_multi_ref_with_refresh_and_intra_pick`** — same
+    plus caller-driven §9.7 / §9.8 reference-slot refresh control.
+
+The intra candidate fixes both Y and UV modes to `DC_PRED` (the §12
+default that needs no neighbour edges to be valid — when both above
+and left are off-frame `predict_y16x16_dc` falls back to §12 mid-grey
+128). Round 160's scope is a single intra candidate; a subsequent
+round extends the picker to score all four whole-block luma modes and
+all four chroma modes (the storage shape already accommodates this —
+`intra_y_modes` / `intra_uv_modes` are per-MB).
+
+J formula matches the inter picker's metric (Y-plane SAD on the
+prediction residual, before residual coding / reconstruction) so the
+cross-candidate trade is apples-to-apples. Intra mode-tree bits charge
+the §11.2 `IF_YMODE_TREE` walk + §11.4 `UV_MODE_TREE` walk at the
+§16.1 default probability tables (we hold both `intra_y_mode_prob_update`
+gates at 0 so the wire table stays at the defaults the decoder's
+`InterFrameIntraProbs::defaults` exposes).
+
+§9.10 `prob_intra` is fitted to the picker's observed (intra, inter)
+per-MB count distribution via `fit_prob_l8(count_intra, count_inter)`,
+the same Laplace-of-counts step the §9.10 `prob_last` / `prob_gf`
+fitting uses on the §16.2 ref_frame selector. With no MBs picking
+intra the fitter returns the clamped boundary `prob_intra = 1`; the
+`is_inter_mb = true` bit then codes at probability 255/256, costing
+~6 bits per frame on top of the historical "hardwired `prob_intra =
+255`" path's ~0 — a frame-constant ~1-byte ceiling on the safety
+overhead.
+
+Sample measurements at `y_ac_qi = 32` (synthetic 32×32 frame, two-MB
+columns × two-MB rows):
+
+| Source                                                    | Pre-r160 | r160 intra-pick | Δ          |
+| --------------------------------------------------------- | -------- | --------------- | ---------- |
+| Perfect-match P (LAST = source, intra always loses on J)  | 22 B     | 20 B            | **-2 B**   |
+| Black-K + bright-P (intra DC wins every MB)               | (n/a)    | self-decode at inf dB, `prob_intra = 255` | — |
+
+Decoder side: zero changes. The new tests pin (a)
+`encode_p_frame_multi_ref_with_intra_pick` self-decodes through
+`Vp8DecoderState::decode_frame` at Y-PSNR ≥ 30 dB on a mid-quantiser
+target; (b) on the perfect-match source the new entry-point's wire
+stays within 4 bytes of the pre-r160 wire (the fitter's `prob_intra =
+1` clamp keeps the `is_inter_mb = true` cost near-zero); (c) on a
+black-K + bright-P source the picker selects intra for every MB and
+`prob_intra` lands at 255 (the `fit_prob_l8(count_intra > 0,
+count_inter = 0)` clamped boundary); (d) a three-frame I + P + P
+stream self-decodes end-to-end with P1 (intra-cascade) and P2 (LAST
+matches source ⇒ inter wins) showing the expected `prob_intra`
+distribution shift. Tests: 529 → 532 (+3 in
+`encoder_pframe_intra_pick.rs`).
+
+The next-step ladder for the encoder is now: (1) §9.3 segmentation
+header support (the round-159 follow-up's #2), (2) intra all-four-Y +
+all-four-UV mode RD picking (extends r160's DC-only candidate), (3)
+end-to-end libvpx / vpxdec black-box cross-decode validation, (4)
+deeper §18.3 sub-pel ME / RD refinement, (5) thread the r160
+intra-pick into the `Vp8InterStreamEncoder` stream driver (currently
+only the bare-encoder entry-points carry the toggle).
+
 ## Status — 2026-05-27 (round 159)
 
 **§13.4 fitter threaded into the multi-frame stream drivers (RFC 6386

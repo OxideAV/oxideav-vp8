@@ -6,6 +6,38 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§11 / §12.2 intra-within-inter MB picking — first cut (DC_PRED Y +
+  DC_PRED UV, RFC 6386 §11 / §12.2 / §16.1)** — round 160 lands the
+  opt-in bit of round 159's next-step ladder item #1: the per-MB
+  picker, when called through the new
+  `encode_p_frame_multi_ref_with_intra_pick` (or
+  `encode_p_frame_multi_ref_with_refresh_and_intra_pick`)
+  entry-point, additionally scores a §12.2 DC_PRED intra candidate
+  against the running in-frame neighbours and picks whichever of
+  (best inter pick, intra DC) wins on `J + lambda * is_inter_mb-bit`.
+  J formula matches the inter picker's metric (Y-plane SAD on the
+  prediction residual, before residual coding / reconstruction) so
+  the cross-candidate trade is apples-to-apples. §9.10 `prob_intra`
+  is fitted to the picker's observed (intra, inter) per-MB count
+  distribution via `fit_prob_l8(count_intra, count_inter)`. Decoder
+  side: zero changes — the bytes re-enter
+  `Vp8DecoderState::decode_frame`'s existing inter path; the §16.1
+  `parse_inter_frame_intra_macroblock_modes` walker + the keyframe
+  per-MB reconstructor handle the intra-on-interframe branch the
+  same way they handle a key frame's intra MBs. Existing
+  entry-points (`encode_p_frame_multi_ref` and its
+  `_with_refresh` / `_with_token_updates` / `_with_lf_deltas`
+  family) stay byte-identical to the pre-r160 wire (the new
+  `pick_intra` toggle threads through the inner driver, defaulting
+  off on every pre-r160 caller). Round 160's scope is a single
+  intra candidate; subsequent rounds extend the picker to all four
+  whole-block Y modes and all four chroma modes. New
+  `tests/encoder_pframe_intra_pick.rs` (3 tests) pins the picker
+  selecting intra on a black-K + bright-P pattern, the safety guard
+  bounding wire growth on a perfect-match source (≤ +4 bytes
+  slack), and end-to-end I + P + P self-decode at Y-PSNR ≥ 30 dB
+  per frame at mid quantiser.
+
 * **§13.4 fitter threaded into the multi-frame stream drivers (RFC 6386
   §13.4 / §13.5 / §9.7)** — round 159 closes the round-157 / round-158
   follow-up ("Out of round-158 scope: threading the fitter into

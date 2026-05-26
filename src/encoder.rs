@@ -1726,8 +1726,9 @@ use crate::intra_predict::{
 };
 use crate::inverse_transform::{add_residue_4x4, inverse_dct_4x4, inverse_wht_4x4};
 use crate::macroblock::{
-    IntraBmode, IntraUvMode, IntraYMode, MacroblockModes, BMODE_TREE, KF_BMODE_PROB,
-    KF_UV_MODE_PROB, KF_YMODE_PROB, KF_YMODE_TREE, UV_MODE_TREE,
+    IntraBmode, IntraUvMode, IntraYMode, MacroblockModes, BMODE_TREE, IF_UV_MODE_PROB_DEFAULTS,
+    IF_YMODE_PROB_DEFAULTS, IF_YMODE_TREE, KF_BMODE_PROB, KF_UV_MODE_PROB, KF_YMODE_PROB,
+    KF_YMODE_TREE, UV_MODE_TREE,
 };
 
 /// Round-half-away-from-zero integer division — the natural inverse of
@@ -5273,6 +5274,180 @@ fn pick_mb_for_ref(
     }
 }
 
+/// Outcome of scoring one intra (DC_PRED) candidate against the
+/// already-reconstructed in-frame neighbours during the round-160
+/// intra-within-inter MB picker. Mirrors [`PickedMbForRef`]'s shape so
+/// the per-MB driver can compare the two J values side-by-side and pick
+/// whichever wins.
+///
+/// The candidate fixes both Y and UV modes to `DC_PRED` (the §12 default
+/// that needs no neighbour edges to be valid — `predict_y16x16_dc` falls
+/// back to the §12 mid-grey when both above and left are off-frame).
+/// Round 160's scope is a single intra candidate; a follow-up round
+/// extends the picker to score all four whole-block luma modes and all
+/// four chroma modes.
+#[derive(Clone)]
+struct IntraMbPick {
+    /// Per-MB residual coefficients (Y2 + 16 Y + 4 U + 4 V), already
+    /// quantised — what the §13 token-emit walk consumes when the
+    /// per-MB driver records this candidate as the winner.
+    raw_coeffs: MbCoeffs,
+    /// §11.1 mb_skip_coeff. True iff every coded block is all-zero
+    /// after quantisation.
+    mb_skip_coeff: bool,
+    /// Post-§14 reconstruction the encoder writes into its running
+    /// `planes` buffer (and into the next-frame LAST slot once §15 has
+    /// filtered it).
+    recon: crate::reconstruct::ReconstructedMb,
+    /// `J = Y-SAD + lambda * (intra-mode-tree bits)`. Does NOT include
+    /// the §16 `is_inter_mb = false` bit — the caller adds that
+    /// alongside the inter J's `is_inter_mb = true` bit so the picker
+    /// trade includes the §16 discriminator bit equally on both sides
+    /// (the `prob_intra` charge cancels out when picking against the
+    /// uniform `prob_intra_pick = 128`, but we still account for it
+    /// symbolically).
+    j: f64,
+}
+
+/// `-log2 P` cost in fractional bits of the §11.2 / §16.1 interframe
+/// `IF_YMODE_TREE` path for one whole-block luma intra mode, given the
+/// §16.1 default `ymode_prob` table (we hold `intra_y_mode_prob_update`
+/// at its no-update gate, so the wire table stays at the defaults the
+/// decoder's `InterFrameIntraProbs::defaults` exposes).
+fn if_ymode_tree_bits(mode: IntraYMode) -> f64 {
+    treed_bits(&IF_YMODE_TREE, |i| IF_YMODE_PROB_DEFAULTS[i], mode.leaf())
+}
+
+/// `-log2 P` cost in fractional bits of the §11.4 / §16.1 interframe
+/// `UV_MODE_TREE` path for one whole-block chroma intra mode, against
+/// the §16.1 default `uv_mode_prob` table.
+fn if_uv_mode_tree_bits(mode: IntraUvMode) -> f64 {
+    treed_bits(&UV_MODE_TREE, |i| IF_UV_MODE_PROB_DEFAULTS[i], mode.leaf())
+}
+
+/// Score the §11 / §12.2 DC_PRED intra candidate for one macroblock on
+/// an inter frame against the running in-frame neighbours
+/// (`MbNeighbors` gathered from the encoder's reconstruction buffer the
+/// SAME way the decoder's `gather_neighbors_public` will when it walks
+/// the bytes).
+///
+/// The candidate fixes the §11.2 Y mode to `DC_PRED` and the §11.4 UV
+/// mode to `DC_PRED` so we only need the §12 default-fill kernels (no
+/// dependency on neighbour content for the prediction to be valid).
+/// The full §14 chain — predict → FDCT → Y2/WHT → quantise → dequant →
+/// IDCT → add — runs so the returned `recon` is the exact pixels the
+/// decoder will produce on this MB.
+///
+/// The returned `J` is `Y-SAD + lambda * (Y-mode + UV-mode tree bits)`,
+/// mirroring the inter picker's `J = SAD + lambda * mv_ref_tree_bits`
+/// convention (the inter picker doesn't include token bits either; the
+/// Y2/Y/UV token mass is roughly proportional across candidates of
+/// similar prediction quality, and matching the inter picker's
+/// distortion form keeps the cross-candidate trade apples-to-apples).
+fn pick_intra_mb_dc(
+    pixels: &MbPixels,
+    neighbors: &crate::reconstruct::MbNeighbors,
+    factors: &crate::dequant::MbDequantFactors,
+    lambda: f64,
+) -> IntraMbPick {
+    let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
+
+    // ---- §12 prediction (Y DC_PRED + UV DC_PRED) ----
+    let mut y_pred = [0u8; 256];
+    crate::intra_predict::predict_y16x16_dc(
+        &mut y_pred,
+        neighbors.y_above.as_ref(),
+        neighbors.y_left.as_ref(),
+    );
+    let mut u_pred = [0u8; 64];
+    let mut v_pred = [0u8; 64];
+    crate::intra_predict::predict_uv8x8_dc(
+        &mut u_pred,
+        neighbors.u_above.as_ref(),
+        neighbors.u_left.as_ref(),
+    );
+    crate::intra_predict::predict_uv8x8_dc(
+        &mut v_pred,
+        neighbors.v_above.as_ref(),
+        neighbors.v_left.as_ref(),
+    );
+    let _ = default_corner; // TM_PRED only; DC_PRED never reads the corner.
+
+    // ---- Distortion: Y-plane SAD on the prediction residual, matching
+    //      the inter picker's metric (`|src - reference[mv]|` summed
+    //      over the 16×16 luma block, BEFORE residual coding /
+    //      reconstruction). The post-reconstruction SSD a keyframe RD
+    //      picker would use is finer-grained but on a different scale
+    //      than the inter picker's SAD; matching the inter picker's
+    //      pre-recon SAD keeps the cross-candidate J comparison
+    //      apples-to-apples.
+    let mut sad: u32 = 0;
+    for (a, b) in pixels.y.iter().zip(y_pred.iter()) {
+        sad += (*a as i32 - *b as i32).unsigned_abs();
+    }
+
+    // ---- §14 forward transform + quantise ----
+    let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &y_pred, factors);
+    let u_quant = transform_chroma_plane(&pixels.u, &u_pred, factors);
+    let v_quant = transform_chroma_plane(&pixels.v, &v_pred, factors);
+    let raw_coeffs = MbCoeffs {
+        y: y_quant,
+        y2: y2_quant,
+        u: u_quant,
+        v: v_quant,
+    };
+
+    // §11.1 mb_skip_coeff — DC_PRED has Y2, so every block (Y2 + 16 Y
+    // coded from coefficient 1 + 4 U + 4 V) contributes to the count.
+    let mut nonzero_block_count = 0usize;
+    if raw_coeffs.y2.iter().any(|&v| v != 0) {
+        nonzero_block_count += 1;
+    }
+    for blk in raw_coeffs.y.iter() {
+        if blk.iter().skip(1).any(|&v| v != 0) {
+            nonzero_block_count += 1;
+        }
+    }
+    for blk in raw_coeffs.u.iter() {
+        if blk.iter().any(|&v| v != 0) {
+            nonzero_block_count += 1;
+        }
+    }
+    for blk in raw_coeffs.v.iter() {
+        if blk.iter().any(|&v| v != 0) {
+            nonzero_block_count += 1;
+        }
+    }
+    let mb_skip_coeff = nonzero_block_count == 0;
+
+    // ---- §14 reconstruction (decoder-shared path) ----
+    let mut dq = raw_coeffs;
+    factors.dequantize(&mut dq);
+    let recon = crate::reconstruct::decode_keyframe_mb_non_bpred(
+        IntraYMode::Dc,
+        IntraUvMode::Dc,
+        mb_skip_coeff,
+        neighbors,
+        &dq.y2,
+        &dq.y,
+        &dq.u,
+        &dq.v,
+    )
+    .expect("decode_keyframe_mb_non_bpred rejects only B_PRED, never DC_PRED");
+
+    // Mode bits: Y-mode (IF_YMODE_TREE, DC_PRED leaf = 0) + UV-mode
+    // (UV_MODE_TREE, DC_PRED leaf = 0).
+    let mode_bits = if_ymode_tree_bits(IntraYMode::Dc) + if_uv_mode_tree_bits(IntraUvMode::Dc);
+    let j = sad as f64 + lambda * mode_bits;
+
+    IntraMbPick {
+        raw_coeffs,
+        mb_skip_coeff,
+        recon,
+        j,
+    }
+}
+
 /// `-log2 P` cost in fractional bits of the §16.2 `ref_frame_tree`
 /// path for one reference frame, given the wire probs.
 fn ref_frame_tree_bits(ref_frame: crate::motion_comp::RefFrame, prob_last: u8, prob_gf: u8) -> f64 {
@@ -5844,6 +6019,83 @@ pub fn encode_p_frame_multi_ref_with_refresh(
     )
 }
 
+/// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
+/// §9.8 reference-slot refresh control **and** round-160 §11 /
+/// §12.2 intra-within-inter MB picking.
+///
+/// Extends [`encode_p_frame_multi_ref_with_refresh`] with the
+/// round-160 per-MB intra candidate ladder: in addition to scoring the
+/// §16 inter ladder (ZEROMV / NEARESTMV / NEARMV / NEWMV / SPLITMV
+/// across every available reference frame), the picker also scores a
+/// §11 / §12.2 DC_PRED intra candidate against the running in-frame
+/// neighbours. Whichever of (best inter pick, intra DC) has the lower
+/// `J + lambda * is_inter_mb-bit` wins per MB; when the intra
+/// candidate wins on at least one MB the §9.10 `prob_intra` byte drops
+/// below 255 and the §16.1 intra-mode-tree path emits on those MBs.
+///
+/// Decoder side: zero changes. The bytes re-enter
+/// [`crate::state::Vp8DecoderState::decode_frame`] on a fresh decoder
+/// state; the §16.1 `parse_inter_frame_intra_macroblock_modes` walker
+/// + the keyframe per-MB reconstructor handle the intra-on-interframe
+///   branch the same way they handle a key frame's intra MBs.
+///
+/// Wire compatibility: with a `pixels` content that never makes intra
+/// beat inter (e.g. a flat or low-detail source where the §17 motion
+/// search resolves to a near-zero residual), the picker stays
+/// inter-only, `prob_intra` is fitted to `1` (the §16 spec-neutral
+/// "no intra MB" value clamped up from 0 — the `is_inter_mb = true`
+/// bit then codes at probability 255/256, costing ~6 bits per frame
+/// on top of the historical "prob_intra = 255" path's ~0). Wire
+/// growth is therefore bounded by a frame-constant ~6 bits ≈ 1 byte
+/// even in the pathological no-intra-pick case.
+pub fn encode_p_frame_multi_ref_with_refresh_and_intra_pick(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    refresh.validate()?;
+    encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+        None,
+        None,
+        true,
+    )
+}
+
+/// Backward-compatible wrapper for
+/// [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`]: passes
+/// [`RefreshControls::default`] so the wire ladder matches the
+/// round-149 hardwired refresh pattern (`refresh_last = 1`, every
+/// other §9.7 / §9.8 bit `0`) while the round-160 intra-pick path
+/// runs.
+pub fn encode_p_frame_multi_ref_with_intra_pick(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_with_refresh_and_intra_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        &RefreshControls::default(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_p_frame_multi_ref_inner(
     frame: &I420Frame,
@@ -5857,7 +6109,7 @@ fn encode_p_frame_multi_ref_inner(
     carried_mode_deltas: [i16; 4],
     token_updates: Option<&TokenProbUpdates>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
-    encode_p_frame_multi_ref_inner_with_counts(
+    encode_p_frame_multi_ref_inner_with_counts_and_pick(
         frame,
         last,
         golden,
@@ -5869,6 +6121,7 @@ fn encode_p_frame_multi_ref_inner(
         carried_mode_deltas,
         token_updates,
         None,
+        false,
     )
 }
 
@@ -5901,6 +6154,45 @@ fn encode_p_frame_multi_ref_inner_with_counts(
     carried_mode_deltas: [i16; 4],
     token_updates: Option<&TokenProbUpdates>,
     counts: Option<&mut BranchCounts>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        token_updates,
+        counts,
+        false,
+    )
+}
+
+/// Same as [`encode_p_frame_multi_ref_inner_with_counts`] plus the
+/// round-160 `pick_intra` toggle: when `pick_intra = true` the per-MB
+/// picker additionally scores a §12.2 DC_PRED intra candidate against
+/// the running in-frame neighbours and picks whichever of (best inter
+/// pick, intra DC) wins on `J + lambda * is_inter_mb-bit`. When
+/// `pick_intra = false` the inter-only ladder runs (every MB stays
+/// inter; `prob_intra` is hard-wired to 255), reproducing every
+/// pre-round-160 wire byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
+    pick_intra: bool,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     lf_deltas.validate()?;
@@ -6059,6 +6351,20 @@ fn encode_p_frame_multi_ref_inner_with_counts(
     // MBs have no Y2 block (§14.2 page 76) so they thread through
     // `encode_mb_tokens(use_bpred = true)`, mirroring the B_PRED path.
     let mut use_bpred_per_mb: Vec<bool> = Vec::with_capacity(mb_rows * mb_cols);
+    // Round 160 — `pick_intra` toggle: per-MB flag set to `true` when
+    // the §11 / §12.2 DC_PRED intra candidate's J beat the §16 inter
+    // pick's J + the is_inter_mb-bit overhead. When `pick_intra = false`
+    // (every pre-r160 entry-point), this vec stays all-`false` and the
+    // emit loop reproduces the pre-r160 wire byte-for-byte.
+    let mut is_intra_per_mb: Vec<bool> = vec![false; mb_rows * mb_cols];
+    // For intra MBs, the chosen §11.2 / §11.4 modes. Round 160 always
+    // selects `(IntraYMode::Dc, IntraUvMode::Dc)` (the DC_PRED-only
+    // candidate `pick_intra_mb_dc` returns); the storage allows a
+    // subsequent round to extend the picker to all four whole-block
+    // modes per plane without re-shaping the per-MB driver. `(Dc, Dc)`
+    // for inter MBs (unused).
+    let intra_y_modes: Vec<IntraYMode> = vec![IntraYMode::Dc; mb_rows * mb_cols];
+    let intra_uv_modes: Vec<IntraUvMode> = vec![IntraUvMode::Dc; mb_rows * mb_cols];
 
     // §17.2 MV-component contexts the encoder writes NEWMV diffs
     // against. We emit every `mv_prob_update()` F-gate as 0 (no update)
@@ -6121,6 +6427,7 @@ fn encode_p_frame_multi_ref_inner_with_counts(
         let mut left_mb = crate::near_mv::MbInfo::border();
         let mut aboveleft_mb = crate::near_mv::MbInfo::border();
         for (mb_col, above_slot) in search_above.iter_mut().enumerate() {
+            let raster = mb_row * mb_cols + mb_col;
             let pixels = frame.extract_mb(mb_row, mb_col);
 
             // ---- Per-ref picker: run for each available reference ----------
@@ -6171,44 +6478,120 @@ fn encode_p_frame_multi_ref_inner_with_counts(
             let chosen_mode = chosen.chosen_mode;
             let chosen_mv = chosen.chosen_mv;
             let chosen_split = chosen.chosen_split;
-            let raw_coeffs = chosen.raw_coeffs;
-            let mb_skip_coeff = chosen.mb_skip_coeff;
-            let recon = chosen.recon;
-            let use_bpred = chosen.use_bpred;
+            let mut raw_coeffs = chosen.raw_coeffs;
+            let mut mb_skip_coeff = chosen.mb_skip_coeff;
+            let mut recon = chosen.recon;
+            let mut use_bpred = chosen.use_bpred;
+
+            // ---- Round 160 — intra-within-inter MB picking -------------
+            //
+            // When `pick_intra = true`, additionally score the §11 /
+            // §12.2 DC_PRED intra candidate against the running in-frame
+            // neighbours (the SAME `MbNeighbors` the decoder will gather
+            // when it walks the bytes — `gather_neighbors_public` on the
+            // running `planes` buffer). The intra candidate wins iff its
+            // J + the §16 `is_inter_mb = false` bit charge is strictly
+            // less than the inter candidate's J + the matching
+            // `is_inter_mb = true` charge.
+            //
+            // During picking we score against a uniform
+            // `prob_intra_pick = 128` (the spec-neutral prior); the
+            // distribution-fitted `prob_intra` for the actual wire emit
+            // is derived AFTER every MB is picked (mirroring the
+            // `prob_last_pick = 128` ↔ `fit_prob_l8` pattern used for
+            // the §16.2 ref_frame selector).
+            //
+            // `pick_intra = false` (every pre-r160 entry-point) skips
+            // this block entirely; `is_intra_per_mb` stays all-`false`
+            // and the rest of the inner driver reproduces the
+            // pre-r160 wire byte-for-byte.
+            let mut chose_intra = false;
+            if pick_intra {
+                let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
+                let intra_pick = pick_intra_mb_dc(&pixels, &neighbors, &factors, lambda);
+                let prob_intra_pick: u8 = 128;
+                let inter_total = chosen.j
+                    + lambda * ref_frame_tree_bits(chosen_ref_frame, prob_last_pick, prob_gf_pick)
+                    + lambda * bool_bits(prob_intra_pick, true);
+                let intra_total = intra_pick.j + lambda * bool_bits(prob_intra_pick, false);
+                if intra_total < inter_total {
+                    chose_intra = true;
+                    raw_coeffs = intra_pick.raw_coeffs;
+                    mb_skip_coeff = intra_pick.mb_skip_coeff;
+                    recon = intra_pick.recon;
+                    use_bpred = false; // DC_PRED has Y2 (§14.2 page 76)
+                }
+            }
 
             crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
 
-            // Per the §15 loop-filter geometry, a whole-MB inter MB
-            // carries `y_mode = DC_PRED` for the §15.1 page-86 skip rule
-            // (filter_subblocks ← B_PRED || any-coded-coeff); a SPLITMV
-            // MB maps to `y_mode = B_PRED` so the §15 "filter internal
-            // edges" rule fires the way the spec wants. See
-            // `state.rs::Vp8DecoderState` for the matching decoder-side
-            // mapping.
-            let y_mode_for_lf = if chosen_split.is_some() {
+            // §15 loop-filter geometry:
+            //   * whole-MB inter MB ⇒ y_mode = DC_PRED (filter "skip"
+            //     rule on page 86 keys on `B_PRED || any-coded-coeff`);
+            //   * SPLITMV MB         ⇒ y_mode = B_PRED (so the §15
+            //     "internal edges always filtered" rule fires); and
+            //   * intra MB           ⇒ y_mode = intra_y_modes[raster]
+            //     (round 160: always DC_PRED, never B_PRED, so the
+            //     skip rule reduces to the keyframe path's whole-block
+            //     case).
+            //
+            // See `state.rs::Vp8DecoderState` for the matching
+            // decoder-side mapping.
+            let y_mode_for_lf = if chose_intra {
+                intra_y_modes[raster] // always DC_PRED on r160
+            } else if chosen_split.is_some() {
                 IntraYMode::B
             } else {
                 IntraYMode::Dc
+            };
+            let uv_mode_for_lf = if chose_intra {
+                intra_uv_modes[raster] // always DC_PRED on r160
+            } else {
+                IntraUvMode::Dc
             };
             modes.push(MacroblockModes {
                 segment_id: None,
                 mb_skip_coeff,
                 y_mode: y_mode_for_lf,
                 subblock_modes: None,
-                uv_mode: IntraUvMode::Dc,
+                uv_mode: uv_mode_for_lf,
             });
             all_coeffs.push(raw_coeffs);
-            ref_frames_out.push(Some(chosen_ref_frame));
-            inter_modes_out.push(Some(chosen_mode));
-            chosen_mvs.push(chosen_mv);
-            use_bpred_per_mb.push(use_bpred);
+            if chose_intra {
+                // Intra MB: no §16 ref_frame, no §16.2 inter mode, no MV.
+                // The decoder's §15 loop-filter delta layer treats
+                // `ref_frame = None` as "intra" (the §9.4 / §15.2
+                // ref_delta lookup uses `INTRA_FRAME_REF` for `None`).
+                ref_frames_out.push(None);
+                inter_modes_out.push(None);
+                chosen_mvs.push(crate::motion_vector::Mv::default());
+                split_candidates.push(None);
+                use_bpred_per_mb.push(false);
+                is_intra_per_mb[raster] = true;
+                // intra_y_modes / intra_uv_modes already hold DC_PRED.
+            } else {
+                ref_frames_out.push(Some(chosen_ref_frame));
+                inter_modes_out.push(Some(chosen_mode));
+                chosen_mvs.push(chosen_mv);
+                use_bpred_per_mb.push(use_bpred);
+            }
 
             // Update the neighbour records for the next MB in the row /
             // for the next row, mirroring the decoder's per-MB walk.
             // SPLITMV neighbours feed `above_block_mv` / `left_block_mv`
             // (§20.11) with their per-sub-block detail, so we record the
-            // full `split_mvs[16]` for the next census.
-            let cur = if let Some(ref cand) = chosen_split {
+            // full `split_mvs[16]` for the next census. Intra MBs are
+            // recorded with `ref_frame = None` / `mv = 0` — the §16.3
+            // census skips them exactly like the off-frame border (an
+            // intra neighbour contributes zero to `near.mvs[]`).
+            let cur = if chose_intra {
+                crate::near_mv::MbInfo {
+                    ref_frame: None,
+                    mv: crate::motion_vector::Mv::default(),
+                    is_split: false,
+                    split_mvs: None,
+                }
+            } else if let Some(ref cand) = chosen_split {
                 crate::near_mv::MbInfo {
                     ref_frame: Some(chosen_ref_frame),
                     mv: cand.split_mvs[15],
@@ -6223,7 +6606,11 @@ fn encode_p_frame_multi_ref_inner_with_counts(
                     split_mvs: None,
                 }
             };
-            split_candidates.push(chosen_split);
+            if !chose_intra {
+                split_candidates.push(chosen_split);
+            } else {
+                split_candidates.push(None);
+            }
             aboveleft_mb = *above_slot;
             left_mb = cur;
             *above_slot = cur;
@@ -6364,11 +6751,21 @@ fn encode_p_frame_multi_ref_inner_with_counts(
     //   intra_uv_mode_prob_update gate (F? L8 × 3),
     //   mv_prob_update() (38 F? L7 entries).
     //
-    // prob_intra = 255 forces every MB to read as inter (the decoder
-    // does `dec.read_bool(prob_intra)` and `prob_intra = 255` makes the
-    // result "true" almost-always for the bool we'll emit). We emit
-    // `is_inter_mb = true` for every MB, which against `prob_intra = 255`
-    // costs essentially zero bits.
+    // When `pick_intra = false` (every pre-r160 entry-point):
+    //   prob_intra = 255 forces every MB to read as inter (the decoder
+    //   does `dec.read_bool(prob_intra)` and `prob_intra = 255` makes
+    //   the result "true" almost-always for the bool we'll emit). We
+    //   emit `is_inter_mb = true` for every MB, which against
+    //   `prob_intra = 255` costs essentially zero bits.
+    //
+    // When `pick_intra = true` (round 160 intra-within-inter
+    // entry-point): prob_intra is fitted to the picker's observed
+    // (intra, inter) per-MB count distribution via [`fit_prob_l8`].
+    // `prob_intra` is P(`is_inter_mb == false`) ⇒
+    // `fit_prob_l8(intra_count, inter_count)`. With no MBs picking
+    // intra the fitter returns 1 (clamped from 0) — `is_inter_mb`
+    // codes cheaply (one bit per MB at probability 255/256). With
+    // every MB picking intra the fitter returns 255.
     //
     // prob_last / prob_gf are fitted to the picker's observed per-MB
     // distribution by [`fit_prob_l8`] above so the §16.2 selector bits
@@ -6380,7 +6777,13 @@ fn encode_p_frame_multi_ref_inner_with_counts(
     // `fit_prob_l8` returns the spec-neutral 128 — that prob is never
     // read in that case, since `prob_last_fit == 255` forces every
     // selector to LAST.
-    let prob_intra: u8 = 255;
+    let prob_intra: u8 = if pick_intra {
+        let count_intra: u32 = is_intra_per_mb.iter().filter(|&&b| b).count() as u32;
+        let count_inter: u32 = is_intra_per_mb.len() as u32 - count_intra;
+        fit_prob_l8(count_intra, count_inter)
+    } else {
+        255
+    };
     let prob_last: u8 = prob_last_fit;
     let prob_gf: u8 = prob_gf_fit;
     hdr.write_literal(prob_intra as u32, 8);
@@ -6429,14 +6832,64 @@ fn encode_p_frame_multi_ref_inner_with_counts(
         for (mb_col, above_slot) in above_mb.iter_mut().enumerate() {
             let raster = mb_row * mb_cols + mb_col;
             let mb = &modes[raster];
+            let is_intra = is_intra_per_mb[raster];
+
+            // 1. mb_skip_coeff (mb_no_skip_coeff = 1).
+            hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
+            // 2. is_inter_mb. Round 160's intra-pick path can land
+            //    here with `is_intra = true`, in which case we write a
+            //    `false` against `prob_intra` and the §16.1 intra
+            //    branch runs below. With `pick_intra = false` (every
+            //    pre-r160 entry-point) `is_intra` is always `false`,
+            //    `prob_intra = 255`, and the wire is byte-identical to
+            //    the historical inter-only path.
+            hdr.write_bool(prob_intra, !is_intra);
+
+            if is_intra {
+                // §16.1 intra-on-interframe macroblock mode layer:
+                //   * y_mode against `IF_YMODE_TREE` + the §16.1
+                //     default `IF_YMODE_PROB_DEFAULTS` (we hold the
+                //     §9.10 `intra_y_mode_prob_update` gate at 0 so
+                //     the wire table stays at the defaults the
+                //     decoder's `InterFrameIntraProbs::defaults`
+                //     exposes);
+                //   * uv_mode against `UV_MODE_TREE` + the §16.1
+                //     default `IF_UV_MODE_PROB_DEFAULTS` (same gate
+                //     held at 0).
+                //
+                // Round 160 always picks `(DC_PRED, DC_PRED)`; the
+                // tree walks therefore emit one bit each (leaf 0 on
+                // both trees).
+                hdr.write_treed(
+                    &IF_YMODE_TREE,
+                    |i| IF_YMODE_PROB_DEFAULTS[i],
+                    intra_y_modes[raster].leaf(),
+                );
+                hdr.write_treed(
+                    &UV_MODE_TREE,
+                    |i| IF_UV_MODE_PROB_DEFAULTS[i],
+                    intra_uv_modes[raster].leaf(),
+                );
+
+                // Neighbour record advances: intra MBs go in as
+                // `ref_frame = None` / `mv = 0` so the §16.3 census
+                // skips them exactly like the off-frame border.
+                let cur = crate::near_mv::MbInfo {
+                    ref_frame: None,
+                    mv: crate::motion_vector::Mv::default(),
+                    is_split: false,
+                    split_mvs: None,
+                };
+                aboveleft_mb = *above_slot;
+                left_mb = cur;
+                *above_slot = cur;
+                continue;
+            }
+
             let chosen_mode = inter_modes_out[raster].expect("inter mode recorded above");
             let chosen_mv = chosen_mvs[raster];
             let chosen_ref_frame = ref_frames_out[raster].expect("inter ref_frame recorded above");
 
-            // 1. mb_skip_coeff (mb_no_skip_coeff = 1).
-            hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
-            // 2. is_inter_mb (every MB is inter).
-            hdr.write_bool(prob_intra, true);
             // 3. ref_frame selector — RFC 6386 §16.2 `ref_frame_tree`.
             //    LAST   → B(prob_last)=false
             //    GOLDEN → B(prob_last)=true,  B(prob_gf)=false

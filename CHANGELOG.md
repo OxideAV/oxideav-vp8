@@ -6,6 +6,47 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: §16.2 NEARESTMV / NEARMV candidates in the
+  rate-distortion picker (RFC 6386 §16.2 / §16.3)** — widens the
+  round-145 P-frame J = SAD + λ·bits picker from {ZEROMV, NEWMV} to
+  all four whole-MB `mv_ref_tree` leaves by also scoring the §16.3
+  census-derived `near.mvs[1]` (NEARESTMV) and `near.mvs[2]` (NEARMV)
+  candidates. The two new candidates are clamped through the same
+  per-MB `MvClampRect` the decoder's `resolve_inter_mb_mv` uses, then
+  scored through the §18.3 sixtap-aware `mb_luma_sad_at_mv` evaluator
+  (neighbour MVs can land at any §17 quarter-pixel position). Tie-break
+  order is bit-cost-ascending — ZEROMV ≻ NEARESTMV ≻ NEARMV ≻ NEWMV
+  — so when two candidates produce equal SAD the lower-bit
+  `mv_ref_tree` path wins. A NEARESTMV / NEARMV whose clamped MV is
+  `(0, 0)` is dropped (ZEROMV uses strictly fewer bits at the same
+  SAD, so emitting one would waste a bit); NEWMV likewise drops on a
+  `(0, 0)` search result or an out-of-§17.1-range differential.
+
+  No new public surface: the picker change is internal to
+  `encode_p_frame_zero_mv`. `EncodeError::UnsupportedInterMode` now
+  only surfaces on a resolved `SPLITMV` (still deferred); its `Display`
+  message updated to list the four supported leaves.
+
+  Validated end-to-end on a new `tests/encoder_pframe_nearestmv.rs`
+  test: a 2-frame I+P sequence with a uniform whole-pixel translation
+  `(+4, +8)` luma px of a high-frequency-content plane. With the
+  extended picker the first MB to detect motion emits NEWMV; the §16.3
+  census then propagates that vector into subsequent MBs' nearest slot
+  via the left / above-left / above neighbour walk. The picker emits
+  **23 of 24 NEARESTMV MBs and 1 of 24 NEWMV MBs** (the seed) and the
+  self-decode Y-PSNR clears **48.14 dB** at `yac_qi = 4`. A second
+  flat-scene test pins that NEARESTMV / NEARMV / NEWMV are not emitted
+  when ZEROMV ties on SAD (`mv_ref_tree` bit-cost-ascending tie-break
+  must hold). The round-145 quarter-pixel test still picks 9 of 16
+  quarter-pixel-only NEWMV MBs at **48.85 dB**, the round-144
+  half-pixel test still picks 3 of 16 half-pixel-grid NEWMV MBs at
+  **56.80 dB**, and the round-143 whole-pixel test still picks 4 of
+  16 whole-pixel NEWMV MBs at **50.34 dB** — the existing tests'
+  NEWMV emissions did not flip to NEARESTMV (each scene's neighbour
+  census does not produce a useful nearest candidate for the NEWMV
+  MBs in question, so the bit-cost-ascending tie-break protects the
+  half- / quarter-pel codepaths from drift).
+
 * **VP8 encoder Phase 11: §18.3 quarter-pixel motion-search refinement
   (RFC 6386 §17.1 / §18.3)** — extends the round-144 P-frame picker to
   follow its `half_pixel_refine_luma` post-pass with a

@@ -2,6 +2,61 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 146)
+
+**Encoder Phase 11 — §16.2 NEARESTMV / NEARMV candidates in the
+rate-distortion picker.** The round-145 P-frame picker scored only the
+two `mv_ref_tree` leaves the encoder could synthesise itself (ZEROMV
+and NEWMV); round 146 widens the trade to all four whole-MB modes by
+also scoring the §16.3 census-derived `near.mvs[1]` (NEARESTMV) and
+`near.mvs[2]` (NEARMV) candidates:
+
+```
+J(zero)    = SAD_at_(0,0)             + λ · mv_ref_tree("0")   bits
+J(nearest) = SAD_at_clamp(near.mvs[1]) + λ · mv_ref_tree("10")  bits
+J(near)    = SAD_at_clamp(near.mvs[2]) + λ · mv_ref_tree("110") bits
+J(new)     = SAD_at_searched_mv        + λ · (mv_ref_tree("1110") + §17 mv bits)
+```
+
+The NEARESTMV / NEARMV candidates are clamped through the same per-MB
+`MvClampRect` the decoder's `resolve_inter_mb_mv` uses, then scored
+through the §18.3 sixtap-aware `mb_luma_sad_at_mv` evaluator (neighbour
+MVs can land at any §17 quarter-pixel position). A NEARESTMV / NEARMV
+whose clamped MV is `(0, 0)` is dropped — at identical SAD ZEROMV uses
+strictly fewer bits, so emitting one would be a waste-of-bits picker
+bug. NEWMV likewise drops on a `(0, 0)` search result or an
+out-of-§17.1-range differential. Tie-break order is bit-cost-ascending
+(ZEROMV ≻ NEARESTMV ≻ NEARMV ≻ NEWMV).
+
+No new public surface: the picker change is internal to
+`encode_p_frame_zero_mv`. `EncodeError::UnsupportedInterMode` now only
+surfaces when the picker hands the emit layer a `SPLITMV` (still
+deferred).
+
+Validation: a new `tests/encoder_pframe_nearestmv.rs` integration test
+encodes a 2-frame I+P sequence with a **uniform whole-pixel translation**
+(`(+4, +8)` luma px) of a high-frequency-content plane. With the
+extended picker the first MB to detect motion emits NEWMV; the §16.3
+census then propagates that vector into subsequent MBs' nearest slot
+via the left / above-left / above neighbour walk. The picker emits
+**23 of 24 NEARESTMV MBs and 1 of 24 NEWMV MBs** (the seed) on the
+shifted scene and the self-decode Y-PSNR clears **48.14 dB** at
+`yac_qi = 4`. A second flat-scene test pins that NEARESTMV / NEARMV /
+NEWMV are NOT emitted when ZEROMV ties on SAD (`mv_ref_tree`
+bit-cost-ascending tie-break must hold). The round-145 quarter-pixel
+test still picks 9 of 16 quarter-pixel-only NEWMV MBs at **48.85 dB**,
+the round-144 half-pixel test still picks 3 of 16 half-pixel-grid
+NEWMV MBs at **56.80 dB**, and the round-143 whole-pixel test still
+picks 4 of 16 whole-pixel NEWMV MBs at **50.34 dB** — none of the
+existing tests' NEWMV emissions flipped to NEARESTMV (each scene's
+neighbour census does not produce a useful nearest candidate for the
+NEWMV MBs in question). Tests: 472 → 474 (+2 in
+`encoder_pframe_nearestmv.rs`).
+
+`SPLITMV`, `GOLDEN` / `ALTREF` source selection, multi-partition
+inter, and the per-MB §9.4 mode/ref delta layer remain follow-up
+rounds.
+
 ## Status — 2026-05-26 (round 145)
 
 **Encoder Phase 11 — §18.3 quarter-pixel motion-search refinement.**

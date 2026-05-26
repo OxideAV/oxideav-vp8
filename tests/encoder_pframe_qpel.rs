@@ -137,6 +137,14 @@ fn parse_p_frame_inter_modes(bytes: &[u8], mb_cols: usize, mb_rows: usize) -> Ve
             let mode = read_inter_mode(&mut dec, &probs).expect("inter mode");
             let mv = match mode {
                 InterMode::Zero => Mv::default(),
+                InterMode::Nearest => {
+                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+                    oxideav_vp8::clamp_mv(near.mvs[1], &bounds)
+                }
+                InterMode::Near => {
+                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+                    oxideav_vp8::clamp_mv(near.mvs[2], &bounds)
+                }
                 InterMode::New => {
                     let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
                     let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);

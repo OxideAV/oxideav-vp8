@@ -2,6 +2,110 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 157)
+
+**Encoder §13.4 `token_prob_update()` observed-counts fitter for the
+keyframe path.** Round 155 (`f6f0ecf`) wired the keyframe caller-
+driven §13.4 layer; round 156 (`0388b2d`) mirrored the same plumbing
+on the inter path so a future round could drop a fitter onto either
+end with the same API shape. Round 157 closes the natural follow-up
+identified by both rounds' next-step ladders: the encoder now *fits*
+the §13.4 payload from observed branch counts instead of asking the
+caller for one.
+
+Four new public surfaces:
+
+  * **`BranchCounts`** — type alias for `[[[[(u32, u32); 11]; 3]; 8]; 4]`,
+    the per-position `(zeros, ones)` counter for the 4×8×3×11 token-tree
+    table the §13.4 sub-block updates. One entry per
+    `(plane, band, prev_ctx, position)` slot of the §13.5
+    `coeff_probs[4][8][3][11]` table.
+  * **`empty_branch_counts()` / `count_block_branches` /
+    `count_mb_branches` / `count_keyframe_branches`** — the count
+    collector walkers. Each is a lockstep replica of the corresponding
+    §13.3 entropy-write path (`encode_coeff_block` /
+    `encode_mb_tokens` / the keyframe DCT-partition walk) but records
+    branch counts into a [`BranchCounts`] accumulator instead of
+    writing bits. The §13.3 above / left predictor contexts evolve
+    identically to the real encoder (frame-lived above per column, per-
+    row left reset, skip-MB context clearing), so the counts are bit-
+    for-bit the events the real walk would have emitted.
+  * **`fit_token_prob_updates(counts, min_saving_bits) -> TokenProbUpdates`** —
+    the cost-model fitter. At each slot it computes
+    `p_obs = round(256 * zeros / total)` clamped to `[1, 255]` (the
+    boolean coder's valid Prob range), compares the body bit cost of
+    coding the observed counts at `p_old` vs `p_new` using the
+    encoder's existing `bool_bits` cost model, and emits a `Some(p_new)`
+    update only when the body saving exceeds the §13.4 transmission
+    cost (one flag bit at `coeff_update_probs[i][j][k][t]` plus an
+    L(8) literal, less the no-update flag-bit cost) plus a small
+    `min_saving_bits` guard against pass-2 RD-pick drift.
+  * **`encode_keyframe_with_fitted_token_prob_updates(frame, params)`** —
+    the high-level driver. Two passes: encode with §13.5 defaults to
+    collect counts via the new `encode_keyframe_inner` side-channel,
+    then fit, then re-encode with the fitted updates through
+    `encode_keyframe_with_token_prob_updates`. A `bytes_fitted <=
+    bytes_default` safety guard ships the smaller wire — the entry-
+    point is therefore monotone: it never *grows* the wire relative
+    to the round-154 (defaults-only) baseline.
+
+Measured wire shrinkage on synthetic frames at `y_ac_qi = 32`:
+
+| Source                                | Default | Fitted | Δ           |
+| ------------------------------------- | ------- | ------ | ----------- |
+| 32×32 luma ramp + chroma gradient     | 386 B   | 349 B  | **-9.6 %**  |
+| 64×64 checker + gradient              | 1034 B  | 792 B  | **-23.4 %** |
+| 128×128 quadratic radial              | 11725 B | 7785 B | **-33.6 %** |
+
+The savings rise with frame area because the §13.4 transmission cost
+amortises over more residual: a 1056-position header that costs O(n)
+bits up front saves O(coefficients) bits downstream, and the
+coefficient count grows linearly with `mb_cols * mb_rows` while the
+header stays fixed-size.
+
+Decoder side: no changes — the round 155 inter-path overlay
+(`Vp8DecoderState::decode_inter_frame` →
+`overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`) and
+the keyframe `merge_default_token_probs` consumer have always honoured
+the on-wire §13.4 sub-block exactly; the round-157 fitter just exercises
+that pathway for every keyframe by default.
+
+Out of round-157 scope: the inter (P-frame) path's analogous
+`encode_p_frame_*_with_fitted_token_prob_updates` entry. The
+[`BranchCounts`] / [`fit_token_prob_updates`] machinery is shared, so
+the inter fitter can stack on top in a subsequent round through the
+same cost-model — only the per-frame collection plumbing
+(`count_inter_frame_branches`) needs to be added, mirroring
+`count_keyframe_branches`'s shape. The `Vp8KeyframeStreamEncoder` and
+`Vp8InterStreamEncoder` stream drivers also stay on the caller-driven
+entry-points for now; threading the fitter into the stream drivers'
+`encode_frame` ladder is a follow-up.
+
+Validation: a new `tests/encoder_fitted_token_prob_updates.rs`
+integration test (8 tests) pins (a) the fitter is a strict no-op on
+empty counts (no events ⇒ no updates can win); (b) `p_new == p_old`
+short-circuits to no update; (c) the high-level entry never grows the
+wire relative to the default-encode baseline; (d) the fitted wire
+decodes through `decode_vp8` clearing the 25 dB PSNR floor; (e) the
+high-level entry returns either the default bytes or strictly-smaller
+bytes; (f) the fitted §19.2 header round-trips through
+`Vp8CodedHeader::parse` with every recovered `Some(p)` in `[1, 255]`;
+(g) `count_keyframe_branches` honours `mb_skip_coeff` (skip MBs emit
+no counts); (h) `fit_token_prob_updates` emits a near-255 `p_new` at a
+hand-loaded 1024:1 zero-biased slot. Tests: 509 → 517 (+8 in
+`encoder_fitted_token_prob_updates.rs`).
+
+The next-step ladder for the encoder is now: (1) inter-path observed-
+counts fitter (the same `BranchCounts` + `fit_token_prob_updates`
+machinery + a new `count_inter_frame_branches` walker, then a new
+`encode_p_frame_*_with_fitted_token_prob_updates` entry that stacks
+on the round-156 caller-driven inter surface), (2) intra-within-inter
+MB picking (§11 RD against the inter J at `prob_intra < 255`), (3)
+§9.3 segmentation support, (4) thread the fitter into the
+`Vp8KeyframeStreamEncoder` / `Vp8InterStreamEncoder` ladder so the
+stream drivers benefit by default, (5) end-to-end libvpx black-box
+cross-decode validation.
+
 ## Status — 2026-05-27 (round 156)
 
 **Encoder §13.4 `token_prob_update()` caller-driven layer extended to

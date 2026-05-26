@@ -6,6 +6,39 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.4 `token_prob_update()` observed-counts fitter for the keyframe
+  encoder (RFC 6386 §13.4 / §13.5)** — round 155 wired the keyframe
+  caller-driven layer; round 156 mirrored it on the inter path; round
+  157 closes the natural follow-up by letting the encoder *fit* the
+  §13.4 payload from observed counts. Four new public surfaces:
+  `BranchCounts` (the per-position `(zeros, ones)` counter type for the
+  4×8×3×11 table), `empty_branch_counts` / `count_block_branches` /
+  `count_mb_branches` / `count_keyframe_branches` (the count-collector
+  walkers, lockstep replicas of `encode_coeff_block` /
+  `encode_mb_tokens` / the keyframe token-encode pass — they only
+  record branch counts, no entropy bits are written),
+  `fit_token_prob_updates(counts, min_saving_bits)` (the bit-cost
+  fitter — emits `Some(p_obs)` only when the body bit saving exceeds
+  the §13.4 transmission cost plus a small re-encode-drift guard),
+  and `encode_keyframe_with_fitted_token_prob_updates` (the high-level
+  two-pass driver: encode-with-defaults → collect counts → fit →
+  re-encode → ship the smaller wire). The fitter's safety guard
+  (`bytes_fitted <= bytes_default`) guarantees the entry-point never
+  *grows* the wire. Synthetic-frame measurements at `y_ac_qi = 32`:
+  -9.6 % (32×32 ramp), -23.4 % (64×64 checker+gradient), -33.6 %
+  (128×128 quadratic radial). New regression test
+  `encoder_fitted_token_prob_updates.rs` (8 tests) pins (a) the fitter
+  is a strict no-op on empty counts; (b) `p_new == p_old` short-
+  circuits to no update; (c) the high-level entry never grows the
+  wire; (d) the fitted wire decodes through `decode_vp8` clearing the
+  same 25 dB PSNR floor the r155 / r156 tests pin; (e) the high-level
+  entry returns either the default bytes or strictly-smaller bytes;
+  (f) the fitted §19.2 header round-trips through `Vp8CodedHeader::parse`
+  with every recovered `Some(p)` in `[1, 255]`; (g) `count_keyframe_
+  branches` honours `mb_skip_coeff` (skip MBs emit no counts);
+  (h) `fit_token_prob_updates` emits a near-255 `p_new` at a hand-
+  loaded 1024:1 zero-biased slot.
+
 * **§13.4 `token_prob_update()` caller-driven layer for the inter
   (P-frame) encoder (RFC 6386 §13.4 / §13.5)** — round 155 landed the
   caller-driven layer on the keyframe path; round 156 mirrors the

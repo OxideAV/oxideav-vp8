@@ -2980,6 +2980,313 @@ fn encode_block_with_ctx(
     Ok(nz)
 }
 
+// ─────────────────────── §13.4 observed-counts fitter (round 157) ───────────────────────
+
+/// Per-position branch counters for the §13.4 `token_prob_update()`
+/// table: for every `(plane, band, prev_ctx, position)` slot of the
+/// `coeff_probs[4][8][3][11]` table the encoder uses, count how many
+/// times the §13.3 token-tree walk emitted a `0` bit at that position
+/// (`zeros`) and how many times it emitted a `1` bit (`ones`). One
+/// such counter per slot suffices: every bit the encoder emits against
+/// `coeff_probs[i][j][k][t]` lands in `[i][j][k][t]` exactly once, so
+/// a frame-wide accumulator is the natural rate-statistic for the §13.4
+/// caller-driven update layer landed in rounds 155 / 156.
+///
+/// Used by [`count_keyframe_branches`] and the round-157
+/// [`encode_keyframe_with_fitted_token_prob_updates`] fitter that
+/// derives per-position `Some(p_obs)` replacement probabilities from
+/// the observed counts and emits a §13.4 update only when the body bit
+/// saving outweighs the §13.4 transmission cost.
+///
+/// The element type is `(u32, u32)` for `(zeros, ones)`. The maximum
+/// per-frame count at any one position is bounded by the number of
+/// coefficients in the frame (`16 * mb_cols * mb_rows` for the full-band
+/// case), well within `u32`'s range for any realistic VP8 picture.
+pub type BranchCounts = [[[[(u32, u32); 11]; 3]; 8]; 4];
+
+/// Zeroed [`BranchCounts`] suitable as the start of an accumulator.
+///
+/// Equivalent to `[[[[(0, 0); 11]; 3]; 8]; 4]`; named so `count_*`
+/// helpers can be called without the caller having to repeat the
+/// 4-dimension initialiser literal at every site.
+pub fn empty_branch_counts() -> BranchCounts {
+    [[[[(0u32, 0u32); 11]; 3]; 8]; 4]
+}
+
+/// Walk one §13.3 sub-block exactly as [`encode_coeff_block`] would
+/// emit it, but accumulating `(zeros, ones)` branch counts into
+/// `counts` instead of writing to a [`BoolEncoder`]. The control flow
+/// mirrors `encode_coeff_block` line for line so the counts track the
+/// real token pass (token-tree path traversal; cat-token extra bits
+/// and per-coefficient sign bits are intentionally not counted — those
+/// are coded against fixed probabilities outside the `coeff_probs`
+/// table the §13.4 layer can update).
+///
+/// `coeffs` is in **scan (zig-zag) order**, matching `encode_coeff_block`.
+/// `above_has_nonzero` / `left_has_nonzero` seed `ctx3` exactly as the
+/// real encoder does. Returns the non-zero coefficient count so the
+/// caller can thread the §13.3 predictor update through `MbEntropyCtx`
+/// in lockstep with the real encoder.
+pub fn count_block_branches(
+    block_type: BlockType,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+    counts: &mut BranchCounts,
+) -> usize {
+    let plane = block_type.plane_index();
+    let first_coeff = block_type.first_coeff();
+
+    let mut last_non_zero: i32 = -1;
+    for (i, &v) in coeffs.iter().enumerate() {
+        if i >= first_coeff && v != 0 {
+            last_non_zero = i as i32;
+        }
+    }
+
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let mut prev_was_zero = false;
+    let mut non_zero_count = 0usize;
+
+    let mut i = first_coeff;
+    while i < 16 {
+        let band = COEFF_BANDS[i];
+
+        let emit_eob = (i as i32) > last_non_zero;
+        let (token, abs_value) = if emit_eob {
+            (DctToken::Eob, 0u16)
+        } else {
+            let v = coeffs[i];
+            let abs = v.unsigned_abs();
+            (classify_coeff_token(abs), abs)
+        };
+
+        let start = if prev_was_zero { 2i8 } else { 0i8 };
+        for (i_half, bit) in token_to_bit_path(token, start) {
+            let slot = &mut counts[plane][band][ctx3][i_half];
+            if bit {
+                slot.1 += 1;
+            } else {
+                slot.0 += 1;
+            }
+        }
+
+        if token == DctToken::Eob {
+            break;
+        }
+
+        if abs_value != 0 {
+            non_zero_count += 1;
+        }
+
+        ctx3 = if abs_value == 0 {
+            0
+        } else if abs_value == 1 {
+            1
+        } else {
+            2
+        };
+        prev_was_zero = token == DctToken::Dct0;
+        i += 1;
+    }
+
+    non_zero_count
+}
+
+/// Count the §13.4 branch counts for one whole macroblock's residual,
+/// mirroring [`encode_mb_tokens`] (Y2 if present, 16 Y sub-blocks, 4 U
+/// sub-blocks, 4 V sub-blocks) and threading the §13.3 above / left
+/// predictor contexts through `count_block_branches`. The §20.16
+/// ABOVE / LEFT context-index tables match `encode_block_with_ctx`.
+///
+/// Like `encode_mb_tokens`, this is the per-MB driver; the frame
+/// driver ([`count_keyframe_branches`]) calls it row-by-row with
+/// frame-lived `above_ctx` and per-row `left_ctx` and respects
+/// `mb_skip_coeff` (skip MBs emit no tokens but clear their predictor
+/// slots via [`clear_skip_ctx`]).
+pub fn count_mb_branches(
+    raw_coeffs: &MbCoeffs,
+    use_bpred: bool,
+    above: &mut MbEntropyCtx,
+    left: &mut MbEntropyCtx,
+    counts: &mut BranchCounts,
+) {
+    const LEFT_CTX: [usize; 25] = [
+        0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, // 16 Y
+        4, 4, 5, 5, // 4 U
+        6, 6, 7, 7, // 4 V
+        8, // Y2
+    ];
+    const ABOVE_CTX: [usize; 25] = [
+        0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, // 16 Y
+        4, 5, 4, 5, // 4 U
+        6, 7, 6, 7, // 4 V
+        8, // Y2
+    ];
+
+    let walk = |block_index: usize,
+                block_type: BlockType,
+                scan: &[i16; 16],
+                above: &mut MbEntropyCtx,
+                left: &mut MbEntropyCtx,
+                counts: &mut BranchCounts| {
+        let a = ABOVE_CTX[block_index];
+        let l = LEFT_CTX[block_index];
+        let nz = count_block_branches(block_type, above.nonzero[a], left.nonzero[l], scan, counts);
+        let has = nz != 0;
+        above.nonzero[a] = has;
+        left.nonzero[l] = has;
+    };
+
+    if !use_bpred {
+        let scan_y2 = raster_to_scan(&raw_coeffs.y2);
+        walk(24, BlockType::Y2, &scan_y2, above, left, counts);
+    }
+    let y_plane = if use_bpred {
+        BlockType::YNoY2
+    } else {
+        BlockType::YAfterY2
+    };
+    for (i, y_block) in raw_coeffs.y.iter().enumerate() {
+        let scan = raster_to_scan(y_block);
+        walk(i, y_plane, &scan, above, left, counts);
+    }
+    for (i, u_block) in raw_coeffs.u.iter().enumerate() {
+        let scan = raster_to_scan(u_block);
+        walk(16 + i, BlockType::UV, &scan, above, left, counts);
+    }
+    for (i, v_block) in raw_coeffs.v.iter().enumerate() {
+        let scan = raster_to_scan(v_block);
+        walk(20 + i, BlockType::UV, &scan, above, left, counts);
+    }
+}
+
+/// Walk a whole keyframe's already-picked macroblock modes + raw
+/// coefficients and accumulate §13.4 branch counts into `counts`,
+/// mirroring the §13.3 token-encode pass of
+/// [`encode_keyframe_with_reconstruction_and_token_updates`] —
+/// row-major raster, frame-lived `above` per-column context, per-row
+/// `left` reset, skip-MB context clearing via [`clear_skip_ctx`].
+///
+/// `modes` and `all_coeffs` are the same per-MB outputs the keyframe
+/// driver feeds to its multi-partition token pass; `mb_cols` /
+/// `mb_rows` are the macroblock-grid dimensions. The partition index a
+/// given row routes to is irrelevant to the counts (the §13.3
+/// above-context is shared across partitions and the per-row left
+/// context resets identically regardless of partition assignment).
+pub fn count_keyframe_branches(
+    modes: &[MacroblockModes],
+    all_coeffs: &[MbCoeffs],
+    mb_cols: usize,
+    mb_rows: usize,
+    counts: &mut BranchCounts,
+) {
+    let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
+    for mb_row in 0..mb_rows {
+        let mut left_ctx = MbEntropyCtx::default();
+        for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
+            let raster = mb_row * mb_cols + mb_col;
+            let mb = &modes[raster];
+            let use_bpred = mb.y_mode == IntraYMode::B;
+            if mb.mb_skip_coeff {
+                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
+                continue;
+            }
+            count_mb_branches(
+                &all_coeffs[raster],
+                use_bpred,
+                above_col,
+                &mut left_ctx,
+                counts,
+            );
+        }
+    }
+}
+
+/// Derive a §13.4 [`TokenProbUpdates`] payload from observed branch
+/// counts that **saves bits** when applied: each
+/// `(plane, band, prev_ctx, position)` slot is set to `Some(p_obs)` if
+/// and only if the body bit saving at that slot — coding `(zeros, ones)`
+/// against the new probability vs the §13.5 default — outweighs the
+/// §13.4 transmission cost (one flag-bit at the position's update
+/// probability + an `L(8)` literal carrying the replacement, less the
+/// flag-bit cost the no-update path would have paid). Slots with zero
+/// total count, or where the saving is below `min_saving_bits`, stay
+/// `None` (defaults retained).
+///
+/// `p_obs` is the maximum-likelihood estimate of the per-bit
+/// probability of `0` at this slot, scaled to the §13.5 0..=255
+/// `Prob`-byte range: `round(256 * zeros / total)`, clamped to `1..=255`
+/// to mirror the boolean coder's `[1, 255]` valid range (and to keep
+/// `bool_bits(p, bit)` finite when this fitter's output is fed back to
+/// the encoder's cost estimator).
+///
+/// `min_saving_bits` is a small positive guard against round-trip
+/// instability: the body saving is computed against the **observed**
+/// distribution (which differs from the encoder's next-pass token
+/// distribution once the new probs perturb the RD pick), so a
+/// near-break-even slot may actually be net-negative after re-encode.
+/// A guard of `~2 bits` is a reasonable starting point and is exposed
+/// for tests that want the strict break-even output.
+pub fn fit_token_prob_updates(
+    counts: &BranchCounts,
+    min_saving_bits: f64,
+) -> crate::coded_header::TokenProbUpdates {
+    let defaults = &crate::dct_tokens::DEFAULT_COEFF_PROBS;
+    let mut out: crate::coded_header::TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+
+    for i in 0..4 {
+        for j in 0..8 {
+            for k in 0..3 {
+                for t in 0..11 {
+                    let (n0, n1) = counts[i][j][k][t];
+                    let total = n0 + n1;
+                    if total == 0 {
+                        continue;
+                    }
+                    let p_old = defaults[i][j][k][t];
+
+                    // Maximum-likelihood p_obs scaled to the §13.5
+                    // 0..=255 byte range, clamped to [1, 255] so the
+                    // resulting Prob is always valid (the boolean
+                    // coder rejects 0 / 256).
+                    let p_new_raw = ((n0 as u64) * 256 + (total as u64) / 2) / (total as u64);
+                    let p_new = p_new_raw.clamp(1, 255) as u8;
+
+                    if p_new == p_old {
+                        continue;
+                    }
+
+                    // Body bit-cost in each direction, using the same
+                    // `bool_bits` cost model the encoder's RD estimator
+                    // uses. Saving > 0 ⇒ the new prob codes the
+                    // observed counts more cheaply than the default.
+                    let body_old = (n0 as f64) * bool_bits(p_old, false)
+                        + (n1 as f64) * bool_bits(p_old, true);
+                    let body_new = (n0 as f64) * bool_bits(p_new, false)
+                        + (n1 as f64) * bool_bits(p_new, true);
+                    let body_saving = body_old - body_new;
+
+                    // §13.4 transmission cost: replacing the no-op
+                    // `flag = 0` (cost = bool_bits(update_prob, false))
+                    // with `flag = 1` (cost = bool_bits(update_prob,
+                    // true)) plus an 8-bit literal carrying p_new.
+                    let update_prob =
+                        COEFF_UPDATE_PROBS_FLAT[i * 8 * 3 * 11 + j * 3 * 11 + k * 11 + t];
+                    let header_extra =
+                        bool_bits(update_prob, true) + 8.0 - bool_bits(update_prob, false);
+
+                    if body_saving > header_extra + min_saving_bits {
+                        out[i][j][k][t] = Some(p_new);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 // ─────────────────────── §9 / §11 / §19.2 keyframe raster driver ───────────────────────
 
 /// A source I420 (YCbCr 4:2:0) picture handed to the keyframe raster
@@ -3222,6 +3529,102 @@ pub fn encode_keyframe_with_token_prob_updates(
     Ok(bytes)
 }
 
+/// Encode a key frame, **fitting** the §13.4 `token_prob_update()`
+/// per-position replacements from this frame's observed token-tree
+/// branch counts (RFC 6386 §13.4 / §13.5).
+///
+/// Rounds 155 and 156 landed the caller-driven §13.4 layer for the
+/// keyframe and inter paths respectively — they let an external caller
+/// hand in any `TokenProbUpdates` payload and the encoder writes the
+/// §13.4 sub-block, threads the merged `coeff_probs` through the §13.3
+/// token-encode pass, and the decoder rebuilds the same merged table
+/// from the on-wire updates. Round 157 closes the natural follow-up:
+/// the encoder now *picks* the §13.4 updates itself, from the very
+/// counts the residual it is about to emit would produce against the
+/// §13.5 defaults.
+///
+/// The fit is the obvious one: at each
+/// `(plane, band, prev_ctx, position)` slot of the 4×8×3×11 table,
+/// `p_obs = round(256 * zeros / total)` clamped to `[1, 255]` (the
+/// boolean coder's valid `Prob` range) is the maximum-likelihood
+/// estimate of the per-bit "probability of `0`" the encoder just
+/// observed. An update is emitted only when the body bit saving
+/// `(n0 * cost(p_old,0) + n1 * cost(p_old,1)) - (n0 * cost(p_new,0) +
+/// n1 * cost(p_new,1))` exceeds the §13.4 transmission cost
+/// `(cost(update_prob,1) + 8) - cost(update_prob,0)` plus a small
+/// `min_saving_bits = 2.0` guard against re-encode drift. Slots with
+/// zero observed count keep the §13.5 default. See
+/// [`fit_token_prob_updates`] for the full cost-model.
+///
+/// Internally the function takes two passes:
+///
+///   1. Encode with the §13.5 defaults and collect the per-position
+///      branch counts via the [`encode_keyframe_inner`]
+///      `counts` side-channel.
+///   2. Run [`fit_token_prob_updates`] to derive the
+///      [`TokenProbUpdates`] payload that nets a positive bit saving
+///      against those counts, then re-encode with that payload through
+///      [`encode_keyframe_with_token_prob_updates`].
+///
+/// If the fitter returns an all-`None` payload (no slot crossed the
+/// saving threshold), or the fitted re-encode is **larger** than the
+/// default-encode wire (the model's saving estimate is computed
+/// against pass-1's coefficient distribution; pass-2's RD pick perturbs
+/// it slightly), the default-encode bytes are returned instead — so
+/// this entry-point is guaranteed to be `<=` the
+/// `encode_keyframe_with_token_prob_updates(.., all-None)` wire in
+/// every case. The returned bytes always decode through the crate's
+/// own [`crate::decode_vp8`] and any compliant VP8 decoder.
+///
+/// Out of round-157 scope: the inter (P-frame) path's analogous
+/// `encode_p_frame_*_with_fitted_token_prob_updates` entry — this round
+/// scopes to the keyframe path mirroring the r155-then-r156 split that
+/// landed the caller-driven layer; the inter fitter can stack on top
+/// in a subsequent round through the same [`fit_token_prob_updates`]
+/// machinery (the cost-model and the [`BranchCounts`] type are shared).
+pub fn encode_keyframe_with_fitted_token_prob_updates(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+) -> Result<Vec<u8>, EncodeError> {
+    // Pass 1 — defaults + observed branch counts.
+    let mut counts = empty_branch_counts();
+    let (bytes_default, _planes_default) =
+        encode_keyframe_inner(frame, params, None, Some(&mut counts))?;
+
+    // Fit. 2.0 bits of slack guards against the small body-saving
+    // overstatement that comes from the pass-2 RD pick perturbing
+    // the coefficient distribution slightly relative to pass-1's
+    // counts.
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+
+    // If no slot crossed the threshold, the default encode wins
+    // trivially (the all-`None` path is byte-identical to the
+    // round-154 wire).
+    let any_update = fitted.iter().any(|p| {
+        p.iter()
+            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
+    });
+    if !any_update {
+        return Ok(bytes_default);
+    }
+
+    // Pass 2 — re-encode with the fitted updates. The pick / forward-
+    // transform layer re-runs against the merged probabilities (the RD
+    // estimator uses the merged table), so the chosen coefficients may
+    // shift relative to pass 1. The encoder remains self-consistent —
+    // the decoder rebuilds the same merged table from the on-wire
+    // updates and reconstructs the same picture.
+    let bytes_fitted = encode_keyframe_with_token_prob_updates(frame, params, &fitted)?;
+
+    // Guard against the cost-model overstating the saving: only ship
+    // the fitted bytes when they actually shrink the wire.
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok(bytes_fitted)
+    } else {
+        Ok(bytes_default)
+    }
+}
+
 /// Encode a key frame and return both the bitstream bytes **and** the
 /// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`] the
 /// decoder will rebuild from those bytes.
@@ -3270,6 +3673,28 @@ pub fn encode_keyframe_with_reconstruction_and_token_updates(
     frame: &I420Frame,
     params: &KeyframeParams,
     token_updates: Option<&TokenProbUpdates>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_inner(frame, params, token_updates, None)
+}
+
+/// Internal keyframe driver shared by
+/// [`encode_keyframe_with_reconstruction_and_token_updates`] and the
+/// round-157 [`encode_keyframe_with_fitted_token_prob_updates`] fitter.
+///
+/// `counts` (when `Some`) is filled with the per-position §13.4 branch
+/// counts the §13.3 token-encode pass produces against the supplied
+/// `token_updates` table. With `counts = None` the function reduces
+/// exactly to the public entry-point above (no extra work, no behaviour
+/// change). With `counts = Some(&mut c)` the §13.3 walk records each
+/// `(plane, band, prev_ctx, position)` bit-event into `c` alongside its
+/// regular `BoolEncoder` write — `c`'s contents are the only side-effect
+/// of the parameter; the emitted bytes are byte-identical to the
+/// `counts = None` invocation with the same `token_updates`.
+fn encode_keyframe_inner(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
@@ -3563,6 +3988,15 @@ pub fn encode_keyframe_with_reconstruction_and_token_updates(
             )
             .map_err(EncodeError::Token)?;
         }
+    }
+    // §13.4 observed-counts side-channel (round 157). Re-walks the
+    // §13.3 token loop above with `count_keyframe_branches`, driving
+    // its own private above / left predictor contexts in lockstep —
+    // so the recorded per-position counts are bit-for-bit the events
+    // the bytes in `partitions` just emitted. With `counts = None`
+    // this is a no-op.
+    if let Some(c) = counts {
+        count_keyframe_branches(&modes, &all_coeffs, mb_cols, mb_rows, c);
     }
     let dct_partitions: Vec<Vec<u8>> = partitions.into_iter().map(|p| p.finish()).collect();
     let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();

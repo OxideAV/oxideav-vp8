@@ -3203,6 +3203,62 @@ pub fn count_keyframe_branches(
     }
 }
 
+/// Walk a whole inter (P-) frame's already-picked macroblock modes +
+/// raw coefficients and accumulate §13.4 branch counts into `counts`,
+/// mirroring the §13.3 token-encode pass of
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`]
+/// — row-major raster, frame-lived `above` per-column context, per-row
+/// `left` reset, skip-MB context clearing via `clear_skip_ctx`.
+///
+/// The shape mirrors [`count_keyframe_branches`] exactly with one
+/// addition: a per-MB `use_bpred` slice is required because the inter
+/// path's "no Y2" decision is **not** carried in [`MacroblockModes`]'s
+/// `y_mode` field (the inter picker stamps `y_mode = IntraYMode::Dc`
+/// onto every MB; per §13.1 / §14.2 page 76, SPLITMV MBs also omit Y2
+/// independent of `y_mode`). The inter inner driver records the
+/// effective "no Y2" flag in its `use_bpred_per_mb` vector — which is
+/// exactly what this walker consumes.
+///
+/// `modes`, `use_bpred_per_mb`, and `all_coeffs` must share the
+/// macroblock-grid length (`mb_cols * mb_rows`); a mismatch is a caller
+/// bug. The partition index a given row routes to is irrelevant to the
+/// counts (the §13.3 above-context is shared across partitions and the
+/// per-row left context resets identically regardless of partition
+/// assignment).
+pub fn count_inter_frame_branches(
+    modes: &[MacroblockModes],
+    use_bpred_per_mb: &[bool],
+    all_coeffs: &[MbCoeffs],
+    mb_cols: usize,
+    mb_rows: usize,
+    counts: &mut BranchCounts,
+) {
+    debug_assert_eq!(modes.len(), mb_cols * mb_rows);
+    debug_assert_eq!(use_bpred_per_mb.len(), mb_cols * mb_rows);
+    debug_assert_eq!(all_coeffs.len(), mb_cols * mb_rows);
+
+    let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
+    for mb_row in 0..mb_rows {
+        let mut left_ctx = MbEntropyCtx::default();
+        for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
+            let raster = mb_row * mb_cols + mb_col;
+            let mb = &modes[raster];
+            let use_bpred = use_bpred_per_mb[raster];
+            if mb.mb_skip_coeff {
+                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
+                continue;
+            }
+            count_mb_branches(
+                &all_coeffs[raster],
+                use_bpred,
+                above_col,
+                &mut left_ctx,
+                counts,
+            );
+        }
+    }
+}
+
 /// Derive a §13.4 [`TokenProbUpdates`] payload from observed branch
 /// counts that **saves bits** when applied: each
 /// `(plane, band, prev_ctx, position)` slot is set to `Some(p_obs)` if
@@ -5469,6 +5525,167 @@ pub fn encode_p_frame_multi_ref_with_token_updates(
     )
 }
 
+/// §16.2 multi-reference P-frame encoder with an automatically-fitted
+/// §13.4 `token_prob_update()` payload — the inter-path mirror of
+/// [`encode_keyframe_with_fitted_token_prob_updates`] (round 157).
+///
+/// Round 156 wired the inter caller-driven layer; round 158 closes the
+/// natural follow-up by letting the encoder *fit* the §13.4 payload
+/// from observed branch counts instead of asking the caller for one.
+/// The fitter shares its cost-model ([`fit_token_prob_updates`]) and
+/// counter type ([`BranchCounts`]) with the keyframe path; only the
+/// per-frame collection plumbing — [`count_inter_frame_branches`] —
+/// is inter-specific (the inter picker stamps `IntraYMode::Dc` onto
+/// every MB so the "no Y2" decision can't be recovered from `y_mode`;
+/// the inner driver records it in a `use_bpred_per_mb` vector that
+/// this walker consumes).
+///
+/// Internally the function takes two passes:
+///
+///   1. Encode with the §13.5 defaults and collect the per-position
+///      branch counts via the [`encode_p_frame_multi_ref_inner_with_counts`]
+///      `counts` side-channel.
+///   2. Run [`fit_token_prob_updates`] to derive the
+///      [`TokenProbUpdates`] payload that nets a positive bit saving
+///      against those counts, then re-encode with that payload through
+///      [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`].
+///
+/// If the fitter returns an all-`None` payload (no slot crossed the
+/// saving threshold), or the fitted re-encode is **larger** than the
+/// default-encode wire (the model's saving estimate is computed
+/// against pass-1's coefficient distribution; pass-2's RD pick perturbs
+/// it slightly), the default-encode bytes are returned instead — so
+/// this entry-point is guaranteed to be `<=` the
+/// `encode_p_frame_multi_ref_with_token_updates(.., None)` wire in
+/// every case. The returned bytes always decode through the crate's
+/// own [`crate::state::Vp8DecoderState`] and any compliant VP8 decoder.
+///
+/// **Carried-base assumption.** Same as the round-156 inter caller-
+/// driven entry-point: this function assumes the prior key frame was
+/// emitted with the §13.5 defaults (i.e. `encode_keyframe` or
+/// `encode_keyframe_with_token_prob_updates(.., None)`). The decoder
+/// overlays the fitted payload on top of that base via
+/// [`Vp8DecoderState::decode_inter_frame`] (`overlay_token_probs(self.
+/// coeff_probs, &coded.token_prob_updates)`); the encoder's two-pass
+/// fit also overlays on the §13.5 defaults, so the merged tables match
+/// byte-for-byte. Mixing a non-default-base keyframe with this
+/// entry-point is out of round-158 scope.
+///
+/// Out of round-158 scope: threading the fitter into
+/// [`crate::stream::Vp8InterStreamEncoder`]'s `encode_frame` ladder —
+/// the stream-driver method
+/// [`crate::stream::Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`]
+/// stays on the caller-driven entry-point for now; a subsequent round
+/// adds the analogous `_with_fitted_token_prob_updates` stream method.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    // Pass 1 — defaults + observed branch counts.
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_with_counts(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        None,
+        Some(&mut counts),
+    )?;
+
+    // Fit. 2.0 bits of slack guards against the small body-saving
+    // overstatement that comes from the pass-2 RD pick perturbing the
+    // coefficient distribution slightly relative to pass-1's counts.
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+
+    // If no slot crossed the threshold, the default encode wins
+    // trivially (the all-`None` path is byte-identical to the round-156
+    // inter wire).
+    let any_update = fitted.iter().any(|p| {
+        p.iter()
+            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
+    });
+    if !any_update {
+        return Ok((bytes_default, planes_default));
+    }
+
+    // Pass 2 — re-encode with the fitted updates. The picker re-runs
+    // against the merged probabilities (RD estimator uses the merged
+    // table), so the chosen coefficients may shift relative to pass 1.
+    // The encoder remains self-consistent: the decoder rebuilds the
+    // same merged table from the on-wire updates and reconstructs the
+    // same picture.
+    let (bytes_fitted, planes_fitted) =
+        encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates(
+            frame,
+            last,
+            golden,
+            altref,
+            params,
+            refresh,
+            lf_deltas,
+            carried_ref_deltas,
+            carried_mode_deltas,
+            Some(&fitted),
+        )?;
+
+    // Guard against the cost-model overstating the saving: only ship
+    // the fitted bytes when they actually shrink the wire (or match).
+    // Note: when we fall back we MUST also fall back to the default-
+    // pass reconstruction, otherwise a streaming caller's next-frame
+    // LAST slot would mis-match what the decoder will hold (the two
+    // passes' picker outputs differ when the merged table differs).
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
+}
+
+/// §16.2 multi-reference P-frame encoder with an automatically-fitted
+/// §13.4 `token_prob_update()` payload (and round-150 defaults for
+/// refresh + §9.4 deltas).
+///
+/// Thin wrapper over
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+/// that uses [`RefreshControls::default`] / [`LoopFilterDeltas::default`]
+/// and `[0; 4]` carried delta state — i.e. the configuration that makes
+/// the round-149 / round-150 / round-151 wire byte-for-byte equivalent
+/// to the historical [`encode_p_frame_multi_ref`] when the fitter falls
+/// back to "no updates win" (the `bytes_fitted <= bytes_default` safety
+/// guard).
+pub fn encode_p_frame_multi_ref_with_fitted_token_prob_updates(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        &RefreshControls::default(),
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+    )
+}
+
 /// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
 /// §9.8 reference-slot refresh control.
 ///
@@ -5566,6 +5783,51 @@ fn encode_p_frame_multi_ref_inner(
     carried_ref_deltas: [i16; 4],
     carried_mode_deltas: [i16; 4],
     token_updates: Option<&TokenProbUpdates>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner_with_counts(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        token_updates,
+        None,
+    )
+}
+
+/// Inter (P-frame) driver shared by every public inter entry-point.
+///
+/// Mirrors [`encode_keyframe_inner`]'s `counts` side-channel: when
+/// `counts = Some(&mut c)` the §13.3 token-encode pass also records
+/// each `(plane, band, prev_ctx, position)` bit-event into `c`
+/// alongside its regular `BoolEncoder` write — `c`'s contents are the
+/// only side-effect of the parameter; the emitted bytes are byte-
+/// identical to the `counts = None` invocation with the same
+/// `token_updates`. The walk runs `count_inter_frame_branches` against
+/// the same `(modes, use_bpred_per_mb, all_coeffs, mb_cols, mb_rows)`
+/// the §13.3 emit loop just consumed, so the recorded counts are bit-
+/// for-bit the events the partitions emitted.
+///
+/// Used by the round-158 [`encode_p_frame_multi_ref_with_fitted_token_prob_updates`]
+/// fitter to drive its two-pass observed-counts fitter without
+/// duplicating the long picker/motion-search/§15 walk.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_multi_ref_inner_with_counts(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     lf_deltas.validate()?;
@@ -6319,6 +6581,15 @@ fn encode_p_frame_multi_ref_inner(
             )
             .map_err(EncodeError::Token)?;
         }
+    }
+    // §13.4 observed-counts side-channel (round 158). Re-walks the §13.3
+    // token loop above with `count_inter_frame_branches`, driving its
+    // own private above / left predictor contexts in lockstep — so the
+    // recorded per-position counts are bit-for-bit the events the bytes
+    // in `partitions` just emitted. With `counts = None` this is a
+    // no-op.
+    if let Some(c) = counts {
+        count_inter_frame_branches(&modes, &use_bpred_per_mb, &all_coeffs, mb_cols, mb_rows, c);
     }
     let dct_partitions: Vec<Vec<u8>> = partitions.into_iter().map(|p| p.finish()).collect();
     let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();

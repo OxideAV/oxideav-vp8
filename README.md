@@ -2,6 +2,105 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 158)
+
+**Encoder §13.4 `token_prob_update()` observed-counts fitter mirrored
+onto the inter (P-frame) path.** Round 157 (`769dda2`) landed the
+fitter on the keyframe path and called out the inter mirror as the
+next-step ladder's first item; round 158 closes that follow-up.
+
+Three new public surfaces (mirroring r157's keyframe trio):
+
+  * **`count_inter_frame_branches(modes, use_bpred_per_mb, all_coeffs,
+    mb_cols, mb_rows, counts)`** — the inter analogue of
+    `count_keyframe_branches`. Same shape, plus an explicit
+    `use_bpred_per_mb: &[bool]` argument because the inter picker
+    stamps `IntraYMode::Dc` onto every MB so the "no Y2" decision
+    cannot be recovered from `y_mode` (per §13.1 / §14.2 page 76,
+    SPLITMV MBs also omit Y2 independent of `y_mode`). The inter
+    inner driver records the effective "no Y2" flag in its
+    `use_bpred_per_mb` vector — which is exactly what this walker
+    consumes. The §13.3 above / left predictor contexts evolve
+    identically to the real inter encoder.
+  * **`encode_p_frame_multi_ref_with_fitted_token_prob_updates(frame,
+    last, golden, altref, params)`** — the high-level thin-wrapper
+    entry. Uses `RefreshControls::default` /
+    `LoopFilterDeltas::default` / `[0; 4]` carried state.
+  * **`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(...)`**
+    — the full-surface entry exposing all §9.4 / §9.7 / §9.8 knobs
+    alongside the fitter, so a streaming caller can layer the §13.4
+    payload over any GOLDEN/ALTREF rotation + per-reference loop-filter
+    delta pattern.
+
+Both entries take the same two-pass approach as r157's keyframe entry:
+encode with §13.5 defaults to collect counts via the new
+`encode_p_frame_multi_ref_inner_with_counts` private side-channel; run
+`fit_token_prob_updates` (the shared cost-model from r157); then
+re-encode with the fitted payload through the round-156 caller-driven
+entry. A `bytes_fitted <= bytes_default` safety guard ships whichever
+wire is smaller, returning the *matching* reconstruction planes so a
+streaming caller's next-frame LAST slot stays consistent regardless
+of which pass won.
+
+Measured wire shrinkage on synthetic frames at `y_ac_qi = 32` (smooth
+ramp, default LAST reference, ZEROMV-favouring inter residual):
+
+| Source                    | Default | Fitted | Δ           |
+| ------------------------- | ------- | ------ | ----------- |
+| 32×32 ramp                | 141 B   | 141 B  | **±0.0 %**  |
+| 64×64 ramp                | 389 B   | 357 B  | **-8.2 %**  |
+| 128×128 ramp              | 1110 B  | 899 B  | **-19.0 %** |
+| 256×256 ramp              | 3462 B  | 2424 B | **-30.0 %** |
+
+The 32×32 result is the safety-guard fall-back: 16 MBs don't generate
+enough coefficient mass to amortise the 1056-position §13.4
+transmission cost, so the fitter falls through to the default-encode
+bytes (which is the round-156 inter wire byte-for-byte). The savings
+rise with frame area for the same reason as the keyframe fitter: a
+fixed-size 1056-position header amortises over `O(mb_cols * mb_rows)`
+coefficient bits downstream. Inter-path savings sit slightly below the
+keyframe savings at matched dimensions because the ZEROMV-favouring
+inter residual has lower coefficient mass than the keyframe residual
+(prediction subtracts most of the picture), so there's less material
+for the fitter to exploit per MB.
+
+Decoder side: no changes — the inter path's
+`Vp8DecoderState::decode_inter_frame` already overlays
+`coded.token_prob_updates` on its carried entropy state
+(`overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`);
+the round-158 fitter just exercises that pathway for every P-frame
+when the caller opts into the fitted entry-point.
+
+Out of round-158 scope: threading the fitter into
+`Vp8InterStreamEncoder`'s `encode_frame` / `encode_p_frame_*` ladder
+(the stream-driver methods stay on the caller-driven entry-points for
+now). The `Vp8KeyframeStreamEncoder` stream driver also stays on the
+caller-driven entry. Adding the analogous
+`encode_p_frame_with_*_and_fitted_token_prob_updates` stream methods is
+a one-line plumb-through follow-up that can stack onto this round.
+
+Validation: a new
+`tests/encoder_pframe_fitted_token_prob_updates.rs` integration test
+(6 tests) pins (a) the high-level inter entry never grows the wire
+relative to the default inter wire (the safety guard); (b) the fitted
+inter wire decodes through `Vp8DecoderState` after its I-frame
+predecessor clearing the same 25 dB PSNR floor the r155 / r156 / r157
+tests pin; (c) the fitted §19.2 header round-trips through
+`Vp8CodedHeader::parse` with every recovered `Some(p)` in `[1, 255]`;
+(d) `count_inter_frame_branches` honours `mb_skip_coeff` (skip MBs
+emit no counts); (e) the thin-wrapper and full-surface entries produce
+byte-for-byte the same wire when the full-surface caller passes
+`default`s; (f) the fitter derives a strictly-smaller wire on a noisy
+64×64 residual. Tests: 517 → 523 (+6 in
+`encoder_pframe_fitted_token_prob_updates.rs`).
+
+The next-step ladder for the encoder is now: (1) intra-within-inter
+MB picking (§11 RD against the inter J at `prob_intra < 255`), (2)
+§9.3 segmentation support, (3) thread the fitter into the
+`Vp8KeyframeStreamEncoder` / `Vp8InterStreamEncoder` ladder so the
+stream drivers benefit by default, (4) end-to-end libvpx black-box
+cross-decode validation, (5) deeper §18.3 sub-pel ME / RD refinement.
+
 ## Status — 2026-05-27 (round 157)
 
 **Encoder §13.4 `token_prob_update()` observed-counts fitter for the

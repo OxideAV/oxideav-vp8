@@ -6,6 +6,53 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.4 `token_prob_update()` observed-counts fitter for the inter
+  (P-frame) encoder (RFC 6386 §13.4 / §13.5)** — round 158's mirror of
+  the round-157 keyframe fitter, closing the natural symmetry between
+  the keyframe and inter paths. Three new surfaces:
+  `count_inter_frame_branches` (the inter analogue of
+  `count_keyframe_branches` — same shape, plus an explicit
+  `use_bpred_per_mb: &[bool]` argument because the inter picker stamps
+  `IntraYMode::Dc` onto every MB and the "no Y2" decision can't be
+  recovered from `y_mode`),
+  `encode_p_frame_multi_ref_with_fitted_token_prob_updates` (the
+  high-level thin-wrapper entry that uses `RefreshControls::default` /
+  `LoopFilterDeltas::default` / `[0; 4]` carried state), and
+  `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+  (the full-surface entry that exposes all §9.4 / §9.7 / §9.8 knobs
+  alongside the fitter). Both entries take the same two-pass approach
+  as the keyframe fitter: pass 1 encodes with §13.5 defaults and
+  collects per-position branch counts via the new
+  `encode_p_frame_multi_ref_inner_with_counts` private side-channel;
+  `fit_token_prob_updates` then derives the §13.4 payload; pass 2
+  re-encodes with that payload through the round-156 caller-driven
+  entry. A `bytes_fitted <= bytes_default` safety guard ships whichever
+  wire is smaller (with matching reconstruction planes, so a streaming
+  caller's next-frame LAST slot stays consistent regardless of which
+  pass won). Synthetic-frame measurements at `y_ac_qi = 32` (smooth
+  ramp, default reference, ZEROMV-favouring inter residual): 32×32 ramp
+  unchanged (safety-guard fallback — too small to amortise the §13.4
+  transmission cost), 64×64 ramp -8.2 %, 128×128 ramp -19.0 %,
+  256×256 ramp -30.0 %. The savings rise with frame area for the same
+  reason as the keyframe fitter: a 1056-position header amortises over
+  more residual when there are more macroblocks. Decoder side: no
+  changes — the inter path's existing
+  `Vp8DecoderState::decode_inter_frame` →
+  `overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`
+  consumes the fitted payload exactly as it did the round-156 caller-
+  driven payload. New regression test
+  `encoder_pframe_fitted_token_prob_updates.rs` (6 tests) pins (a) the
+  high-level entry never grows the wire relative to the default
+  inter wire (the safety guard); (b) the fitted inter wire decodes
+  through `Vp8DecoderState` after its I-frame predecessor clearing the
+  same 25 dB PSNR floor the r155 / r156 / r157 tests pin; (c) the
+  fitted §19.2 header round-trips through `Vp8CodedHeader::parse` with
+  every recovered `Some(p)` in `[1, 255]`; (d)
+  `count_inter_frame_branches` honours `mb_skip_coeff` (skip MBs emit
+  no counts); (e) the thin-wrapper and full-surface entries produce
+  byte-for-byte the same wire when the full-surface caller passes
+  `default`s; (f) `fit_token_prob_updates` derives a strictly-smaller
+  wire on a noisy 64×64 residual.
 * **§13.4 `token_prob_update()` observed-counts fitter for the keyframe
   encoder (RFC 6386 §13.4 / §13.5)** — round 155 wired the keyframe
   caller-driven layer; round 156 mirrored it on the inter path; round

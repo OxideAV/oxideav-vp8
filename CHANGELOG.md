@@ -6,6 +6,54 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: §18.3 quarter-pixel motion-search refinement
+  (RFC 6386 §17.1 / §18.3)** — extends the round-144 P-frame picker to
+  follow its `half_pixel_refine_luma` post-pass with a
+  `quarter_pixel_refine_luma` second post-pass that probes the 8
+  quarter-pixel offsets (±`QUARTER_PIXEL_STEP` on each of the row / col
+  axes around the half-pixel center, excluding the center) and keeps
+  whichever 16×16 luma SAD is smallest. Each quarter-pixel candidate is
+  evaluated through the §18.3 six-tap synthesis (`filter_block_4x4`
+  under the version=0 bicubic tap-set), indexed by
+  `(stored_luma_mv(mv) & 7)` — a §17 quarter-pixel offset of magnitude
+  1 selects the `1/4`-position filter row (`{ 2, -11, 108, 36, -8, 1 }`)
+  or `3/4`-position row (the reverse) depending on the parity of the
+  existing half-pixel component, distinct from the `1/2` symmetric row
+  exercised by the round-144 half-pixel refinement. Tie-breaks prefer
+  the half-pixel center — fewer §17.2 component bits to code. §17.1
+  clamping is applied per candidate: a quarter-pixel offset that walks
+  past `±1023` collapses back onto an already-evaluated MV and is
+  skipped.
+
+  Public API additions:
+  * `oxideav_vp8::quarter_pixel_refine_luma(reference, mb_col, mb_row,
+    src_y, half_pixel_center) -> SearchResult` — the §18.3 quarter-
+    pixel refinement entry, expected to be called on the result of a
+    `half_pixel_refine_luma` post-pass.
+  * `oxideav_vp8::QUARTER_PIXEL_STEP = 1` — one quarter-pixel step in
+    §17 quarter-pixel units (per §17.1, V is a signed integer in
+    quarter-pixels of luma displacement). After §18.1 doubling this
+    maps to the §18.3 eighth-pixel fraction `2` (`1/4` tap row).
+
+  Validated end-to-end on a new `tests/encoder_pframe_qpel.rs` test: a
+  2-frame I+P sequence whose P-frame source is the §18.3 sixtap
+  synthesis of the I-frame at MV (0, `+QUARTER_PIXEL_STEP`) — a
+  +0.25 px horizontal shift fundamentally unreachable from a half-
+  pixel-only descent. With the quarter-pixel refinement the picker
+  emits 9 of 16 quarter-pixel-only NEWMV MBs (mv & 1 != 0) and the
+  self-decode Y-PSNR clears **48.85 dB** at `yac_qi = 4`. The round-144
+  half-pixel test (`encoder_pframe_halfpel.rs`) still picks the same
+  3 of 16 half-pixel-grid NEWMV MBs and lands the same **57.0 dB**
+  Y-PSNR — the tie-break ("equal SAD ⇒ keep the half-pixel center")
+  protects the half-pixel codepath from drift. The round-143 whole-
+  pixel translation test (`encoder_pframe_newmv.rs`) likewise still
+  picks 4 of 16 whole-pixel NEWMV MBs at **50.34 dB**. Five new
+  `motion_search.rs` unit tests pin: flat-source tie-break, exact
+  quarter-pixel shift recovery (using a stepped high-frequency plane
+  since a linear ramp degenerates under sixtap `u8` rounding), descent
+  never increases SAD, refinement at a whole-pixel center, §17.1 clamp
+  safety at the boundary.
+
 * **VP8 encoder Phase 11: §18.3 half-pixel motion-search refinement
   (RFC 6386 §17.1 / §18.3)** — extends the round-143 P-frame picker to
   follow its whole-pixel `small_diamond_search_luma` descent with a

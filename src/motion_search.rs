@@ -15,15 +15,20 @@
 //!
 //! ## Scope
 //!
-//! * **Whole-pixel descent followed by §18.3 half-pixel refinement.**
-//!   [`small_diamond_search_luma`] finds the best integer-pixel MV via
-//!   a 4-neighbour descent against the §20.14 edge-replicating fetch
-//!   primitive; [`half_pixel_refine_luma`] then probes the 8 half-pixel
-//!   offsets around that whole-pixel result, each evaluated through the
-//!   §18.3 six-tap synthesis the decoder runs (`version == 0` bicubic
-//!   tap set). The returned MV is always on the half-pixel grid (both
-//!   components multiples of [`HALF_PIXEL_STEP`]) and inside
-//!   `[MV_MIN, MV_MAX]`. Quarter-pixel refinement is a future round.
+//! * **Whole-pixel descent followed by §18.3 half-pixel and quarter-
+//!   pixel refinement.** [`small_diamond_search_luma`] finds the best
+//!   integer-pixel MV via a 4-neighbour descent against the §20.14
+//!   edge-replicating fetch primitive; [`half_pixel_refine_luma`] then
+//!   probes the 8 half-pixel offsets around that whole-pixel result;
+//!   [`quarter_pixel_refine_luma`] then probes the 8 quarter-pixel
+//!   offsets around the half-pixel result. Each sub-pixel candidate is
+//!   evaluated through the §18.3 six-tap synthesis the decoder runs
+//!   (`version == 0` bicubic tap set), keyed by `(stored_luma_mv(mv) &
+//!   7)` — so a §17 quarter-pixel MV of magnitude 1 selects the
+//!   `1/4`-position row of the §18.3 filter table (`{ 2, -11, 108, 36,
+//!   -8, 1 }`), magnitude 3 the `3/4`-position row, and so on. The
+//!   returned MV is always on the §17 quarter-pixel grid (the on-wire
+//!   resolution of `mv` per §17.1) and inside `[MV_MIN, MV_MAX]`.
 //! * **Luma only.** The chroma plane is not sampled — the §18.1
 //!   `chroma_mv = avg(v, v, v, v)` derivation means a half-pixel luma
 //!   MV maps to a sub-pixel chroma MV by construction; sampling chroma
@@ -82,6 +87,14 @@ pub const WHOLE_PIXEL_STEP: i16 = 4;
 /// eighth-pixel fraction `4` — i.e. the symmetric half-pixel tap row of
 /// the §18.3 `filters` table (row 4: `{ 3, -16, 77, 77, -16, 3 }`).
 pub const HALF_PIXEL_STEP: i16 = 2;
+
+/// One quarter-pixel step in §17 quarter-pixel units (`1` per quarter
+/// pixel — §17.1 codes `V` in quarter-pixels directly). After §18.1
+/// doubling this becomes the §18.3 eighth-pixel fraction `2` — i.e. the
+/// `1/4`-position tap row of the §18.3 `filters` table (row 2:
+/// `{ 2, -11, 108, 36, -8, 1 }`). A `QUARTER_PIXEL_STEP` of magnitude 3
+/// likewise selects row 6 (`3/4`, the reverse of row 2).
+pub const QUARTER_PIXEL_STEP: i16 = 1;
 
 /// Pixel-wise sum of absolute differences between two 16×16 blocks.
 ///
@@ -449,6 +462,107 @@ pub fn half_pixel_refine_luma(
         // Tie goes to the previous best (which starts as the center,
         // so on equality the whole-pixel center wins — fewer §17.2
         // component bits to code).
+        if cand_sad < best_sad {
+            best_sad = cand_sad;
+            best_mv = cand_mv;
+        }
+    }
+
+    SearchResult {
+        mv: best_mv,
+        sad: best_sad,
+    }
+}
+
+/// Quarter-pixel motion-search refinement around a half-pixel center —
+/// RFC 6386 §18.3 / §17.1.
+///
+/// Given a `half_pixel_center` MV that came out of
+/// [`half_pixel_refine_luma`] (components multiples of
+/// [`HALF_PIXEL_STEP`]), probe the eight quarter-pixel offsets
+/// ±[`QUARTER_PIXEL_STEP`] in each of the (row, col) axes — i.e. the
+/// 3×3 grid around the center excluding the center itself — and return
+/// the MV with the smallest 16×16 luma SAD across {center, all 8
+/// neighbours}.
+///
+/// Each quarter-pixel candidate is evaluated through [`mb_luma_sad_at_mv`],
+/// which runs the §18.3 six-tap synthesis (the bicubic `version == 0`
+/// tap-set the encoder always commits to in its frame tag). After §18.1
+/// doubling, a §17 quarter-pixel offset becomes the §18.3 eighth-pixel
+/// fraction `2` (`1/4` tap row, `{ 2, -11, 108, 36, -8, 1 }`) or `6`
+/// (`3/4` tap row, the reverse) depending on whether the center already
+/// carried a half-pixel offset on that axis. The center's SAD is
+/// recomputed (via the §18.3 sixtap, which collapses to the copy path
+/// only when both fractions are zero) so the function is independent of
+/// how the caller derived the half-pixel candidate.
+///
+/// `half_pixel_center` is asserted to be on the half-pixel grid
+/// (components multiples of [`HALF_PIXEL_STEP`]) and inside §17.1's
+/// `[MV_MIN, MV_MAX]`. Candidates outside §17.1's range are clamped
+/// (snapped onto the nearest in-range value); a candidate that collapses
+/// onto an already-evaluated MV after clamping is skipped to avoid
+/// recomputing the same SAD. Ties between the center and a neighbour go
+/// to the **center** — fewer §17.2 component bits to code (one extra
+/// quarter-pixel offset on a component adds at least one §17.2 long-form
+/// bit per component vs. the half- or whole-pixel center).
+///
+/// This is the smallest §18.3 refinement on top of [`half_pixel_refine_luma`]
+/// that gives a pure-translation source landing on the quarter-pixel
+/// grid (e.g. a `+0.25` luma-pixel shift) a chance of self-decoding
+/// bit-exactly — content at that fractional offset is fundamentally
+/// unreachable from a half-pixel-only descent.
+pub fn quarter_pixel_refine_luma(
+    reference: LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    half_pixel_center: Mv,
+) -> SearchResult {
+    debug_assert_eq!(
+        half_pixel_center.row % HALF_PIXEL_STEP,
+        0,
+        "half_pixel_center.row must be on the half-pixel grid"
+    );
+    debug_assert_eq!(
+        half_pixel_center.col % HALF_PIXEL_STEP,
+        0,
+        "half_pixel_center.col must be on the half-pixel grid"
+    );
+    debug_assert!((MV_MIN..=MV_MAX).contains(&half_pixel_center.row));
+    debug_assert!((MV_MIN..=MV_MAX).contains(&half_pixel_center.col));
+
+    let mut best_mv = half_pixel_center;
+    let mut best_sad = mb_luma_sad_at_mv(reference, mb_col, mb_row, src_y, best_mv);
+
+    // 8 quarter-pixel offsets around the center, in §17 quarter-pixel units.
+    let step = QUARTER_PIXEL_STEP as i32;
+    let offsets: [(i32, i32); 8] = [
+        (-step, -step),
+        (-step, 0),
+        (-step, step),
+        (0, -step),
+        (0, step),
+        (step, -step),
+        (step, 0),
+        (step, step),
+    ];
+
+    for (drow, dcol) in offsets {
+        let cand_row = clamp_component(half_pixel_center.row as i32 + drow);
+        let cand_col = clamp_component(half_pixel_center.col as i32 + dcol);
+        // After §17.1 clamping a quarter-pixel candidate at the boundary
+        // can collapse back onto the center (e.g. row=1023 + 1 ⇒ 1023);
+        // skip those to avoid recomputing the identical SAD.
+        if cand_row == best_mv.row && cand_col == best_mv.col {
+            continue;
+        }
+        let cand_mv = Mv {
+            row: cand_row,
+            col: cand_col,
+        };
+        let cand_sad = mb_luma_sad_at_mv(reference, mb_col, mb_row, src_y, cand_mv);
+        // Tie goes to the previous best (which starts as the half-pixel
+        // center, so on equality the lower-§17.2-bit candidate wins).
         if cand_sad < best_sad {
             best_sad = cand_sad;
             best_mv = cand_mv;
@@ -995,6 +1109,216 @@ mod tests {
         let sad_general = mb_luma_sad_at_mv(ref_luma, 0, 0, &src_blk, mv);
         let sad_whole = mb_luma_sad_at_whole_mv(ref_luma, 0, 0, &src_blk, mv);
         assert_eq!(sad_general, sad_whole);
+    }
+
+    #[test]
+    fn quarter_pixel_refine_keeps_center_on_flat_source() {
+        // Flat source ⇒ SAD is zero at every MV ⇒ tie-break keeps the
+        // half-pixel center (fewer §17.2 component bits than a quarter-
+        // pixel offset on the same axis).
+        let width = 32;
+        let height = 32;
+        let reference = vec![200u8; width * height];
+        let src_blk = [200u8; 256];
+        let result = quarter_pixel_refine_luma(
+            packed_luma_ref(&reference, width, height),
+            0,
+            0,
+            &src_blk,
+            Mv {
+                row: 0,
+                col: HALF_PIXEL_STEP,
+            },
+        );
+        assert_eq!(
+            result.mv,
+            Mv {
+                row: 0,
+                col: HALF_PIXEL_STEP,
+            }
+        );
+        assert_eq!(result.sad, 0);
+    }
+
+    /// Render a luma plane with sharp luminance steps superimposed on a
+    /// gentle ramp — designed so the §18.3 sixtap response is distinct
+    /// at every fractional offset (the ramp alone is linear and the
+    /// sixtap collapses to identity rounding on it, so every fractional
+    /// MV yields the same byte pattern; the steps break that
+    /// degeneracy).
+    fn stepped_plane(width: usize, height: usize) -> Vec<u8> {
+        let mut p = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                // Base ramp + per-column step pattern (every 3rd column
+                // takes a +40 luma bump) + per-row stripe (every 5th
+                // row takes a -20 luma dip). High-frequency content
+                // makes the §18.3 sixtap distinguish quarter-pixel
+                // offsets from half-pixel and whole-pixel offsets.
+                let base = ((x as i32) + 2 * (y as i32)).clamp(0, 180);
+                let step = if x % 3 == 0 { 40 } else { 0 };
+                let stripe = if y % 5 == 0 { -20 } else { 0 };
+                let v = (base + step + stripe).clamp(0, 240);
+                p[y * width + x] = v as u8;
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn quarter_pixel_refine_finds_quarter_pixel_horizontal_shift() {
+        // Build a synthetic source whose MB(1, 1) block is EXACTLY the
+        // §18.3 sixtap synthesis of the reference at MV (0, +1/4 px) so
+        // there is one and only one quarter-pixel candidate that drives
+        // the SAD to zero. The stepped_plane carries high-frequency
+        // content the sixtap distinguishes at every fractional offset
+        // (a purely linear plane like two_d_ramp gives identical bytes
+        // for every quarter/half-pixel MV in `u8` arithmetic).
+        let width = 64;
+        let height = 64;
+        let reference = stepped_plane(width, height);
+        let ref_luma = packed_luma_ref(&reference, width, height);
+        let truth_mv = Mv {
+            row: 0,
+            col: QUARTER_PIXEL_STEP,
+        };
+        // Source MB = sample-exact mirror of mb_luma_sad_at_mv's
+        // prediction at truth_mv (so SAD == 0 at truth_mv).
+        let mut src_blk = [0u8; 256];
+        let mv_eighth = stored_luma_mv(truth_mv);
+        let filters = filter_set_for_version(0).taps();
+        let blk_x0 = 16;
+        let blk_y0 = 16;
+        for sub_r in 0..4 {
+            for sub_c in 0..4 {
+                let blk_x = blk_x0 + sub_c * 4;
+                let blk_y = blk_y0 + sub_r * 4;
+                let patch = filter_block_4x4(
+                    &reference, width, width, height, blk_x, blk_y, mv_eighth, filters,
+                );
+                for r in 0..4 {
+                    let dst_row = sub_r * 4 + r;
+                    let dst_col = sub_c * 4;
+                    src_blk[dst_row * 16 + dst_col..dst_row * 16 + dst_col + 4]
+                        .copy_from_slice(&patch[r * 4..r * 4 + 4]);
+                }
+            }
+        }
+        // The driver starts at the whole-pixel center (0, 0), runs the
+        // half-pixel refinement first, then the quarter-pixel refinement.
+        // From the whole-pixel center the half-pixel refinement cannot
+        // reach the +1/4 px source (the half-pixel grid is a strict
+        // subset of the quarter-pixel grid), so the half-pixel result
+        // lands at one of {(0, 0), (0, +1/2)}; the quarter-pixel
+        // refinement around that result reaches (0, +1/4) via either a
+        // (0, +1) step from (0, 0) or a (0, -1) step from (0, +1/2).
+        let half = half_pixel_refine_luma(ref_luma, 1, 1, &src_blk, Mv { row: 0, col: 0 });
+        let result = quarter_pixel_refine_luma(ref_luma, 1, 1, &src_blk, half.mv);
+        assert_eq!(
+            result.mv, truth_mv,
+            "quarter-pixel +1/4 px horizontal shift expected, got {:?}",
+            result.mv
+        );
+        assert_eq!(result.sad, 0);
+    }
+
+    #[test]
+    fn quarter_pixel_refine_never_worsens_sad() {
+        // The refinement is descent semantics: the returned SAD must be
+        // ≤ the SAD at the half-pixel center.
+        let width = 48;
+        let height = 48;
+        let reference = ramp_plane(width, height);
+        // Synthesize a source with a slight fractional phase shift built
+        // by a manual triangle-tap (a/4 + b/2 + c/4) so the SAD topology
+        // has non-trivial quarter-pixel response.
+        let mut src_plane = reference.clone();
+        for y in 0..height {
+            for x in 1..(width - 1) {
+                let a = reference[y * width + x - 1] as u32;
+                let b = reference[y * width + x] as u32;
+                let c = reference[y * width + x + 1] as u32;
+                src_plane[y * width + x] = ((a + 2 * b + c) / 4) as u8;
+            }
+        }
+        let src_blk = extract_mb_block(&src_plane, width, 1, 1);
+        let ref_luma = packed_luma_ref(&reference, width, height);
+        let half_center = Mv {
+            row: 0,
+            col: HALF_PIXEL_STEP,
+        };
+        let sad_at_center = mb_luma_sad_at_mv(ref_luma, 1, 1, &src_blk, half_center);
+        let result = quarter_pixel_refine_luma(ref_luma, 1, 1, &src_blk, half_center);
+        assert!(
+            result.sad <= sad_at_center,
+            "quarter-pixel refinement must not worsen SAD (center={sad_at_center}, result={})",
+            result.sad
+        );
+        // The chosen MV must stay within ±QUARTER_PIXEL_STEP of the
+        // half-pixel center on each component — the refinement's
+        // neighbourhood is the 3×3 quarter-pixel grid. (The §17 quarter-
+        // pixel grid invariant is upheld by `Mv`'s i16 components by
+        // construction, since QUARTER_PIXEL_STEP == 1.)
+        let drow = result.mv.row - half_center.row;
+        let dcol = result.mv.col - half_center.col;
+        assert!(drow.abs() <= QUARTER_PIXEL_STEP);
+        assert!(dcol.abs() <= QUARTER_PIXEL_STEP);
+    }
+
+    #[test]
+    fn quarter_pixel_refine_clamps_at_section_17_1_boundary() {
+        // Center at the §17.1 boundary (row=col=+1022 = a half-pixel-grid
+        // MV near MV_MAX); quarter-pixel candidates that would step past
+        // +1023 get clamped back onto an already-evaluated MV and
+        // skipped. The result must stay on the quarter-pixel grid and
+        // inside §17.1's range.
+        let width = 32;
+        let height = 32;
+        let reference = vec![100u8; width * height];
+        let src_blk = [100u8; 256];
+        let result = quarter_pixel_refine_luma(
+            packed_luma_ref(&reference, width, height),
+            0,
+            0,
+            &src_blk,
+            Mv {
+                row: 1022,
+                col: 1022,
+            },
+        );
+        assert!((MV_MIN..=MV_MAX).contains(&result.mv.row));
+        assert!((MV_MIN..=MV_MAX).contains(&result.mv.col));
+        // The §17 quarter-pixel grid invariant is upheld by `Mv`'s
+        // i16 components by construction (QUARTER_PIXEL_STEP == 1).
+        // Flat ⇒ tie-break keeps the center.
+        assert_eq!(
+            result.mv,
+            Mv {
+                row: 1022,
+                col: 1022,
+            }
+        );
+        assert_eq!(result.sad, 0);
+    }
+
+    #[test]
+    fn quarter_pixel_refine_at_whole_pixel_center_equals_half_pixel_refine() {
+        // When the half-pixel center is a whole-pixel MV (both fractions
+        // zero), the quarter-pixel refinement explores the 8 ±1-§17-unit
+        // offsets around it. The result must still be a non-worsening
+        // refinement and live on the quarter-pixel grid.
+        let width = 48;
+        let height = 48;
+        let reference = ramp_plane(width, height);
+        let src_blk = extract_mb_block(&reference, width, 1, 1);
+        let ref_luma = packed_luma_ref(&reference, width, height);
+        let whole_center = Mv { row: 0, col: 0 };
+        let sad_at_center = mb_luma_sad_at_mv(ref_luma, 1, 1, &src_blk, whole_center);
+        let result = quarter_pixel_refine_luma(ref_luma, 1, 1, &src_blk, whole_center);
+        assert!(result.sad <= sad_at_center);
+        // Identical source/ref at MV (0,0) ⇒ tie-break keeps the center.
+        assert_eq!(result.mv, whole_center);
+        assert_eq!(result.sad, 0);
     }
 
     #[test]

@@ -350,8 +350,8 @@ pub use motion_comp::{
 };
 pub use motion_search::{
     block_sad_16x16, half_pixel_refine_luma, mb_luma_sad_at_mv, mb_luma_sad_at_whole_mv,
-    small_diamond_search_luma, LumaRef, SearchResult, HALF_PIXEL_STEP, MV_MAX, MV_MIN,
-    WHOLE_PIXEL_STEP,
+    quarter_pixel_refine_luma, small_diamond_search_luma, LumaRef, SearchResult, HALF_PIXEL_STEP,
+    MV_MAX, MV_MIN, QUARTER_PIXEL_STEP, WHOLE_PIXEL_STEP,
 };
 pub use motion_vector::{
     default_mv_contexts, mv_bits, mv_component_bits, read_mv, read_mv_component,

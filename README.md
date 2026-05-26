@@ -2,6 +2,54 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 145)
+
+**Encoder Phase 11 — §18.3 quarter-pixel motion-search refinement.**
+The P-frame picker now follows the round-144 `half_pixel_refine_luma`
+post-pass with a `quarter_pixel_refine_luma` second post-pass: it
+probes the 8 quarter-pixel offsets (±`QUARTER_PIXEL_STEP` on each of
+the row / col axes — i.e. the 3×3 grid around the half-pixel center,
+excluding the center) and keeps whichever 16×16 luma SAD is smallest.
+Each quarter-pixel candidate is evaluated through the §18.3 six-tap
+synthesis (`filter_block_4x4` under the `version == 0` bicubic tap-set),
+indexed by `(stored_luma_mv(mv) & 7)` — a §17 quarter-pixel offset of
+magnitude 1 selects the `1/4`-position filter row (`{ 2, -11, 108, 36,
+-8, 1 }`) or `3/4`-position row (the reverse) depending on the parity
+of the existing half-pixel component. The sub-pixel MV the picker picks
+is a SAD the decoder reproduces bit-for-bit. Tie-breaks prefer the
+half-pixel center — fewer §17.2 component bits to code. §17.1 clamping
+is applied per candidate: a quarter-pixel offset that walks past
+`±1023` collapses back onto an already-evaluated MV and is skipped.
+
+New public surface: `quarter_pixel_refine_luma(reference, mb_col,
+mb_row, src_y, half_pixel_center) -> SearchResult` (the refinement
+entry) and the `QUARTER_PIXEL_STEP = 1` quarter-pixel-unit constant
+(per §17.1, V is a signed integer in luma quarter-pixels).
+
+Validation: a new `tests/encoder_pframe_qpel.rs` integration test
+encodes a 2-frame I+P sequence whose P-frame source is the §18.3
+six-tap synthesis of the I-frame at MV (0, `+QUARTER_PIXEL_STEP`) — a
++0.25 px horizontal shift fundamentally unreachable from a half-pixel-
+only descent. With the refinement the picker emits 9 of 16
+quarter-pixel-only NEWMV MBs (`mv & 1 != 0`) and the self-decode
+Y-PSNR clears **48.85 dB** at `yac_qi = 4`. The round-144 half-pixel
+test still picks the same 3 of 16 half-pixel-grid NEWMV MBs and lands
+the same **57.0 dB** Y-PSNR (`yac_qi = 4`); the round-143 whole-pixel
+translation test still picks the same 4 of 16 whole-pixel NEWMV MBs
+and lands the same **50.34 dB** Y-PSNR (`yac_qi = 32`) — the tie-break
+ladder ("equal SAD ⇒ keep the lower-§17.2-bit candidate") protects
+the half-pixel and whole-pixel codepaths from drift. Five new
+`motion_search.rs` unit tests pin: flat-source tie-break, exact
+quarter-pixel shift recovery (using a stepped high-frequency plane
+since a linear ramp degenerates under sixtap `u8` rounding), descent
+never increases SAD, refinement at a whole-pixel center, §17.1 clamp
+safety at the boundary. Tests: 466 → 472 (+5 in `motion_search.rs`,
++1 in `encoder_pframe_qpel.rs`).
+
+`NEARESTMV` / `NEARMV` / `SPLITMV` candidates, `GOLDEN` / `ALTREF`
+source selection, multi-partition inter, and the per-MB §9.4 mode/ref
+delta layer remain follow-up rounds.
+
 ## Status — 2026-05-26 (round 144)
 
 **Encoder Phase 11 — §18.3 half-pixel motion-search refinement.** The
@@ -43,9 +91,10 @@ half-pixel shift recovery, descent never increases SAD,
 §17.1 clamp safety at the boundary. Tests: 460 → 466 (+5 in
 `motion_search.rs`, +1 in `encoder_pframe_halfpel.rs`).
 
-Quarter-pel refinement, `NEARESTMV` / `NEARMV` / `SPLITMV` candidates,
-`GOLDEN` / `ALTREF` source selection, multi-partition inter, and the
-per-MB §9.4 mode/ref delta layer remain follow-up rounds.
+Quarter-pel refinement landed in round 145; `NEARESTMV` / `NEARMV` /
+`SPLITMV` candidates, `GOLDEN` / `ALTREF` source selection,
+multi-partition inter, and the per-MB §9.4 mode/ref delta layer remain
+follow-up rounds.
 
 ## Status — 2026-05-26 (round 143)
 

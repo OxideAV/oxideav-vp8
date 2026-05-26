@@ -1,0 +1,277 @@
+//! End-to-end I + P self-decode roundtrip for the round-145 §18.3
+//! quarter-pixel refinement path
+//! ([`oxideav_vp8::encode_p_frame_zero_mv`]'s
+//! [`oxideav_vp8::quarter_pixel_refine_luma`] post-pass on the
+//! half-pixel search result).
+//!
+//! Encodes a 2-frame sequence where the P-frame source is the §18.3
+//! six-tap synthesis of the I-frame source at a deliberate **quarter-
+//! pixel** MV — a translation that is fundamentally unreachable from a
+//! half-pixel-only descent (any whole/half-pixel MV leaves a residue the
+//! §14 quantiser must absorb, capping PSNR). With the quarter-pixel
+//! refinement the encoder should pick at least one quarter-pixel MV per
+//! affected MB and produce a self-decode that bit-exactly recovers the
+//! source modulo the §14 quantiser's residual rounding.
+//!
+//! What this pins:
+//!
+//!   * the §18.3 `filter_block_4x4` six-tap synthesis on the encoder's
+//!     prediction path at the quarter-pixel-only filter rows (`1/4` and
+//!     `3/4`, i.e. eighth-pixel fractions 2 and 6 — distinct from the
+//!     `1/2` symmetric row exercised by the round-144 half-pixel test);
+//!   * the §17.2 `write_mv` round-trip carrying a quarter-pixel
+//!     differential (the `(mv & 3)` quarter-pixel bits propagate);
+//!   * the §-non-normative RD trade picking a quarter-pixel NEWMV over
+//!     ZEROMV / half-pixel NEWMV when the residue savings cover the
+//!     §17.2 bit cost.
+//!
+//! Black-box: the encoder's output is fed straight into the crate's own
+//! [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
+
+use oxideav_vp8::{
+    default_mv_contexts, encode_keyframe_with_reconstruction, encode_p_frame_zero_mv,
+    filter_block_4x4, filter_set_for_version, find_near_mvs, mv_ref_probs, read_inter_mode,
+    read_mv, stored_luma_mv, BoolDecoder, I420Frame, InterMode, KeyframeParams, MbInfo, Mv,
+    RefFrame, SignBias, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader, QUARTER_PIXEL_STEP,
+};
+
+fn plane_psnr(src: &[u8], rec: &[u8]) -> f64 {
+    assert_eq!(src.len(), rec.len());
+    let mut sse: u64 = 0;
+    for (a, b) in src.iter().zip(rec.iter()) {
+        let d = *a as i32 - *b as i32;
+        sse += (d * d) as u64;
+    }
+    if sse == 0 {
+        return f64::INFINITY;
+    }
+    let mse = sse as f64 / src.len() as f64;
+    10.0 * (255.0f64 * 255.0 / mse).log10()
+}
+
+/// Build an I-frame luma plane with sharp luminance steps superimposed
+/// on a gentle ramp. The high-frequency content gives the §18.3 sixtap a
+/// distinct response at every quarter-pixel offset (a pure linear ramp
+/// would yield identical bytes for every quarter / half / whole-pixel
+/// MV after `u8` rounding, defeating the picker).
+fn frame_with_high_frequency_content(width: usize, height: usize) -> Vec<u8> {
+    let mut y = vec![0u8; width * height];
+    for r in 0..height {
+        for c in 0..width {
+            let base = ((c as i32) / 2 + (r as i32) / 3).clamp(0, 160);
+            let step = if c % 3 == 0 { 40 } else { 0 };
+            let stripe = if r % 5 == 0 { -20 } else { 0 };
+            y[r * width + c] = (base + step + stripe).clamp(0, 240) as u8;
+        }
+    }
+    y
+}
+
+/// Synthesise the P-frame source as the §18.3 six-tap prediction of the
+/// I-frame plane at a global quarter-pixel MV. The result is the "exact"
+/// pixel data a quarter-pixel-aware encoder should be able to
+/// reconstruct with a zero residue (modulo §14 quantiser rounding).
+fn shift_plane_by_quarter_pixel(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    mv_quarter: Mv,
+) -> Vec<u8> {
+    let filters = filter_set_for_version(0).taps();
+    let mv_eighth = stored_luma_mv(mv_quarter);
+    let mut out = vec![0u8; width * height];
+    for blk_y in (0..height).step_by(4) {
+        for blk_x in (0..width).step_by(4) {
+            let patch =
+                filter_block_4x4(src, width, width, height, blk_x, blk_y, mv_eighth, filters);
+            for r in 0..4 {
+                for c in 0..4 {
+                    let dy = blk_y + r;
+                    let dx = blk_x + c;
+                    if dy < height && dx < width {
+                        out[dy * width + dx] = patch[r * 4 + c];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Strip down the §11/§16 macroblock-mode walk to extract per-MB
+/// `(InterMode, Mv)` from an encoded P-frame (every MB inter against
+/// LAST, no segmentation, no token-prob updates, §17.2 mv_prob_update
+/// F-gates all zero — the [`oxideav_vp8::encode_p_frame_zero_mv`]
+/// convention).
+fn parse_p_frame_inter_modes(bytes: &[u8], mb_cols: usize, mb_rows: usize) -> Vec<(InterMode, Mv)> {
+    let header = Vp8FrameHeader::parse(bytes).expect("parse P-frame header");
+    let off = header.header_bytes_consumed;
+    let size = header.first_partition_size as usize;
+    let first = &bytes[off..off + size];
+    let (coded, mut dec) =
+        Vp8CodedHeader::parse_with_decoder(first, false).expect("parse coded header");
+
+    let prob_skip_false = coded.prob_skip_false.expect("prob_skip_false present");
+    let prob_intra = coded.prob_intra.expect("prob_intra present");
+    let prob_last = coded.prob_last.expect("prob_last present");
+    let mv_contexts = default_mv_contexts();
+
+    let mut above: Vec<MbInfo> = vec![MbInfo::border(); mb_cols];
+    let mut out: Vec<(InterMode, Mv)> = Vec::with_capacity(mb_rows * mb_cols);
+
+    for mb_row in 0..mb_rows {
+        let mut left = MbInfo::border();
+        let mut aboveleft = MbInfo::border();
+        for (mb_col, above_slot) in above.iter_mut().enumerate() {
+            let _ = dec.read_bool(prob_skip_false).expect("skip bit");
+            let _ = dec.read_bool(prob_intra).expect("inter bit");
+            let _ = dec.read_bool(prob_last).expect("ref-frame bit");
+            let near = find_near_mvs(
+                above_slot,
+                &left,
+                &aboveleft,
+                RefFrame::Last,
+                SignBias::default(),
+            );
+            let probs = mv_ref_probs(&near.cnt);
+            let mode = read_inter_mode(&mut dec, &probs).expect("inter mode");
+            let mv = match mode {
+                InterMode::Zero => Mv::default(),
+                InterMode::New => {
+                    let bounds = oxideav_vp8::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+                    let best = oxideav_vp8::clamp_mv(near.mvs[0], &bounds);
+                    let diff = read_mv(&mut dec, &mv_contexts).expect("NEWMV diff");
+                    Mv {
+                        row: best.row.wrapping_add(diff.row),
+                        col: best.col.wrapping_add(diff.col),
+                    }
+                }
+                other => panic!("encoder emitted unexpected inter mode {other:?}"),
+            };
+            out.push((mode, mv));
+            let cur = MbInfo {
+                ref_frame: Some(RefFrame::Last),
+                mv,
+                is_split: false,
+                split_mvs: None,
+            };
+            aboveleft = *above_slot;
+            left = cur;
+            *above_slot = cur;
+        }
+    }
+    out
+}
+
+/// A 2-frame I+P sequence whose P-frame source is the §18.3 sixtap
+/// synthesis of the I-frame source at MV (row=0, col=+QUARTER_PIXEL_STEP).
+/// The quarter-pixel-aware picker MUST emit at least one quarter-pixel
+/// NEWMV (the only MV that recovers the +0.25 px shift with a zero
+/// residue), and the self-decode Y-PSNR must clear a tighter threshold
+/// than the round-144 half-pixel-only floor on a quarter-pixel-shifted
+/// scene (which had to absorb the residue through the §14 quantiser).
+#[test]
+fn i_plus_p_quarter_pixel_shift_emits_quarter_pixel_newmv_and_clears_44db() {
+    let (w, h) = (64usize, 64usize);
+    let (cw, ch) = (w / 2, h / 2);
+
+    let y_i = frame_with_high_frequency_content(w, h);
+    // P-frame source = §18.3 sixtap of I at MV (0, +1/4 px). Apply only
+    // inside the inner region — the outer 16-pixel ring uses the I-frame
+    // values verbatim so the encoder's edge-replicated quarter-pixel halo
+    // does not introduce uncontrolled SAD.
+    let mut y_p = shift_plane_by_quarter_pixel(
+        &y_i,
+        w,
+        h,
+        Mv {
+            row: 0,
+            col: QUARTER_PIXEL_STEP,
+        },
+    );
+    // Outer 8 px border = I-frame values verbatim so MB(0,*) / MB(*,0) /
+    // MB(rows-1, *) / MB(*, cols-1) have ZEROMV as their winning MV
+    // (their content didn't move). We only care that the INNER MBs (the
+    // ones that fully landed inside the quarter-pixel-shifted region)
+    // pick a quarter-pixel MV.
+    for r in 0..h {
+        for c in 0..w {
+            let in_border = r < 8 || r >= h - 8 || c < 8 || c >= w - 8;
+            if in_border {
+                y_p[r * w + c] = y_i[r * w + c];
+            }
+        }
+    }
+
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
+
+    let frame_i = I420Frame::packed(w as u32, h as u32, &y_i, &u, &v);
+    let frame_p = I420Frame::packed(w as u32, h as u32, &y_p, &u, &v);
+
+    let params = KeyframeParams {
+        y_ac_qi: 4, // low quantiser ⇒ §14 residue rounding is tiny ⇒ the
+        // quarter-pixel-MV PSNR gap vs. half-pixel-only is what dominates.
+        loop_filter_level: 0,
+        sharpness_level: 0,
+        nbr_of_dct_partitions: 1,
+    };
+
+    let (i_bytes, i_recon) =
+        encode_keyframe_with_reconstruction(&frame_i, &params).expect("encode I");
+    let (p_bytes, _) = encode_p_frame_zero_mv(&frame_p, &i_recon, &params).expect("encode P");
+
+    let mut state = Vp8DecoderState::new();
+    let _i_decoded = state.decode_frame(&i_bytes).expect("decode I");
+    let p_decoded = state.decode_frame(&p_bytes).expect("decode P");
+
+    let y_psnr = plane_psnr(&y_p, &p_decoded.y);
+    eprintln!("quarter-pixel-shifted P-frame self-decode Y-PSNR: {y_psnr:.2} dB (yac_qi=4)");
+    // A half-pixel-only encoder absorbs the +0.25 px shift through the
+    // §14 residue, capping Y-PSNR around the high 30s on this content;
+    // the quarter-pixel-aware encoder should clear 44 dB once the picker
+    // is choosing quarter-pixel MVs.
+    assert!(
+        y_psnr >= 44.0,
+        "quarter-pixel P-frame Y-plane self-decode PSNR {y_psnr:.2} dB < 44 dB"
+    );
+
+    // ---- Verify at least one quarter-pixel-only NEWMV was emitted ---
+    let mb_cols = w.div_ceil(16);
+    let mb_rows = h.div_ceil(16);
+    let modes = parse_p_frame_inter_modes(&p_bytes, mb_cols, mb_rows);
+    // Quarter-pixel-only MVs are §17 components with `mv & 1 != 0`
+    // (any odd quarter-pixel count) — i.e. the MV is on the §17 quarter-
+    // pixel grid but NOT on the half-pixel grid (mv % 2 == 0).
+    let quarter_pixel_only_newmv_count = modes
+        .iter()
+        .filter(|(mode, mv)| *mode == InterMode::New && ((mv.row & 1) != 0 || (mv.col & 1) != 0))
+        .count();
+    eprintln!(
+        "P-frame inter-mode pick: {quarter_pixel_only_newmv_count}/{} quarter-pixel-only NEWMV MBs",
+        modes.len()
+    );
+    assert!(
+        quarter_pixel_only_newmv_count >= 1,
+        "expected at least 1 quarter-pixel-only NEWMV on a +1/4 px shifted scene, got {}/{}",
+        quarter_pixel_only_newmv_count,
+        modes.len()
+    );
+
+    // Every NEWMV MB must still satisfy §17.1 [-1023, +1023].
+    for (i, (mode, mv)) in modes.iter().enumerate() {
+        if *mode == InterMode::New {
+            assert!(
+                (-1023..=1023).contains(&mv.row) && (-1023..=1023).contains(&mv.col),
+                "MB {i}: §17.1 range violation, mv={mv:?}"
+            );
+        }
+    }
+}
+
+// Silence the unused-import lint when the test binary's import block is
+// pruned by future maintenance — `BoolDecoder` is used inside
+// `parse_p_frame_inter_modes` via the `bool_decoder::read_bool` method,
+// but rustc's unused-import check counts only direct uses.
+#[allow(dead_code)]
+fn _unused_imports_kept_alive(_d: BoolDecoder<'_>) {}

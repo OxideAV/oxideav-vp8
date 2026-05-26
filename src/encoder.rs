@@ -120,6 +120,16 @@ pub enum EncodeError {
         /// The offending value (must be `0`, `1`, or `2`).
         value: u8,
     },
+    /// A §9.4 reference or mode `loop_filter_delta` value exceeded the
+    /// 6-bit-magnitude + 1-bit-sign field (`abs(value) > 63`). Surfaced
+    /// by [`LoopFilterDeltas::validate`] and
+    /// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas`].
+    LoopFilterDeltaOutOfRange {
+        /// The §9.4 delta slot whose value was out of range.
+        which: LoopFilterDeltaSlot,
+        /// The offending signed value (must be `-63..=63`).
+        value: i16,
+    },
 }
 
 /// Names the two §9.7 `copy_buffer_to_*` selector fields so a rejected
@@ -132,6 +142,38 @@ pub enum CopyBufferSelector {
     /// §9.7 `copy_buffer_to_alternate` — 0 = none, 1 = copy `last_frame`,
     /// 2 = copy `golden_frame`.
     Alternate,
+}
+
+/// Names the §9.4 per-reference + per-mode `loop_filter_delta` slots so
+/// a rejected value in [`LoopFilterDeltas`] can report which one failed.
+///
+/// The four reference slots are indexed by their §20.6 `ref_frame`
+/// order (`CURRENT_FRAME = 0`, `LAST_FRAME = 1`, `GOLDEN_FRAME = 2`,
+/// `ALTREF_FRAME = 3`); the four mode slots are indexed by the §20.6
+/// `mode_delta[]` order (`B_PRED = 0`, `ZERO_MV = 1`, `NEAREST/NEAR/NEW = 2`,
+/// `SPLIT_MV = 3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopFilterDeltaSlot {
+    /// §20.6 `ref_delta[CURRENT_FRAME]` — applied to intra-coded MBs.
+    RefCurrent,
+    /// §20.6 `ref_delta[LAST_FRAME]` — applied to inter MBs predicting
+    /// from `LAST`.
+    RefLast,
+    /// §20.6 `ref_delta[GOLDEN_FRAME]` — applied to inter MBs predicting
+    /// from `GOLDEN`.
+    RefGolden,
+    /// §20.6 `ref_delta[ALTREF_FRAME]` — applied to inter MBs predicting
+    /// from `ALTREF`.
+    RefAltref,
+    /// §20.6 `mode_delta[0]` — applied to intra MBs with `y_mode = B_PRED`.
+    ModeBpred,
+    /// §20.6 `mode_delta[1]` — applied to inter MBs with `y_mode = ZEROMV`.
+    ModeZeroMv,
+    /// §20.6 `mode_delta[2]` — applied to inter MBs with `y_mode` in
+    /// `{NEARESTMV, NEARMV, NEWMV}`.
+    ModeOtherMv,
+    /// §20.6 `mode_delta[3]` — applied to inter MBs with `y_mode = SPLITMV`.
+    ModeSplitMv,
 }
 
 impl core::fmt::Display for EncodeError {
@@ -182,6 +224,21 @@ impl core::fmt::Display for EncodeError {
                 match which {
                     CopyBufferSelector::Golden => "golden",
                     CopyBufferSelector::Alternate => "alternate",
+                }
+            ),
+            EncodeError::LoopFilterDeltaOutOfRange { which, value } => write!(
+                f,
+                "vp8 encode: loop_filter_delta[{}] = {value} is outside the \
+                 §9.4 6-bit-magnitude + 1-bit-sign field (-63..=63)",
+                match which {
+                    LoopFilterDeltaSlot::RefCurrent => "ref_current",
+                    LoopFilterDeltaSlot::RefLast => "ref_last",
+                    LoopFilterDeltaSlot::RefGolden => "ref_golden",
+                    LoopFilterDeltaSlot::RefAltref => "ref_altref",
+                    LoopFilterDeltaSlot::ModeBpred => "mode_bpred",
+                    LoopFilterDeltaSlot::ModeZeroMv => "mode_zero_mv",
+                    LoopFilterDeltaSlot::ModeOtherMv => "mode_other_mv",
+                    LoopFilterDeltaSlot::ModeSplitMv => "mode_split_mv",
                 }
             ),
         }
@@ -539,6 +596,239 @@ pub fn write_loop_filter(
     // when the feature is off — the rest of the table is gated on it.
     enc.write_bool(128, loop_filter_adj_enable);
     Ok(())
+}
+
+/// Caller-supplied per-reference + per-mode loop-filter delta layer
+/// per RFC 6386 §9.4 (the `mb_lf_adjustments()` sub-block).
+///
+/// The decoder already honours these deltas
+/// ([`crate::loop_filter::calculate_mb_filter_level_inter`]): each
+/// per-MB filter level starts from the frame `loop_filter_level`, then
+/// receives the matching `ref_frame_delta[ref]` plus the matching
+/// `mode_delta[mode]`, with the final level clamped into `0..=63`.
+/// This struct gives the encoder a way to *transmit* the deltas in the
+/// §19.2 frame header so the decoder applies them, and to use the same
+/// deltas during the encoder's own §15 post-walk filter pass so the
+/// encoder's reconstruction buffer stays byte-identical to what the
+/// decoder rebuilds.
+///
+/// `enabled` corresponds to the §19.2 `loop_filter_adj_enable` bit
+/// (`true` ⇒ the delta layer is on for this frame). `update`
+/// corresponds to the §19.2 `mode_ref_lf_delta_update` bit (`true` ⇒
+/// the frame carries fresh delta values; `false` ⇒ the decoder reuses
+/// the deltas from a prior frame). When `enabled` is `false` no per-MB
+/// delta is applied (and `update` is irrelevant). When `enabled` is
+/// `true` but `update` is `false`, no per-slot values are written to
+/// the bitstream — the decoder pulls from its carried state.
+///
+/// When `update` is `true`, each per-slot `Option<i8>` is either
+/// `Some(v)` (a fresh signed value with `abs(v) <= 63` is emitted) or
+/// `None` (the slot's bit `delta_update_flag` is 0 and the decoder
+/// keeps its carried value for that slot). The four `ref_frame_delta`
+/// slots are indexed by `CURRENT_FRAME = 0`, `LAST_FRAME = 1`,
+/// `GOLDEN_FRAME = 2`, `ALTREF_FRAME = 3` (§20.6 `ref_delta[]` order).
+/// The four `mode_delta` slots are indexed by `B_PRED = 0`,
+/// `ZERO_MV = 1`, `NEAREST/NEAR/NEW = 2`, `SPLIT_MV = 3` (§20.6
+/// `mode_delta[]` order).
+///
+/// The encoder's §15 post-walk filter pass reads the *effective*
+/// deltas — the values it just wrote plus the carried values for any
+/// `None` slot. The encoder maintains its own carried state across
+/// frames inside [`Vp8InterStreamEncoder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopFilterDeltas {
+    /// §19.2 `loop_filter_adj_enable` (L1).
+    pub enabled: bool,
+    /// §19.2 `mode_ref_lf_delta_update` (L1). Only consulted when
+    /// `enabled` is `true`; if `false`, no per-slot values are written
+    /// and the decoder reuses the prior frame's deltas.
+    pub update: bool,
+    /// §19.2 four per-reference deltas, in the §20.6 `{CURRENT, LAST,
+    /// GOLDEN, ALTREF}` index order. Each `Some(v)` writes the
+    /// per-slot flag = 1 followed by L(6) magnitude + L(1) sign;
+    /// `None` writes the flag = 0 (decoder keeps its carried value).
+    /// Magnitudes greater than 63 are rejected by [`Self::validate`].
+    pub ref_frame_delta: [Option<i8>; 4],
+    /// §19.2 four per-mode deltas, in the §20.6 `{B_PRED, ZERO_MV,
+    /// OTHER_MV, SPLIT_MV}` index order. Same encoding as
+    /// `ref_frame_delta`.
+    pub mode_delta: [Option<i8>; 4],
+}
+
+impl Default for LoopFilterDeltas {
+    /// Disabled deltas: matches the round-150-and-earlier behaviour
+    /// (`loop_filter_adj_enable = 0`).
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            update: false,
+            ref_frame_delta: [None; 4],
+            mode_delta: [None; 4],
+        }
+    }
+}
+
+impl LoopFilterDeltas {
+    /// Per-slot magnitude check: every `Some(v)` must satisfy
+    /// `abs(v) <= 63` (the §9.4 L(6) + L(1) field). Out-of-range values
+    /// surface as [`EncodeError::LoopFilterDeltaOutOfRange`] before any
+    /// encoding work runs.
+    pub fn validate(&self) -> Result<(), EncodeError> {
+        const REF_SLOTS: [LoopFilterDeltaSlot; 4] = [
+            LoopFilterDeltaSlot::RefCurrent,
+            LoopFilterDeltaSlot::RefLast,
+            LoopFilterDeltaSlot::RefGolden,
+            LoopFilterDeltaSlot::RefAltref,
+        ];
+        const MODE_SLOTS: [LoopFilterDeltaSlot; 4] = [
+            LoopFilterDeltaSlot::ModeBpred,
+            LoopFilterDeltaSlot::ModeZeroMv,
+            LoopFilterDeltaSlot::ModeOtherMv,
+            LoopFilterDeltaSlot::ModeSplitMv,
+        ];
+        for (slot, value) in REF_SLOTS.iter().zip(self.ref_frame_delta.iter()) {
+            if let Some(v) = value {
+                let mag = (*v as i16).unsigned_abs();
+                if mag > 63 {
+                    return Err(EncodeError::LoopFilterDeltaOutOfRange {
+                        which: *slot,
+                        value: *v as i16,
+                    });
+                }
+            }
+        }
+        for (slot, value) in MODE_SLOTS.iter().zip(self.mode_delta.iter()) {
+            if let Some(v) = value {
+                let mag = (*v as i16).unsigned_abs();
+                if mag > 63 {
+                    return Err(EncodeError::LoopFilterDeltaOutOfRange {
+                        which: *slot,
+                        value: *v as i16,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the effective per-slot ref + mode deltas the §15 filter
+    /// pass must use this frame, given the carried (across-frame) delta
+    /// state. Matches the §9.4 / §20.6 "previous-frame values are used
+    /// unless updated in the current header" rule:
+    ///
+    /// * If `enabled` is `false`, every effective slot resolves to 0
+    ///   (the per-MB delta layer is off — the §15 filter level is the
+    ///   frame base only).
+    /// * If `enabled` is `true` and `update` is `false`, every
+    ///   effective slot equals the carried value (no fresh values
+    ///   transmitted, the decoder reuses its carried state).
+    /// * If `enabled` is `true` and `update` is `true`, each slot
+    ///   resolves to its `Some(v)` value if updated this frame,
+    ///   otherwise to the carried value (the per-slot "absent" path
+    ///   keeps prior state).
+    ///
+    /// Returns `(effective_ref_deltas, effective_mode_deltas)` in the
+    /// §20.6 `{CURRENT, LAST, GOLDEN, ALTREF}` / `{B_PRED, ZERO_MV,
+    /// OTHER_MV, SPLIT_MV}` index order. The returned arrays match
+    /// what [`crate::loop_filter::FrameFilterConfig::interframe`]
+    /// resolves from the parsed `mb_lf_adjustments` block — encoder
+    /// and decoder agree on the effective values byte-for-byte.
+    pub fn effective(
+        &self,
+        carried_ref_deltas: [i16; 4],
+        carried_mode_deltas: [i16; 4],
+    ) -> ([i16; 4], [i16; 4]) {
+        if !self.enabled {
+            return ([0; 4], [0; 4]);
+        }
+        if !self.update {
+            return (carried_ref_deltas, carried_mode_deltas);
+        }
+        let mut eff_ref = carried_ref_deltas;
+        let mut eff_mode = carried_mode_deltas;
+        for (slot, value) in eff_ref.iter_mut().zip(self.ref_frame_delta.iter()) {
+            if let Some(v) = value {
+                *slot = *v as i16;
+            }
+        }
+        for (slot, value) in eff_mode.iter_mut().zip(self.mode_delta.iter()) {
+            if let Some(v) = value {
+                *slot = *v as i16;
+            }
+        }
+        (eff_ref, eff_mode)
+    }
+}
+
+/// §9.4 loop-filter writer with caller-supplied per-reference + per-mode
+/// `mb_lf_adjustments()` deltas.
+///
+/// Extends [`write_loop_filter`] with [`LoopFilterDeltas`] support: the
+/// `loop_filter_adj_enable` bit + (when set) the `mode_ref_lf_delta_update`
+/// bit + (when set) the four per-reference + four per-mode L(1) presence
+/// flags and gated L(6) magnitude + L(1) sign values follow the §19.2
+/// frame-header layout exactly. Passing
+/// [`LoopFilterDeltas::default`] (with `enabled = false`) reproduces
+/// the round-150 wire (`loop_filter_adj_enable = 0`) byte-for-byte.
+pub fn write_loop_filter_with_deltas(
+    enc: &mut BoolEncoder,
+    filter_type: bool,
+    loop_filter_level: u8,
+    sharpness_level: u8,
+    deltas: &LoopFilterDeltas,
+) -> Result<(), EncodeError> {
+    if loop_filter_level > 63 {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: loop_filter_level,
+        });
+    }
+    if sharpness_level > 7 {
+        return Err(EncodeError::SharpnessLevelOutOfRange {
+            value: sharpness_level,
+        });
+    }
+    deltas.validate()?;
+
+    enc.write_bool(128, filter_type);
+    enc.write_literal(loop_filter_level as u32, 6);
+    enc.write_literal(sharpness_level as u32, 3);
+
+    // mb_lf_adjustments() — §9.4 / §19.2 (page 121–122).
+    enc.write_bool(128, deltas.enabled);
+    if deltas.enabled {
+        enc.write_bool(128, deltas.update);
+        if deltas.update {
+            for slot in &deltas.ref_frame_delta {
+                match slot {
+                    Some(v) => {
+                        enc.write_bool(128, true);
+                        write_signed_lf_delta(enc, *v);
+                    }
+                    None => enc.write_bool(128, false),
+                }
+            }
+            for slot in &deltas.mode_delta {
+                match slot {
+                    Some(v) => {
+                        enc.write_bool(128, true);
+                        write_signed_lf_delta(enc, *v);
+                    }
+                    None => enc.write_bool(128, false),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit the §9.4 L(6) magnitude + L(1) sign payload for a single
+/// `loop_filter_delta` slot. Mirrors the decoder's `read_signed_delta`
+/// reconstruction in [`crate::coded_header`].
+fn write_signed_lf_delta(enc: &mut BoolEncoder, value: i8) {
+    debug_assert!((-63..=63).contains(&(value as i16)));
+    let magnitude = (value as i16).unsigned_abs() as u32;
+    enc.write_literal(magnitude, 6);
+    enc.write_bool(128, value < 0);
 }
 
 /// §9.5 `log2_nbr_of_dct_partitions` writer.
@@ -4463,6 +4753,57 @@ pub fn encode_p_frame_multi_ref(
 }
 
 /// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
+/// §9.8 reference-slot refresh control **and** caller-driven §9.4
+/// per-reference / per-mode `loop_filter_delta` layer.
+///
+/// Extends [`encode_p_frame_multi_ref_with_refresh`] with the §9.4
+/// `mb_lf_adjustments()` sub-block: the frame header emits the new
+/// `loop_filter_adj_enable` / `mode_ref_lf_delta_update` bits and the
+/// gated per-slot L(6) + L(1) values per [`LoopFilterDeltas`], and the
+/// encoder's own §15 post-walk filter pass uses the effective per-MB
+/// filter level ([`crate::loop_filter::calculate_mb_filter_level_inter`])
+/// so the encoder's reconstruction buffer matches what the decoder
+/// rebuilds from the same wire byte-for-byte.
+///
+/// `carried_ref_deltas` and `carried_mode_deltas` represent the
+/// across-frame delta state per RFC 6386 §9.4: "the values from the
+/// previous frame are used, unless they are updated in the current
+/// header." For a standalone encode (no prior frame state), pass
+/// `[0; 4]` for both; for a streaming caller, thread the values from
+/// the previous frame's effective deltas — [`Vp8InterStreamEncoder`]
+/// does this automatically.
+///
+/// Wire compatibility: `LoopFilterDeltas::default()` (with
+/// `enabled = false`) and `[0; 4]` carried state reproduce the
+/// round-150 wire byte-for-byte. Setting `enabled = true` flips on the
+/// §9.4 layer; setting `update = false` while `enabled = true` reuses
+/// the carried deltas without writing fresh values.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+    )
+}
+
+/// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
 /// §9.8 reference-slot refresh control.
 ///
 /// Extends [`encode_p_frame_zero_mv`] with optional `golden` and
@@ -4533,7 +4874,33 @@ pub fn encode_p_frame_multi_ref_with_refresh(
     params: &KeyframeParams,
     refresh: &RefreshControls,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_multi_ref_inner(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
+    lf_deltas.validate()?;
     let width = frame.width;
     let height = frame.height;
     if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
@@ -4865,6 +5232,17 @@ pub fn encode_p_frame_multi_ref_with_refresh(
     let prob_last_fit = fit_prob_l8(count_last, count_golden + count_altref);
     let prob_gf_fit = fit_prob_l8(count_golden, count_altref);
 
+    // ---- §9.4 effective per-reference / per-mode delta resolution -------
+    //
+    // RFC 6386 §9.4: per-slot deltas persist across frames; a slot's
+    // `delta_update_flag = 0` (`None` in `LoopFilterDeltas`) means the
+    // decoder keeps the value it carried in from the previous frame.
+    // The encoder's §15 post-walk filter must use the SAME effective
+    // value the decoder will use (otherwise our reconstruction would
+    // diverge from the wire), so resolve effective deltas here.
+    let (effective_ref_deltas, effective_mode_deltas) =
+        lf_deltas.effective(carried_ref_deltas, carried_mode_deltas);
+
     // ---- §15 loop-filter post-pass --------------------------------------
     if params.loop_filter_level != 0 {
         let lf_config = crate::loop_filter::FrameFilterConfig {
@@ -4875,15 +5253,15 @@ pub fn encode_p_frame_multi_ref_with_refresh(
             segmentation_enabled: false,
             segment_abs: false,
             segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
-            delta_enabled: false,
-            ref_delta_current: 0,
-            bpred_mode_delta: 0,
-            ref_delta_last: 0,
-            ref_delta_golden: 0,
-            ref_delta_altref: 0,
-            zero_mv_mode_delta: 0,
-            other_mv_mode_delta: 0,
-            split_mv_mode_delta: 0,
+            delta_enabled: lf_deltas.enabled,
+            ref_delta_current: effective_ref_deltas[0],
+            bpred_mode_delta: effective_mode_deltas[0],
+            ref_delta_last: effective_ref_deltas[1],
+            ref_delta_golden: effective_ref_deltas[2],
+            ref_delta_altref: effective_ref_deltas[3],
+            zero_mv_mode_delta: effective_mode_deltas[1],
+            other_mv_mode_delta: effective_mode_deltas[2],
+            split_mv_mode_delta: effective_mode_deltas[3],
         };
         crate::loop_filter::filter_inter_frame(
             &mut planes,
@@ -4902,14 +5280,16 @@ pub fn encode_p_frame_multi_ref_with_refresh(
     // key-frame-only per §9.2).
     // §9.3 — segmentation off.
     write_segment_update_flags(&mut hdr, false);
-    // §9.4 — loop filter. `filter_type = false` (normal),
-    // `mode_ref_lf_delta_enabled = false`.
-    write_loop_filter(
+    // §9.4 — loop filter. `filter_type = false` (normal). The §19.2
+    // `mb_lf_adjustments()` sub-block follows whatever the caller's
+    // `LoopFilterDeltas` says — including the default
+    // `loop_filter_adj_enable = 0` for the round-150 wire shape.
+    write_loop_filter_with_deltas(
         &mut hdr,
         false,
         params.loop_filter_level,
         params.sharpness_level,
-        false,
+        lf_deltas,
     )?;
     // §9.5 — partition count. Macroblock rows are distributed
     // round-robin across the §9.5 partitions per the §20.4 row-loop

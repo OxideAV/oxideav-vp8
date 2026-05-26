@@ -62,8 +62,8 @@
 //!   `if (!key_frame)`).
 
 use crate::encoder::{
-    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref,
-    encode_p_frame_multi_ref_with_refresh, EncodeError, I420Frame, KeyframeParams, RefreshControls,
+    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref, EncodeError, I420Frame,
+    KeyframeParams, LoopFilterDeltas, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
 use crate::state::RefFrameSlot;
@@ -416,6 +416,17 @@ pub struct Vp8InterStreamEncoder {
     last: Option<RefFrameSlot>,
     golden: Option<RefFrameSlot>,
     altref: Option<RefFrameSlot>,
+    /// Across-frame §9.4 `ref_frame_delta[]` state in the §20.6
+    /// `{CURRENT, LAST, GOLDEN, ALTREF}` order. Threaded into every
+    /// P-frame's [`oxideav_vp8::LoopFilterDeltas::effective`] call so
+    /// the encoder's §15 post-walk filter matches what the decoder
+    /// derives from the wire. Reset to `[0; 4]` on every key frame
+    /// (RFC 6386 §9.4 — key frames begin a fresh delta sequence).
+    carried_ref_deltas: [i16; 4],
+    /// Across-frame §9.4 `mode_delta[]` state in the §20.6 `{B_PRED,
+    /// ZERO_MV, OTHER_MV, SPLIT_MV}` order. Same lifecycle as
+    /// `carried_ref_deltas`.
+    carried_mode_deltas: [i16; 4],
 }
 
 impl Vp8InterStreamEncoder {
@@ -445,6 +456,8 @@ impl Vp8InterStreamEncoder {
             last: None,
             golden: None,
             altref: None,
+            carried_ref_deltas: [0; 4],
+            carried_mode_deltas: [0; 4],
         })
     }
 
@@ -576,12 +589,21 @@ impl Vp8InterStreamEncoder {
                 self.golden = Some(new_slot.clone());
                 self.altref = Some(new_slot);
                 self.last_keyframe_index = Some(frame_index);
+                // §9.4 key frames begin a fresh delta sequence — clear
+                // the carried state so the next P-frame's effective
+                // deltas start from 0 (matching the decoder's behaviour
+                // after a key frame).
+                self.carried_ref_deltas = [0; 4];
+                self.carried_mode_deltas = [0; 4];
             }
             FrameKind::InterZeroMv => {
                 // §9.7 inter refresh ladder used by encode_p_frame_zero_mv:
                 // refresh_last = 1, refresh_golden_frame = 0,
                 // refresh_alternate_frame = 0, copy_buffer_to_* = 0.
-                // Only LAST changes.
+                // Only LAST changes. The §9.4 carried-delta state stays
+                // unchanged (the scheduler-driven path emits
+                // `loop_filter_adj_enable = 0`, so this frame's effective
+                // deltas are all 0 and we have no fresh values to carry).
                 self.last = Some(new_slot);
             }
         }
@@ -644,6 +666,38 @@ impl Vp8InterStreamEncoder {
         frame: &I420Frame<'_>,
         refresh: &RefreshControls,
     ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_p_frame_with_refresh_and_lf_deltas(frame, refresh, &LoopFilterDeltas::default())
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern **and** a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter
+    /// delta layer.
+    ///
+    /// Companion to [`Self::encode_p_frame_with_refresh`] that exposes
+    /// the §9.4 `loop_filter_adj_enable` /
+    /// `mode_ref_lf_delta_update` + per-slot delta fields through
+    /// [`crate::encoder::LoopFilterDeltas`]. The stream encoder threads
+    /// the across-frame carried delta state per RFC 6386 §9.4 ("the
+    /// values from the previous frame are used, unless they are updated
+    /// in the current header") — the caller does not need to track it.
+    ///
+    /// Wire compatibility: passing
+    /// [`crate::encoder::LoopFilterDeltas::default`] (with
+    /// `enabled = false`) reproduces
+    /// [`Self::encode_p_frame_with_refresh`] byte-for-byte, including
+    /// when called repeatedly through the carried-state mechanism
+    /// (`enabled = false` resolves effective deltas to 0 regardless
+    /// of carried state).
+    ///
+    /// Slot-rotation and pre-conditions match
+    /// [`Self::encode_p_frame_with_refresh`].
+    pub fn encode_p_frame_with_refresh_and_lf_deltas(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
         let dims = (frame.width, frame.height);
         match self.dimensions {
             Some(locked) if locked != dims => {
@@ -662,16 +716,38 @@ impl Vp8InterStreamEncoder {
         let last_planes = ref_slot_to_keyframe_planes(last_slot);
         let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
         let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
-        let (bytes, planes) = encode_p_frame_multi_ref_with_refresh(
+        let (bytes, planes) = crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas(
             frame,
             &last_planes,
             golden_planes.as_ref(),
             altref_planes.as_ref(),
             &self.params,
             refresh,
+            lf_deltas,
+            self.carried_ref_deltas,
+            self.carried_mode_deltas,
         )?;
 
         let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // The decoder updates its carried state with the effective
+        // values it just resolved (carried + present updates). Mirror
+        // that exactly so the next frame's effective deltas line up.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            // RFC 6386 §9.4: when adj is enabled, the carried state for
+            // the NEXT frame is what this frame's effective deltas
+            // resolved to (whether they came from updates or carry).
+            // When adj is DISABLED this frame, the spec keeps the
+            // carried state untouched — the disabled-this-frame case is
+            // not a "reset" event, it just means no delta is applied
+            // this frame; the deltas persist for whenever the next
+            // frame re-enables the feature.
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
 
         // ---- §9.7 / §9.8 reference-slot rotation -----------------------
         // Mirror the §20 page-147 ordering exactly (the same walk the
@@ -720,6 +796,20 @@ impl Vp8InterStreamEncoder {
             kind: FrameKind::InterZeroMv,
             frame_index,
         })
+    }
+
+    /// Borrow the across-frame §9.4 `ref_frame_delta[]` carried state
+    /// (in `{CURRENT, LAST, GOLDEN, ALTREF}` order). Cleared to
+    /// `[0; 4]` on every key frame per RFC 6386 §9.4.
+    pub fn carried_ref_deltas(&self) -> [i16; 4] {
+        self.carried_ref_deltas
+    }
+
+    /// Borrow the across-frame §9.4 `mode_delta[]` carried state
+    /// (in `{B_PRED, ZERO_MV, OTHER_MV, SPLIT_MV}` order). Cleared
+    /// to `[0; 4]` on every key frame per RFC 6386 §9.4.
+    pub fn carried_mode_deltas(&self) -> [i16; 4] {
+        self.carried_mode_deltas
     }
 
     /// Number of frames successfully encoded so far.

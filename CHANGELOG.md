@@ -6,6 +6,65 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: §9.4 caller-driven per-reference /
+  per-mode `mb_lf_adjustments()` delta layer (RFC 6386 §9.4 /
+  §19.2 / §20.6)** — round 150 (`e6df803`) landed the §9.7 / §9.8
+  caller-driven refresh layer; round 151 closes the last documented
+  "lacks" tail on the inter encoder. The decoder already honoured
+  the §9.4 deltas
+  (`loop_filter::calculate_mb_filter_level_inter`); round 151
+  exposes the encoder's transmit path through a new public
+  `LoopFilterDeltas` struct (`enabled`, `update`,
+  `ref_frame_delta[4]`, `mode_delta[4]`), a new
+  `LoopFilterDeltaSlot` enum, and a new public
+  `write_loop_filter_with_deltas` writer.
+
+  New entry-points:
+    - `encode_p_frame_multi_ref_with_refresh_and_lf_deltas(frame,
+      last, golden, altref, params, refresh, lf_deltas,
+      carried_ref_deltas, carried_mode_deltas)` — standalone
+      multi-reference P-frame encoder with both `RefreshControls`
+      and `LoopFilterDeltas` exposed. Callers supply the
+      across-frame carried state (use `[0; 4]` for a single-shot
+      encode).
+    - `Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas(frame,
+      refresh, lf_deltas)` — stream-driver method that threads the
+      across-frame carried state internally per RFC 6386 §9.4
+      ("the values from the previous frame are used, unless they
+      are updated in the current header"). The carried state is
+      reset to `[0; 4]` on every key frame per §9.4 (key frames
+      begin a fresh sequence).
+    - `Vp8InterStreamEncoder::carried_ref_deltas` /
+      `carried_mode_deltas` accessors for the across-frame carry
+      inspection / testing.
+    - `LoopFilterDeltas::effective(carried_ref, carried_mode)` ⇒
+      `(eff_ref, eff_mode)` — public helper that resolves a
+      frame's effective per-slot deltas given the carried state.
+      Used by the §15 post-walk filter inside the encoder and
+      exposed so callers can inspect their carry threading.
+
+  Magnitude validation: per-slot values outside `-63..=63` are
+  rejected with the new
+  `EncodeError::LoopFilterDeltaOutOfRange { which: LoopFilterDeltaSlot,
+  value: i16 }` variant.
+
+  `LoopFilterDeltas::default()` (`enabled = false`) reproduces the
+  round-150 wire byte-for-byte, so every existing call site stays
+  unchanged.
+
+  Validation: 7 new integration tests in
+  `tests/encoder_pframe_lf_deltas.rs` pin (a) round-150 wire
+  equivalence for the default deltas; (b) header round-trip for
+  non-trivial `enabled = true, update = true` values through
+  `Vp8CodedHeader::parse`; (c) the `enabled = true, update = false`
+  wire shape (decoder reads `None` for every slot); (d) decoder
+  data-flow honouring (same source encoded with zero vs `(+20,
+  +15)` deltas produces observably-different decoded Y planes);
+  (e) stream encoder across-frame carry + keyframe reset; (f)
+  magnitude rejection on both `LoopFilterDeltas::validate` and the
+  encoder entry-point; (g) the spec carry-rule pinned in
+  `LoopFilterDeltas::effective`. Tests: 487 → 494.
+
 * **VP8 encoder Phase 11: §9.7 / §9.8 caller-driven reference-slot
   refresh patterns (RFC 6386 §9.7 / §9.8 / §19.2 / §20)** — round 149
   baked the inter-frame refresh ladder to `refresh_last = 1` and every

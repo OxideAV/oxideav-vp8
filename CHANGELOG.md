@@ -6,6 +6,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: §9.5 / §20.4 multi-partition inter token
+  output (RFC 6386 §9.5 / §20.4 / §13.3)** — extends the round-137
+  multi-partition keyframe writer to P-frames. `encode_p_frame_multi_ref`
+  now honours `params.nbr_of_dct_partitions` (1 / 2 / 4 / 8) for inter
+  frames as well: macroblock rows are distributed round-robin across
+  the partitions per the §20.4 row-loop (row `r` → partition
+  `r % N`), each partition is its own `BoolEncoder` instance
+  finalised with its own §7.3 4-byte flush trailer, and the wire
+  prepends `(N - 1) * 3` bytes of size table per the §9.5 layout.
+  The §13.3 above-context is column-wise and frame-lived so it is
+  shared across partitions; the "left" context resets at every
+  macroblock-row boundary so it never has to cross a partition seam.
+
+  The residual coding inside each partition is bit-identical to the
+  1-partition case, so the self-decoded picture is unchanged across
+  all four legal counts — the layout choice only trades a small
+  size overhead (`(N - 1) * 3 + (N - 1) * 4` bytes per frame) for the
+  decoder-side parallelism the §9.5 split was designed to enable.
+  Validation: a new `tests/encoder_pframe_multi_partition.rs`
+  integration test sweeps `N ∈ {1, 2, 4, 8}` on a 32×128 (8 MB row)
+  I + P pair at `yac_qi = 16` and asserts the P-frame self-decode
+  Y-PSNR is bit-identical across all four counts (**47.01 dB** for
+  every partition count) and the encoded byte length grows
+  monotonically (80 → 84 → 94 → 114 bytes). Two regression-guard
+  tests cover the short-frame case (mb_rows < N, leaving partitions
+  unused) and the rejection of out-of-range counts with
+  `EncodeError::InvalidDctPartitionCount` before the per-MB pick
+  walk runs.
+
+  Tests: 478 → 481 (+3 in `encoder_pframe_multi_partition.rs`).
+
 * **VP8 encoder Phase 11: §16.2 `ref_frame_tree` GOLDEN / ALTREF
   reference-frame selector in the rate-distortion picker
   (RFC 6386 §9.10 / §16.2 / §16.3)** — extends the round-147 P-frame

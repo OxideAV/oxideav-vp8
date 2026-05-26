@@ -2,6 +2,46 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 149)
+
+**Encoder Phase 11 — §9.5 / §20.4 multi-partition inter token output.**
+The round-137 keyframe encoder gained `nbr_of_dct_partitions` ∈ {1, 2,
+4, 8}; round 149 mirrors that on the P-frame path
+([`encode_p_frame_multi_ref`]). Macroblock rows are distributed
+round-robin across the partitions per the §20.4 row-loop (row `r` →
+partition `r % N`), each partition gets its own `BoolEncoder` instance
+finalised with its own §7.3 4-byte flush trailer, and the wire
+prepends `(N - 1) * 3` bytes of §9.5 size table. The §13.3
+above-context is column-wise and frame-lived so it is shared across
+partitions; the "left" context resets at every macroblock-row
+boundary so it never has to cross a partition seam — which is what
+makes multi-partition decoding worthwhile for downstream consumers
+(the §9.5 split exists so the four / eight decoder partitions can run
+in parallel).
+
+The residual coding inside each partition is bit-identical to the
+1-partition case, so the self-decoded picture is unchanged across all
+four legal counts. Validation: a new
+`tests/encoder_pframe_multi_partition.rs` integration test sweeps
+`N ∈ {1, 2, 4, 8}` on a 32×128 (8 MB row) I + P pair at
+`yac_qi = 16` and asserts the P-frame self-decode Y-PSNR is
+bit-identical across all four counts (**47.01 dB** for every
+partition count) and the encoded byte length grows monotonically
+(**80 → 84 → 94 → 114 bytes**, one §7.3 flush trailer + one §9.5
+size-table entry per extra partition). Two regression-guard tests
+cover the short-frame case (mb_rows < N, leaving partitions unused —
+PSNR still bit-identical at 46.70 dB across the sweep) and the
+rejection of out-of-range counts with
+`EncodeError::InvalidDctPartitionCount` before the per-MB pick walk
+runs. The round-148 goldenref test still clears **49.76 dB**, the
+round-147 splitmv test still emits 16 of 16 SPLITMV at **39.65 dB**,
+and the round-146 / 145 / 144 / 143 motion-search tests are
+unchanged. Tests: 478 → 481 (+3 in
+`encoder_pframe_multi_partition.rs`).
+
+The per-MB §9.4 mode / ref delta layer and caller-driven §9.7 GOLDEN
+/ ALTREF refresh patterns remain follow-up rounds.
+
 ## Status — 2026-05-26 (round 148)
 
 **Encoder Phase 11 — §16.2 `ref_frame_tree` GOLDEN / ALTREF reference-
@@ -64,9 +104,9 @@ feature test at **50.34 dB** — the GOLDEN / ALTREF widening doesn't
 disturb the existing single-ref picker behaviour. Tests: 475 → 478
 (+3 in `encoder_pframe_goldenref.rs`).
 
-Multi-partition inter, the per-MB §9.4 mode / ref delta layer, and
-caller-driven §9.7 GOLDEN / ALTREF refresh patterns remain follow-up
-rounds.
+Multi-partition inter (landed round 149), the per-MB §9.4 mode / ref
+delta layer, and caller-driven §9.7 GOLDEN / ALTREF refresh patterns
+remain follow-up rounds.
 
 ## Status — 2026-05-26 (round 147)
 

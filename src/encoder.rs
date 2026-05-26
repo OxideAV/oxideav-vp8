@@ -4330,6 +4330,18 @@ pub fn encode_p_frame_zero_mv(
 /// All other behaviour (NEAREST / NEAR / NEW / SPLITMV picking,
 /// §17.2 differential coding, §15 loop filter, §13 token emit)
 /// matches [`encode_p_frame_zero_mv`].
+///
+/// `params.nbr_of_dct_partitions` (1 / 2 / 4 / 8) controls the §9.5
+/// token-partition layout: macroblock rows are distributed round-robin
+/// across the partitions per the §20.4 row-loop (row `r` → partition
+/// `r % N`). This is a layout reorganisation only — the residual coding
+/// inside each partition is bit-identical to the 1-partition case, so
+/// the self-decoded picture is unchanged across all four legal values
+/// and the wire grows by `(N - 1) * 3` bytes of size table plus
+/// `(N - 1) * 4` bytes of extra §7.3 flush trailers. Values outside
+/// the `1 | 2 | 4 | 8` set are rejected with
+/// [`EncodeError::InvalidDctPartitionCount`] before the per-MB pick
+/// walk runs.
 pub fn encode_p_frame_multi_ref(
     frame: &I420Frame,
     last: &crate::frame::KeyframePlanes,
@@ -4357,6 +4369,14 @@ pub fn encode_p_frame_multi_ref(
             value: params.sharpness_level,
         });
     }
+    // §9.5 — the partition-count is validated here so a bad value is
+    // rejected before the long mode-pick / motion-search walk runs.
+    // `write_token_partition_count` re-validates at the actual
+    // bitstream emission point.
+    let num_partitions = match params.nbr_of_dct_partitions {
+        1 | 2 | 4 | 8 => params.nbr_of_dct_partitions as usize,
+        other => return Err(EncodeError::InvalidDctPartitionCount { value: other }),
+    };
 
     let mb_cols = width.div_ceil(16) as usize;
     let mb_rows = height.div_ceil(16) as usize;
@@ -4706,8 +4726,13 @@ pub fn encode_p_frame_multi_ref(
         params.sharpness_level,
         false,
     )?;
-    // §9.5 — partition count (1 this round).
-    write_token_partition_count(&mut hdr, 1)?;
+    // §9.5 — partition count. Macroblock rows are distributed
+    // round-robin across the §9.5 partitions per the §20.4 row-loop
+    // (row `r` → partition `r % N`). This is a layout reorganisation
+    // only — the residual coding inside each partition is bit-
+    // identical to the 1-partition case, so the self-decoded picture
+    // is unchanged across all four legal values.
+    write_token_partition_count(&mut hdr, params.nbr_of_dct_partitions)?;
     // §9.6 — quant indices (baseline only).
     write_quant_indices(&mut hdr, params.y_ac_qi, None, None, None, None, None)?;
 
@@ -4982,17 +5007,28 @@ pub fn encode_p_frame_multi_ref(
         });
     }
 
-    // ---- §19.2 DCT partition: §13.3 residual tokens ---------------------
+    // ---- §19.2 DCT partition group: §13.3 residual tokens --------------
     //
-    // Single partition this round. Walks every non-skipped MB in
-    // raster order, threading the §13.3 above (per-column, frame-
-    // lived) / left (per-row) non-zero predictor contexts exactly as
-    // the decoder reads them. Skip MBs clear their predictor slots
-    // (§13.1) so the next non-skip neighbour sees `has_coeffs = false`.
-    let mut tok = BoolEncoder::new();
+    // Macroblock rows are distributed round-robin across the §9.5
+    // partitions per the §20.4 row-loop: row `r` is encoded into
+    // partition `r % N`. Each partition gets its own [`BoolEncoder`]
+    // instance (§4 page 9 — "All partitions are decoded using separate
+    // instances of the boolean entropy decoder"), finalised
+    // independently with its own §7.3 4-byte flush trailer. The §13.3
+    // above-context is column-wise and frame-lived — shared across
+    // partitions because the decoder's `decode_residuals` also keeps
+    // one above slot per column for the whole frame. The "left"
+    // context resets at every row start so it does not need to cross
+    // partitions.
+    let mut partitions: Vec<BoolEncoder> =
+        (0..num_partitions).map(|_| BoolEncoder::new()).collect();
     let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
     for mb_row in 0..mb_rows {
+        // §13.3 page 65: the "left" predictor resets at the start of
+        // every macroblock row.
         let mut left_ctx = MbEntropyCtx::default();
+        let part_idx = mb_row % num_partitions;
+        let tok = &mut partitions[part_idx];
         for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
             let raster = mb_row * mb_cols + mb_col;
             let mb = &modes[raster];
@@ -5008,7 +5044,7 @@ pub fn encode_p_frame_multi_ref(
             // walker skips block 24 and routes the 16 Y blocks through
             // `BlockType::YNoY2` instead of `YAfterY2`.
             encode_mb_tokens(
-                &mut tok,
+                tok,
                 &all_coeffs[raster],
                 use_bpred,
                 &coeff_probs,
@@ -5018,11 +5054,13 @@ pub fn encode_p_frame_multi_ref(
             .map_err(EncodeError::Token)?;
         }
     }
-    let dct_partition = tok.finish();
-    let dct_total = dct_partition.len();
+    let dct_partitions: Vec<Vec<u8>> = partitions.into_iter().map(|p| p.finish()).collect();
+    let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();
+    let size_table_len = (num_partitions - 1) * 3;
 
     // ---- §9.1 inter frame tag + assembly --------------------------------
-    let mut out: Vec<u8> = Vec::with_capacity(3 + first_partition_size + dct_total);
+    let mut out: Vec<u8> =
+        Vec::with_capacity(3 + first_partition_size + size_table_len + dct_total);
     write_frame_tag(
         &mut out,
         false, // inter frame
@@ -5035,7 +5073,18 @@ pub fn encode_p_frame_multi_ref(
         ScaleCode::None,
     )?;
     out.extend_from_slice(&first_partition);
-    out.extend_from_slice(&dct_partition);
+    // §9.5 size table: 3-byte little-endian length for every partition
+    // except the last (whose size the decoder infers from what is left
+    // in the frame). One partition → no table.
+    for part in dct_partitions.iter().take(num_partitions - 1) {
+        let sz = part.len();
+        out.push((sz & 0xff) as u8);
+        out.push(((sz >> 8) & 0xff) as u8);
+        out.push(((sz >> 16) & 0xff) as u8);
+    }
+    for part in &dct_partitions {
+        out.extend_from_slice(part);
+    }
 
     Ok((out, planes))
 }

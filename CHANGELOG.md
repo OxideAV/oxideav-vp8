@@ -6,6 +6,67 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: consume motion search into per-MB ZEROMV/NEWMV
+  rate-distortion pick (RFC 6386 §16.2 / §16.3 / §17 / §18)** — wires
+  the round-142 `motion_search` primitive into
+  `encode_p_frame_zero_mv`'s per-MB loop, so the encoder now picks
+  between `ZEROMV` and whole-pixel `NEWMV` against `LAST` based on a
+  non-normative `J = SAD + lambda * bits` trade. Per MB:
+  * A `small_diamond_search_luma` descent runs against the clamped
+    §16.3 "best" predictor (the running `find_near_mvs[CNT_BEST]`),
+    bounded at 8 iterations.
+  * `J_zero = SAD_at_(0,0) + lambda * bits(ZEROMV path)` and
+    `J_new = SAD_at_searched_mv + lambda * (bits(NEWMV path) + §17
+    component bits)` are compared; lower J wins, ties to ZEROMV. The
+    NEWMV differential is `chosen_mv - clamp_mv(near.mvs[0])`, exactly
+    matching the decoder's `resolve_inter_mb_mv` add. A differential
+    that wraps outside `[-1023, +1023]` is treated as `+inf` cost so
+    that candidate is dropped.
+  * `lambda` reuses the keyframe RD picker's `q^2 / 32` shape against
+    the luma AC dequant factor.
+  * On NEWMV the encoder emits the §16.2 `mv_ref_tree` path "1110"
+    against the §16.3 census-derived probs, then the §17.2 MV
+    differential via the new public `write_mv` (against the §17.2
+    default `MvContexts` — `mv_prob_update()` is still emitted with
+    every F-gate = 0 so the decoder reads at the same defaults).
+  * The §18 prediction at a non-zero whole-pixel MV is the §18.2 /
+    §18.3 whole-pixel copy (fractional bits are zero ⇒ no sub-pixel
+    filter pass runs).
+
+  Public API additions:
+  * `oxideav_vp8::write_mv_component(enc, ctx, value)` — §17.1
+    `read_mvcomponent` inverse on the production `BoolEncoder`.
+  * `oxideav_vp8::write_mv(enc, contexts, mv)` — §17.2 `read_mv`
+    inverse, row-then-column.
+  * `oxideav_vp8::mv_component_bits(ctx, value)` and
+    `oxideav_vp8::mv_bits(contexts, mv)` — fractional-bit cost of
+    a §17 MV / component against a `MvContext` (`-log2(P(bit))`
+    accumulator, mirrors the emit control flow exactly so the cost
+    equals the bits the real pass will emit modulo per-partition
+    renormalisation).
+  * New `EncodeError::UnsupportedInterMode { mode }` for the picker
+    contract — non-NEWMV / non-ZEROMV resolved modes surface as an
+    error rather than panicking, so a future picker can roll out
+    incrementally.
+
+  Validation: a new `tests/encoder_pframe_newmv.rs` integration test
+  encodes a 2-frame I+P sequence with a clean +4-pixel diagonal
+  translation of a 16×16 feature square. The encoder picks NEWMV for
+  4 of 16 macroblocks (the 4 the feature crosses) and the self-decode
+  Y-plane PSNR clears 50 dB at `yac_qi = 32` (vs. ~30–35 dB the
+  ZEROMV-only path would deliver on the same scene). A second test
+  pins that the picker stays on ZEROMV when no motion is possible
+  (flat scene). The existing 10-frame stream + 64×64 I+P slow-drift
+  tests still pass — the picker prefers ZEROMV on low-motion content.
+
+  Out of scope (later rounds): half- / quarter-pel refinement (§18.3),
+  `NEARESTMV` / `NEARMV` / `SPLITMV` mode candidates, `GOLDEN` /
+  `ALTREF` source selection.
+
+  Tests: 453 → 460 (+5 public-API round-trip + bit-cost monotonicity
+  in `motion_vector.rs`, +2 NEWMV / ZEROMV picker tests in
+  `encoder_pframe_newmv.rs`).
+
 * **VP8 encoder Phase 11 begin: whole-pixel motion-search primitive
   (RFC 6386 §17.1 / §18.1 / §20.14)** — new `crate::motion_search`
   module wires the smallest piece of infrastructure a non-zero MV

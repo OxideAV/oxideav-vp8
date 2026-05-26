@@ -2,6 +2,47 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 143)
+
+**Encoder Phase 11 — per-MB ZEROMV / NEWMV rate-distortion pick.** The
+round-142 `motion_search` primitive is now consumed by
+`encode_p_frame_zero_mv`: every macroblock runs an 8-iteration
+`small_diamond_search_luma` descent against the clamped §16.3 "best"
+predictor, then the §-non-normative
+`J = SAD + lambda * (mode_bits + §17 mv_bits)` trade picks between
+ZEROMV (search-skipped) and whole-pixel NEWMV. Lambda reuses the
+keyframe RD picker's `q^2 / 32` shape. The §17.2 NEWMV differential is
+`chosen_mv - clamp_mv(near.mvs[0])`, exactly matching the decoder's
+`resolve_inter_mb_mv` add. A differential that wraps outside §17.1's
+`[-1023, +1023]` window is treated as `+inf` cost so that candidate is
+dropped. Ties between candidates go to ZEROMV (fewer bits, no MV
+component bits).
+
+New public surface: `write_mv_component(enc, ctx, value)` /
+`write_mv(enc, contexts, mv)` (§17.2 emit, paired with the existing
+`read_mv` / `read_mv_component`), `mv_component_bits(ctx, value)` /
+`mv_bits(contexts, mv)` (fractional `-log2(P(bit))` cost used by the
+RD picker), and `EncodeError::UnsupportedInterMode { mode }` for the
+picker contract (non-{ZEROMV,NEWMV} resolved modes surface as an error
+rather than panicking so a future picker can roll out incrementally).
+
+Validation: a new `tests/encoder_pframe_newmv.rs` integration test
+encodes a 2-frame I+P sequence with a clean +4-luma-pixel diagonal
+translation of a 16×16 feature square. The encoder picks NEWMV for
+4 of 16 macroblocks (the 4 the feature crosses) and the self-decode
+Y-plane PSNR clears **50.3 dB** at `yac_qi = 32` (vs. the ZEROMV-only
+path which would absorb the translation through the §14 quantiser and
+crater PSNR on this contrast level). A second test pins that the
+picker stays on ZEROMV when no motion is possible (flat scene), and
+five new `motion_vector.rs` unit tests round-trip
+`write_mv_component` / `write_mv` through the production `BoolEncoder`
++ §17 decoder and pin `mv_component_bits` monotonicity.
+
+Half- / quarter-pel refinement (§18.3), `NEARESTMV` / `NEARMV` /
+`SPLITMV` candidates, and `GOLDEN` / `ALTREF` source selection remain
+follow-up rounds. Tests: 453 → 460 (+5 in `motion_vector.rs`, +2 in
+`encoder_pframe_newmv.rs`).
+
 ## Status — 2026-05-26 (round 142)
 
 **Encoder Phase 11 begin — whole-pixel motion-search primitive.** New

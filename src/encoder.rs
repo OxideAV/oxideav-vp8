@@ -100,6 +100,16 @@ pub enum EncodeError {
         /// `(width, height)` of the reference [`crate::frame::KeyframePlanes`].
         reference: (u32, u32),
     },
+    /// The Phase-11 inter-mode picker only emits `ZEROMV` or `NEWMV`
+    /// against `LAST`; any other resolved [`crate::near_mv::InterMode`]
+    /// reaching the §16/§17 emit layer is an internal bug. Surfaces as
+    /// an error rather than panicking so a future picker that produces
+    /// `NEARESTMV` / `NEARMV` / `SPLITMV` can be rolled out
+    /// incrementally without an unrecoverable assert.
+    UnsupportedInterMode {
+        /// The resolved mode the picker handed the emit layer.
+        mode: crate::near_mv::InterMode,
+    },
 }
 
 impl core::fmt::Display for EncodeError {
@@ -137,6 +147,11 @@ impl core::fmt::Display for EncodeError {
                 "vp8 encode: P-frame source frame {}x{} (macroblock-aligned) does \
                  not match the supplied reference frame {}x{}",
                 source.0, source.1, reference.0, reference.1
+            ),
+            EncodeError::UnsupportedInterMode { mode } => write!(
+                f,
+                "vp8 encode: inter-mode {mode:?} is not supported by the Phase-11 \
+                 ZEROMV / NEWMV picker"
             ),
         }
     }
@@ -3236,33 +3251,41 @@ fn write_mode_layer(
     }
 }
 
-// ─────────────────── P-frame encoder (ZERO_MV / LAST only) ───────────────────
+// ─────────────────── P-frame encoder (ZEROMV / NEWMV / LAST) ──────────────────
 //
-// RFC 6386 §9 / §16 / §17 / §18 minimum-viable inter-frame encoder.
+// RFC 6386 §9 / §16 / §17 / §18 inter-frame encoder. Every emitted
+// macroblock is inter against the LAST reference (§16.2
+// `prob_last`-selected); the per-MB inter mode is picked between
+// `ZEROMV` (§16.2 `mv_ref_tree` leaf "0") and `NEWMV` (leaf "1110") via
+// a non-normative §-not-specified rate-distortion trade:
 //
-// Every emitted macroblock is coded as inter, with reference frame =
-// LAST (§16.2 `prob_last`-selected) and inter-mode = ZEROMV (§16.2
-// `mv_ref_tree` leaf "0"). The §18 motion-compensation prediction
-// therefore reduces to an identity copy of the LAST reference at the
-// macroblock's own position (motion vector (0,0) — no §18.3 sub-pixel
-// interpolation, no §16.3 census-driven `mv_ref` selection, no §17
-// differential MV bits). The §14 residual = source - prediction is
-// quantised and §13.3-token-coded through the existing intra pipeline.
+//   J(zero) = SAD_at_(0,0)
+//   J(new)  = SAD_at_searched_mv + lambda * (mv_ref_tree path bits delta
+//                                            + §17 mv-component bits)
 //
-// Per §17 the §17.2 `mv_prob_update()` block is still emitted (with
-// every `F` flag set to 0 — "no update", matching the no-token-prob-
-// update pattern) so the decoder's MV-decode infrastructure runs
-// against the defaults; no MV component bits ever follow on the wire
-// because every MB picks ZEROMV at the §16.2 tree.
+// Lower J wins; `NEARESTMV` / `NEARMV` / `SPLITMV` are out of scope
+// this round, as is half- / quarter-pel refinement (the search is the
+// §17 whole-pixel `small_diamond_search_luma` primitive, range-clamped
+// to `[-1023, +1023]` per §17.1). When the chosen MV is non-zero the
+// §18 prediction is the §18.2 / §18.3 whole-pixel copy (the §17
+// quarter-pixel MV's fractional bits are zero ⇒ no sub-pixel filter
+// pass runs).
+//
+// The §14 residual = source - prediction is quantised and §13.3-token-
+// coded through the existing intra pipeline regardless of which mode
+// was picked. Per §17 the §17.2 `mv_prob_update()` block is still
+// emitted with every `F` flag set to 0 — "no update", matching the
+// no-token-prob-update pattern — so the decoder's MV-decode runs
+// against the §17.2 defaults; the same `MvContexts` is used encoder-
+// side to write the NEWMV differential.
 
-/// Encode one VP8 P-frame whose every macroblock is ZERO_MV inter
-/// from the LAST reference frame.
+/// Encode one VP8 P-frame whose every macroblock is inter against the
+/// LAST reference, with per-MB `ZEROMV` / `NEWMV` chosen by a non-
+/// normative rate-distortion trade.
 ///
-/// This is the minimum-viable inter encoder: no motion search, no
-/// non-zero MVs, no SPLITMV, no GOLDEN/ALTREF source — just the §18
-/// identity copy from `reference` at each MB's own position, the
-/// §14 quantised residual, and the §13.3 token coding. Each MB on the
-/// wire is one §19.3 `macroblock_header()` plus its §13.3 residual
+/// Each MB on the wire is one §19.3 `macroblock_header()` (mb-skip /
+/// is_inter / ref_frame selector / inter-mode tree walk / optional
+/// §17.2 `read_mv` differential for `NEWMV`) plus its §13.3 residual
 /// (or just the skip bit when the residual is all-zero).
 ///
 /// Returns the emitted bytes alongside the macroblock-aligned post-§15
@@ -3280,15 +3303,23 @@ fn write_mode_layer(
 ///
 /// # Scope (this round)
 ///
-/// * **Every MB is inter / ZEROMV / LAST.** No motion search, no
-///   `NEARESTMV` / `NEARMV` / `NEWMV` / `SPLITMV`, no `GOLDEN` /
-///   `ALTREF` reference selection.
+/// * **Whole-pixel motion search.** A
+///   [`crate::motion_search::small_diamond_search_luma`] descent runs
+///   per MB against the clamped §16.3 "best" predictor (the running
+///   `find_near_mvs[CNT_BEST]` vector). The chosen MV is whichever of
+///   `ZEROMV` (search-skipped, J = SAD at MV (0,0)) and `NEWMV` (J =
+///   SAD at searched MV + lambda × `mv_ref_tree` path bits + §17
+///   component bits) gives a smaller J. `NEARESTMV` / `NEARMV` /
+///   `SPLITMV` and half- / quarter-pel refinement are deferred to
+///   later rounds, as is `GOLDEN` / `ALTREF` source selection.
 /// * **`prob_intra` is 255**, so the decoder reads every MB as
 ///   inter without a bit on the wire wasted on intra-vs-inter
 ///   classification. Token-prob and intra-mode-prob update blocks
 ///   carry no updates; the §17.2 `mv_prob_update()` block is
 ///   emitted with every F-gate set to 0 so the MV-decode
-///   infrastructure runs against the §17.2 defaults.
+///   infrastructure runs against the §17.2 defaults — the encoder
+///   writes the NEWMV differential against the same default
+///   [`MvContexts`].
 /// * **§9.7 refresh ladder**: `refresh_last = 1`,
 ///   `refresh_golden_frame = 0`, `refresh_alternate_frame = 0`,
 ///   `copy_buffer_to_golden = 0`, `copy_buffer_to_alternate = 0`,
@@ -3396,27 +3427,157 @@ pub fn encode_p_frame_zero_mv(
         Vec::with_capacity(mb_rows * mb_cols);
     let mut inter_modes_out: Vec<Option<crate::near_mv::InterMode>> =
         Vec::with_capacity(mb_rows * mb_cols);
+    // Per-MB chosen quarter-pixel MV — consumed by the §11/§16 mode-
+    // emit loop below and (for NEWMV) by the §17.2 component writer.
+    // For ZEROMV MBs this is `Mv::default()`; for NEWMV MBs it is the
+    // search-resolved whole-pixel MV (snapped + clamped to §17.1).
+    let mut chosen_mvs: Vec<crate::motion_vector::Mv> = Vec::with_capacity(mb_rows * mb_cols);
+
+    // §17.2 MV-component contexts the encoder writes NEWMV diffs
+    // against. We emit every `mv_prob_update()` F-gate as 0 (no update)
+    // so the decoder reads against the same §17.2 defaults.
+    let mv_contexts = crate::motion_vector::default_mv_contexts();
+
+    // §-non-normative RD lambda — same `q^2 / 32` shape the keyframe
+    // RD picker uses (see `rd_lambda`). Higher quantiser ⇒ higher
+    // lambda ⇒ stricter penalty per extra bit, biasing toward ZEROMV
+    // at low bitrate. Units: distortion-per-bit (here SAD-per-bit,
+    // which is roughly half SSD-per-bit at low signal levels but
+    // monotone — fine for a relative ZEROMV-vs-NEWMV trade).
+    let lambda = rd_lambda(&factors);
+
+    // Neighbour-record state for the §16.3 `find_near_mvs` census —
+    // shared between the search-and-RD pass below and the §11/§16
+    // mode-emit pass that follows. Each MB sees the same census the
+    // decoder will recompute as it walks the bytes.
+    let mut search_above: Vec<crate::near_mv::MbInfo> =
+        vec![crate::near_mv::MbInfo::border(); mb_cols];
 
     for mb_row in 0..mb_rows {
-        for mb_col in 0..mb_cols {
+        let mut left_mb = crate::near_mv::MbInfo::border();
+        let mut aboveleft_mb = crate::near_mv::MbInfo::border();
+        for (mb_col, above_slot) in search_above.iter_mut().enumerate() {
             let pixels = frame.extract_mb(mb_row, mb_col);
 
-            // §18 prediction at zero MV — identity copy of LAST at the
-            // same position. `predict_inter_mb` with `Mv::default()` and
-            // the §18.3 filter set collapses to whole-pixel copy because
-            // the fractional bits of (0,0) are zero.
+            // ---- §16.3 census + §17 motion search ------------------------
+            //
+            // The §16.3 `find_near_mvs[CNT_BEST]` slot is the "best"
+            // predictor a NEWMV differential is added to (see
+            // `resolve_inter_mb_mv` in `crate::near_mv`). Clamp it
+            // through the §18.1 / §20.11 per-MB rectangle before the
+            // search uses it as the descent center, exactly matching
+            // what the decoder will do when re-reading the NEWMV path.
+            let near = crate::near_mv::find_near_mvs(
+                above_slot,
+                &left_mb,
+                &aboveleft_mb,
+                crate::motion_comp::RefFrame::Last,
+                crate::near_mv::SignBias::default(),
+            );
+            let bounds = crate::near_mv::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+            let best_predictor = crate::near_mv::clamp_mv(near.mvs[0], &bounds);
+            let mv_ref_probs = crate::near_mv::mv_ref_probs(&near.cnt);
+
+            // The motion search reads the LAST reference's luma plane;
+            // chroma is not sampled (§18.1 chroma_mv = avg(v, v, v, v)
+            // means a whole-pixel luma MV maps directly to a whole-pixel
+            // chroma MV, and chroma SAD adds noticeably more cost per
+            // candidate without changing the picked MV).
+            let luma_ref = crate::motion_search::LumaRef {
+                plane: &reference.y,
+                stride: reference.y_stride,
+                width: reference.mb_cols * 16,
+                height: reference.mb_rows * 16,
+            };
+            // SAD at MV (0,0) is the ZEROMV distortion term. Compute it
+            // directly via `mb_luma_sad_at_whole_mv` so the search path
+            // does not need to special-case the zero center.
+            let sad_zero = crate::motion_search::mb_luma_sad_at_whole_mv(
+                luma_ref,
+                mb_col,
+                mb_row,
+                &pixels.y,
+                crate::motion_vector::Mv::default(),
+            );
+            // Search from the clamped best predictor; bounded iteration
+            // count keeps the encoder's worst-case complexity O(MB_count
+            // * MAX_ITERS * 4) and matches the §17 whole-pixel scope.
+            const MAX_DIAMOND_ITERS: u32 = 8;
+            let search = crate::motion_search::small_diamond_search_luma(
+                luma_ref,
+                mb_col,
+                mb_row,
+                &pixels.y,
+                best_predictor,
+                MAX_DIAMOND_ITERS,
+            );
+
+            // ---- §17 / §16.2 rate-distortion mode pick -------------------
+            //
+            // J_zero = SAD_at_(0,0) + lambda * bits_for_ZEROMV_path
+            // J_new  = SAD_at_searched_mv
+            //          + lambda * (bits_for_NEWMV_path + §17 mv bits)
+            //
+            // The mb-skip / is_inter / ref_frame bits are identical for
+            // both candidates (every MB is inter against LAST) so they
+            // cancel — only the `mv_ref_tree` path differs (ZEROMV =
+            // "0", NEWMV = "1110") plus the §17 component bits for NEWMV.
+            // The §17.2 default contexts are what the decoder reads with.
+            let bits_mode_zero = bool_bits(mv_ref_probs[0], false);
+            // NEWMV path "1110": three `true`s at probs[0..=2] then a
+            // `false` at probs[3]. Mirrors `MV_REF_TREE`'s structure
+            // (see `crate::near_mv::MV_REF_TREE`).
+            let bits_mode_new = bool_bits(mv_ref_probs[0], true)
+                + bool_bits(mv_ref_probs[1], true)
+                + bool_bits(mv_ref_probs[2], true)
+                + bool_bits(mv_ref_probs[3], false);
+            // §17.2 differential = chosen_mv - clamped_best_predictor,
+            // wrapping in i16 to mirror the decoder's wrapping-add path
+            // in `resolve_inter_mb_mv`.
+            let diff_row = (search.mv.row as i32) - (best_predictor.row as i32);
+            let diff_col = (search.mv.col as i32) - (best_predictor.col as i32);
+            // The differential can fall outside §17.1's [-1023, +1023]
+            // window even though both endpoints are in-range (e.g.
+            // best = -1020, mv = +1020 ⇒ diff = +2040). Such a diff
+            // cannot be coded; treat that candidate as +inf bit cost so
+            // the picker drops it.
+            let diff_in_range =
+                (-1023..=1023).contains(&diff_row) && (-1023..=1023).contains(&diff_col);
+            let bits_mv_diff = if diff_in_range {
+                crate::motion_vector::mv_component_bits(&mv_contexts[0], diff_row)
+                    + crate::motion_vector::mv_component_bits(&mv_contexts[1], diff_col)
+            } else {
+                f64::INFINITY
+            };
+            // Pick: lower J wins. Use SAD as the distortion term
+            // (cheaper than a full SSD post-reconstruct, and the search
+            // already computed it for both candidates). Ties go to
+            // ZEROMV — fewer bits, simpler downstream context.
+            let j_zero = sad_zero as f64 + lambda * bits_mode_zero;
+            let j_new = search.sad as f64 + lambda * (bits_mode_new + bits_mv_diff);
+            let pick_new =
+                j_new < j_zero && diff_in_range && search.mv != crate::motion_vector::Mv::default();
+
+            let chosen_mode = if pick_new {
+                crate::near_mv::InterMode::New
+            } else {
+                crate::near_mv::InterMode::Zero
+            };
+            let chosen_mv = if pick_new {
+                search.mv
+            } else {
+                crate::motion_vector::Mv::default()
+            };
+
+            // ---- §18 / §14 prediction + residual at the chosen MV --------
             let pred = crate::motion_comp::predict_inter_mb(
                 &reference_planes,
                 mb_col,
                 mb_row,
-                crate::motion_vector::Mv::default(),
+                chosen_mv,
                 false,
                 filters,
             );
-
-            // §14 forward transform + quant against the prediction.
-            // Inter non-SPLITMV MBs carry a Y2 block (§14.2 page 76),
-            // exactly like the whole-block intra DC / V / H / TM modes.
             let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, &factors);
             let u_quant = transform_chroma_plane(&pixels.u, &pred.u, &factors);
             let v_quant = transform_chroma_plane(&pixels.v, &pred.v, &factors);
@@ -3455,14 +3616,11 @@ pub fn encode_p_frame_zero_mv(
             // Reconstruct through the decoder's own §18 + §14 path so
             // the encoder's running buffer is bit-identical to what the
             // decoder produces from the bytes we are about to emit.
-            // (`reconstruct_inter_mb` dequantises and adds residue
-            // internally; `mb_skip_coeff` short-circuits to pure
-            // prediction.)
             let recon = crate::motion_comp::reconstruct_inter_mb(
                 &reference_planes,
                 mb_col,
                 mb_row,
-                crate::motion_vector::Mv::default(),
+                chosen_mv,
                 false,
                 filters,
                 mb_skip_coeff,
@@ -3471,10 +3629,6 @@ pub fn encode_p_frame_zero_mv(
                 &raw_coeffs.u,
                 &raw_coeffs.v,
             );
-            // Note: `reconstruct_inter_mb` does its own internal
-            // dequantization of the residual (factor multiplies inside
-            // the inverse-WHT / inverse-DCT pipeline). It expects the
-            // *quantised* coefficients we just stored.
             crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
 
             // Per the §15 loop-filter geometry, an inter MB carries
@@ -3491,7 +3645,20 @@ pub fn encode_p_frame_zero_mv(
             });
             all_coeffs.push(raw_coeffs);
             ref_frames_out.push(Some(crate::motion_comp::RefFrame::Last));
-            inter_modes_out.push(Some(crate::near_mv::InterMode::Zero));
+            inter_modes_out.push(Some(chosen_mode));
+            chosen_mvs.push(chosen_mv);
+
+            // Update the neighbour records for the next MB in the row /
+            // for the next row, mirroring the decoder's per-MB walk.
+            let cur = crate::near_mv::MbInfo {
+                ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                mv: chosen_mv,
+                is_split: false,
+                split_mvs: None,
+            };
+            aboveleft_mb = *above_slot;
+            left_mb = cur;
+            *above_slot = cur;
         }
     }
 
@@ -3607,21 +3774,19 @@ pub fn encode_p_frame_zero_mv(
     //   1. mb_skip_coeff (when mb_no_skip_coeff = 1)
     //   2. is_inter_mb (against prob_intra)
     //   3. ref_frame selector (against prob_last; LAST = false)
-    //   4. inter-mode tree walk (ZEROMV = "0" against probs[0])
+    //   4. inter-mode tree walk (ZEROMV = "0", NEWMV = "1110")
+    //   5. NEWMV only: §17.2 row + column MV differential, written
+    //      against the §17.2 default MV contexts (the same defaults
+    //      the decoder reads with because we emit `mv_prob_update()`
+    //      with every F-gate = 0 above).
     //
     // The §16.3 census determines the four probabilities the inter-
     // mode tree's bool reads, and depends on the already-decoded
-    // neighbours. For a frame whose every MB is ZEROMV with LAST,
-    // every neighbour has `ref_frame = Some(LAST)` and `mv = (0,0)`
-    // — i.e. every non-border neighbour is an inter MB with a zero
-    // vector, which the §16.3 census records as `cnt[CNT_BEST] += w`
-    // (weights 2/2/1 for above/left/above-left). The §16.3 sort then
-    // produces `cnt = [w_total, 0, 0, 0]` and `mv_ref_probs` reads
-    // `MV_COUNTS_TO_PROBS[cnt_best][0]` for the ZEROMV-vs-rest bit.
-    //
-    // We mirror the same census/probability evolution the decoder
-    // performs (so the bit we write is consumed at the same
-    // probability the decoder reads it at).
+    // neighbours' resolved `ref_frame` + `mv`. We re-run the census
+    // here against the SAME neighbour state the search loop walked
+    // above (using each MB's `chosen_mv` as its resolved vector), so
+    // the bits we write are consumed at exactly the probabilities the
+    // decoder reads them at.
     let mut above_mb: Vec<crate::near_mv::MbInfo> = vec![crate::near_mv::MbInfo::border(); mb_cols];
 
     for mb_row in 0..mb_rows {
@@ -3630,6 +3795,8 @@ pub fn encode_p_frame_zero_mv(
         for (mb_col, above_slot) in above_mb.iter_mut().enumerate() {
             let raster = mb_row * mb_cols + mb_col;
             let mb = &modes[raster];
+            let chosen_mode = inter_modes_out[raster].expect("inter mode recorded above");
+            let chosen_mv = chosen_mvs[raster];
 
             // 1. mb_skip_coeff (mb_no_skip_coeff = 1).
             hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
@@ -3638,8 +3805,8 @@ pub fn encode_p_frame_zero_mv(
             // 3. ref_frame selector — LAST is "false" against prob_last.
             hdr.write_bool(prob_last, false);
 
-            // 4. Inter-mode tree — ZEROMV is leaf 0, path "0", read
-            //    against probs[0] from the §16.3 census.
+            // 4. Inter-mode tree — ZEROMV is leaf 0, path "0";
+            //    NEWMV is leaf 3, path "1110".
             let near = crate::near_mv::find_near_mvs(
                 above_slot,
                 &left_mb,
@@ -3648,14 +3815,41 @@ pub fn encode_p_frame_zero_mv(
                 crate::near_mv::SignBias::default(),
             );
             let probs = crate::near_mv::mv_ref_probs(&near.cnt);
-            // Walk MV_REF_TREE: at the root, ZEROMV (leaf 0) is the
-            // "false" branch against probs[0].
-            hdr.write_bool(probs[0], false);
+            match chosen_mode {
+                crate::near_mv::InterMode::Zero => {
+                    // "0" against probs[0].
+                    hdr.write_bool(probs[0], false);
+                }
+                crate::near_mv::InterMode::New => {
+                    // "1110": three true bits at probs[0..=2] then one
+                    // false at probs[3]. Pinned by `MV_REF_TREE`.
+                    hdr.write_bool(probs[0], true);
+                    hdr.write_bool(probs[1], true);
+                    hdr.write_bool(probs[2], true);
+                    hdr.write_bool(probs[3], false);
+                    // §17.2 NEWMV differential = chosen_mv -
+                    // clamp_mv(near.mvs[0]). The decoder reads `best`
+                    // through the same §16.3 / §18.1 clamp before adding.
+                    let bounds =
+                        crate::near_mv::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+                    let best = crate::near_mv::clamp_mv(near.mvs[0], &bounds);
+                    let diff = crate::motion_vector::Mv {
+                        row: chosen_mv.row.wrapping_sub(best.row),
+                        col: chosen_mv.col.wrapping_sub(best.col),
+                    };
+                    crate::motion_vector::write_mv(&mut hdr, &mv_contexts, diff);
+                }
+                other => {
+                    // Phase-11 picker only emits ZEROMV / NEWMV; any
+                    // other resolved mode is an internal bug.
+                    return Err(EncodeError::UnsupportedInterMode { mode: other });
+                }
+            }
 
             // Update neighbour records for the next MB.
             let cur = crate::near_mv::MbInfo {
                 ref_frame: Some(crate::motion_comp::RefFrame::Last),
-                mv: crate::motion_vector::Mv::default(),
+                mv: chosen_mv,
                 is_split: false,
                 split_mvs: None,
             };

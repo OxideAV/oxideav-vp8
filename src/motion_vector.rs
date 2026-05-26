@@ -52,6 +52,7 @@
 
 use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
 use crate::coded_header::{MvProbUpdates, DEFAULT_MV_CONTEXT, MV_PROB_COUNT};
+use crate::encoder::BoolEncoder;
 
 /// A decoded motion vector — RFC 6386 §17.2 `MV` (`{ int16 row, col; }`).
 ///
@@ -236,6 +237,189 @@ pub fn read_mv(dec: &mut BoolDecoder<'_>, contexts: &MvContexts) -> Result<Mv, B
     let row = read_mv_component(dec, &contexts[0])? as i16;
     let col = read_mv_component(dec, &contexts[1])? as i16;
     Ok(Mv { row, col })
+}
+
+/// Walk [`SMALL_MVTREE`] for an encoder-side short component — RFC 6386
+/// §17.1, the inverse of [`read_small_mv`]. Writes the path from the root
+/// node to leaf `-leaf` against [`BoolEncoder::write_bool`] at the same
+/// per-node probability offset the decoder reads at.
+fn write_small_mv(enc: &mut BoolEncoder, p: &MvContext, leaf: i32) {
+    debug_assert!((0..=7).contains(&leaf));
+    fn find_path(tree: &[i8], i: usize, target: i8, path: &mut Vec<bool>) -> bool {
+        for bit in 0..2 {
+            let next = tree[i + bit];
+            path.push(bit == 1);
+            if next <= 0 {
+                if next == -target {
+                    return true;
+                }
+            } else if find_path(tree, next as usize, target, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    let found = find_path(&SMALL_MVTREE, 0, leaf as i8, &mut path);
+    debug_assert!(found, "no SMALL_MVTREE path for leaf {leaf}");
+    let mut i: usize = 0;
+    for &bit in &path {
+        let prob = p[MVP_SHORT + (i >> 1)];
+        enc.write_bool(prob, bit);
+        let next = SMALL_MVTREE[i + bit as usize];
+        if next <= 0 {
+            break;
+        }
+        i = next as usize;
+    }
+}
+
+/// Encode one motion-vector component into `enc` — the inverse of
+/// [`read_mv_component`] (RFC 6386 §17.1 `read_mvcomponent`).
+///
+/// `p` is the component's 19-position [`MvContext`] (row or column). The
+/// component value `V` is a signed quarter-pixel displacement in
+/// `-1023..=1023`; debug builds assert the range. The emitted bits exactly
+/// round-trip through `read_mv_component(dec, p)`.
+///
+/// The §17.1 emit procedure:
+///
+/// 1. Compute `A = |V|`. If `A >= 8`, write `1` against `p[MVPis_short]`
+///    then bits 0, 1, 2, then bits 9..=4 descending. Bit 3 is only
+///    explicitly coded when `A > 15` (the long-form decoder assumes bit 3
+///    is implicitly 1 in `[8, 15]`).
+/// 2. Otherwise (`A <= 7`) write `0` against `p[MVPis_short]` then walk
+///    [`SMALL_MVTREE`] to leaf `A`.
+/// 3. If `A != 0` write the sign at `p[MVPsign]` (`true` ⇒ negative).
+pub fn write_mv_component(enc: &mut BoolEncoder, p: &MvContext, value: i32) {
+    debug_assert!(
+        (-1023..=1023).contains(&value),
+        "§17.1 MV component out of range: {value}"
+    );
+    let a = value.unsigned_abs() as i32;
+    if a > 7 {
+        enc.write_bool(p[MVP_IS_SHORT], true);
+        for i in 0..3 {
+            enc.write_bool(p[MVP_BITS + i], (a >> i) & 1 != 0);
+        }
+        let mut i = 9;
+        loop {
+            enc.write_bool(p[MVP_BITS + i], (a >> i) & 1 != 0);
+            i -= 1;
+            if i <= 3 {
+                break;
+            }
+        }
+        // Bit 3 only emitted when A > 15 (long-form decoder treats bit 3
+        // as implicit 1 in [8, 15]).
+        if (a & 0xfff0) != 0 {
+            enc.write_bool(p[MVP_BITS + 3], (a >> 3) & 1 != 0);
+        }
+    } else {
+        enc.write_bool(p[MVP_IS_SHORT], false);
+        write_small_mv(enc, p, a);
+    }
+    if a != 0 {
+        enc.write_bool(p[MVP_SIGN], value < 0);
+    }
+}
+
+/// Encode a complete motion vector into `enc` — RFC 6386 §17.2 `read_mv`,
+/// inverse direction. Writes the row component against `contexts[0]` then
+/// the column component against `contexts[1]` ("always row, then column").
+pub fn write_mv(enc: &mut BoolEncoder, contexts: &MvContexts, mv: Mv) {
+    write_mv_component(enc, &contexts[0], mv.row as i32);
+    write_mv_component(enc, &contexts[1], mv.col as i32);
+}
+
+/// Fractional-bit cost of one §17.1 MV component against context `p`.
+///
+/// Computes the `-log2(P(bit))` of every §17.1 boolean
+/// [`write_mv_component`] would emit, summed. Used by the encoder's
+/// non-normative RD trade to compare NEWMV against ZEROMV without
+/// actually emitting anything. `prob` is clamped to `1..=255` so the
+/// logarithm is finite (the spec's probabilities live in that range).
+///
+/// Mirrors the [`write_mv_component`] control flow line-for-line, so the
+/// cost equals the bits the real pass below will emit (modulo the §7.3
+/// renormalisation tail bytes, which add < 1 byte per partition, not per
+/// MV — negligible for a per-MB ZEROMV-vs-NEWMV comparison).
+pub fn mv_component_bits(p: &MvContext, value: i32) -> f64 {
+    debug_assert!((-1023..=1023).contains(&value));
+    #[inline]
+    fn bool_bits(prob: u8, value: bool) -> f64 {
+        let p0 = (prob.max(1) as f64) / 256.0;
+        let p = if value { 1.0 - p0 } else { p0 };
+        -p.max(1.0 / 256.0).log2()
+    }
+    fn small_mv_bits(p: &MvContext, leaf: i32) -> f64 {
+        fn find_path(tree: &[i8], i: usize, target: i8, path: &mut Vec<bool>) -> bool {
+            for bit in 0..2 {
+                let next = tree[i + bit];
+                path.push(bit == 1);
+                if next <= 0 {
+                    if next == -target {
+                        return true;
+                    }
+                } else if find_path(tree, next as usize, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let mut path = Vec::new();
+        let found = find_path(&SMALL_MVTREE, 0, leaf as i8, &mut path);
+        debug_assert!(found);
+        let mut bits = 0.0;
+        let mut i: usize = 0;
+        for &bit in &path {
+            bits += bool_bits(p[MVP_SHORT + (i >> 1)], bit);
+            let next = SMALL_MVTREE[i + bit as usize];
+            if next <= 0 {
+                break;
+            }
+            i = next as usize;
+        }
+        bits
+    }
+
+    let a = value.unsigned_abs() as i32;
+    let mut bits = 0.0;
+    if a > 7 {
+        bits += bool_bits(p[MVP_IS_SHORT], true);
+        for i in 0..3 {
+            bits += bool_bits(p[MVP_BITS + i], (a >> i) & 1 != 0);
+        }
+        let mut i = 9;
+        loop {
+            bits += bool_bits(p[MVP_BITS + i], (a >> i) & 1 != 0);
+            i -= 1;
+            if i <= 3 {
+                break;
+            }
+        }
+        if (a & 0xfff0) != 0 {
+            bits += bool_bits(p[MVP_BITS + 3], (a >> 3) & 1 != 0);
+        }
+    } else {
+        bits += bool_bits(p[MVP_IS_SHORT], false);
+        bits += small_mv_bits(p, a);
+    }
+    if a != 0 {
+        bits += bool_bits(p[MVP_SIGN], value < 0);
+    }
+    bits
+}
+
+/// Fractional-bit cost of an entire §17.2 motion vector against `contexts`.
+///
+/// Equal to `mv_component_bits(&contexts[0], row) +
+/// mv_component_bits(&contexts[1], col)`; sums the row-then-column
+/// emission order of [`write_mv`].
+pub fn mv_bits(contexts: &MvContexts, mv: Mv) -> f64 {
+    mv_component_bits(&contexts[0], mv.row as i32) + mv_component_bits(&contexts[1], mv.col as i32)
 }
 
 #[cfg(test)]
@@ -585,5 +769,90 @@ mod tests {
     #[test]
     fn mv_default_is_zero_vector() {
         assert_eq!(Mv::default(), Mv { row: 0, col: 0 });
+    }
+
+    // ─── public write_mv_component / mv_component_bits coverage ──────────
+
+    /// Round-trip a component through the **production** encoder
+    /// [`super::write_mv_component`] (using the crate's real [`BoolEncoder`])
+    /// and the §17.1 decoder — pins the public API encodes the same bits
+    /// the local test encoder produces.
+    fn roundtrip_component_public(ctx: &MvContext, value: i32) -> i32 {
+        let mut enc = crate::encoder::BoolEncoder::new();
+        super::write_mv_component(&mut enc, ctx, value);
+        let bytes = enc.finish();
+        let mut dec = BoolDecoder::init(&bytes).expect("init");
+        read_mv_component(&mut dec, ctx).expect("decode")
+    }
+
+    #[test]
+    fn public_write_mv_component_round_trips_short_and_long() {
+        let ctx = DEFAULT_MV_CONTEXT[0];
+        for v in -7..=7 {
+            assert_eq!(roundtrip_component_public(&ctx, v), v, "short v={v}");
+        }
+        for &v in &[8, 9, 15, 16, 17, 24, 100, 511, 512, 1023] {
+            assert_eq!(roundtrip_component_public(&ctx, v), v, "long +{v}");
+            assert_eq!(roundtrip_component_public(&ctx, -v), -v, "long -{v}");
+        }
+    }
+
+    #[test]
+    fn public_write_mv_round_trips_through_read_mv() {
+        // write_mv writes row first (against contexts[0]) then column —
+        // a `read_mv` recovers both at the same emission order.
+        let contexts = default_mv_contexts();
+        let mut enc = crate::encoder::BoolEncoder::new();
+        super::write_mv(&mut enc, &contexts, Mv { row: -12, col: 47 });
+        let bytes = enc.finish();
+        let mut dec = BoolDecoder::init(&bytes).expect("init");
+        let mv = read_mv(&mut dec, &contexts).expect("read_mv");
+        assert_eq!(mv, Mv { row: -12, col: 47 });
+    }
+
+    #[test]
+    fn mv_component_bits_zero_is_just_is_short_bit() {
+        // Encoding V=0 emits the `is_short=false` bit + the SMALL_MVTREE
+        // path to leaf 0 ("000") — three bits at probs[2]/[3]/[4] — and
+        // no sign bit (A==0). All bits are emitted at the spec defaults.
+        let ctx = DEFAULT_MV_CONTEXT[0];
+        let bits = super::mv_component_bits(&ctx, 0);
+        // The lower bound is the count of bools written (4): a degenerate
+        // p=255 short side would still cost ~0 bits per bool, but with the
+        // real defaults each bool costs > 0 bits.
+        assert!(
+            bits > 0.0,
+            "non-zero bool cost expected for V=0, got {bits}"
+        );
+        assert!(bits < 8.0, "V=0 emits a handful of bools, got {bits}");
+    }
+
+    #[test]
+    fn mv_component_bits_grow_with_magnitude() {
+        // Cheaper to code a zero MV than a far-away MV against the
+        // standard MV_CONTEXT defaults — pin this so an accidental
+        // probability swap surfaces. (Strict monotonicity holds at every
+        // doubled magnitude on the §17.2 default table.)
+        let ctx = DEFAULT_MV_CONTEXT[0];
+        let b0 = super::mv_component_bits(&ctx, 0);
+        let b4 = super::mv_component_bits(&ctx, 4);
+        let b32 = super::mv_component_bits(&ctx, 32);
+        let b256 = super::mv_component_bits(&ctx, 256);
+        assert!(
+            b0 < b4 && b4 < b32 && b32 < b256,
+            "expected monotone growth, got {b0} < {b4} < {b32} < {b256}"
+        );
+    }
+
+    #[test]
+    fn mv_bits_is_sum_of_component_bits() {
+        // mv_bits is documented to equal the row + column component bit
+        // cost; pin it against an explicit (row, col).
+        let ctx = default_mv_contexts();
+        let mv = Mv { row: 7, col: -200 };
+        let total = super::mv_bits(&ctx, mv);
+        let parts = super::mv_component_bits(&ctx[0], mv.row as i32)
+            + super::mv_component_bits(&ctx[1], mv.col as i32);
+        assert!((total - parts).abs() < 1e-12);
     }
 }

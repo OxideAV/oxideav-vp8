@@ -353,8 +353,8 @@ pub use motion_search::{
     MV_MAX, MV_MIN, WHOLE_PIXEL_STEP,
 };
 pub use motion_vector::{
-    default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,
-    MvContexts, SMALL_MVTREE,
+    default_mv_contexts, mv_bits, mv_component_bits, read_mv, read_mv_component,
+    resolve_mv_contexts, write_mv, write_mv_component, Mv, MvContext, MvContexts, SMALL_MVTREE,
 };
 pub use near_mv::{
     above_block_mv, clamp_mv, decode_inter_mb, decode_split_mv, decode_split_mv_mb, find_near_mvs,

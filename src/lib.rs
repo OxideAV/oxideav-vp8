@@ -286,6 +286,7 @@ pub mod inverse_transform;
 pub mod loop_filter;
 pub mod macroblock;
 pub mod motion_comp;
+pub mod motion_search;
 pub mod motion_vector;
 pub mod near_mv;
 pub mod reconstruct;
@@ -346,6 +347,10 @@ pub use motion_comp::{
     reconstruct_inter_mb_whole_pixel, reconstruct_split_mv_mb, select_ref_frame, sixtap_2d,
     split_chroma_mvs, stored_luma_mv, whole_pixel_fraction_is_zero, FilterSet, MotionCompError,
     RefFrame, ReferencePlanes, BILINEAR_FILTERS, SIXTAP_FILTERS,
+};
+pub use motion_search::{
+    block_sad_16x16, mb_luma_sad_at_whole_mv, small_diamond_search_luma, LumaRef, SearchResult,
+    MV_MAX, MV_MIN, WHOLE_PIXEL_STEP,
 };
 pub use motion_vector::{
     default_mv_contexts, read_mv, read_mv_component, resolve_mv_contexts, Mv, MvContext,

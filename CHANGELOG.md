@@ -6,6 +6,55 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11 begin: whole-pixel motion-search primitive
+  (RFC 6386 §17.1 / §18.1 / §20.14)** — new `crate::motion_search`
+  module wires the smallest piece of infrastructure a non-zero MV
+  codepath needs:
+  * `block_sad_16x16(src, pred) -> u32` — pixel-wise sum of absolute
+    differences for two 16×16 luma blocks.
+  * `LumaRef<'_> { plane, stride, width, height }` — a borrow of one
+    reference frame's luma plane (bundled into a single argument so
+    the search functions stay under clippy's `too_many_arguments`
+    limit).
+  * `SearchResult { mv: Mv, sad: u32 }` — the descent result.
+  * `mb_luma_sad_at_whole_mv(reference, mb_col, mb_row, src_y, mv) ->
+    u32` — fetches a 16×16 reference patch at the §17 quarter-pixel
+    MV (whole-pixel only this round) via the existing §20.14
+    edge-replicating `fetch_block_whole_pixel` and returns SAD vs
+    source. Debug builds assert the MV is on the whole-pixel grid
+    (`mv % WHOLE_PIXEL_STEP == 0`) and inside §17.1's `[-1023, +1023]`
+    range.
+  * `small_diamond_search_luma(reference, mb_col, mb_row, src_y,
+    center, max_iters) -> SearchResult` — small-diamond (4-neighbour:
+    N / S / W / E at ±1 whole pixel each) integer-pixel descent from
+    `center`. Snaps `center` to the whole-pixel grid (toward zero) +
+    clamps to `[MV_MIN, MV_MAX]` up front; each candidate is similarly
+    clamped + snapped. Terminates when no neighbour improves the SAD
+    or after `max_iters` iterations. `max_iters = 0` returns the SAD
+    at the snapped/clamped center without any neighbour exploration.
+  * Constants `MV_MIN: i16 = -1023`, `MV_MAX: i16 = 1023`,
+    `WHOLE_PIXEL_STEP: i16 = 4`.
+
+  Nothing in this module touches the bitstream encoder yet —
+  `encode_p_frame_zero_mv` still hardwires every MB to ZEROMV at
+  (0, 0). The NEWMV emit path that consumes this search result, plus
+  the half- / quarter-pel refinement, the §16.3 mv-cost weighting
+  (lambda * MV-coding-bits added to SAD), and the GOLDEN / ALTREF
+  source-selection layer remain follow-up rounds. New public
+  re-exports from `oxideav_vp8`: `block_sad_16x16`, `LumaRef`,
+  `SearchResult`, `mb_luma_sad_at_whole_mv`,
+  `small_diamond_search_luma`, `MV_MIN`, `MV_MAX`,
+  `WHOLE_PIXEL_STEP`. 14 new unit tests in `motion_search.rs` cover:
+  pure-SAD identities (identical inputs / one-pixel delta / saturated
+  / known manual sum), SAD-at-zero-MV consistency with
+  `block_sad_16x16`, exact-translation convergence (horizontal
+  2-whole-pixel; diagonal 2-row + 3-col), descent invariants
+  (never increases SAD from snapped center), §17.1 range clamp of an
+  `i16::MAX` / `i16::MIN` center, off-picture edge-replicate safety,
+  snap-to-whole-pixel coercion of a sub-pixel center, max_iters = 0
+  no-op probe, identical-source / center-MV stability, and a
+  `SearchResult` Copy/Eq contract pin. Tests: 439 → 453 (+14).
+
 * **VP8 encoder Phase 10: multi-frame I + P stream driver
   (RFC 6386 §9 / §9.7 / §9.8 / §16 / §17 / §18)** — new
   `Vp8InterStreamEncoder` extends Phase 8's keyframe driver to

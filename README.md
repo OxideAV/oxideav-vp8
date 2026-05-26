@@ -2,6 +2,37 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 142)
+
+**Encoder Phase 11 begin — whole-pixel motion-search primitive.** New
+`crate::motion_search` module wires the smallest infrastructure a
+non-zero MV codepath needs: a 16×16 luma SAD evaluator at any §17.1
+whole-pixel MV plus a small-diamond integer-pixel descent that finds a
+local SAD minimum from a caller-supplied center MV. The MV is in §17
+quarter-pixel units (whole-pixel = multiples of 4) and is clamped into
+`[MV_MIN, MV_MAX] = [-1023, +1023]` before fetching; the underlying
+reference fetch (`fetch_block_whole_pixel`) edge-replicates per §20.14
+`build_mc_border`, so a candidate that walks the patch off the picture
+is safe. The descent visits the 4-neighbour (N / S / E / W at ±1 whole
+pixel each) ring until no neighbour improves the SAD or after
+`max_iters` iterations.
+
+New public surface: `block_sad_16x16`, `LumaRef<'_>`, `SearchResult
+{ mv: Mv, sad: u32 }`, `mb_luma_sad_at_whole_mv`,
+`small_diamond_search_luma`, `MV_MIN` / `MV_MAX` / `WHOLE_PIXEL_STEP`
+constants. No bitstream emit yet — `encode_p_frame_zero_mv` still
+hardwires every MB to ZEROMV at (0, 0); the NEWMV emit path that
+consumes this search result is a follow-up round.
+
+Validated on 14 new unit tests in `motion_search.rs`: pure-SAD
+identities (identical / one-pixel / saturated / known-manual), SAD-at-
+zero-MV consistency with `block_sad_16x16`, exact-translation
+convergence (horizontal 2-whole-pixel, diagonal 2+3 whole-pixel),
+descent invariants (never increases SAD), §17.1 range clamp of an
+`i16::MAX` center, off-picture edge-replicate safety, snap-to-whole-
+pixel coercion of a sub-pixel center, and a `SearchResult` Copy/Eq
+contract pin. Tests: 439 → 453 (+14, all in `motion_search.rs`).
+
 ## Status — 2026-05-26 (round 141)
 
 **Encoder Phase 10 — multi-frame I + P stream driver.** New

@@ -131,6 +131,7 @@ fn p_frame_picker_selects_golden_when_last_has_drifted() {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         },
         100, // big interval — K is only frame 0.
     )
@@ -204,6 +205,7 @@ fn multi_ref_with_no_golden_altref_collapses_to_last_only() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
 
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
@@ -244,6 +246,7 @@ fn multi_ref_with_identical_refs_still_picks_last_only() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
 
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);

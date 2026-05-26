@@ -93,6 +93,7 @@ fn default_lf_deltas_match_round_150_wire_byte_for_byte() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
     let k_frame = I420Frame::packed(width, height, &k_y, &k_u, &k_v);
@@ -154,6 +155,7 @@ fn lf_deltas_with_update_round_trip_through_header_parser() {
         loop_filter_level: 16,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
     let k_frame = I420Frame::packed(width, height, &k_y, &k_u, &k_v);
@@ -214,6 +216,7 @@ fn lf_deltas_enabled_but_no_update_emits_zero_per_slot_values() {
         loop_filter_level: 16,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
     let k_frame = I420Frame::packed(width, height, &k_y, &k_u, &k_v);
@@ -272,6 +275,7 @@ fn decoder_observes_transmitted_deltas_on_loop_filter_strength() {
         loop_filter_level: 24,
         sharpness_level: 2,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
 
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
@@ -361,6 +365,7 @@ fn stream_encoder_carries_deltas_across_p_frames_and_resets_on_keyframe() {
         loop_filter_level: 16,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let mut enc = Vp8InterStreamEncoder::new(params, 100).expect("non-zero interval");
     let mut dec = Vp8DecoderState::new();
@@ -477,6 +482,7 @@ fn out_of_range_delta_magnitude_is_rejected() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let (_k_bytes, k_planes) =
         oxideav_vp8::encode_keyframe_with_reconstruction(&k_frame, &params).expect("K");

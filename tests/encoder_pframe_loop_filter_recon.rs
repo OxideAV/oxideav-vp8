@@ -81,6 +81,7 @@ fn encode_and_self_decode_p_frame(
         loop_filter_level,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
 
     let (i_bytes, i_recon) =

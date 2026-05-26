@@ -4,6 +4,25 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **`KeyframeParams::filter_type` exposes the §9.4 `filter_type` knob
+  to the encoder (RFC 6386 §9.4 / §15.2 / §15.3)** — the §9.4 1-bit
+  field selecting the §15.3 normal vs §15.2 simple loop filter was
+  previously hardwired to `false` (normal) on every encoder entry
+  point. Round 154 adds a `filter_type: bool` field to
+  `KeyframeParams` and threads it into both (a) the `write_loop_filter`
+  / `write_loop_filter_with_deltas` wire emit (the bit the decoder
+  reads back) and (b) `FrameFilterConfig::simple` for the encoder's
+  own §15 post-walk filter pass over its reconstruction buffer, so
+  encoder-vs-decoder pixel lockstep holds at both branches.
+  `KeyframeParams::default()` keeps `filter_type = false` so every
+  pre-r154 wire is byte-identical. New regression test
+  `encoder_pframe_simple_filter.rs` pins lockstep at both settings on
+  a seam-crossing fixture and pins that the two settings produce
+  observably different decoded Y planes (the §15.2 simple kernel is
+  edge-only / luma-only and cannot agree with §15.3 on real content).
+
 ### Fixed
 
 * **Encoder inter MB picker now dequantises forward-transform output

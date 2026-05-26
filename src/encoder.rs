@@ -3064,6 +3064,17 @@ pub struct KeyframeParams {
     /// partition is bit-identical to the 1-partition case, so the
     /// decoded picture is unchanged across all four choices.
     pub nbr_of_dct_partitions: u8,
+    /// §9.4 `filter_type` — `false` selects the §15.3 *normal* loop
+    /// filter (the default; matches every earlier round's wire), `true`
+    /// selects the §15.2 *simple* filter. The simple filter is a 4-pixel
+    /// edge-only kernel (no §15.3 inner-window high-edge-variance branch
+    /// and no chroma plane), so it costs the decoder less work but on a
+    /// natural-content frame yields lower PSNR than the normal filter.
+    /// The encoder runs the same selection inside its own §15 post-walk
+    /// filter pass so encoder-vs-decoder pixel lockstep holds at both
+    /// values. Only consulted when `loop_filter_level != 0`; the §15
+    /// whole-frame skip path bypasses the filter entirely either way.
+    pub filter_type: bool,
 }
 
 impl Default for KeyframeParams {
@@ -3073,6 +3084,7 @@ impl Default for KeyframeParams {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         }
     }
 }
@@ -3309,9 +3321,11 @@ pub fn encode_keyframe_with_reconstruction(
     // steps, so we can pass the raw quantised `all_coeffs` directly.
     if params.loop_filter_level != 0 {
         let lf_config = crate::loop_filter::FrameFilterConfig {
-            // §15.3 normal filter — mirrors the `filter_type = false`
-            // bit we emit just below in `write_loop_filter`.
-            simple: false,
+            // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
+            // simple. Mirrors the bit `write_loop_filter` writes below;
+            // the encoder's own post-walk filter must match what the
+            // decoder will run.
+            simple: params.filter_type,
             key_frame: true,
             loop_filter_level: params.loop_filter_level,
             sharpness_level: params.sharpness_level,
@@ -3347,15 +3361,16 @@ pub fn encode_keyframe_with_reconstruction(
     hdr.write_bool(128, false);
     // §9.3 — segmentation off.
     write_segment_update_flags(&mut hdr, false);
-    // §9.4 — loop filter. `filter_type = false` selects the §15.3 normal
-    // filter; `mode_ref_lf_delta_enabled = false` (per the
-    // [`KeyframeParams`] docs) so no per-MB delta layer is emitted.
+    // §9.4 — loop filter. `filter_type` follows `params.filter_type`
+    // (false ⇒ §15.3 normal, true ⇒ §15.2 simple);
+    // `mode_ref_lf_delta_enabled = false` (per the [`KeyframeParams`]
+    // docs) so no per-MB delta layer is emitted.
     // `loop_filter_level == 0` triggers the §15 whole-frame skip on the
     // decoder side; any non-zero value is honoured by both ends of the
     // round-trip via the post-walk filter pass above.
     write_loop_filter(
         &mut hdr,
-        false,
+        params.filter_type,
         params.loop_filter_level,
         params.sharpness_level,
         false,
@@ -5255,7 +5270,11 @@ fn encode_p_frame_multi_ref_inner(
     // ---- §15 loop-filter post-pass --------------------------------------
     if params.loop_filter_level != 0 {
         let lf_config = crate::loop_filter::FrameFilterConfig {
-            simple: false,
+            // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
+            // simple. Mirrors the bit `write_loop_filter_with_deltas`
+            // writes below; the encoder's own post-walk filter must
+            // match what the decoder will run.
+            simple: params.filter_type,
             key_frame: false,
             loop_filter_level: params.loop_filter_level,
             sharpness_level: params.sharpness_level,
@@ -5289,13 +5308,14 @@ fn encode_p_frame_multi_ref_inner(
     // key-frame-only per §9.2).
     // §9.3 — segmentation off.
     write_segment_update_flags(&mut hdr, false);
-    // §9.4 — loop filter. `filter_type = false` (normal). The §19.2
+    // §9.4 — loop filter. `filter_type` follows `params.filter_type`
+    // (false ⇒ §15.3 normal, true ⇒ §15.2 simple). The §19.2
     // `mb_lf_adjustments()` sub-block follows whatever the caller's
     // `LoopFilterDeltas` says — including the default
     // `loop_filter_adj_enable = 0` for the round-150 wire shape.
     write_loop_filter_with_deltas(
         &mut hdr,
-        false,
+        params.filter_type,
         params.loop_filter_level,
         params.sharpness_level,
         lf_deltas,
@@ -5762,6 +5782,7 @@ mod tests {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         };
         let bytes = encode_keyframe(&frame, &params).expect("encode");
 
@@ -5853,6 +5874,7 @@ mod tests {
                 loop_filter_level: 0,
                 sharpness_level: 0,
                 nbr_of_dct_partitions: 1,
+                filter_type: false,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
             let p = keyframe_luma_psnr(&bytes, &y, w as usize, h as usize);
@@ -5890,6 +5912,7 @@ mod tests {
                 loop_filter_level: 0,
                 sharpness_level: 0,
                 nbr_of_dct_partitions: 1,
+                filter_type: false,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
             let p = keyframe_luma_psnr(&bytes, &y, w as usize, h as usize);

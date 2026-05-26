@@ -138,6 +138,7 @@ fn ten_frame_inter_stream_mid_quant_meets_30db_per_frame() {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         },
         keyframe_interval,
     )

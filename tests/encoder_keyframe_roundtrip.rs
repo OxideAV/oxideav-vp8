@@ -122,6 +122,7 @@ fn roundtrip_at_partitioned(
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions,
+        filter_type: false,
     };
     let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
     let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -197,6 +198,7 @@ fn keyframe_multi_partition_psnr_matches_single_partition_baseline() {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: count,
+            filter_type: false,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -253,6 +255,7 @@ fn keyframe_multi_partition_short_frame_roundtrip() {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -264,6 +267,7 @@ fn keyframe_multi_partition_short_frame_roundtrip() {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: count,
+            filter_type: false,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -287,6 +291,7 @@ fn keyframe_invalid_partition_count_rejected() {
             loop_filter_level: 0,
             sharpness_level: 0,
             nbr_of_dct_partitions: bad,
+            filter_type: false,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::InvalidDctPartitionCount { value }) => assert_eq!(value, bad),
@@ -325,6 +330,7 @@ fn keyframe_loop_filter_levels_roundtrip() {
             loop_filter_level: level,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
 
@@ -380,6 +386,7 @@ fn keyframe_loop_filter_level_out_of_range_rejected() {
             loop_filter_level: bad,
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::LoopFilterLevelOutOfRange { value }) => assert_eq!(value, bad),
@@ -400,6 +407,7 @@ fn keyframe_sharpness_level_out_of_range_rejected() {
             loop_filter_level: 8,
             sharpness_level: bad,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::SharpnessLevelOutOfRange { value }) => assert_eq!(value, bad),
@@ -421,6 +429,7 @@ fn keyframe_sharpness_level_roundtrip() {
             loop_filter_level: 16,
             sharpness_level: sharpness,
             nbr_of_dct_partitions: 1,
+            filter_type: false,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own filtered keyframe");

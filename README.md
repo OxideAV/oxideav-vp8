@@ -2,6 +2,60 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-26 (round 154)
+
+**Encoder §9.4 `filter_type` knob exposed.** Round 152b (`8ebab4b`)
+restored encoder-vs-decoder pixel lockstep on non-zero
+`loop_filter_level` P-frames by dequantising the inter MB picker's
+forward-transform output before reconstruction (the issue the round-151
+status block flagged as follow-up). Round 154 follows up by exposing
+the §9.4 `filter_type` bit — the 1-bit selector between the §15.3
+*normal* loop filter (the historical default) and the §15.2 *simple*
+filter (a 4-pixel edge-only luma-only kernel without the §15.3 inner-
+window high-edge-variance branch).
+
+The bit was previously hardwired to `false` on every encoder entry
+point. A new `KeyframeParams::filter_type: bool` field threads the
+choice into both ends:
+
+  * **`write_loop_filter` / `write_loop_filter_with_deltas`** —
+    the §19.2 wire bit the decoder reads at parse time. The
+    `keyframe`-mode and `inter`-mode call sites both pick up
+    `params.filter_type` instead of the hardcoded `false`.
+  * **`FrameFilterConfig::simple`** — the encoder's own §15 post-walk
+    filter pass that mutates the reconstruction buffer. Both
+    `filter_frame` (keyframe) and `filter_inter_frame` (inter)
+    already branch on `simple` per RFC 6386 §15.1 ladder; the
+    encoder now selects the same branch the decoder will run from
+    the same wire.
+
+`KeyframeParams::default()` keeps `filter_type = false` so every
+pre-r154 call site emits the round-151 wire byte-for-byte. The
+`Vp8InterStreamEncoder` and `Vp8KeyframeStreamEncoder` stream
+drivers inherit the field through their `KeyframeParams` storage —
+no extra plumbing needed at the stream layer.
+
+Validation: a new `tests/encoder_pframe_simple_filter.rs` integration
+test (4 tests) encodes a 32×32 I+P pair at `loop_filter_level = 32`
+on a deliberately seam-crossing source (two ramps with a luminance
+step at the vertical MB seam — content §15 actually filters) and
+pins (a) encoder-recon == decoder-recon byte-for-byte at
+`filter_type = false`; (b) encoder-recon == decoder-recon byte-for-
+byte at `filter_type = true`; (c) the two settings produce
+observably different decoded Y planes (so the new knob is load-
+bearing on the picture, not just on the header); (d)
+`KeyframeParams::default()` keeps `filter_type = false` for
+round-153 wire compatibility. The existing
+`encoder_pframe_loop_filter_recon` lockstep tests still pass at
+both `loop_filter_level = 0` and `loop_filter_level = 32` on the
+`filter_type = false` default. Tests: 496 → 500 (+4 in
+`encoder_pframe_simple_filter.rs`).
+
+The next-step ladder for the encoder is now: (1) intra-within-inter
+MB picking (§11 RD against the inter J at `prob_intra < 255`), (2)
+§13.4 token-prob fitting from observed counts, (3) §9.3 segmentation
+support, (4) end-to-end libvpx black-box cross-decode validation.
+
 ## Status — 2026-05-26 (round 151)
 
 **Encoder Phase 11 — §9.4 caller-driven per-reference / per-mode

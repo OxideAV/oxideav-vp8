@@ -101,6 +101,7 @@ fn default_refresh_controls_match_round_149_wire_byte_for_byte() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
     let k_frame = I420Frame::packed(width, height, &k_y, &k_u, &k_v);
@@ -152,6 +153,7 @@ fn refresh_golden_gates_copy_buffer_to_golden_off_in_wire() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let (k_y, k_u, k_v) = stripe_frame(width as usize, height as usize);
     let k_frame = I420Frame::packed(width, height, &k_y, &k_u, &k_v);
@@ -274,6 +276,7 @@ fn stream_slot_rotation_walks_s20_page_147_ordering() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let mut enc = Vp8InterStreamEncoder::new(params, 100).expect("non-zero interval");
     let mut dec = Vp8DecoderState::new();
@@ -410,6 +413,7 @@ fn refresh_golden_carries_picker_quality_to_later_p_frame() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
     let mut enc = Vp8InterStreamEncoder::new(params, 100).expect("non-zero interval");
     let mut dec = Vp8DecoderState::new();

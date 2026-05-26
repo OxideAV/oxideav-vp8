@@ -235,6 +235,7 @@ fn i_plus_p_uniform_translation_emits_nearestmv() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
 
     let (i_bytes, i_recon) =
@@ -334,6 +335,7 @@ fn flat_scene_picker_resolves_to_zero_mv() {
         loop_filter_level: 0,
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
+        filter_type: false,
     };
 
     let (_i_bytes, i_recon) =

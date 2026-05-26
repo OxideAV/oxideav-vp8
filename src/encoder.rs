@@ -3264,12 +3264,13 @@ fn write_mode_layer(
 //                                            + §17 mv-component bits)
 //
 // Lower J wins; `NEARESTMV` / `NEARMV` / `SPLITMV` are out of scope
-// this round, as is half- / quarter-pel refinement (the search is the
-// §17 whole-pixel `small_diamond_search_luma` primitive, range-clamped
-// to `[-1023, +1023]` per §17.1). When the chosen MV is non-zero the
-// §18 prediction is the §18.2 / §18.3 whole-pixel copy (the §17
-// quarter-pixel MV's fractional bits are zero ⇒ no sub-pixel filter
-// pass runs).
+// this round, as is quarter-pel refinement (the search is the §17
+// whole-pixel `small_diamond_search_luma` primitive followed by a
+// §18.3 `half_pixel_refine_luma` probe of the 8 half-pixel offsets
+// around the whole-pixel result, all clamped to `[-1023, +1023]` per
+// §17.1). When the chosen MV is half-pixel-aligned the §18 prediction
+// runs the §18.3 six-tap synthesis (`version == 0` bicubic tap-set);
+// at a whole-pixel MV it collapses to the §18.2 / §18.3 copy path.
 //
 // The §14 residual = source - prediction is quantised and §13.3-token-
 // coded through the existing intra pipeline regardless of which mode
@@ -3303,15 +3304,19 @@ fn write_mode_layer(
 ///
 /// # Scope (this round)
 ///
-/// * **Whole-pixel motion search.** A
+/// * **Whole-pixel + §18.3 half-pixel motion search.** A
 ///   [`crate::motion_search::small_diamond_search_luma`] descent runs
 ///   per MB against the clamped §16.3 "best" predictor (the running
-///   `find_near_mvs[CNT_BEST]` vector). The chosen MV is whichever of
+///   `find_near_mvs[CNT_BEST]` vector), followed by a
+///   [`crate::motion_search::half_pixel_refine_luma`] probe of the 8
+///   half-pixel offsets around the whole-pixel result (each evaluated
+///   through the §18.3 six-tap synthesis the decoder will reproduce).
+///   The chosen MV is whichever of
 ///   `ZEROMV` (search-skipped, J = SAD at MV (0,0)) and `NEWMV` (J =
 ///   SAD at searched MV + lambda × `mv_ref_tree` path bits + §17
 ///   component bits) gives a smaller J. `NEARESTMV` / `NEARMV` /
-///   `SPLITMV` and half- / quarter-pel refinement are deferred to
-///   later rounds, as is `GOLDEN` / `ALTREF` source selection.
+///   `SPLITMV` and quarter-pel refinement are deferred to later
+///   rounds, as is `GOLDEN` / `ALTREF` source selection.
 /// * **`prob_intra` is 255**, so the decoder reads every MB as
 ///   inter without a bit on the wire wasted on intra-vs-inter
 ///   classification. Token-prob and intra-mode-prob update blocks
@@ -3503,13 +3508,28 @@ pub fn encode_p_frame_zero_mv(
             // count keeps the encoder's worst-case complexity O(MB_count
             // * MAX_ITERS * 4) and matches the §17 whole-pixel scope.
             const MAX_DIAMOND_ITERS: u32 = 8;
-            let search = crate::motion_search::small_diamond_search_luma(
+            let whole_pel = crate::motion_search::small_diamond_search_luma(
                 luma_ref,
                 mb_col,
                 mb_row,
                 &pixels.y,
                 best_predictor,
                 MAX_DIAMOND_ITERS,
+            );
+            // §18.3 half-pixel refinement: probe the 8 half-pixel
+            // offsets around the whole-pixel result and keep whichever
+            // 16×16 luma SAD is smallest. The refinement uses the same
+            // §18.3 sixtap synthesis (`version == 0` bicubic tap-set)
+            // the decoder will run when re-decoding this candidate, so
+            // a sub-pixel MV the picker picks is a SAD the decoder
+            // reproduces bit-for-bit. Tie-breaking prefers the
+            // whole-pixel center (fewer §17.2 component bits).
+            let search = crate::motion_search::half_pixel_refine_luma(
+                luma_ref,
+                mb_col,
+                mb_row,
+                &pixels.y,
+                whole_pel.mv,
             );
 
             // ---- §17 / §16.2 rate-distortion mode pick -------------------

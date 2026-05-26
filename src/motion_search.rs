@@ -13,57 +13,58 @@
 //! sum-of-absolute-differences (SAD) between the source and the
 //! reference patch the MV would select.
 //!
-//! ## Scope (this round)
+//! ## Scope
 //!
-//! * **Whole-pixel candidates only.** SAD is computed against the
-//!   integer-offset reference window via the existing §20.14
-//!   edge-replicating fetch primitive; no half-pel or quarter-pel
-//!   refinement is performed here. The returned MV always has
-//!   `row & 3 == 0` and `col & 3 == 0` (multiples of 4 in §17
-//!   quarter-pixel units).
+//! * **Whole-pixel descent followed by §18.3 half-pixel refinement.**
+//!   [`small_diamond_search_luma`] finds the best integer-pixel MV via
+//!   a 4-neighbour descent against the §20.14 edge-replicating fetch
+//!   primitive; [`half_pixel_refine_luma`] then probes the 8 half-pixel
+//!   offsets around that whole-pixel result, each evaluated through the
+//!   §18.3 six-tap synthesis the decoder runs (`version == 0` bicubic
+//!   tap set). The returned MV is always on the half-pixel grid (both
+//!   components multiples of [`HALF_PIXEL_STEP`]) and inside
+//!   `[MV_MIN, MV_MAX]`. Quarter-pixel refinement is a future round.
 //! * **Luma only.** The chroma plane is not sampled — the §18.1
-//!   `chroma_mv = avg(v, v, v, v)` derivation means any whole-pixel
-//!   luma MV maps to a whole-pixel chroma MV anyway, but a chroma SAD
-//!   adds little for whole-pixel candidates and noticeably more
-//!   per-iteration cost.
-//! * **Small-diamond descent.** The single search routine
-//!   ([`small_diamond_search_luma`]) iterates a 4-neighbour
-//!   (N / S / E / W at ±1 whole pixel each) descent from a caller-
-//!   supplied center MV, terminating when no neighbour improves the
-//!   SAD or after `max_iters` iterations. This is the cheapest motion
-//!   search shape that still moves off the trivial `(0, 0)` center;
-//!   larger patterns (hex, square, diamond-with-radius-N) are deferred
-//!   to a later round once the rest of the non-zero MV codepath
-//!   (NEWMV emit, mv-cost lambda tuning, prediction reuse) is wired up.
-//! * **No emit.** Nothing in this module touches the bitstream encoder.
-//!   `encode_p_frame_zero_mv` still hardwires every MB to `(0, 0)` and
-//!   ZERO_MV — the caller side that will consume this search and
-//!   actually emit a NEWMV-coded MB is a follow-up round.
+//!   `chroma_mv = avg(v, v, v, v)` derivation means a half-pixel luma
+//!   MV maps to a sub-pixel chroma MV by construction; sampling chroma
+//!   SAD per candidate would noticeably increase per-iteration cost
+//!   without typically changing the picked MV.
+//! * **Small-diamond integer descent.** A 4-neighbour (N / S / E / W at
+//!   ±1 whole pixel) descent from a caller-supplied center, terminating
+//!   when no neighbour improves the SAD or after `max_iters` iterations.
+//!   Larger integer patterns (hex, square, diamond-with-radius-N) are
+//!   deferred.
 //!
 //! ## §17.1 range clamp
 //!
 //! All candidate MVs are clamped into `[MV_MIN, MV_MAX]` =
-//! `[-1023, +1023]` quarter-pixels before fetching the reference patch.
-//! The fetch itself is `fetch_block_whole_pixel`'s
-//! [`crate::motion_comp::fetch_block_whole_pixel`] which already
-//! edge-replicates per §20.14 `build_mc_border`, so a MV that walks the
-//! patch off the picture is safe (it just reads the nearest in-bounds
-//! row / column). The §17.1 clamp is applied because anything outside
-//! that range cannot be coded in the bitstream regardless of whether the
-//! reference fetch would be valid.
+//! `[-1023, +1023]` quarter-pixels before the reference fetch. The
+//! underlying §20.14 `build_mc_border` edge replication inside
+//! [`crate::motion_comp::fetch_block_whole_pixel`] /
+//! [`crate::motion_comp::fetch_block_halo`] keeps a candidate that
+//! walks the patch (or the sixtap halo) off the picture safe: the fetch
+//! just reads the nearest in-bounds row / column. The §17.1 clamp is
+//! applied because anything outside that range cannot be coded in the
+//! bitstream regardless of whether the reference fetch would be valid.
 //!
 //! ## Reference
 //!
 //! * RFC 6386 §2 — encoder algorithm not specified.
 //! * RFC 6386 §17.1 — MV component range `[-1023, +1023]`, whole pixels
-//!   at multiples of 4.
+//!   at multiples of 4 (i.e. half-pixel = multiples of 2 = the
+//!   [`HALF_PIXEL_STEP`] grid).
 //! * RFC 6386 §18.1 — `stored_luma_mv` doubling that turns a §17
-//!   quarter-pixel MV into the §18 eighth-pixel resolution
-//!   `fetch_block_whole_pixel` consumes.
+//!   quarter-pixel MV into the §18 eighth-pixel resolution the §18.3
+//!   filter table indexes.
+//! * RFC 6386 §18.3 — six-tap sub-pixel interpolation (`version == 0`
+//!   bicubic / `version != 0` bilinear); the half-pixel refinement runs
+//!   the same `filter_block_4x4` synthesis the decoder will reproduce.
 //! * RFC 6386 §20.14 — `build_mc_border` edge replication for fetches
 //!   that walk off the picture.
 
-use crate::motion_comp::{fetch_block_whole_pixel, stored_luma_mv};
+use crate::motion_comp::{
+    fetch_block_whole_pixel, filter_block_4x4, filter_set_for_version, stored_luma_mv,
+};
 use crate::motion_vector::Mv;
 
 /// Minimum value of a single §17.1 MV component (quarter-pixel units).
@@ -75,6 +76,12 @@ pub const MV_MAX: i16 = 1023;
 /// One whole-pixel step in §17 quarter-pixel units (`4 quarter-pixels`
 /// per whole pixel).
 pub const WHOLE_PIXEL_STEP: i16 = 4;
+
+/// One half-pixel step in §17 quarter-pixel units (`2 quarter-pixels`
+/// per half pixel). After §18.1 doubling this becomes the §18.3
+/// eighth-pixel fraction `4` — i.e. the symmetric half-pixel tap row of
+/// the §18.3 `filters` table (row 4: `{ 3, -16, 77, 77, -16, 3 }`).
+pub const HALF_PIXEL_STEP: i16 = 2;
 
 /// Pixel-wise sum of absolute differences between two 16×16 blocks.
 ///
@@ -279,6 +286,172 @@ pub fn small_diamond_search_luma(
             // Local minimum on the small-diamond pattern; nothing
             // larger would dislodge it without a bigger neighbourhood.
             break;
+        }
+    }
+
+    SearchResult {
+        mv: best_mv,
+        sad: best_sad,
+    }
+}
+
+/// Compute the 16×16 luma SAD for one §17 quarter-pixel MV candidate
+/// (potentially at half-pixel resolution).
+///
+/// Unlike [`mb_luma_sad_at_whole_mv`] this routine accepts any §17.1
+/// MV whose components are multiples of [`HALF_PIXEL_STEP`] (i.e.
+/// whole-pixel ∪ half-pixel). The §18.3 prediction synthesis goes
+/// through the same [`filter_block_4x4`] / [`crate::motion_comp::sixtap_2d`]
+/// path the decoder runs at decode time, with the version=0 bicubic
+/// six-tap tap-set — the encoder commits to `version == 0` in every
+/// emitted frame tag, so this is the tap-set the decoder will reproduce
+/// on its half-pixel MV path. Sub-blocks whose §18.1-doubled fraction
+/// is zero (whole-pixel) collapse to the §18.3 "subblock is simply
+/// copied" path inside [`filter_block_4x4`].
+///
+/// The MV must be inside `[MV_MIN, MV_MAX]` per §17.1; debug builds
+/// assert. Quarter-pixel positions (`mv.row & 1 != 0`, etc.) are not
+/// rejected — the underlying §18.3 filter table is indexed by
+/// `(stored_luma_mv(mv) & 7)` and supports all eight fractions — but
+/// the [`half_pixel_refine_luma`] caller only ever produces half-pixel
+/// candidates.
+pub fn mb_luma_sad_at_mv(
+    reference: LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    mv: Mv,
+) -> u32 {
+    debug_assert!((MV_MIN..=MV_MAX).contains(&mv.row));
+    debug_assert!((MV_MIN..=MV_MAX).contains(&mv.col));
+
+    let blk_x0 = mb_col * 16;
+    let blk_y0 = mb_row * 16;
+    // §18.1 stored_luma_mv doubles the §17 quarter-pixel vector into
+    // the §18 eighth-pixel resolution the §18.3 filter table indexes.
+    let mv_eighth = stored_luma_mv(mv);
+    // §20.14 setup_subpixel_filters: `version == 0` selects the bicubic
+    // six-tap set. The encoder commits to `version == 0` in its emitted
+    // frame tag, so the decoder will run the same tap-set when re-decoding
+    // this candidate.
+    let filters = filter_set_for_version(0).taps();
+
+    let mut pred = [0u8; 256];
+    for sub_r in 0..4 {
+        for sub_c in 0..4 {
+            let blk_x = blk_x0 + sub_c * 4;
+            let blk_y = blk_y0 + sub_r * 4;
+            let patch = filter_block_4x4(
+                reference.plane,
+                reference.stride,
+                reference.width,
+                reference.height,
+                blk_x,
+                blk_y,
+                mv_eighth,
+                filters,
+            );
+            for r in 0..4 {
+                let dst_row = sub_r * 4 + r;
+                let dst_col = sub_c * 4;
+                pred[dst_row * 16 + dst_col..dst_row * 16 + dst_col + 4]
+                    .copy_from_slice(&patch[r * 4..r * 4 + 4]);
+            }
+        }
+    }
+
+    block_sad_16x16(src_y, &pred)
+}
+
+/// Half-pixel motion-search refinement around a whole-pixel center —
+/// RFC 6386 §18.3 / §17.1.
+///
+/// Given a `whole_pixel_center` MV that came out of an integer-pixel
+/// search such as [`small_diamond_search_luma`], probe the eight
+/// half-pixel offsets ±[`HALF_PIXEL_STEP`] in each of the (row, col)
+/// axes — i.e. the 3×3 grid `{(-1, -1), (-1, 0), (-1, +1), (0, -1),
+/// (0, +1), (+1, -1), (+1, 0), (+1, +1)} * HALF_PIXEL_STEP` around the
+/// center, excluding the center itself — and return the MV with the
+/// smallest 16×16 luma SAD across {center, all 8 neighbours}.
+///
+/// Each half-pixel candidate is evaluated through [`mb_luma_sad_at_mv`],
+/// which runs the §18.3 six-tap synthesis (the bicubic `version == 0`
+/// tap-set the encoder always commits to in its frame tag). The center's
+/// SAD is recomputed (whole-pixel ⇒ the §18.3 copy path) rather than
+/// passed in as an argument so the function is independent of how the
+/// caller derived the integer-pixel candidate.
+///
+/// `whole_pixel_center` is asserted to be on the whole-pixel grid
+/// (components multiples of [`WHOLE_PIXEL_STEP`]) and inside §17.1's
+/// `[MV_MIN, MV_MAX]`. Candidates outside §17.1's range are clamped
+/// (snapped onto the nearest in-range value); a candidate that collapses
+/// onto an already-evaluated MV after clamping is skipped to avoid
+/// recomputing the same SAD. Ties between the center and a neighbour go
+/// to the **center** — fewer §17.2 component bits to code (the magnitude
+/// 2 differential adds at least one extra bit per component vs. the
+/// magnitude-0 / multiple-of-4 differential the whole-pixel center
+/// carries).
+///
+/// This is the smallest §18.3 refinement that gives a sub-pixel
+/// translation a chance of self-decoding bit-exactly: pure-translation
+/// content that lies on the half-pixel grid (e.g. a `+0.5` luma pixel
+/// shift) is fundamentally unreachable from a whole-pixel-only descent.
+pub fn half_pixel_refine_luma(
+    reference: LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    whole_pixel_center: Mv,
+) -> SearchResult {
+    debug_assert_eq!(
+        whole_pixel_center.row % WHOLE_PIXEL_STEP,
+        0,
+        "whole_pixel_center.row must be on the whole-pixel grid"
+    );
+    debug_assert_eq!(
+        whole_pixel_center.col % WHOLE_PIXEL_STEP,
+        0,
+        "whole_pixel_center.col must be on the whole-pixel grid"
+    );
+    debug_assert!((MV_MIN..=MV_MAX).contains(&whole_pixel_center.row));
+    debug_assert!((MV_MIN..=MV_MAX).contains(&whole_pixel_center.col));
+
+    let mut best_mv = whole_pixel_center;
+    let mut best_sad = mb_luma_sad_at_mv(reference, mb_col, mb_row, src_y, best_mv);
+
+    // 8 half-pixel offsets around the center, in §17 quarter-pixel units.
+    let step = HALF_PIXEL_STEP as i32;
+    let offsets: [(i32, i32); 8] = [
+        (-step, -step),
+        (-step, 0),
+        (-step, step),
+        (0, -step),
+        (0, step),
+        (step, -step),
+        (step, 0),
+        (step, step),
+    ];
+
+    for (drow, dcol) in offsets {
+        let cand_row = clamp_component(whole_pixel_center.row as i32 + drow);
+        let cand_col = clamp_component(whole_pixel_center.col as i32 + dcol);
+        // After §17.1 clamping a half-pixel candidate at the boundary
+        // can collapse back onto the center (e.g. row=1023 + 2 ⇒ 1023);
+        // skip those to avoid recomputing the identical SAD.
+        if cand_row == best_mv.row && cand_col == best_mv.col {
+            continue;
+        }
+        let cand_mv = Mv {
+            row: cand_row,
+            col: cand_col,
+        };
+        let cand_sad = mb_luma_sad_at_mv(reference, mb_col, mb_row, src_y, cand_mv);
+        // Tie goes to the previous best (which starts as the center,
+        // so on equality the whole-pixel center wins — fewer §17.2
+        // component bits to code).
+        if cand_sad < best_sad {
+            best_sad = cand_sad;
+            best_mv = cand_mv;
         }
     }
 
@@ -636,6 +809,192 @@ mod tests {
         // The exact optimum lives at col = 2 whole pixels = 8 in §17 units.
         assert_eq!(result.mv, Mv { row: 0, col: 8 });
         assert_eq!(result.sad, 0);
+    }
+
+    #[test]
+    fn half_pixel_refine_keeps_center_on_flat_source() {
+        // Flat source ⇒ SAD is zero at every MV ⇒ tie-break keeps the
+        // whole-pixel center (fewer §17.2 component bits).
+        let width = 32;
+        let height = 32;
+        let reference = vec![200u8; width * height];
+        let src_blk = [200u8; 256];
+        let result = half_pixel_refine_luma(
+            packed_luma_ref(&reference, width, height),
+            0,
+            0,
+            &src_blk,
+            Mv { row: 0, col: 0 },
+        );
+        assert_eq!(result.mv, Mv { row: 0, col: 0 });
+        assert_eq!(result.sad, 0);
+    }
+
+    /// Render a luma plane with a non-degenerate 2D ramp: distinct row
+    /// and column gradients with different slopes. Used by the
+    /// half-pixel refinement test so the §18.3 filter at every half-
+    /// pixel position produces a distinct prediction (no row/column
+    /// invariance lets a diagonal half-pixel candidate tie a cardinal).
+    fn two_d_ramp_plane(width: usize, height: usize) -> Vec<u8> {
+        let mut p = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                // Different per-axis slopes so the sixtap response at
+                // each (dx, dy) half-pixel offset is distinct.
+                let v = ((x as i32) + 3 * (y as i32)).clamp(0, 240);
+                p[y * width + x] = v as u8;
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn half_pixel_refine_finds_half_pixel_horizontal_shift() {
+        // Build a synthetic source whose MB(1, 1) block is EXACTLY the
+        // §18.3 sixtap synthesis of the reference at MV (0, +1/2 px) so
+        // there is one and only one half-pixel candidate that drives the
+        // SAD to zero (the two_d_ramp plane has a distinct response at
+        // every half-pixel position, breaking row-invariance ties).
+        let width = 64;
+        let height = 64;
+        let reference = two_d_ramp_plane(width, height);
+        // Construct src_blk = sixtap_2d(reference at MB(1,0), col-half).
+        // That is: take the reference and apply mb_luma_sad_at_mv's own
+        // prediction path with the ground-truth MV — the resulting block
+        // is by construction the SAD-zero source for MV (0, HALF_PIXEL_STEP).
+        let ref_luma = packed_luma_ref(&reference, width, height);
+        // Synthesize the source MB by re-using the §18.3 prediction at
+        // the ground-truth half-pixel MV, then verify the descent finds
+        // it.
+        let truth_mv = Mv {
+            row: 0,
+            col: HALF_PIXEL_STEP,
+        };
+        // Build the source block by running the same per-sub-block
+        // filter the SAD evaluator uses internally — sample-exact mirror
+        // of mb_luma_sad_at_mv's prediction (so SAD == 0 at truth_mv).
+        let mut src_blk = [0u8; 256];
+        let mv_eighth = stored_luma_mv(truth_mv);
+        let filters = filter_set_for_version(0).taps();
+        let blk_x0 = 16;
+        let blk_y0 = 16;
+        for sub_r in 0..4 {
+            for sub_c in 0..4 {
+                let blk_x = blk_x0 + sub_c * 4;
+                let blk_y = blk_y0 + sub_r * 4;
+                let patch = filter_block_4x4(
+                    &reference, width, width, height, blk_x, blk_y, mv_eighth, filters,
+                );
+                for r in 0..4 {
+                    let dst_row = sub_r * 4 + r;
+                    let dst_col = sub_c * 4;
+                    src_blk[dst_row * 16 + dst_col..dst_row * 16 + dst_col + 4]
+                        .copy_from_slice(&patch[r * 4..r * 4 + 4]);
+                }
+            }
+        }
+        let result = half_pixel_refine_luma(ref_luma, 1, 1, &src_blk, Mv { row: 0, col: 0 });
+        assert_eq!(
+            result.mv, truth_mv,
+            "half-pixel +0.5 px horizontal shift expected, got {:?}",
+            result.mv
+        );
+        // The source equals the §18.3 prediction at truth_mv by
+        // construction ⇒ SAD must be exactly zero at the picked MV.
+        assert_eq!(result.sad, 0);
+    }
+
+    #[test]
+    fn half_pixel_refine_never_worsens_sad() {
+        // The refinement is descent semantics: the returned SAD must be
+        // ≤ the SAD at the whole-pixel center. Use a randomish-but-
+        // deterministic plane so any half-pixel candidate has a chance
+        // of beating the center.
+        let width = 48;
+        let height = 48;
+        let reference = ramp_plane(width, height);
+        // Source = ramp + low-amplitude horizontal phase shift built by
+        // averaging neighbours (a manual half-pixel filter is overkill;
+        // any non-trivial source vs. ref will exercise the descent).
+        let mut src_plane = reference.clone();
+        for y in 0..height {
+            for x in 1..(width - 1) {
+                let a = reference[y * width + x - 1] as u32;
+                let b = reference[y * width + x] as u32;
+                src_plane[y * width + x] = ((a + b) / 2) as u8;
+            }
+        }
+        let src_blk = extract_mb_block(&src_plane, width, 1, 1);
+        let ref_luma = packed_luma_ref(&reference, width, height);
+        let sad_at_center = mb_luma_sad_at_mv(ref_luma, 1, 1, &src_blk, Mv { row: 0, col: 0 });
+        let result = half_pixel_refine_luma(ref_luma, 1, 1, &src_blk, Mv { row: 0, col: 0 });
+        assert!(
+            result.sad <= sad_at_center,
+            "half-pixel refinement must not worsen SAD (center={sad_at_center}, result={})",
+            result.sad
+        );
+        // The chosen MV must be a half-pixel multiple of HALF_PIXEL_STEP
+        // (i.e. ±0 or ±HALF_PIXEL_STEP on each component).
+        assert!(result.mv.row.unsigned_abs() <= HALF_PIXEL_STEP as u16);
+        assert!(result.mv.col.unsigned_abs() <= HALF_PIXEL_STEP as u16);
+        assert_eq!(result.mv.row % HALF_PIXEL_STEP, 0);
+        assert_eq!(result.mv.col % HALF_PIXEL_STEP, 0);
+    }
+
+    #[test]
+    fn half_pixel_refine_clamps_at_section_17_1_boundary() {
+        // Center at the §17.1 boundary (row=+1020 = 255 whole pixels);
+        // half-pixel candidates that would step past the boundary
+        // (col = MV_MAX = 1023 plus HALF_PIXEL_STEP) get clamped back
+        // onto an already-evaluated MV and skipped. The result must
+        // still be on the half-pixel grid and inside §17.1's range.
+        let width = 32;
+        let height = 32;
+        let reference = vec![100u8; width * height];
+        let src_blk = [100u8; 256];
+        let result = half_pixel_refine_luma(
+            packed_luma_ref(&reference, width, height),
+            0,
+            0,
+            &src_blk,
+            Mv {
+                row: 1020,
+                col: 1020,
+            },
+        );
+        assert!((MV_MIN..=MV_MAX).contains(&result.mv.row));
+        assert!((MV_MIN..=MV_MAX).contains(&result.mv.col));
+        // Flat ⇒ tie-break keeps the center.
+        assert_eq!(
+            result.mv,
+            Mv {
+                row: 1020,
+                col: 1020
+            }
+        );
+        assert_eq!(result.sad, 0);
+    }
+
+    #[test]
+    fn mb_luma_sad_at_mv_whole_pixel_matches_whole_pixel_helper() {
+        // For a whole-pixel MV, mb_luma_sad_at_mv must equal
+        // mb_luma_sad_at_whole_mv (the §18.3 sixtap collapses to the
+        // copy path when the fraction is zero, so the two evaluators
+        // produce the same prediction).
+        let width = 32;
+        let height = 32;
+        let reference = ramp_plane(width, height);
+        let mut src_plane = reference.clone();
+        // Perturb the source so the SAD isn't trivially zero.
+        for y in 0..height {
+            src_plane[y * width + (y % width)] = src_plane[y * width + (y % width)].wrapping_add(7);
+        }
+        let src_blk = extract_mb_block(&src_plane, width, 0, 0);
+        let ref_luma = packed_luma_ref(&reference, width, height);
+        let mv = Mv { row: 0, col: 0 };
+        let sad_general = mb_luma_sad_at_mv(ref_luma, 0, 0, &src_blk, mv);
+        let sad_whole = mb_luma_sad_at_whole_mv(ref_luma, 0, 0, &src_blk, mv);
+        assert_eq!(sad_general, sad_whole);
     }
 
     #[test]

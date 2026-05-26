@@ -62,7 +62,7 @@
 //!   `if (!key_frame)`).
 
 use crate::encoder::{
-    encode_keyframe_with_reconstruction, encode_p_frame_zero_mv, EncodeError, I420Frame,
+    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref, EncodeError, I420Frame,
     KeyframeParams,
 };
 use crate::frame::KeyframePlanes;
@@ -527,10 +527,29 @@ impl Vp8InterStreamEncoder {
             (b, p, FrameKind::Key)
         } else {
             // Safe: `emit_key` is false ⇒ `self.last` is Some by the
-            // expression above.
-            let reference = self.last.as_ref().expect("LAST slot present for P-frame");
-            let ref_planes = ref_slot_to_keyframe_planes(reference);
-            let (b, p) = encode_p_frame_zero_mv(frame, &ref_planes, &self.params)?;
+            // expression above. We pass all three §9 reference slots
+            // (`LAST` required, `GOLDEN` / `ALTREF` optional) to the
+            // multi-ref encoder so it can score each MB against every
+            // available reference and emit the §16.2 `ref_frame_tree`
+            // selector bits per MB. Until a future round wires up the
+            // §9.7 `refresh_golden_frame` / `refresh_alternate_frame`
+            // ladder, GOLDEN / ALTREF stay frozen at the most-recent
+            // keyframe's reconstruction — they still beat LAST for
+            // MBs whose source content matches the keyframe (e.g.
+            // after a brief disturbance returns to the original
+            // frame).
+            let last_planes = ref_slot_to_keyframe_planes(
+                self.last.as_ref().expect("LAST slot present for P-frame"),
+            );
+            let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+            let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+            let (b, p) = encode_p_frame_multi_ref(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+            )?;
             (b, p, FrameKind::InterZeroMv)
         };
 

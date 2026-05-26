@@ -3926,6 +3926,360 @@ fn write_submv_ref(enc: &mut BoolEncoder, probs: &[u8; 3], mode: crate::near_mv:
 ///   partition output for inter is the same layout reorganisation as
 ///   for keyframes; it can be wired in by a follow-up.
 ///
+/// Outcome of running the §16.2 / §16.3 / §16.4 + §17 / §18 / §14
+/// per-MB picker for one reference frame. Used by
+/// [`encode_p_frame_multi_ref`] to score each available reference
+/// (`LAST` / optional `GOLDEN` / optional `ALTREF`) and pick the
+/// winning ref + mode + MV per MB.
+#[derive(Clone)]
+struct PickedMbForRef {
+    /// The reference frame this candidate scored against.
+    ref_frame: crate::motion_comp::RefFrame,
+    /// The §16.2 whole-MB inter mode (or `Split` for SPLITMV) that
+    /// won inside this ref's per-MB pick.
+    chosen_mode: crate::near_mv::InterMode,
+    /// The §17 quarter-pixel MV the chosen mode resolves to (the
+    /// SPLITMV path stores `split_mvs[15]`, matching the §16.3
+    /// `MbInfo::mv` convention).
+    chosen_mv: crate::motion_vector::Mv,
+    /// `Some(..)` iff `chosen_mode == InterMode::Split`. The §16.4
+    /// partition, per-group `sub_mv_ref` modes, per-group NEW4X4
+    /// differentials, and resolved `split_mvs[16]`.
+    chosen_split: Option<SplitMvCandidate>,
+    /// Per-MB residual coefficients (Y2 + 16 Y + 4 U + 4 V), already
+    /// quantised — what the §13 token emit walks for this MB.
+    raw_coeffs: MbCoeffs,
+    /// §11.1 mb_skip_coeff. True iff every coded block is all-zero
+    /// after quantisation.
+    mb_skip_coeff: bool,
+    /// Post-§14 reconstruction the encoder writes into its running
+    /// `planes` buffer (and into the next-frame LAST slot once §15
+    /// has filtered it).
+    recon: crate::reconstruct::ReconstructedMb,
+    /// True iff the §13.3 token walk routes through the B_PRED /
+    /// SPLITMV "no Y2" path (`encode_mb_tokens(use_bpred = true)`).
+    use_bpred: bool,
+    /// `J = SAD + lambda * (mv_ref_tree + §17 mv + §16.4 partition +
+    /// sub_mv_ref + NEW4X4) bits`. Does NOT include the §16.2
+    /// `ref_frame_tree` bits — the caller adds those, since the
+    /// `prob_last` / `prob_gf` used during picking and the
+    /// distribution-fitted values used at emit-time can differ.
+    j: f64,
+}
+
+/// Run the full per-MB picker for one reference frame. Mirrors the
+/// per-MB body of [`encode_p_frame_multi_ref`]'s search loop but
+/// parameterised by the reference frame + its planes + its luma SAD
+/// view. Used to compare LAST / GOLDEN / ALTREF candidates for the
+/// same MB.
+#[allow(clippy::too_many_arguments)]
+fn pick_mb_for_ref(
+    ref_frame: crate::motion_comp::RefFrame,
+    reference_planes: &crate::motion_comp::ReferencePlanes<'_>,
+    luma_ref: crate::motion_search::LumaRef<'_>,
+    pixels: &MbPixels,
+    above_slot: &crate::near_mv::MbInfo,
+    left_mb: &crate::near_mv::MbInfo,
+    aboveleft_mb: &crate::near_mv::MbInfo,
+    mb_col: usize,
+    mb_row: usize,
+    mb_cols: usize,
+    mb_rows: usize,
+    mv_contexts: &crate::motion_vector::MvContexts,
+    lambda: f64,
+    filters: &[[i32; 6]; 8],
+    factors: &crate::dequant::MbDequantFactors,
+) -> PickedMbForRef {
+    // ---- §16.3 census + §17 motion search ------------------------
+    //
+    // The §16.3 `find_near_mvs[CNT_BEST]` slot is the "best"
+    // predictor a NEWMV differential is added to (see
+    // `resolve_inter_mb_mv` in `crate::near_mv`). Clamp it through
+    // the §18.1 / §20.11 per-MB rectangle before the search uses it
+    // as the descent center, exactly matching what the decoder will
+    // do when re-reading the NEWMV path. The census is per-ref:
+    // neighbour MVs only count toward `near.mvs[]` when their
+    // recorded `ref_frame` matches ours.
+    let near = crate::near_mv::find_near_mvs(
+        above_slot,
+        left_mb,
+        aboveleft_mb,
+        ref_frame,
+        crate::near_mv::SignBias::default(),
+    );
+    let bounds = crate::near_mv::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+    let best_predictor = crate::near_mv::clamp_mv(near.mvs[0], &bounds);
+    let mv_ref_probs = crate::near_mv::mv_ref_probs(&near.cnt);
+
+    // SAD at MV (0,0) is the ZEROMV distortion term.
+    let sad_zero = crate::motion_search::mb_luma_sad_at_whole_mv(
+        luma_ref,
+        mb_col,
+        mb_row,
+        &pixels.y,
+        crate::motion_vector::Mv::default(),
+    );
+    const MAX_DIAMOND_ITERS: u32 = 8;
+    let whole_pel = crate::motion_search::small_diamond_search_luma(
+        luma_ref,
+        mb_col,
+        mb_row,
+        &pixels.y,
+        best_predictor,
+        MAX_DIAMOND_ITERS,
+    );
+    let half_pel = crate::motion_search::half_pixel_refine_luma(
+        luma_ref,
+        mb_col,
+        mb_row,
+        &pixels.y,
+        whole_pel.mv,
+    );
+    let search = crate::motion_search::quarter_pixel_refine_luma(
+        luma_ref,
+        mb_col,
+        mb_row,
+        &pixels.y,
+        half_pel.mv,
+    );
+
+    // §16.2 inter-mode tree bit costs.
+    let bits_mode_zero = bool_bits(mv_ref_probs[0], false);
+    let bits_mode_nearest = bool_bits(mv_ref_probs[0], true) + bool_bits(mv_ref_probs[1], false);
+    let bits_mode_near = bool_bits(mv_ref_probs[0], true)
+        + bool_bits(mv_ref_probs[1], true)
+        + bool_bits(mv_ref_probs[2], false);
+    let bits_mode_new = bool_bits(mv_ref_probs[0], true)
+        + bool_bits(mv_ref_probs[1], true)
+        + bool_bits(mv_ref_probs[2], true)
+        + bool_bits(mv_ref_probs[3], false);
+    let diff_row = (search.mv.row as i32) - (best_predictor.row as i32);
+    let diff_col = (search.mv.col as i32) - (best_predictor.col as i32);
+    let diff_in_range = (-1023..=1023).contains(&diff_row) && (-1023..=1023).contains(&diff_col);
+    let bits_mv_diff = if diff_in_range {
+        crate::motion_vector::mv_component_bits(&mv_contexts[0], diff_row)
+            + crate::motion_vector::mv_component_bits(&mv_contexts[1], diff_col)
+    } else {
+        f64::INFINITY
+    };
+
+    let nearest_mv = crate::near_mv::clamp_mv(near.mvs[1], &bounds);
+    let near_mv = crate::near_mv::clamp_mv(near.mvs[2], &bounds);
+    let sad_nearest =
+        crate::motion_search::mb_luma_sad_at_mv(luma_ref, mb_col, mb_row, &pixels.y, nearest_mv);
+    let sad_near =
+        crate::motion_search::mb_luma_sad_at_mv(luma_ref, mb_col, mb_row, &pixels.y, near_mv);
+
+    let j_zero = sad_zero as f64 + lambda * bits_mode_zero;
+    let j_nearest = sad_nearest as f64 + lambda * bits_mode_nearest;
+    let j_near = sad_near as f64 + lambda * bits_mode_near;
+    let j_new = search.sad as f64 + lambda * (bits_mode_new + bits_mv_diff);
+
+    let nearest_eligible = nearest_mv != crate::motion_vector::Mv::default();
+    let near_eligible = near_mv != crate::motion_vector::Mv::default();
+    let new_eligible = diff_in_range && search.mv != crate::motion_vector::Mv::default();
+
+    let mut chosen_mode = crate::near_mv::InterMode::Zero;
+    let mut chosen_mv = crate::motion_vector::Mv::default();
+    let mut chosen_j = j_zero;
+    if nearest_eligible && j_nearest < chosen_j {
+        chosen_mode = crate::near_mv::InterMode::Nearest;
+        chosen_mv = nearest_mv;
+        chosen_j = j_nearest;
+    }
+    if near_eligible && j_near < chosen_j {
+        chosen_mode = crate::near_mv::InterMode::Near;
+        chosen_mv = near_mv;
+        chosen_j = j_near;
+    }
+    if new_eligible && j_new < chosen_j {
+        chosen_mode = crate::near_mv::InterMode::New;
+        chosen_mv = search.mv;
+        chosen_j = j_new;
+    }
+
+    // ---- §16.4 SPLITMV picker --------------------------------------
+    let bits_mode_split = bool_bits(mv_ref_probs[0], true)
+        + bool_bits(mv_ref_probs[1], true)
+        + bool_bits(mv_ref_probs[2], true)
+        + bool_bits(mv_ref_probs[3], true);
+    let mut best_split: Option<SplitMvCandidate> = None;
+    for &partition in &[
+        crate::near_mv::MvPartition::TopBottom,
+        crate::near_mv::MvPartition::LeftRight,
+        crate::near_mv::MvPartition::Quarters,
+        crate::near_mv::MvPartition::Mv16,
+    ] {
+        if let Some(cand) = score_split_partition(
+            partition,
+            luma_ref,
+            mb_col,
+            mb_row,
+            &pixels.y,
+            best_predictor,
+            above_slot,
+            left_mb,
+            mv_contexts,
+            lambda,
+        ) {
+            let total_j = cand.j + lambda * bits_mode_split;
+            if best_split
+                .as_ref()
+                .map(|b| total_j < b.j + lambda * bits_mode_split)
+                .unwrap_or(true)
+            {
+                best_split = Some(SplitMvCandidate {
+                    partition: cand.partition,
+                    split_mvs: cand.split_mvs,
+                    submv_modes: cand.submv_modes,
+                    submv_new_diffs: cand.submv_new_diffs,
+                    j: total_j,
+                });
+            }
+        }
+    }
+    let mut chosen_split: Option<SplitMvCandidate> = None;
+    if let Some(cand) = best_split {
+        if cand.j < chosen_j {
+            chosen_mode = crate::near_mv::InterMode::Split;
+            chosen_mv = cand.split_mvs[15];
+            chosen_j = cand.j;
+            chosen_split = Some(cand);
+        }
+    }
+
+    // ---- §18 / §14 prediction + residual + reconstruction at the
+    //      chosen (mode, mv) for THIS ref ---------------------------
+    let (raw_coeffs, use_bpred) = if let Some(ref cand) = chosen_split {
+        let pred = crate::motion_comp::predict_split_mv(
+            reference_planes,
+            mb_col,
+            mb_row,
+            &cand.split_mvs,
+            false,
+            filters,
+        );
+        let raw_coeffs = transform_split_mv_mb(
+            &pixels.y, &pred.y, &pixels.u, &pred.u, &pixels.v, &pred.v, factors,
+        );
+        (raw_coeffs, true)
+    } else {
+        let pred = crate::motion_comp::predict_inter_mb(
+            reference_planes,
+            mb_col,
+            mb_row,
+            chosen_mv,
+            false,
+            filters,
+        );
+        let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, factors);
+        let u_quant = transform_chroma_plane(&pixels.u, &pred.u, factors);
+        let v_quant = transform_chroma_plane(&pixels.v, &pred.v, factors);
+        let raw_coeffs = MbCoeffs {
+            y: y_quant,
+            y2: y2_quant,
+            u: u_quant,
+            v: v_quant,
+        };
+        (raw_coeffs, false)
+    };
+
+    // §11.1 skip-detection.
+    let mut nonzero_block_count = 0usize;
+    if !use_bpred && raw_coeffs.y2.iter().any(|&v| v != 0) {
+        nonzero_block_count += 1;
+    }
+    for blk in raw_coeffs.y.iter() {
+        let first = if use_bpred { 0 } else { 1 };
+        if blk.iter().skip(first).any(|&v| v != 0) {
+            nonzero_block_count += 1;
+        }
+    }
+    for blk in raw_coeffs.u.iter() {
+        if blk.iter().any(|&v| v != 0) {
+            nonzero_block_count += 1;
+        }
+    }
+    for blk in raw_coeffs.v.iter() {
+        if blk.iter().any(|&v| v != 0) {
+            nonzero_block_count += 1;
+        }
+    }
+    let mb_skip_coeff = nonzero_block_count == 0;
+
+    let recon = if let Some(ref cand) = chosen_split {
+        crate::motion_comp::reconstruct_split_mv_mb(
+            reference_planes,
+            mb_col,
+            mb_row,
+            &cand.split_mvs,
+            false,
+            filters,
+            mb_skip_coeff,
+            &raw_coeffs.y,
+            &raw_coeffs.u,
+            &raw_coeffs.v,
+        )
+    } else {
+        crate::motion_comp::reconstruct_inter_mb(
+            reference_planes,
+            mb_col,
+            mb_row,
+            chosen_mv,
+            false,
+            filters,
+            mb_skip_coeff,
+            &raw_coeffs.y2,
+            &raw_coeffs.y,
+            &raw_coeffs.u,
+            &raw_coeffs.v,
+        )
+    };
+
+    PickedMbForRef {
+        ref_frame,
+        chosen_mode,
+        chosen_mv,
+        chosen_split,
+        raw_coeffs,
+        mb_skip_coeff,
+        recon,
+        use_bpred,
+        j: chosen_j,
+    }
+}
+
+/// `-log2 P` cost in fractional bits of the §16.2 `ref_frame_tree`
+/// path for one reference frame, given the wire probs.
+fn ref_frame_tree_bits(ref_frame: crate::motion_comp::RefFrame, prob_last: u8, prob_gf: u8) -> f64 {
+    match ref_frame {
+        // LAST: B(prob_last) reads `false`.
+        crate::motion_comp::RefFrame::Last => bool_bits(prob_last, false),
+        // GOLDEN: B(prob_last) reads `true`, B(prob_gf) reads `false`.
+        crate::motion_comp::RefFrame::Golden => {
+            bool_bits(prob_last, true) + bool_bits(prob_gf, false)
+        }
+        // ALTREF: B(prob_last) reads `true`, B(prob_gf) reads `true`.
+        crate::motion_comp::RefFrame::AltRef => {
+            bool_bits(prob_last, true) + bool_bits(prob_gf, true)
+        }
+    }
+}
+
+/// Pick the L(8) wire value for `prob` that minimises the total
+/// `-count_true * log2(1 - p/256) - count_false * log2(p/256)` cost
+/// of `count_false` "false" reads + `count_true` "true" reads. The
+/// optimum is `256 * count_false / total`, clamped into `1..=255` to
+/// keep the §7.3 bool range from collapsing.
+fn fit_prob_l8(count_false: u32, count_true: u32) -> u8 {
+    let total = count_false + count_true;
+    if total == 0 {
+        return 128; // arbitrary; nobody reads it.
+    }
+    let raw = ((count_false as u64 * 256) / total as u64) as u32;
+    raw.clamp(1, 255) as u8
+}
+
 /// Self-decode validation: the emitted bytes decode through
 /// [`crate::state::Vp8DecoderState`] (after the I-frame the LAST slot
 /// holds) and reproduce the source within the §14 quantiser's
@@ -3934,6 +4288,53 @@ fn write_submv_ref(enc: &mut BoolEncoder, probs: &[u8; 3], mode: crate::near_mv:
 pub fn encode_p_frame_zero_mv(
     frame: &I420Frame,
     reference: &crate::frame::KeyframePlanes,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref(frame, reference, None, None, params)
+}
+
+/// §16.2 multi-reference P-frame encoder. Extends
+/// [`encode_p_frame_zero_mv`] with optional `golden` and `altref`
+/// reference planes; the per-MB picker scores every available
+/// reference against the §17 / §16.2 / §16.3 / §16.4 candidate ladder
+/// and emits whichever (`ref_frame`, mode, MV) tuple minimises
+/// `J = SAD + lambda * (mv_ref_tree_bits + ref_frame_tree_bits + §17 mv bits)`.
+///
+/// `last` is required (every inter frame must hold a `LAST` reference
+/// at the §9 three-slot ladder). `golden` and `altref` are optional;
+/// pass `None` for a slot to disable that reference. All three planes
+/// must share `(mb_cols, mb_rows)` with the source frame's
+/// macroblock-grid dimensions; a mismatch is surfaced as
+/// [`EncodeError::ReferenceDimensionsMismatch`].
+///
+/// # Wire layout differences vs. [`encode_p_frame_zero_mv`]
+///
+/// * `prob_intra` stays 255 (no intra MBs this round). `prob_last`
+///   and `prob_gf` are derived from the post-picker per-MB reference
+///   distribution so the §16.2 selector bits compress against an
+///   on-distribution prior (a Laplace-of-counts step clamped into
+///   `1..=255`).
+/// * The per-MB §19.3 `ref_frame` selector emits the chosen
+///   reference: LAST → `B(prob_last)` reads `false`; GOLDEN →
+///   `B(prob_last)` reads `true` then `B(prob_gf)` reads `false`;
+///   ALTREF → both bools read `true`.
+/// * Reconstruction reads from whichever reference's planes the
+///   picker chose for each MB, so a single P-frame can mix LAST /
+///   GOLDEN / ALTREF predictors.
+/// * `refresh_last = 1`, `refresh_golden_frame = 0`,
+///   `refresh_alternate_frame = 0`, `copy_buffer_to_*` = 0 — the
+///   §9.7 refresh ladder used by [`encode_p_frame_zero_mv`] still
+///   applies (only LAST changes). Caller-driven GOLDEN / ALTREF
+///   refresh patterns are a follow-up.
+///
+/// All other behaviour (NEAREST / NEAR / NEW / SPLITMV picking,
+/// §17.2 differential coding, §15 loop filter, §13 token emit)
+/// matches [`encode_p_frame_zero_mv`].
+pub fn encode_p_frame_multi_ref(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
     params: &KeyframeParams,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
@@ -3959,14 +4360,27 @@ pub fn encode_p_frame_zero_mv(
 
     let mb_cols = width.div_ceil(16) as usize;
     let mb_rows = height.div_ceil(16) as usize;
-    if reference.mb_cols != mb_cols || reference.mb_rows != mb_rows {
+    if last.mb_cols != mb_cols || last.mb_rows != mb_rows {
         return Err(EncodeError::ReferenceDimensionsMismatch {
             source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
-            reference: (
-                (reference.mb_cols * 16) as u32,
-                (reference.mb_rows * 16) as u32,
-            ),
+            reference: ((last.mb_cols * 16) as u32, (last.mb_rows * 16) as u32),
         });
+    }
+    if let Some(g) = golden {
+        if g.mb_cols != mb_cols || g.mb_rows != mb_rows {
+            return Err(EncodeError::ReferenceDimensionsMismatch {
+                source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+                reference: ((g.mb_cols * 16) as u32, (g.mb_rows * 16) as u32),
+            });
+        }
+    }
+    if let Some(a) = altref {
+        if a.mb_cols != mb_cols || a.mb_rows != mb_rows {
+            return Err(EncodeError::ReferenceDimensionsMismatch {
+                source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+                reference: ((a.mb_cols * 16) as u32, (a.mb_rows * 16) as u32),
+            });
+        }
     }
 
     // The decoder keeps the §13.5 default token-probability table for
@@ -3983,16 +4397,36 @@ pub fn encode_p_frame_zero_mv(
         0,
     );
 
-    // The frame raster driver shares a single ReferencePlanes borrow.
-    let reference_planes = crate::motion_comp::ReferencePlanes {
-        y: &reference.y,
-        u: &reference.u,
-        v: &reference.v,
-        y_stride: reference.y_stride,
-        uv_stride: reference.uv_stride,
-        mb_cols: reference.mb_cols,
-        mb_rows: reference.mb_rows,
+    // Per-reference plane bundle. `Last` is always populated; the
+    // optional Golden / AltRef refs are populated when their slot is
+    // available.
+    let reference_planes_last = crate::motion_comp::ReferencePlanes {
+        y: &last.y,
+        u: &last.u,
+        v: &last.v,
+        y_stride: last.y_stride,
+        uv_stride: last.uv_stride,
+        mb_cols: last.mb_cols,
+        mb_rows: last.mb_rows,
     };
+    let reference_planes_golden = golden.map(|g| crate::motion_comp::ReferencePlanes {
+        y: &g.y,
+        u: &g.u,
+        v: &g.v,
+        y_stride: g.y_stride,
+        uv_stride: g.uv_stride,
+        mb_cols: g.mb_cols,
+        mb_rows: g.mb_rows,
+    });
+    let reference_planes_altref = altref.map(|a| crate::motion_comp::ReferencePlanes {
+        y: &a.y,
+        u: &a.u,
+        v: &a.v,
+        y_stride: a.y_stride,
+        uv_stride: a.uv_stride,
+        mb_cols: a.mb_cols,
+        mb_rows: a.mb_rows,
+    });
     // §18.3 filter set (the version=0 default tap-set is fine — every
     // MB has a (0,0) MV, so the convolution collapses to whole-pixel
     // copy and the chosen tap set never runs).
@@ -4056,381 +4490,102 @@ pub fn encode_p_frame_zero_mv(
     let mut search_above: Vec<crate::near_mv::MbInfo> =
         vec![crate::near_mv::MbInfo::border(); mb_cols];
 
+    // Available references for the §16.2 ref_frame selector. LAST is
+    // always present; GOLDEN / ALTREF appear iff the caller passed
+    // their planes. The order ((Last, Golden, AltRef)) is the decoder's
+    // §16.2 ref_frame_tree walk order; the picker iterates them and
+    // keeps the lowest total-J candidate.
+    let mut available_refs: Vec<(
+        crate::motion_comp::RefFrame,
+        crate::motion_comp::ReferencePlanes,
+    )> = Vec::with_capacity(3);
+    available_refs.push((crate::motion_comp::RefFrame::Last, reference_planes_last));
+    if let Some(rp) = reference_planes_golden {
+        available_refs.push((crate::motion_comp::RefFrame::Golden, rp));
+    }
+    if let Some(rp) = reference_planes_altref {
+        available_refs.push((crate::motion_comp::RefFrame::AltRef, rp));
+    }
+
+    // Per-MB chosen reference frame — paired with `chosen_mvs` /
+    // `inter_modes_out` etc. Used by the wire-emit loop below to write
+    // the §16.2 ref_frame selector bits and by the neighbour census
+    // (the decoder's `find_near_mvs` uses the recorded ref_frame to
+    // decide which neighbours' MVs count toward `near.mvs[]`).
+    //
+    // Stored alongside `ref_frames_out` (which is `Option<RefFrame>`
+    // for the §15 loop-filter delta layer's per-MB ref-delta routing,
+    // and only ever populated for an inter MB).
+    //
+    // During picking we score each ref against a uniform
+    // `prob_last_pick = 128`, `prob_gf_pick = 128` because the
+    // distribution-fitted wire probabilities are derived AFTER the
+    // picker has run. The picking score therefore charges 1 bit for
+    // LAST vs. (1 bit + 1 bit) = 2 bits for GOLDEN/ALTREF. Once every
+    // MB is picked, `fit_prob_l8` derives the on-distribution
+    // probabilities for the actual wire emit.
+    let prob_last_pick: u8 = 128;
+    let prob_gf_pick: u8 = 128;
+
     for mb_row in 0..mb_rows {
         let mut left_mb = crate::near_mv::MbInfo::border();
         let mut aboveleft_mb = crate::near_mv::MbInfo::border();
         for (mb_col, above_slot) in search_above.iter_mut().enumerate() {
             let pixels = frame.extract_mb(mb_row, mb_col);
 
-            // ---- §16.3 census + §17 motion search ------------------------
+            // ---- Per-ref picker: run for each available reference ----------
             //
-            // The §16.3 `find_near_mvs[CNT_BEST]` slot is the "best"
-            // predictor a NEWMV differential is added to (see
-            // `resolve_inter_mb_mv` in `crate::near_mv`). Clamp it
-            // through the §18.1 / §20.11 per-MB rectangle before the
-            // search uses it as the descent center, exactly matching
-            // what the decoder will do when re-reading the NEWMV path.
-            let near = crate::near_mv::find_near_mvs(
-                above_slot,
-                &left_mb,
-                &aboveleft_mb,
-                crate::motion_comp::RefFrame::Last,
-                crate::near_mv::SignBias::default(),
-            );
-            let bounds = crate::near_mv::MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-            let best_predictor = crate::near_mv::clamp_mv(near.mvs[0], &bounds);
-            let mv_ref_probs = crate::near_mv::mv_ref_probs(&near.cnt);
-
-            // The motion search reads the LAST reference's luma plane;
-            // chroma is not sampled (§18.1 chroma_mv = avg(v, v, v, v)
-            // means a whole-pixel luma MV maps directly to a whole-pixel
-            // chroma MV, and chroma SAD adds noticeably more cost per
-            // candidate without changing the picked MV).
-            let luma_ref = crate::motion_search::LumaRef {
-                plane: &reference.y,
-                stride: reference.y_stride,
-                width: reference.mb_cols * 16,
-                height: reference.mb_rows * 16,
-            };
-            // SAD at MV (0,0) is the ZEROMV distortion term. Compute it
-            // directly via `mb_luma_sad_at_whole_mv` so the search path
-            // does not need to special-case the zero center.
-            let sad_zero = crate::motion_search::mb_luma_sad_at_whole_mv(
-                luma_ref,
-                mb_col,
-                mb_row,
-                &pixels.y,
-                crate::motion_vector::Mv::default(),
-            );
-            // Search from the clamped best predictor; bounded iteration
-            // count keeps the encoder's worst-case complexity O(MB_count
-            // * MAX_ITERS * 4) and matches the §17 whole-pixel scope.
-            const MAX_DIAMOND_ITERS: u32 = 8;
-            let whole_pel = crate::motion_search::small_diamond_search_luma(
-                luma_ref,
-                mb_col,
-                mb_row,
-                &pixels.y,
-                best_predictor,
-                MAX_DIAMOND_ITERS,
-            );
-            // §18.3 half-pixel refinement: probe the 8 half-pixel
-            // offsets around the whole-pixel result and keep whichever
-            // 16×16 luma SAD is smallest. The refinement uses the same
-            // §18.3 sixtap synthesis (`version == 0` bicubic tap-set)
-            // the decoder will run when re-decoding this candidate, so
-            // a sub-pixel MV the picker picks is a SAD the decoder
-            // reproduces bit-for-bit. Tie-breaking prefers the
-            // whole-pixel center (fewer §17.2 component bits).
-            let half_pel = crate::motion_search::half_pixel_refine_luma(
-                luma_ref,
-                mb_col,
-                mb_row,
-                &pixels.y,
-                whole_pel.mv,
-            );
-            // §18.3 quarter-pixel refinement: probe the 8 quarter-pixel
-            // offsets around the half-pixel result. After §18.1 doubling
-            // a magnitude-1 §17 quarter-pixel offset becomes the §18.3
-            // eighth-pixel fraction `2` (`1/4` tap row,
-            // `{ 2, -11, 108, 36, -8, 1 }`) or `6` (`3/4` tap row, the
-            // reverse) depending on the parity of the existing half-pixel
-            // component. The descent is monotone (`quarter_pixel_refine_luma`
-            // tie-breaks toward the half-pixel center → fewer §17.2 bits)
-            // and ends one quarter-pixel away from `half_pel.mv` at most.
-            let search = crate::motion_search::quarter_pixel_refine_luma(
-                luma_ref,
-                mb_col,
-                mb_row,
-                &pixels.y,
-                half_pel.mv,
-            );
-
-            // ---- §17 / §16.2 rate-distortion mode pick -------------------
-            //
-            //   J_zero    = SAD_at_(0,0) + lambda * bits_for_ZEROMV_path
-            //   J_nearest = SAD_at_clamp(near.mvs[1])
-            //               + lambda * bits_for_NEARESTMV_path
-            //   J_near    = SAD_at_clamp(near.mvs[2])
-            //               + lambda * bits_for_NEARMV_path
-            //   J_new     = SAD_at_searched_mv
-            //               + lambda * (bits_for_NEWMV_path + §17 mv bits)
-            //
-            // The mb-skip / is_inter / ref_frame bits are identical for
-            // every candidate (every MB is inter against LAST) so they
-            // cancel — only the `mv_ref_tree` path differs:
-            //
-            //   ZEROMV    = "0"    (1 bool)
-            //   NEARESTMV = "10"   (2 bools)
-            //   NEARMV    = "110"  (3 bools)
-            //   NEWMV     = "1110" (4 bools) + §17.2 component bits
-            //
-            // The §17.2 default contexts are what the decoder reads with.
-            let bits_mode_zero = bool_bits(mv_ref_probs[0], false);
-            // NEARESTMV path "10": one `true` at probs[0], then `false`
-            // at probs[1]. Mirrors `MV_REF_TREE`'s structure (see
-            // `crate::near_mv::MV_REF_TREE`).
-            let bits_mode_nearest =
-                bool_bits(mv_ref_probs[0], true) + bool_bits(mv_ref_probs[1], false);
-            // NEARMV path "110": two `true`s at probs[0..=1], then
-            // `false` at probs[2].
-            let bits_mode_near = bool_bits(mv_ref_probs[0], true)
-                + bool_bits(mv_ref_probs[1], true)
-                + bool_bits(mv_ref_probs[2], false);
-            // NEWMV path "1110": three `true`s at probs[0..=2] then a
-            // `false` at probs[3].
-            let bits_mode_new = bool_bits(mv_ref_probs[0], true)
-                + bool_bits(mv_ref_probs[1], true)
-                + bool_bits(mv_ref_probs[2], true)
-                + bool_bits(mv_ref_probs[3], false);
-            // §17.2 differential = chosen_mv - clamped_best_predictor,
-            // wrapping in i16 to mirror the decoder's wrapping-add path
-            // in `resolve_inter_mb_mv`.
-            let diff_row = (search.mv.row as i32) - (best_predictor.row as i32);
-            let diff_col = (search.mv.col as i32) - (best_predictor.col as i32);
-            // The differential can fall outside §17.1's [-1023, +1023]
-            // window even though both endpoints are in-range (e.g.
-            // best = -1020, mv = +1020 ⇒ diff = +2040). Such a diff
-            // cannot be coded; treat that candidate as +inf bit cost so
-            // the picker drops it.
-            let diff_in_range =
-                (-1023..=1023).contains(&diff_row) && (-1023..=1023).contains(&diff_col);
-            let bits_mv_diff = if diff_in_range {
-                crate::motion_vector::mv_component_bits(&mv_contexts[0], diff_row)
-                    + crate::motion_vector::mv_component_bits(&mv_contexts[1], diff_col)
-            } else {
-                f64::INFINITY
-            };
-
-            // §16.3 NEARESTMV / NEARMV candidates — the §20.11
-            // `resolve_inter_mb_mv` mode switch clamps `near.mvs[1]` /
-            // `near.mvs[2]` through the same per-MB rectangle the NEWMV
-            // base goes through, so the encoder must score them at the
-            // clamped MV the decoder will reconstruct from. Neighbour MVs
-            // can land at any §17 quarter-pixel position, so the SAD goes
-            // through `mb_luma_sad_at_mv` (the §18.3 sixtap-aware
-            // evaluator) rather than the whole-pixel-only fast path.
-            let nearest_mv = crate::near_mv::clamp_mv(near.mvs[1], &bounds);
-            let near_mv = crate::near_mv::clamp_mv(near.mvs[2], &bounds);
-            let sad_nearest = crate::motion_search::mb_luma_sad_at_mv(
-                luma_ref, mb_col, mb_row, &pixels.y, nearest_mv,
-            );
-            let sad_near = crate::motion_search::mb_luma_sad_at_mv(
-                luma_ref, mb_col, mb_row, &pixels.y, near_mv,
-            );
-
-            // Pick: lower J wins. Use SAD as the distortion term (the
-            // searches already computed three of the four; the fourth is
-            // one extra `mb_luma_sad_at_mv` call per MB). Tie-break order
-            // ZEROMV ≻ NEARESTMV ≻ NEARMV ≻ NEWMV reflects ascending
-            // `mv_ref_tree` bit cost — the fewer-bits candidate wins on
-            // equality.
-            let j_zero = sad_zero as f64 + lambda * bits_mode_zero;
-            let j_nearest = sad_nearest as f64 + lambda * bits_mode_nearest;
-            let j_near = sad_near as f64 + lambda * bits_mode_near;
-            let j_new = search.sad as f64 + lambda * (bits_mode_new + bits_mv_diff);
-
-            // NEARESTMV / NEARMV are only legitimate candidates when their
-            // clamped vector is non-zero — a zero clamped neighbour vector
-            // is pixel-identical to ZEROMV and ZEROMV uses fewer
-            // `mv_ref_tree` bits, so we'd never pick a zero NEARESTMV /
-            // NEARMV. (The decoder still accepts them but emitting one
-            // would waste a bit.)
-            let nearest_eligible = nearest_mv != crate::motion_vector::Mv::default();
-            let near_eligible = near_mv != crate::motion_vector::Mv::default();
-            // NEWMV similarly drops if its diff is out of range or its
-            // searched MV is (0, 0) — a (0,0) NEWMV is again pixel-
-            // identical to ZEROMV at extra bit cost.
-            let new_eligible = diff_in_range && search.mv != crate::motion_vector::Mv::default();
-
-            // Start at ZEROMV (always eligible — it has no MV diff to
-            // overflow, and ties go to it for the bit-cost reason above).
-            let mut chosen_mode = crate::near_mv::InterMode::Zero;
-            let mut chosen_mv = crate::motion_vector::Mv::default();
-            let mut chosen_j = j_zero;
-            if nearest_eligible && j_nearest < chosen_j {
-                chosen_mode = crate::near_mv::InterMode::Nearest;
-                chosen_mv = nearest_mv;
-                chosen_j = j_nearest;
-            }
-            if near_eligible && j_near < chosen_j {
-                chosen_mode = crate::near_mv::InterMode::Near;
-                chosen_mv = near_mv;
-                chosen_j = j_near;
-            }
-            if new_eligible && j_new < chosen_j {
-                chosen_mode = crate::near_mv::InterMode::New;
-                chosen_mv = search.mv;
-                chosen_j = j_new;
-            }
-
-            // ---- §16.4 SPLITMV picker --------------------------------------
-            //
-            // Score each of the four §16.4 partition shapes and keep the
-            // lowest-J candidate. `bits_mode_split` is the §16.2
-            // `mv_ref_tree` path "1111" cost (4 bool reads against
-            // probs[0..=3], every read returning `true`); the §16.4
-            // `mvpartition_tree` + `sub_mv_ref_tree` + NEW4X4 bits are
-            // already inside each candidate's `j`.
-            let bits_mode_split = bool_bits(mv_ref_probs[0], true)
-                + bool_bits(mv_ref_probs[1], true)
-                + bool_bits(mv_ref_probs[2], true)
-                + bool_bits(mv_ref_probs[3], true);
-            let mut best_split: Option<SplitMvCandidate> = None;
-            for &partition in &[
-                crate::near_mv::MvPartition::TopBottom,
-                crate::near_mv::MvPartition::LeftRight,
-                crate::near_mv::MvPartition::Quarters,
-                crate::near_mv::MvPartition::Mv16,
-            ] {
-                if let Some(cand) = score_split_partition(
-                    partition,
+            // For each available reference (LAST + optional GOLDEN +
+            // optional ALTREF), run the full per-MB picker. The picker
+            // returns the chosen mode / MV / split / residual /
+            // reconstruction for that ref, plus the per-ref `J = SAD +
+            // lambda * mv_ref_tree_bits` (excluding ref_frame_tree
+            // bits). The overall winner is the one with the lowest
+            // `J + lambda * ref_frame_tree_bits(ref, prob_last_pick,
+            // prob_gf_pick)`.
+            let mut best: Option<PickedMbForRef> = None;
+            let mut best_total_j = f64::INFINITY;
+            for (ref_frame, ref ref_planes) in available_refs.iter() {
+                let luma_ref = crate::motion_search::LumaRef {
+                    plane: ref_planes.y,
+                    stride: ref_planes.y_stride,
+                    width: ref_planes.mb_cols * 16,
+                    height: ref_planes.mb_rows * 16,
+                };
+                let pick = pick_mb_for_ref(
+                    *ref_frame,
+                    ref_planes,
                     luma_ref,
-                    mb_col,
-                    mb_row,
-                    &pixels.y,
-                    best_predictor,
+                    &pixels,
                     above_slot,
                     &left_mb,
+                    &aboveleft_mb,
+                    mb_col,
+                    mb_row,
+                    mb_cols,
+                    mb_rows,
                     &mv_contexts,
                     lambda,
-                ) {
-                    let total_j = cand.j + lambda * bits_mode_split;
-                    if best_split
-                        .as_ref()
-                        .map(|b| total_j < b.j + lambda * bits_mode_split)
-                        .unwrap_or(true)
-                    {
-                        best_split = Some(SplitMvCandidate {
-                            // Re-store with the §16.2 path bits folded
-                            // into the candidate's `j` so the picker
-                            // comparison stays a direct `j` < `chosen_j`.
-                            partition: cand.partition,
-                            split_mvs: cand.split_mvs,
-                            submv_modes: cand.submv_modes,
-                            submv_new_diffs: cand.submv_new_diffs,
-                            j: total_j,
-                        });
-                    }
-                }
-            }
-
-            // SPLITMV wins only if its total J is strictly lower than
-            // the best whole-MB candidate's. Ties go to the whole-MB
-            // path — SPLITMV carries strictly more bits at identical
-            // distortion than ZEROMV would, so a tie would waste bits.
-            let mut chosen_split: Option<SplitMvCandidate> = None;
-            if let Some(cand) = best_split {
-                if cand.j < chosen_j {
-                    chosen_mode = crate::near_mv::InterMode::Split;
-                    chosen_mv = cand.split_mvs[15];
-                    chosen_split = Some(cand);
-                }
-            }
-
-            // ---- §18 / §14 prediction + residual at the chosen MV --------
-            //
-            // SPLITMV: per-sub-block luma prediction via `predict_split_mv`
-            // + sub-block forward DCT (no Y2). Whole-MB: the existing
-            // `predict_inter_mb` + `transform_whole_block_luma` path.
-            let (raw_coeffs, use_bpred, recon) = if let Some(ref cand) = chosen_split {
-                let pred = crate::motion_comp::predict_split_mv(
-                    &reference_planes,
-                    mb_col,
-                    mb_row,
-                    &cand.split_mvs,
-                    false,
                     filters,
+                    &factors,
                 );
-                let raw_coeffs = transform_split_mv_mb(
-                    &pixels.y, &pred.y, &pixels.u, &pred.u, &pixels.v, &pred.v, &factors,
-                );
-                (raw_coeffs, true, pred)
-            } else {
-                let pred = crate::motion_comp::predict_inter_mb(
-                    &reference_planes,
-                    mb_col,
-                    mb_row,
-                    chosen_mv,
-                    false,
-                    filters,
-                );
-                let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, &factors);
-                let u_quant = transform_chroma_plane(&pixels.u, &pred.u, &factors);
-                let v_quant = transform_chroma_plane(&pixels.v, &pred.v, &factors);
-                let raw_coeffs = MbCoeffs {
-                    y: y_quant,
-                    y2: y2_quant,
-                    u: u_quant,
-                    v: v_quant,
-                };
-                (raw_coeffs, false, pred)
-            };
+                let ref_bits = ref_frame_tree_bits(*ref_frame, prob_last_pick, prob_gf_pick);
+                let total = pick.j + lambda * ref_bits;
+                if total < best_total_j {
+                    best_total_j = total;
+                    best = Some(pick);
+                }
+            }
+            let chosen = best.expect("at least one reference (LAST) was scored");
+            let chosen_ref_frame = chosen.ref_frame;
+            let chosen_mode = chosen.chosen_mode;
+            let chosen_mv = chosen.chosen_mv;
+            let chosen_split = chosen.chosen_split;
+            let raw_coeffs = chosen.raw_coeffs;
+            let mb_skip_coeff = chosen.mb_skip_coeff;
+            let recon = chosen.recon;
+            let use_bpred = chosen.use_bpred;
 
-            // Count non-zero residual blocks so we can emit a skip-MB
-            // (§11.1) when the residual is exactly zero. Block walk
-            // order matches §13.3: optional Y2 + 16 Y + 4 U + 4 V.
-            // SPLITMV has no Y2 and its Y blocks code from coefficient 0
-            // (no DC carve-out), so a non-zero DC counts as a non-zero
-            // block — mirrors the B_PRED skip-detection path.
-            let mut nonzero_block_count = 0usize;
-            if !use_bpred && raw_coeffs.y2.iter().any(|&v| v != 0) {
-                nonzero_block_count += 1;
-            }
-            for blk in raw_coeffs.y.iter() {
-                let first = if use_bpred { 0 } else { 1 };
-                if blk.iter().skip(first).any(|&v| v != 0) {
-                    nonzero_block_count += 1;
-                }
-            }
-            for blk in raw_coeffs.u.iter() {
-                if blk.iter().any(|&v| v != 0) {
-                    nonzero_block_count += 1;
-                }
-            }
-            for blk in raw_coeffs.v.iter() {
-                if blk.iter().any(|&v| v != 0) {
-                    nonzero_block_count += 1;
-                }
-            }
-            let mb_skip_coeff = nonzero_block_count == 0;
-
-            // Reconstruct through the decoder's own §18 + §14 path so
-            // the encoder's running buffer is bit-identical to what the
-            // decoder produces from the bytes we are about to emit. The
-            // `recon` tuple's third slot above already carries the §18
-            // prediction; we now finish the reconstruction with the
-            // appropriate §14 inverse path.
-            let _ = recon; // bound to silence the unused-variable lint
-                           // when `chosen_split` is `None` below.
-            let recon = if let Some(ref cand) = chosen_split {
-                crate::motion_comp::reconstruct_split_mv_mb(
-                    &reference_planes,
-                    mb_col,
-                    mb_row,
-                    &cand.split_mvs,
-                    false,
-                    filters,
-                    mb_skip_coeff,
-                    &raw_coeffs.y,
-                    &raw_coeffs.u,
-                    &raw_coeffs.v,
-                )
-            } else {
-                crate::motion_comp::reconstruct_inter_mb(
-                    &reference_planes,
-                    mb_col,
-                    mb_row,
-                    chosen_mv,
-                    false,
-                    filters,
-                    mb_skip_coeff,
-                    &raw_coeffs.y2,
-                    &raw_coeffs.y,
-                    &raw_coeffs.u,
-                    &raw_coeffs.v,
-                )
-            };
             crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
 
             // Per the §15 loop-filter geometry, a whole-MB inter MB
@@ -4453,7 +4608,7 @@ pub fn encode_p_frame_zero_mv(
                 uv_mode: IntraUvMode::Dc,
             });
             all_coeffs.push(raw_coeffs);
-            ref_frames_out.push(Some(crate::motion_comp::RefFrame::Last));
+            ref_frames_out.push(Some(chosen_ref_frame));
             inter_modes_out.push(Some(chosen_mode));
             chosen_mvs.push(chosen_mv);
             use_bpred_per_mb.push(use_bpred);
@@ -4465,14 +4620,14 @@ pub fn encode_p_frame_zero_mv(
             // full `split_mvs[16]` for the next census.
             let cur = if let Some(ref cand) = chosen_split {
                 crate::near_mv::MbInfo {
-                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    ref_frame: Some(chosen_ref_frame),
                     mv: cand.split_mvs[15],
                     is_split: true,
                     split_mvs: Some(cand.split_mvs),
                 }
             } else {
                 crate::near_mv::MbInfo {
-                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    ref_frame: Some(chosen_ref_frame),
                     mv: chosen_mv,
                     is_split: false,
                     split_mvs: None,
@@ -4484,6 +4639,26 @@ pub fn encode_p_frame_zero_mv(
             *above_slot = cur;
         }
     }
+
+    // ---- §9.10 prob_last / prob_gf fit -----------------------------------
+    //
+    // Now that every MB has a chosen reference, derive the L(8) wire
+    // probabilities that minimise the §16.2 selector-bit cost over
+    // the observed per-MB distribution. `prob_last` is "P(B(prob_last)
+    // reads 0)" = P(LAST); `prob_gf` is "P(B(prob_gf) reads 0 | not
+    // LAST)" = P(GOLDEN | GOLDEN ∪ ALTREF).
+    let mut count_last: u32 = 0;
+    let mut count_golden: u32 = 0;
+    let mut count_altref: u32 = 0;
+    for r in ref_frames_out.iter().flatten() {
+        match r {
+            crate::motion_comp::RefFrame::Last => count_last += 1,
+            crate::motion_comp::RefFrame::Golden => count_golden += 1,
+            crate::motion_comp::RefFrame::AltRef => count_altref += 1,
+        }
+    }
+    let prob_last_fit = fit_prob_l8(count_last, count_golden + count_altref);
+    let prob_gf_fit = fit_prob_l8(count_golden, count_altref);
 
     // ---- §15 loop-filter post-pass --------------------------------------
     if params.loop_filter_level != 0 {
@@ -4569,14 +4744,19 @@ pub fn encode_p_frame_zero_mv(
     // `is_inter_mb = true` for every MB, which against `prob_intra = 255`
     // costs essentially zero bits.
     //
-    // prob_last = 255 makes the read of the LAST-vs-not-LAST bit also
-    // map to "false" (i.e. LAST) at minimum cost. We emit `false` so
-    // the decoder routes to LAST.
-    //
-    // prob_gf is irrelevant (never read because every MB picks LAST).
+    // prob_last / prob_gf are fitted to the picker's observed per-MB
+    // distribution by [`fit_prob_l8`] above so the §16.2 selector bits
+    // compress against an on-distribution prior. When every MB picks
+    // LAST (no GOLDEN / ALTREF was passed or LAST always won the J
+    // trade) `prob_last_fit == 255` and the path collapses to the
+    // single-ref encoder's behaviour. When the GOLDEN / ALTREF refs
+    // were not provided to the caller, both counts are zero and
+    // `fit_prob_l8` returns the spec-neutral 128 — that prob is never
+    // read in that case, since `prob_last_fit == 255` forces every
+    // selector to LAST.
     let prob_intra: u8 = 255;
-    let prob_last: u8 = 255;
-    let prob_gf: u8 = 128;
+    let prob_last: u8 = prob_last_fit;
+    let prob_gf: u8 = prob_gf_fit;
     hdr.write_literal(prob_intra as u32, 8);
     hdr.write_literal(prob_last as u32, 8);
     hdr.write_literal(prob_gf as u32, 8);
@@ -4625,13 +4805,29 @@ pub fn encode_p_frame_zero_mv(
             let mb = &modes[raster];
             let chosen_mode = inter_modes_out[raster].expect("inter mode recorded above");
             let chosen_mv = chosen_mvs[raster];
+            let chosen_ref_frame = ref_frames_out[raster].expect("inter ref_frame recorded above");
 
             // 1. mb_skip_coeff (mb_no_skip_coeff = 1).
             hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
             // 2. is_inter_mb (every MB is inter).
             hdr.write_bool(prob_intra, true);
-            // 3. ref_frame selector — LAST is "false" against prob_last.
-            hdr.write_bool(prob_last, false);
+            // 3. ref_frame selector — RFC 6386 §16.2 `ref_frame_tree`.
+            //    LAST   → B(prob_last)=false
+            //    GOLDEN → B(prob_last)=true,  B(prob_gf)=false
+            //    ALTREF → B(prob_last)=true,  B(prob_gf)=true
+            match chosen_ref_frame {
+                crate::motion_comp::RefFrame::Last => {
+                    hdr.write_bool(prob_last, false);
+                }
+                crate::motion_comp::RefFrame::Golden => {
+                    hdr.write_bool(prob_last, true);
+                    hdr.write_bool(prob_gf, false);
+                }
+                crate::motion_comp::RefFrame::AltRef => {
+                    hdr.write_bool(prob_last, true);
+                    hdr.write_bool(prob_gf, true);
+                }
+            }
 
             // 4. Inter-mode tree (RFC 6386 §16.2 / §20.13 `mv_ref_tree`).
             //    ZEROMV    = leaf 0, path "0"
@@ -4639,11 +4835,18 @@ pub fn encode_p_frame_zero_mv(
             //    NEARMV    = leaf 2, path "110"
             //    NEWMV     = leaf 3, path "1110"
             //    SPLITMV   = leaf 4, path "1111"
+            //
+            // §16.3 `find_near_mvs` is per-MB-ref-frame: neighbours
+            // whose recorded `ref_frame` matches ours count toward
+            // `near.mvs[]`. The wire emit must call the census with
+            // the SAME ref_frame the search loop used (the chosen ref
+            // for this MB) so the bits we emit are consumed at
+            // exactly the probabilities the decoder reads them at.
             let near = crate::near_mv::find_near_mvs(
                 above_slot,
                 &left_mb,
                 &aboveleft_mb,
-                crate::motion_comp::RefFrame::Last,
+                chosen_ref_frame,
                 crate::near_mv::SignBias::default(),
             );
             let probs = crate::near_mv::mv_ref_probs(&near.cnt);
@@ -4752,14 +4955,14 @@ pub fn encode_p_frame_zero_mv(
             let cur = if matches!(chosen_mode, crate::near_mv::InterMode::Split) {
                 let cand = split_candidates[raster].as_ref().expect("split candidate");
                 crate::near_mv::MbInfo {
-                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    ref_frame: Some(chosen_ref_frame),
                     mv: cand.split_mvs[15],
                     is_split: true,
                     split_mvs: Some(cand.split_mvs),
                 }
             } else {
                 crate::near_mv::MbInfo {
-                    ref_frame: Some(crate::motion_comp::RefFrame::Last),
+                    ref_frame: Some(chosen_ref_frame),
                     mv: chosen_mv,
                     is_split: false,
                     split_mvs: None,

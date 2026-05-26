@@ -6,6 +6,68 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: §16.2 `ref_frame_tree` GOLDEN / ALTREF
+  reference-frame selector in the rate-distortion picker
+  (RFC 6386 §9.10 / §16.2 / §16.3)** — extends the round-147 P-frame
+  picker from a single reference (LAST) to scoring each available
+  reference (LAST + optional GOLDEN + optional ALTREF) per MB and
+  emitting whichever wins:
+
+  ```
+  J(ref, mode, mv) = SAD(mv, ref)
+                   + λ · (mv_ref_tree_bits(mode)
+                        + ref_frame_tree_bits(ref)
+                        + §17 mv bits if NEWMV / NEW4X4
+                        + §16.4 partition / sub_mv_ref / NEW4X4 bits
+                          if SPLITMV)
+  ```
+
+  `ref_frame_tree_bits` follows §16.2: LAST → `B(prob_last)` reads
+  `false` (1 bool); GOLDEN → `true, false` (2 bools); ALTREF →
+  `true, true` (2 bools). The picker uses `prob_last = prob_gf = 128`
+  for scoring (neutral 1-bit-per-branch prior); after every MB is
+  picked, the wire `prob_last` / `prob_gf` are fitted to the observed
+  per-MB distribution via
+  `fit_prob_l8(count_false, count_true) = floor(256·count_false/total)`
+  clamped to `1..=255`, so the §16.2 selector bits compress against
+  an on-distribution prior.
+
+  The §16.3 `find_near_mvs` census is per-ref (neighbour MVs only
+  count toward `near.mvs[]` when their recorded `ref_frame` matches
+  the candidate ref), so the picker scores every reference against
+  its own population of neighbour predictors. Reconstruction reads
+  from the winning ref's planes — a single P-frame can mix LAST /
+  GOLDEN / ALTREF predictors per MB.
+
+  `Vp8InterStreamEncoder` now threads all three §9 reference slots
+  through to the new picker; the §9.7 refresh ladder is unchanged
+  (`refresh_last = 1`, GOLDEN / ALTREF stay frozen at the most-recent
+  keyframe's reconstruction), so GOLDEN / ALTREF naturally beat LAST
+  for MBs whose source content matches the keyframe after a brief
+  disturbance.
+
+  New public surface: `encode_p_frame_multi_ref(frame, last,
+  golden: Option<&KeyframePlanes>, altref: Option<&KeyframePlanes>,
+  params)`. Backward-compatible: `encode_p_frame_zero_mv(frame, ref,
+  params)` is a thin wrapper calling the new path with
+  `golden = altref = None`.
+
+  Validation: a new `tests/encoder_pframe_goldenref.rs` integration
+  test encodes a 3-frame I+P+P sequence where the picture content
+  whipsaws (K = high-contrast stripe pattern, P1 = flat gray
+  drifting LAST, P2 = back to original stripe). On P2 the picker
+  selects GOLDEN over LAST for the stripe MB (wire `prob_last` lands
+  at **128** — half the MBs picked non-LAST) and the self-decode
+  Y-PSNR clears **49.76 dB** at `yac_qi = 16`. Two regression-guard
+  tests pin the no-GOLDEN-passed and identical-refs cases to
+  `prob_last = 255` (the picker correctly collapses to LAST-only
+  when GOLDEN / ALTREF provide no distortion gain). All existing
+  inter-encoder tests (splitmv 39.65 dB, uniform translation
+  48.43 dB, quarter-pixel 48.93 dB, half-pixel 58.19 dB, translated
+  feature 50.34 dB) pass with bit-for-bit-equivalent PSNR.
+
+  Tests: 475 → 478 (+3 in `encoder_pframe_goldenref.rs`).
+
 * **VP8 encoder Phase 11: §16.4 SPLITMV per-sub-block motion-vector
   walk in the rate-distortion picker (RFC 6386 §16.4 / §17.2 / §18.1)**
   — extends the round-146 P-frame J = SAD + λ·bits picker from the

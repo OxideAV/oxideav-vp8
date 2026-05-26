@@ -110,6 +110,28 @@ pub enum EncodeError {
         /// The resolved mode the picker handed the emit layer.
         mode: crate::near_mv::InterMode,
     },
+    /// `copy_buffer_to_golden` or `copy_buffer_to_alternate` was outside
+    /// the 2-bit field (`0..=2`) per §9.7. Surfaced by
+    /// [`encode_p_frame_multi_ref_with_refresh`] when its
+    /// [`RefreshControls`] argument fails validation.
+    InvalidCopyBufferSelector {
+        /// The §9.7 selector field whose value was out of range.
+        which: CopyBufferSelector,
+        /// The offending value (must be `0`, `1`, or `2`).
+        value: u8,
+    },
+}
+
+/// Names the two §9.7 `copy_buffer_to_*` selector fields so a rejected
+/// value in [`RefreshControls`] can report which one failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyBufferSelector {
+    /// §9.7 `copy_buffer_to_golden` — 0 = none, 1 = copy `last_frame`,
+    /// 2 = copy `alt_ref_frame`.
+    Golden,
+    /// §9.7 `copy_buffer_to_alternate` — 0 = none, 1 = copy `last_frame`,
+    /// 2 = copy `golden_frame`.
+    Alternate,
 }
 
 impl core::fmt::Display for EncodeError {
@@ -152,6 +174,15 @@ impl core::fmt::Display for EncodeError {
                 f,
                 "vp8 encode: inter-mode {mode:?} is not supported by the \
                  Phase-11 ZEROMV / NEARESTMV / NEARMV / NEWMV / SPLITMV picker"
+            ),
+            EncodeError::InvalidCopyBufferSelector { which, value } => write!(
+                f,
+                "vp8 encode: copy_buffer_to_{} = {value} is outside the \
+                 2-bit field 0..=2 (§9.7)",
+                match which {
+                    CopyBufferSelector::Golden => "golden",
+                    CopyBufferSelector::Alternate => "alternate",
+                }
             ),
         }
     }
@@ -4280,6 +4311,122 @@ fn fit_prob_l8(count_false: u32, count_true: u32) -> u8 {
     raw.clamp(1, 255) as u8
 }
 
+/// Caller-driven §9.7 / §9.8 reference-slot refresh pattern for a single
+/// P-frame.
+///
+/// The five fields map one-for-one to the §9.7 / §9.8 bits the inter
+/// frame header carries (RFC 6386 §9.7 page 38, §9.8 page 39):
+///
+/// * `refresh_golden_frame` — `L(1)`. `true` replaces the GOLDEN slot
+///   with the current reconstruction; `false` leaves it in place (or
+///   defers to `copy_buffer_to_golden`).
+/// * `refresh_alternate_frame` — `L(1)`. `true` replaces the ALTREF
+///   slot with the current reconstruction; `false` defers to
+///   `copy_buffer_to_alternate`.
+/// * `copy_buffer_to_golden` — `L(2)`, only read when
+///   `refresh_golden_frame == 0`. `0` no copy; `1` copies LAST into
+///   GOLDEN; `2` copies ALTREF into GOLDEN.
+/// * `copy_buffer_to_alternate` — `L(2)`, only read when
+///   `refresh_alternate_frame == 0`. `0` no copy; `1` copies LAST into
+///   ALTREF; `2` copies GOLDEN into ALTREF.
+/// * `refresh_last` — `L(1)`. `true` replaces the LAST slot with the
+///   current reconstruction (the conventional inter pattern); `false`
+///   leaves LAST in place so the next P-frame predicts off the
+///   already-held picture.
+///
+/// The decoder's §9.7 / §9.8 walk (page 147 of RFC 6386:
+/// `copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`)
+/// is implemented verbatim in [`crate::state::Vp8DecoderState`], so any
+/// pattern this struct can express is decodable by the in-tree decoder
+/// — `Vp8InterStreamEncoder` mirrors the same walk on its own slot
+/// trio to keep encoder and decoder lockstep.
+///
+/// [`Default`] reproduces the round-149 pattern
+/// ([`encode_p_frame_multi_ref`]'s hardwired ladder):
+/// `refresh_last = true`, everything else 0 / `false`. With those
+/// defaults the new public
+/// [`encode_p_frame_multi_ref_with_refresh`] emits a wire that is
+/// byte-identical to [`encode_p_frame_multi_ref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshControls {
+    /// §9.7 `refresh_golden_frame` (L1). `true` replaces GOLDEN with
+    /// the current reconstruction.
+    pub refresh_golden_frame: bool,
+    /// §9.7 `refresh_alternate_frame` (L1). `true` replaces ALTREF with
+    /// the current reconstruction.
+    pub refresh_alternate_frame: bool,
+    /// §9.7 `copy_buffer_to_golden` (L2, gated on
+    /// `refresh_golden_frame == 0`). 0 = none, 1 = LAST → GOLDEN,
+    /// 2 = ALTREF → GOLDEN. Values > 2 are rejected with
+    /// [`EncodeError::InvalidCopyBufferSelector`].
+    pub copy_buffer_to_golden: u8,
+    /// §9.7 `copy_buffer_to_alternate` (L2, gated on
+    /// `refresh_alternate_frame == 0`). 0 = none, 1 = LAST → ALTREF,
+    /// 2 = GOLDEN → ALTREF. Values > 2 are rejected with
+    /// [`EncodeError::InvalidCopyBufferSelector`].
+    pub copy_buffer_to_alternate: u8,
+    /// §9.8 `refresh_last` (L1). `true` replaces LAST with the current
+    /// reconstruction (the conventional inter behaviour); `false` keeps
+    /// the previous LAST picture so the next P-frame predicts off it.
+    pub refresh_last: bool,
+}
+
+impl Default for RefreshControls {
+    /// Round-149 default: `refresh_last = true`, every other field at
+    /// zero. Reproduces the wire and slot semantics of
+    /// [`encode_p_frame_multi_ref`].
+    fn default() -> Self {
+        Self {
+            refresh_golden_frame: false,
+            refresh_alternate_frame: false,
+            copy_buffer_to_golden: 0,
+            copy_buffer_to_alternate: 0,
+            refresh_last: true,
+        }
+    }
+}
+
+impl RefreshControls {
+    /// Validate the per-field constraints. `copy_buffer_to_*`
+    /// selectors outside `0..=2` are rejected with
+    /// [`EncodeError::InvalidCopyBufferSelector`].
+    ///
+    /// The §19.2 page-122 listing gates the L(2) `copy_buffer_to_*`
+    /// emission on `if (!refresh_*_frame)`: the encoder does not
+    /// transmit the selector when the matching refresh bit is 1, so a
+    /// caller that sets both `refresh_golden_frame = true` AND
+    /// `copy_buffer_to_golden != 0` would silently lose the copy
+    /// intent (the slot is overwritten by the current reconstruction
+    /// regardless). To make that misuse impossible we reject it here.
+    pub fn validate(&self) -> Result<(), EncodeError> {
+        if self.copy_buffer_to_golden > 2 {
+            return Err(EncodeError::InvalidCopyBufferSelector {
+                which: CopyBufferSelector::Golden,
+                value: self.copy_buffer_to_golden,
+            });
+        }
+        if self.copy_buffer_to_alternate > 2 {
+            return Err(EncodeError::InvalidCopyBufferSelector {
+                which: CopyBufferSelector::Alternate,
+                value: self.copy_buffer_to_alternate,
+            });
+        }
+        if self.refresh_golden_frame && self.copy_buffer_to_golden != 0 {
+            return Err(EncodeError::InvalidCopyBufferSelector {
+                which: CopyBufferSelector::Golden,
+                value: self.copy_buffer_to_golden,
+            });
+        }
+        if self.refresh_alternate_frame && self.copy_buffer_to_alternate != 0 {
+            return Err(EncodeError::InvalidCopyBufferSelector {
+                which: CopyBufferSelector::Alternate,
+                value: self.copy_buffer_to_alternate,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Self-decode validation: the emitted bytes decode through
 /// [`crate::state::Vp8DecoderState`] (after the I-frame the LAST slot
 /// holds) and reproduce the source within the §14 quantiser's
@@ -4293,9 +4440,33 @@ pub fn encode_p_frame_zero_mv(
     encode_p_frame_multi_ref(frame, reference, None, None, params)
 }
 
-/// §16.2 multi-reference P-frame encoder. Extends
-/// [`encode_p_frame_zero_mv`] with optional `golden` and `altref`
-/// reference planes; the per-MB picker scores every available
+/// Backward-compatible wrapper for
+/// [`encode_p_frame_multi_ref_with_refresh`]: passes
+/// [`RefreshControls::default`] so the wire ladder matches the
+/// round-149 hardwired pattern (`refresh_last = 1`, every other
+/// §9.7 / §9.8 bit `0`).
+pub fn encode_p_frame_multi_ref(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_with_refresh(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        &RefreshControls::default(),
+    )
+}
+
+/// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
+/// §9.8 reference-slot refresh control.
+///
+/// Extends [`encode_p_frame_zero_mv`] with optional `golden` and
+/// `altref` reference planes; the per-MB picker scores every available
 /// reference against the §17 / §16.2 / §16.3 / §16.4 candidate ladder
 /// and emits whichever (`ref_frame`, mode, MV) tuple minimises
 /// `J = SAD + lambda * (mv_ref_tree_bits + ref_frame_tree_bits + §17 mv bits)`.
@@ -4306,6 +4477,18 @@ pub fn encode_p_frame_zero_mv(
 /// must share `(mb_cols, mb_rows)` with the source frame's
 /// macroblock-grid dimensions; a mismatch is surfaced as
 /// [`EncodeError::ReferenceDimensionsMismatch`].
+///
+/// `refresh` carries the five §9.7 / §9.8 reference-slot bits the
+/// frame header emits (`refresh_golden_frame`,
+/// `refresh_alternate_frame`, `copy_buffer_to_golden`,
+/// `copy_buffer_to_alternate`, `refresh_last`). The wrapper
+/// [`encode_p_frame_multi_ref`] passes [`RefreshControls::default`]
+/// (which keeps the round-149 ladder: `refresh_last = 1`, every other
+/// bit `0`); call this entry-point directly to express GOLDEN / ALTREF
+/// rotation patterns (e.g. promote a low-noise reconstruction into
+/// GOLDEN, copy LAST into ALTREF before a scene transition, hold LAST
+/// across a synthetic disturbance). `refresh` is validated up front
+/// with [`RefreshControls::validate`].
 ///
 /// # Wire layout differences vs. [`encode_p_frame_zero_mv`]
 ///
@@ -4321,11 +4504,11 @@ pub fn encode_p_frame_zero_mv(
 /// * Reconstruction reads from whichever reference's planes the
 ///   picker chose for each MB, so a single P-frame can mix LAST /
 ///   GOLDEN / ALTREF predictors.
-/// * `refresh_last = 1`, `refresh_golden_frame = 0`,
-///   `refresh_alternate_frame = 0`, `copy_buffer_to_*` = 0 — the
-///   §9.7 refresh ladder used by [`encode_p_frame_zero_mv`] still
-///   applies (only LAST changes). Caller-driven GOLDEN / ALTREF
-///   refresh patterns are a follow-up.
+/// * The §9.7 / §9.8 ladder follows `refresh`: the
+///   `refresh_golden_frame` / `refresh_alternate_frame` bits emit
+///   first, then the two `copy_buffer_to_*` selectors (always
+///   transmitted; the decoder ignores the copy when the matching
+///   refresh bit is 1 — see §9.7 page 38), then `refresh_last`.
 ///
 /// All other behaviour (NEAREST / NEAR / NEW / SPLITMV picking,
 /// §17.2 differential coding, §15 loop filter, §13 token emit)
@@ -4342,13 +4525,15 @@ pub fn encode_p_frame_zero_mv(
 /// the `1 | 2 | 4 | 8` set are rejected with
 /// [`EncodeError::InvalidDctPartitionCount`] before the per-MB pick
 /// walk runs.
-pub fn encode_p_frame_multi_ref(
+pub fn encode_p_frame_multi_ref_with_refresh(
     frame: &I420Frame,
     last: &crate::frame::KeyframePlanes,
     golden: Option<&crate::frame::KeyframePlanes>,
     altref: Option<&crate::frame::KeyframePlanes>,
     params: &KeyframeParams,
+    refresh: &RefreshControls,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    refresh.validate()?;
     let width = frame.width;
     let height = frame.height;
     if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
@@ -4736,19 +4921,23 @@ pub fn encode_p_frame_multi_ref(
     // §9.6 — quant indices (baseline only).
     write_quant_indices(&mut hdr, params.y_ac_qi, None, None, None, None, None)?;
 
-    // §9.7 (inter) — refresh / sign-bias / entropy ladder.
-    // refresh_golden_frame = 0, refresh_alternate_frame = 0,
-    // copy_buffer_to_golden = 0 (2-bit), copy_buffer_to_alternate = 0,
-    // sign_bias_golden = 0, sign_bias_alternate = 0,
-    // refresh_entropy_probs = 0, refresh_last = 1.
-    hdr.write_bool(128, false); // refresh_golden_frame
-    hdr.write_bool(128, false); // refresh_alternate_frame
-    hdr.write_literal(0, 2); // copy_buffer_to_golden (gated on refresh_golden_frame == 0)
-    hdr.write_literal(0, 2); // copy_buffer_to_alternate (gated on refresh_alternate_frame == 0)
+    // §9.7 / §9.8 (inter) — refresh / sign-bias / entropy ladder.
+    // The §19.2 listing (page 122) gates the L(2) copy_buffer_to_*
+    // fields on `if (!refresh_*_frame)`. We mirror that gating
+    // exactly so the wire is byte-identical to what
+    // `Vp8CodedHeader::parse` expects to read back.
+    hdr.write_bool(128, refresh.refresh_golden_frame); // §9.7 refresh_golden_frame
+    hdr.write_bool(128, refresh.refresh_alternate_frame); // §9.7 refresh_alternate_frame
+    if !refresh.refresh_golden_frame {
+        hdr.write_literal(refresh.copy_buffer_to_golden as u32, 2); // copy_buffer_to_golden
+    }
+    if !refresh.refresh_alternate_frame {
+        hdr.write_literal(refresh.copy_buffer_to_alternate as u32, 2); // copy_buffer_to_alternate
+    }
     hdr.write_bool(128, false); // sign_bias_golden
     hdr.write_bool(128, false); // sign_bias_alternate
     hdr.write_bool(128, false); // refresh_entropy_probs
-    hdr.write_bool(128, true); // refresh_last = 1
+    hdr.write_bool(128, refresh.refresh_last); // §9.8 refresh_last
 
     // §13 / §9.9 — token-prob update sub-block: every flag false.
     write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT);

@@ -62,8 +62,8 @@
 //!   `if (!key_frame)`).
 
 use crate::encoder::{
-    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref, EncodeError, I420Frame,
-    KeyframeParams,
+    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref,
+    encode_p_frame_multi_ref_with_refresh, EncodeError, I420Frame, KeyframeParams, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
 use crate::state::RefFrameSlot;
@@ -90,6 +90,11 @@ pub enum StreamEncodeError {
     /// failure or §13 token failure). Carries the underlying
     /// [`EncodeError`].
     Frame(EncodeError),
+    /// [`Vp8InterStreamEncoder::encode_p_frame_with_refresh`] was called
+    /// before the stream had emitted its first frame, so no `LAST`
+    /// reference is available. The caller should drive at least one
+    /// frame through the scheduler first.
+    NoLastReference,
 }
 
 impl core::fmt::Display for StreamEncodeError {
@@ -103,6 +108,11 @@ impl core::fmt::Display for StreamEncodeError {
                 got.0, got.1, first.0, first.1
             ),
             StreamEncodeError::Frame(e) => write!(f, "vp8 stream encode: {e}"),
+            StreamEncodeError::NoLastReference => write!(
+                f,
+                "vp8 stream encode: encode_p_frame_with_refresh called before \
+                 the stream emitted its first frame (LAST reference slot is empty)"
+            ),
         }
     }
 }
@@ -112,6 +122,7 @@ impl std::error::Error for StreamEncodeError {
         match self {
             StreamEncodeError::DimensionsChanged { .. } => None,
             StreamEncodeError::Frame(e) => Some(e),
+            StreamEncodeError::NoLastReference => None,
         }
     }
 }
@@ -580,6 +591,133 @@ impl Vp8InterStreamEncoder {
         Ok(EncodedStreamFrame {
             bytes,
             kind,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern.
+    ///
+    /// This is the slot-rotation companion to
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh`]: it
+    /// emits a P-frame whose header carries the requested `refresh`
+    /// bits and then evolves the driver's `LAST` / `GOLDEN` / `ALTREF`
+    /// slots per the §20 page-147 walk (`copy_arf → copy_gf →
+    /// refresh_gf → refresh_arf → refresh_last`), so the next
+    /// `encode_frame*` call sees the same slot trio the in-tree
+    /// decoder would after consuming the same wire.
+    ///
+    /// Pre-conditions:
+    ///
+    /// * A `LAST` slot must be present (the stream must have emitted at
+    ///   least one prior frame). If not, the call returns
+    ///   [`StreamEncodeError::NoLastReference`] — the caller should
+    ///   drive at least one frame through the scheduler
+    ///   ([`Self::encode_frame`] or [`Self::encode_frame_with_force`])
+    ///   first.
+    /// * Dimensions must match the stream's locked dimensions; a
+    ///   mismatch is surfaced as
+    ///   [`StreamEncodeError::DimensionsChanged`].
+    /// * `refresh` is forwarded to
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh`],
+    ///   which runs [`RefreshControls::validate`]; invalid
+    ///   `copy_buffer_to_*` selectors surface as
+    ///   [`EncodeError::InvalidCopyBufferSelector`] wrapped in
+    ///   [`StreamEncodeError::Frame`].
+    ///
+    /// The keyframe scheduler is **bypassed** by this entry-point: the
+    /// caller has asked for a specific refresh pattern, and forcing a
+    /// key frame here would lose it.
+    ///
+    /// The slot rotation runs after the bitstream is emitted, mirroring
+    /// the §20 page-147 ordering verbatim:
+    ///
+    /// 1. `copy_buffer_to_alternate` (1 = LAST → ALTREF, 2 = GOLDEN → ALTREF).
+    /// 2. `copy_buffer_to_golden` (1 = LAST → GOLDEN, 2 = ALTREF → GOLDEN).
+    /// 3. `refresh_golden_frame` (replace GOLDEN with current reconstruction).
+    /// 4. `refresh_alternate_frame` (replace ALTREF with current reconstruction).
+    /// 5. `refresh_last` (replace LAST with current reconstruction).
+    ///
+    /// `last_keyframe_index` is **not** touched (this is a P-frame).
+    pub fn encode_p_frame_with_refresh(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) = encode_p_frame_multi_ref_with_refresh(
+            frame,
+            &last_planes,
+            golden_planes.as_ref(),
+            altref_planes.as_ref(),
+            &self.params,
+            refresh,
+        )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Mirror the §20 page-147 ordering exactly (the same walk the
+        // decoder runs in `Vp8DecoderState`):
+        //   copy_buffer_to_alternate → copy_buffer_to_golden →
+        //   refresh_golden_frame → refresh_alternate_frame →
+        //   refresh_last. The "copy" cases consult the slot state from
+        //   BEFORE the refresh writes, so we capture pre-state in
+        //   temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
             frame_index,
         })
     }

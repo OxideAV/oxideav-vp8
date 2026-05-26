@@ -6,6 +6,71 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **VP8 encoder Phase 11: §9.7 / §9.8 caller-driven reference-slot
+  refresh patterns (RFC 6386 §9.7 / §9.8 / §19.2 / §20)** — round 149
+  baked the inter-frame refresh ladder to `refresh_last = 1` and every
+  other §9.7 / §9.8 bit `0`. Round 150 exposes the five
+  reference-slot bits through a new `RefreshControls` struct
+  (`refresh_golden_frame`, `refresh_alternate_frame`,
+  `copy_buffer_to_golden`, `copy_buffer_to_alternate`, `refresh_last`)
+  and threads them into `encode_p_frame_multi_ref_with_refresh` (new
+  public entry-point) and `Vp8InterStreamEncoder::encode_p_frame_with_refresh`
+  (new public method on the stream driver).
+
+  The wire emission follows the §19.2 page-122 listing exactly: the
+  L(2) `copy_buffer_to_*` fields are gated on the matching `if
+  (!refresh_*_frame)` (the decoder reads `None` for the copy field
+  when the refresh bit is 1). `RefreshControls::validate` rejects both
+  raw out-of-range copy values (`> 2`) and the silent-intent
+  combination `refresh_*_frame = true && copy_buffer_to_* != 0`
+  (which the §19.2 gating would silently drop) via the new
+  `EncodeError::InvalidCopyBufferSelector { which, value }` /
+  `CopyBufferSelector` types.
+
+  The stream driver's slot rotation mirrors the §20 page-147
+  ordering verbatim (`copy_arf → copy_gf → refresh_gf → refresh_arf
+  → refresh_last`, with the "copy" cases reading from the
+  pre-rotation slot state), the same walk
+  `Vp8DecoderState::decode_frame` runs, so the encoder's
+  `LAST` / `GOLDEN` / `ALTREF` trio evolves the same way the in-tree
+  decoder would after consuming the same bytes.
+
+  `RefreshControls::default` reproduces the round-149 ladder
+  (`refresh_last = true`, every other bit `0`), so
+  `encode_p_frame_multi_ref` becomes a wrapper over the new
+  with-refresh entry-point and the wire is byte-identical to round
+  149 for the default case (`tests/encoder_pframe_refresh_ladder.rs::
+  default_refresh_controls_match_round_149_wire_byte_for_byte`
+  pins this).
+
+  Validation: a new `tests/encoder_pframe_refresh_ladder.rs`
+  integration test exercises:
+    1. byte-for-byte round-149 wire equivalence for the default
+       controls;
+    2. §19.2 page-122 wire shape — `refresh_golden_frame = 1`
+       gates `copy_buffer_to_golden` off (decoder reads `None`)
+       while `copy_buffer_to_alternate` survives unchanged;
+    3. `RefreshControls::validate` rejection of out-of-range and
+       silent-intent combinations up front;
+    4. the §20 page-147 slot-rotation walk on a 4-frame I+P×3
+       stream — after `refresh_golden_frame = true,
+       copy_buffer_to_alternate = 1` on P2, ALTREF holds the
+       pre-rotation LAST (= P1 recon) and GOLDEN holds the current
+       reconstruction; after `refresh_last = false,
+       copy_buffer_to_alternate = 2` on P3, LAST is unchanged from
+       P2 and ALTREF holds the pre-rotation GOLDEN;
+    5. picker-quality consequence — promoting a clean P1
+       reconstruction into GOLDEN (via
+       `refresh_golden_frame = true` on P1) lets the picker beat
+       the now-flat-gray LAST on a subsequent P3 stripe-back-from-
+       flat frame, with a 30 dB Y-PSNR floor and wire
+       `prob_last < 255` (at least one MB picked GOLDEN);
+    6. `Vp8InterStreamEncoder::encode_p_frame_with_refresh` rejects
+       a fresh-stream call with the new
+       `StreamEncodeError::NoLastReference` variant.
+
+  Tests: 481 → 487 (+6 in `encoder_pframe_refresh_ladder.rs`).
+
 * **VP8 encoder Phase 11: §9.5 / §20.4 multi-partition inter token
   output (RFC 6386 §9.5 / §20.4 / §13.3)** — extends the round-137
   multi-partition keyframe writer to P-frames. `encode_p_frame_multi_ref`

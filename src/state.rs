@@ -68,7 +68,7 @@ use crate::reconstruct::ReconstructedMb;
 /// stored — the reference fetch operates in macroblock-aligned coordinates,
 /// the visible crop is a final-output presentation concern (handled by
 /// [`Vp8DecoderState::decode_frame`] when it emits the [`Vp8DecodedFrame`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefFrameSlot {
     /// Luma plane, row-major, `y_stride * (mb_rows * 16)` bytes.
     pub y: Vec<u8>,

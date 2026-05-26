@@ -2,6 +2,74 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 156)
+
+**Encoder §13.4 `token_prob_update()` caller-driven layer extended to
+the inter (P-frame) path.** Round 155 (`f6f0ecf`) landed the
+caller-driven layer on the keyframe path; round 156 mirrors the same
+pattern on the inter encoder so a future round can drop an observed-
+counts fitter onto either path with the same API shape.
+
+Three new surfaces:
+
+  * **`encode_p_frame_multi_ref_with_token_updates(frame, last, golden,
+    altref, params, token_updates)`** — a thin wrapper that uses
+    `RefreshControls::default` / `LoopFilterDeltas::default` and
+    `[0; 4]` carried delta state, exposing only the new
+    `token_updates` knob on top of the historical
+    `encode_p_frame_multi_ref` signature.
+  * **`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`**
+    — the full inter surface: §9.7 / §9.8 refresh + §9.4 per-reference
+    / per-mode LF deltas + §13.4 token updates in one call, with the
+    full carried-state delta layer.
+  * **`Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`**
+    — the stream-driver method, preserving the §9.7 slot rotation and
+    §9.4 carried-delta lifecycle. Token-prob updates do not affect
+    either (the §13.4 layer governs residual coding only).
+
+The decoder's inter path already overlays `coded.token_prob_updates`
+on its carried entropy state per `Vp8DecoderState::decode_inter_frame`
+(`overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`),
+so when the encoder emits `Some(u)` the decoder reads the same updates
+and rebuilds the same merged `coeff_probs[4][8][3][11]` table for this
+frame. Inter `refresh_entropy_probs` stays `false` (per the §9.10 row-1
+bit the encoder hardwires), so the overlay is THIS-frame-only: the
+decoder restores its saved entry state afterwards, which makes the new
+layer the natural fit for a per-frame "fit prob to observed token
+counts" strategy without leaking between P-frames. Mixing a non-default
+keyframe base table with this inter entry-point is out of round-156
+scope.
+
+Wire compatibility: `token_updates = None` (or an all-`None` array)
+reproduces the round-155 inter wire byte-for-byte. The full-surface
+entry-point with default refresh + LF deltas + no token updates
+reproduces the round-151 wire byte-for-byte.
+
+Validation: a new `tests/encoder_pframe_token_prob_updates.rs`
+integration test (5 tests) pins (a) `token_updates = None` and a
+`Some(all-None)` array both reproduce the round-155 inter wire
+byte-for-byte; (b) a non-trivial `Some(prob)` payload produces an
+observably-different wire AND self-decodes through `Vp8DecoderState`
+to a sound picture clearing 25 dB PSNR on a 32×32 I+P synthetic;
+(c) round-tripping the §19.2 inter header through
+`Vp8CodedHeader::parse` recovers the exact `TokenProbUpdates` array
+the encoder transmitted (per-position `Some(p)` / `None` shape
+preserved across all 1056 positions); (d) the full inter entry-point
+with default refresh + LF deltas + `token_updates = None` reproduces
+the round-151 wire byte-for-byte; (e) the `Vp8InterStreamEncoder`
+stream method preserves the no-op equivalence with the round-151
+stream wire and a follow-up P-frame with no updates still self-decodes
+against the saved entry state (confirming `refresh_entropy_probs = 0`
+restores the right base). Tests: 504 → 509 (+5 in
+`encoder_pframe_token_prob_updates.rs`).
+
+The next-step ladder for the encoder is now: (1) intra-within-inter
+MB picking (§11 RD against the inter J at `prob_intra < 255`), (2)
+§13.4 observed-counts fitter that drives the new keyframe and inter
+entry-points from per-frame branch-frequency stats, (3) §9.3
+segmentation support, (4) end-to-end libvpx black-box cross-decode
+validation.
+
 ## Status — 2026-05-26 (round 155)
 
 **Encoder §13.4 `token_prob_update()` infrastructure exposed.** Round

@@ -61,6 +61,7 @@
 //!   key-frame-suppressed; the listing in §19.2 only emits them on
 //!   `if (!key_frame)`).
 
+use crate::coded_header::TokenProbUpdates;
 use crate::encoder::{
     encode_keyframe_with_reconstruction, encode_p_frame_multi_ref, EncodeError, I420Frame,
     KeyframeParams, LoopFilterDeltas, RefreshControls,
@@ -757,6 +758,137 @@ impl Vp8InterStreamEncoder {
         //   refresh_last. The "copy" cases consult the slot state from
         //   BEFORE the refresh writes, so we capture pre-state in
         //   temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8 refresh
+    /// pattern, §9.4 `mb_lf_adjustments()` delta layer, **and** §13.4
+    /// `token_prob_update()` payload.
+    ///
+    /// Companion to [`Self::encode_p_frame_with_refresh_and_lf_deltas`]
+    /// that exposes the §13.4 per-position
+    /// `coeff_prob_update_flag` / `coeff_prob` sub-block through
+    /// [`crate::coded_header::TokenProbUpdates`]. The encoder writes the
+    /// replacement layer into the first-partition header and codes the
+    /// §13.3 residual tokens against the merged
+    /// `coeff_probs[4][8][3][11]` table (§13.5 defaults overlaid with
+    /// the caller's per-position values), exactly mirroring what the
+    /// decoder's `decode_inter_frame` rebuilds from the same wire.
+    ///
+    /// Wire compatibility: passing `token_updates = None` (or an
+    /// all-`None` array) reproduces
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] byte-for-byte
+    /// — every §13.4 flag is 0 and the §13.5 defaults stay in force.
+    ///
+    /// Slot-rotation and pre-conditions match
+    /// [`Self::encode_p_frame_with_refresh`].
+    ///
+    /// **Assumption on carried entropy state.** This entry-point assumes
+    /// the prior key frame was emitted with the §13.5 defaults (i.e.
+    /// either [`crate::encoder::encode_keyframe`] /
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`], or
+    /// [`crate::encoder::encode_keyframe_with_token_prob_updates`]
+    /// called with an all-`None` array). The standard stream entry-points
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] both
+    /// satisfy this since they go through
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`]. Mixing a
+    /// non-default-base keyframe with this entry-point is out of round-
+    /// 156 scope.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_token_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+        token_updates: Option<&TokenProbUpdates>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+                token_updates,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Same lifecycle rule as `encode_p_frame_with_refresh_and_lf_deltas`:
+        // adj-enabled frames update the carried state with this frame's
+        // effective deltas; adj-disabled frames leave it unchanged. The
+        // §13.4 token-prob layer does NOT affect the §9.4 delta carry.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas`: token-
+        // prob updates do NOT alter the §9.7 slot ladder (they govern
+        // residual coding only).
         let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
         let pre_last = self.last.clone();
         let pre_golden = self.golden.clone();

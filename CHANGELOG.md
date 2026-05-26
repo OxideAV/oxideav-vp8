@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.4 `token_prob_update()` caller-driven layer for the inter
+  (P-frame) encoder (RFC 6386 §13.4 / §13.5)** — round 155 landed the
+  caller-driven layer on the keyframe path; round 156 mirrors the
+  pattern on the inter path. Two new public entry-points:
+  `encode_p_frame_multi_ref_with_token_updates` (a thin wrapper using
+  `RefreshControls::default` / `LoopFilterDeltas::default` and
+  `[0; 4]` carried delta state) and
+  `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`
+  (the full surface with §9.7 refresh + §9.4 LF deltas + §13.4 tokens
+  in one call). A matching `Vp8InterStreamEncoder` method
+  (`encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`)
+  drives the stream encoder through the new payload while preserving
+  the §9.4 carried-delta state and §9.7 slot rotation. The decoder's
+  inter path already overlays `coded.token_prob_updates` on its
+  carried entropy state (`Vp8DecoderState::decode_inter_frame`), so
+  the encoder codes residual tokens against the same merged table the
+  decoder rebuilds for this frame. `token_updates = None` (or an
+  all-`None` array) reproduces the round-155 inter wire byte-for-byte;
+  the new full-surface entry-point with default refresh + LF deltas +
+  no token updates reproduces the round-151 wire byte-for-byte. Note:
+  this entry-point assumes the prior key frame was emitted with the
+  §13.5 defaults — the stream driver's `encode_frame*` keyframe path
+  satisfies this. Inter `refresh_entropy_probs` stays `false` (per
+  §9.10 row 1 of the encoder's hardwired ladder), so the overlay is
+  THIS-frame-only — well-suited to a per-frame fit from observed
+  token counts in a future round. New regression test
+  `encoder_pframe_token_prob_updates.rs` (5 tests) pins (a) no-op
+  equivalence: `token_updates = None` and all-`None` array both
+  reproduce the round-155 inter wire; (b) non-trivial wire divergence
+  + sound self-decode through `Vp8DecoderState` clearing 25 dB PSNR
+  on the I+P pair; (c) per-position recovery through
+  `Vp8CodedHeader::parse` on the new inter wire; (d) full inter
+  entry-point with all defaults reproduces the round-151 wire
+  byte-for-byte; (e) `Vp8InterStreamEncoder` stream method preserves
+  the no-op equivalence and a follow-up P-frame with no updates still
+  self-decodes against the saved entry state.
+
 * **§13.4 `token_prob_update()` caller-driven layer for the keyframe
   encoder (RFC 6386 §13.4 / §13.5)** — three new public surfaces wire
   the encoder up for caller-supplied per-position

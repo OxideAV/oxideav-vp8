@@ -4940,6 +4940,98 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas(
         lf_deltas,
         carried_ref_deltas,
         carried_mode_deltas,
+        None,
+    )
+}
+
+/// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
+/// §9.8 reference-slot refresh control, caller-driven §9.4 per-
+/// reference / per-mode `loop_filter_delta` layer, **and** caller-driven
+/// §13.4 `token_prob_update()` payload.
+///
+/// This is the inter-frame mirror of
+/// [`encode_keyframe_with_token_prob_updates`] (round 155). When
+/// `token_updates` is `Some(u)` the encoder writes the §13.4
+/// per-position replacement layer into the first-partition header and
+/// encodes the §13.3 residual tokens against the merged
+/// `coeff_probs[4][8][3][11]` table (defaults overlaid with `u`). The
+/// decoder reads the same updates from the wire and applies the same
+/// overlay on top of its carried entropy state via
+/// [`crate::dct_tokens::merge_default_token_probs`]-equivalent
+/// machinery, so the round-trip is sound on either path.
+///
+/// `refresh_entropy_probs` stays `false` on inter frames (the §9.10
+/// row-1 bit the encoder hardwires) — per RFC 6386 §9.10, this means
+/// the frame's token-prob overlay is in force for THIS frame only; the
+/// decoder restores the saved (key-frame) table afterwards. Setting
+/// `token_updates = Some(u)` therefore re-prices the token bits of just
+/// this inter frame without leaking into subsequent P-frames, which is
+/// the natural fit for a per-frame "fit prob to observed token counts"
+/// strategy.
+///
+/// Wire compatibility: `token_updates = None` (or an all-`None` array)
+/// reproduces the round-155 inter wire byte-for-byte (the §13.4
+/// sub-block reduces to 1056 zero flags and tokens are coded against
+/// the §13.5 defaults). Every pre-r156 caller of
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas`] stays
+/// unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+    token_updates: Option<&TokenProbUpdates>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        token_updates,
+    )
+}
+
+/// §16.2 multi-reference P-frame encoder with caller-driven §13.4
+/// `token_prob_update()` payload (and round-150 defaults for refresh +
+/// §9.4 deltas).
+///
+/// Thin wrapper over
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`]
+/// that uses [`RefreshControls::default`] / [`LoopFilterDeltas::default`]
+/// and `[0; 4]` carried delta state — i.e. the configuration that makes
+/// the round-149 / round-150 / round-151 wire byte-for-byte equivalent
+/// to the historical [`encode_p_frame_multi_ref`] when
+/// `token_updates = None`.
+pub fn encode_p_frame_multi_ref_with_token_updates(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    token_updates: Option<&TokenProbUpdates>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        &RefreshControls::default(),
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+        token_updates,
     )
 }
 
@@ -5024,6 +5116,7 @@ pub fn encode_p_frame_multi_ref_with_refresh(
         &LoopFilterDeltas::default(),
         [0; 4],
         [0; 4],
+        None,
     )
 }
 
@@ -5038,6 +5131,7 @@ fn encode_p_frame_multi_ref_inner(
     lf_deltas: &LoopFilterDeltas,
     carried_ref_deltas: [i16; 4],
     carried_mode_deltas: [i16; 4],
+    token_updates: Option<&TokenProbUpdates>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     lf_deltas.validate()?;
@@ -5095,11 +5189,26 @@ fn encode_p_frame_multi_ref_inner(
         }
     }
 
-    // The decoder keeps the §13.5 default token-probability table for
-    // this frame (we emit `refresh_entropy_probs = 0` and every §13.4
-    // update flag = false), so the encoder must code tokens against
-    // the same defaults.
-    let coeff_probs = crate::dct_tokens::DEFAULT_COEFF_PROBS;
+    // The decoder's inter path overlays the §13.4 update payload on top
+    // of its carried entropy state ([`Vp8DecoderState::decode_inter_frame`]
+    // — `overlay_token_probs(self.coeff_probs, &coded.token_prob_updates)`).
+    // We assume the prior keyframe was encoded with the §13.5 defaults
+    // (i.e. either [`encode_keyframe`] or
+    // [`encode_keyframe_with_token_prob_updates`] called with an
+    // all-`None` array), in which case the carried base is
+    // `DEFAULT_COEFF_PROBS` and the overlay reduces to
+    // [`crate::dct_tokens::merge_default_token_probs`] on this frame's
+    // `token_updates`. Mixing a non-default-base keyframe with this
+    // entry-point is out of round-156 scope.
+    //
+    // With `token_updates = None` (or all-`None`) the merged table is
+    // byte-identical to the §13.5 defaults and the §13.4 sub-block
+    // reduces to the 1056-zero-flag wire — i.e. the round-155 inter
+    // wire byte-for-byte.
+    let coeff_probs = match token_updates {
+        Some(u) => crate::dct_tokens::merge_default_token_probs(u),
+        None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
+    };
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -5464,8 +5573,17 @@ fn encode_p_frame_multi_ref_inner(
     hdr.write_bool(128, false); // refresh_entropy_probs
     hdr.write_bool(128, refresh.refresh_last); // §9.8 refresh_last
 
-    // §13 / §9.9 — token-prob update sub-block: every flag false.
-    write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT);
+    // §13 / §9.9 — token-prob update sub-block. With
+    // `token_updates = Some(u)` the per-position replacement layer is
+    // written and the merged `coeff_probs` above is what tokens are
+    // coded against; the decoder reads the same updates and overlays
+    // them on its carried state to rebuild the same table. With `None`
+    // every flag is 0 and the §13.5 defaults stay in force — byte-
+    // identical to the round-155 inter wire.
+    match token_updates {
+        Some(u) => write_token_prob_updates(&mut hdr, u, &COEFF_UPDATE_PROBS_FLAT),
+        None => write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT),
+    }
 
     // §9.11 — mb_no_skip_coeff enabled with a balanced prob_skip_false.
     let prob_skip_false = 128u8;

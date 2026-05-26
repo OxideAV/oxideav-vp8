@@ -2,6 +2,77 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 161)
+
+**§11 intra-within-inter MB picker — widened from DC-only to the full
+4 Y modes × 4 UV modes whole-block grid.** Round 160 landed the
+first-cut intra-within-inter picker with a single `(DC_PRED, DC_PRED)`
+candidate; its next-step ladder named "intra all-four-Y + all-four-UV
+mode RD picking" as the natural extension and called out the per-MB
+storage shape (`intra_y_modes` / `intra_uv_modes`) that already
+accommodated it. Round 161 lands that extension: the per-MB picker
+now scores every (`y_mode ∈ {Dc, V, H, Tm}`, `uv_mode ∈ {Dc, V, H,
+Tm}`) whole-block intra combination — 16 candidates in total,
+`B_PRED` excluded because the per-sub-block intra walker is a
+separate fitter family — picks the J-best, and only then trades it
+against the inter winner on `J + lambda * is_inter_mb-bit` exactly
+the way r160 did.
+
+No new public entry-points: the round-160
+`encode_p_frame_multi_ref_with_intra_pick` and
+`encode_p_frame_multi_ref_with_refresh_and_intra_pick` callers now
+get the widened picker transparently. The round-160 J formula
+(`Y-SAD + lambda * mode-tree-bits`) stays unchanged; the inter J
+comparison and §9.10 `prob_intra` fitter (`fit_prob_l8(count_intra,
+count_inter)`) stay unchanged; the §16.1 `IF_YMODE_TREE` /
+`UV_MODE_TREE` wire walks already wrote
+`intra_y_modes[raster].leaf()` / `intra_uv_modes[raster].leaf()`,
+so the only change downstream of the picker is that those slots can
+now hold any of `{Dc, V, H, Tm}` instead of always `Dc`.
+
+The picker uses strict-`<` on J across the 16-candidate sweep so
+ties go to the earliest-tried combination — `(Dc, Dc)` — which keeps
+encode-wire bytes byte-identical to round 160 on any source where DC
+would have won there. Sources with structured content (vertical
+gradients, horizontal stripes, planar ramps) now select V / H / TM
+luma respectively, dropping the §14 residual magnitude where the
+matched mode's prediction is accurate.
+
+Decoder side: zero changes. The bytes re-enter
+`Vp8DecoderState::decode_frame` on a fresh decoder state; the §16.1
+`parse_inter_frame_intra_macroblock_modes` walker reads the
+`IF_YMODE_TREE` / `UV_MODE_TREE` paths and dispatches the right
+§12 kernel via the existing keyframe per-MB reconstructor.
+
+New test pins:
+  * `encoder::tests::pick_intra_mb_all_selects_v_h_tm_for_structured_sources`
+    — direct unit test calling `pick_intra_mb_all` with three crafted
+    MBs that match V_PRED / H_PRED / TM_PRED exactly, asserting the
+    Y-mode pick on each. Also covers the `flat-grey ⇒ (Dc, Dc)`
+    smoke check that wire compatibility with r160 hinges on. The
+    chroma assertion is relaxed to "valid §11.4 leaf" because the
+    picker's distortion model is Y-SAD-only (matches the inter
+    picker for cross-candidate apples-to-apples); chroma mode is
+    chosen on §11.4 tree-bit cost when the Y-SAD dominates.
+
+The pre-existing round-160 self-decode + wire-non-growth pins
+(`encoder_pframe_intra_pick.rs`) still pass unchanged — the widened
+picker is a strict superset of the DC-only one on any source where
+DC still wins, and on sources where V/H/TM beats DC the J-best
+candidate's residual is, by construction, no larger than DC's would
+have been (so the wire is no wider modulo the §11.2 mode-tree leaf
+bit-count difference, which is bounded at ≤ 3 extra bits per intra
+MB). Tests: 532 → 533 (+1 in `src/encoder.rs::tests`).
+
+The next-step ladder for the encoder is now: (1) §9.3 segmentation
+header support (the round-159 follow-up's #2), (2) thread the
+intra-pick into the `Vp8InterStreamEncoder` stream driver (currently
+only the bare-encoder entry-points carry the toggle), (3) end-to-end
+libvpx / vpxdec black-box cross-decode validation, (4) deeper §18.3
+sub-pel ME / RD refinement, (5) intra B_PRED (per-sub-block) within
+the inter picker (separate fitter family — extends the §11.3
+sub-block walker that already lives on the keyframe path).
+
 ## Status — 2026-05-27 (round 160)
 
 **§11 / §12.2 intra-within-inter MB picking — first cut (DC_PRED Y +

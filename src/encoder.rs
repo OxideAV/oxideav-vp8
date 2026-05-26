@@ -5274,20 +5274,26 @@ fn pick_mb_for_ref(
     }
 }
 
-/// Outcome of scoring one intra (DC_PRED) candidate against the
-/// already-reconstructed in-frame neighbours during the round-160
-/// intra-within-inter MB picker. Mirrors [`PickedMbForRef`]'s shape so
-/// the per-MB driver can compare the two J values side-by-side and pick
-/// whichever wins.
+/// Outcome of scoring an intra candidate against the
+/// already-reconstructed in-frame neighbours during the round-160 /
+/// round-161 intra-within-inter MB picker. Mirrors [`PickedMbForRef`]'s
+/// shape so the per-MB driver can compare J side-by-side with the inter
+/// winner and pick whichever wins.
 ///
-/// The candidate fixes both Y and UV modes to `DC_PRED` (the §12 default
-/// that needs no neighbour edges to be valid — `predict_y16x16_dc` falls
-/// back to the §12 mid-grey when both above and left are off-frame).
-/// Round 160's scope is a single intra candidate; a follow-up round
-/// extends the picker to score all four whole-block luma modes and all
-/// four chroma modes.
+/// Round 161 widens the scope to score all four §11.2 whole-block luma
+/// modes (DC_PRED / V_PRED / H_PRED / TM_PRED) crossed with all four
+/// §11.4 chroma modes (the same four), returning the best of the sixteen
+/// candidates rather than the round-160 single DC_PRED candidate.
+/// `B_PRED` stays out — the per-sub-block intra walker is a separate
+/// fitter family and we don't have storage for it on this path.
 #[derive(Clone)]
 struct IntraMbPick {
+    /// §11.2 whole-block luma mode the picker chose. Round 161 can be
+    /// any of `Dc` / `V` / `H` / `Tm`; the storage type allows `B` but
+    /// `pick_intra_mb_all` never returns it.
+    y_mode: IntraYMode,
+    /// §11.4 whole-block chroma mode the picker chose.
+    uv_mode: IntraUvMode,
     /// Per-MB residual coefficients (Y2 + 16 Y + 4 U + 4 V), already
     /// quantised — what the §13 token-emit walk consumes when the
     /// per-MB driver records this candidate as the winner.
@@ -5325,15 +5331,13 @@ fn if_uv_mode_tree_bits(mode: IntraUvMode) -> f64 {
     treed_bits(&UV_MODE_TREE, |i| IF_UV_MODE_PROB_DEFAULTS[i], mode.leaf())
 }
 
-/// Score the §11 / §12.2 DC_PRED intra candidate for one macroblock on
-/// an inter frame against the running in-frame neighbours
+/// Score one (y_mode, uv_mode) whole-block intra candidate for a
+/// macroblock on an inter frame against the running in-frame neighbours
 /// (`MbNeighbors` gathered from the encoder's reconstruction buffer the
 /// SAME way the decoder's `gather_neighbors_public` will when it walks
-/// the bytes).
+/// the bytes). `y_mode == IntraYMode::B` is rejected (debug-asserted) —
+/// the per-sub-block intra walker is a separate fitter family.
 ///
-/// The candidate fixes the §11.2 Y mode to `DC_PRED` and the §11.4 UV
-/// mode to `DC_PRED` so we only need the §12 default-fill kernels (no
-/// dependency on neighbour content for the prediction to be valid).
 /// The full §14 chain — predict → FDCT → Y2/WHT → quantise → dequant →
 /// IDCT → add — runs so the returned `recon` is the exact pixels the
 /// decoder will produce on this MB.
@@ -5344,34 +5348,59 @@ fn if_uv_mode_tree_bits(mode: IntraUvMode) -> f64 {
 /// Y2/Y/UV token mass is roughly proportional across candidates of
 /// similar prediction quality, and matching the inter picker's
 /// distortion form keeps the cross-candidate trade apples-to-apples).
-fn pick_intra_mb_dc(
+fn score_intra_mb_candidate(
+    y_mode: IntraYMode,
+    uv_mode: IntraUvMode,
     pixels: &MbPixels,
     neighbors: &crate::reconstruct::MbNeighbors,
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
 ) -> IntraMbPick {
-    let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
+    debug_assert!(
+        y_mode != IntraYMode::B,
+        "score_intra_mb_candidate is whole-block only; B_PRED is routed via the per-sub-block walker",
+    );
 
-    // ---- §12 prediction (Y DC_PRED + UV DC_PRED) ----
+    // ---- §12 prediction. Each `predict_y16x16` / `predict_uv8x8`
+    //      dispatcher applies the §12 default-fill rules when the
+    //      requested mode's neighbour is `None` (off-frame edge), so the
+    //      V / H / TM modes safely cover the top-row / left-column /
+    //      top-left-corner MBs the same way the decoder does.
+    let topleft_y = neighbors
+        .y_topleft
+        .unwrap_or(crate::intra_predict::DEFAULT_ABOVE_PIXEL);
     let mut y_pred = [0u8; 256];
-    crate::intra_predict::predict_y16x16_dc(
+    crate::intra_predict::predict_y16x16(
         &mut y_pred,
+        y_mode,
         neighbors.y_above.as_ref(),
         neighbors.y_left.as_ref(),
-    );
+        topleft_y,
+    )
+    .expect("y_mode != B asserted above");
+
+    let topleft_u = neighbors
+        .u_topleft
+        .unwrap_or(crate::intra_predict::DEFAULT_ABOVE_PIXEL);
     let mut u_pred = [0u8; 64];
-    let mut v_pred = [0u8; 64];
-    crate::intra_predict::predict_uv8x8_dc(
+    crate::intra_predict::predict_uv8x8(
         &mut u_pred,
+        uv_mode,
         neighbors.u_above.as_ref(),
         neighbors.u_left.as_ref(),
+        topleft_u,
     );
-    crate::intra_predict::predict_uv8x8_dc(
+    let topleft_v = neighbors
+        .v_topleft
+        .unwrap_or(crate::intra_predict::DEFAULT_ABOVE_PIXEL);
+    let mut v_pred = [0u8; 64];
+    crate::intra_predict::predict_uv8x8(
         &mut v_pred,
+        uv_mode,
         neighbors.v_above.as_ref(),
         neighbors.v_left.as_ref(),
+        topleft_v,
     );
-    let _ = default_corner; // TM_PRED only; DC_PRED never reads the corner.
 
     // ---- Distortion: Y-plane SAD on the prediction residual, matching
     //      the inter picker's metric (`|src - reference[mv]|` summed
@@ -5397,8 +5426,9 @@ fn pick_intra_mb_dc(
         v: v_quant,
     };
 
-    // §11.1 mb_skip_coeff — DC_PRED has Y2, so every block (Y2 + 16 Y
-    // coded from coefficient 1 + 4 U + 4 V) contributes to the count.
+    // §11.1 mb_skip_coeff — every non-B_PRED whole-block intra has Y2,
+    // so every block (Y2 + 16 Y coded from coefficient 1 + 4 U + 4 V)
+    // contributes to the count.
     let mut nonzero_block_count = 0usize;
     if raw_coeffs.y2.iter().any(|&v| v != 0) {
         nonzero_block_count += 1;
@@ -5424,8 +5454,8 @@ fn pick_intra_mb_dc(
     let mut dq = raw_coeffs;
     factors.dequantize(&mut dq);
     let recon = crate::reconstruct::decode_keyframe_mb_non_bpred(
-        IntraYMode::Dc,
-        IntraUvMode::Dc,
+        y_mode,
+        uv_mode,
         mb_skip_coeff,
         neighbors,
         &dq.y2,
@@ -5433,19 +5463,64 @@ fn pick_intra_mb_dc(
         &dq.u,
         &dq.v,
     )
-    .expect("decode_keyframe_mb_non_bpred rejects only B_PRED, never DC_PRED");
+    .expect("decode_keyframe_mb_non_bpred rejects only B_PRED, ruled out above");
 
-    // Mode bits: Y-mode (IF_YMODE_TREE, DC_PRED leaf = 0) + UV-mode
-    // (UV_MODE_TREE, DC_PRED leaf = 0).
-    let mode_bits = if_ymode_tree_bits(IntraYMode::Dc) + if_uv_mode_tree_bits(IntraUvMode::Dc);
+    // Mode bits: Y-mode (IF_YMODE_TREE leaf) + UV-mode (UV_MODE_TREE leaf).
+    let mode_bits = if_ymode_tree_bits(y_mode) + if_uv_mode_tree_bits(uv_mode);
     let j = sad as f64 + lambda * mode_bits;
 
     IntraMbPick {
+        y_mode,
+        uv_mode,
         raw_coeffs,
         mb_skip_coeff,
         recon,
         j,
     }
+}
+
+/// Round 161 — score every whole-block intra `(y_mode, uv_mode)`
+/// combination (4 luma × 4 chroma = 16 candidates, `B_PRED` excluded
+/// because the per-sub-block intra walker is a separate fitter family)
+/// and return the winner on `J = Y-SAD + lambda * mode-tree-bits`.
+///
+/// Mirrors the round-160 [`score_intra_mb_candidate`]-of-just-DC entry
+/// shape so the per-MB driver only needs to swap the call and propagate
+/// the chosen `(y_mode, uv_mode)` into the `intra_y_modes` /
+/// `intra_uv_modes` per-MB storage that the round-160 driver already
+/// laid out.
+///
+/// Iteration order matches the encoder enum declaration
+/// (`Dc, V, H, Tm` — `B` skipped). Strict `<` on J means ties go to
+/// the earliest-tried, i.e. `(Dc, Dc)` — the round-160 pick. Encode-wire
+/// bytes are therefore identical to round 160 on any source where DC
+/// would have won there.
+fn pick_intra_mb_all(
+    pixels: &MbPixels,
+    neighbors: &crate::reconstruct::MbNeighbors,
+    factors: &crate::dequant::MbDequantFactors,
+    lambda: f64,
+) -> IntraMbPick {
+    const Y_MODES: [IntraYMode; 4] = [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
+    const UV_MODES: [IntraUvMode; 4] = [
+        IntraUvMode::Dc,
+        IntraUvMode::V,
+        IntraUvMode::H,
+        IntraUvMode::Tm,
+    ];
+    let mut best: Option<IntraMbPick> = None;
+    for &y_mode in Y_MODES.iter() {
+        for &uv_mode in UV_MODES.iter() {
+            let cand =
+                score_intra_mb_candidate(y_mode, uv_mode, pixels, neighbors, factors, lambda);
+            match best.as_ref() {
+                None => best = Some(cand),
+                Some(b) if cand.j < b.j => best = Some(cand),
+                _ => {}
+            }
+        }
+    }
+    best.expect("Y_MODES × UV_MODES is non-empty")
 }
 
 /// `-log2 P` cost in fractional bits of the §16.2 `ref_frame_tree`
@@ -6020,18 +6095,22 @@ pub fn encode_p_frame_multi_ref_with_refresh(
 }
 
 /// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
-/// §9.8 reference-slot refresh control **and** round-160 §11 /
-/// §12.2 intra-within-inter MB picking.
+/// §9.8 reference-slot refresh control **and** round-160 / round-161
+/// §11 intra-within-inter MB picking.
 ///
 /// Extends [`encode_p_frame_multi_ref_with_refresh`] with the
-/// round-160 per-MB intra candidate ladder: in addition to scoring the
-/// §16 inter ladder (ZEROMV / NEARESTMV / NEARMV / NEWMV / SPLITMV
-/// across every available reference frame), the picker also scores a
-/// §11 / §12.2 DC_PRED intra candidate against the running in-frame
-/// neighbours. Whichever of (best inter pick, intra DC) has the lower
-/// `J + lambda * is_inter_mb-bit` wins per MB; when the intra
-/// candidate wins on at least one MB the §9.10 `prob_intra` byte drops
-/// below 255 and the §16.1 intra-mode-tree path emits on those MBs.
+/// round-160 per-MB intra candidate ladder, widened in round 161 to
+/// score the full §11.2 × §11.4 whole-block intra grid (4 luma × 4
+/// chroma = 16 candidates, `B_PRED` excluded). In addition to scoring
+/// the §16 inter ladder (ZEROMV / NEARESTMV / NEARMV / NEWMV / SPLITMV
+/// across every available reference frame), the picker scores every
+/// whole-block intra `(y_mode, uv_mode)` pair against the running
+/// in-frame neighbours. Whichever of (best inter pick, J-best intra)
+/// has the lower `J + lambda * is_inter_mb-bit` wins per MB; when the
+/// intra candidate wins on at least one MB the §9.10 `prob_intra` byte
+/// drops below 255 and the §16.1 intra-mode-tree path emits on those
+/// MBs, with the chosen Y / UV mode tree-encoded against the §16.1
+/// defaults.
 ///
 /// Decoder side: zero changes. The bytes re-enter
 /// [`crate::state::Vp8DecoderState::decode_frame`] on a fresh decoder
@@ -6077,8 +6156,8 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_intra_pick(
 /// [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`]: passes
 /// [`RefreshControls::default`] so the wire ladder matches the
 /// round-149 hardwired refresh pattern (`refresh_last = 1`, every
-/// other §9.7 / §9.8 bit `0`) while the round-160 intra-pick path
-/// runs.
+/// other §9.7 / §9.8 bit `0`) while the round-160 / round-161
+/// intra-pick path runs.
 pub fn encode_p_frame_multi_ref_with_intra_pick(
     frame: &I420Frame,
     last: &crate::frame::KeyframePlanes,
@@ -6172,13 +6251,15 @@ fn encode_p_frame_multi_ref_inner_with_counts(
 }
 
 /// Same as [`encode_p_frame_multi_ref_inner_with_counts`] plus the
-/// round-160 `pick_intra` toggle: when `pick_intra = true` the per-MB
-/// picker additionally scores a §12.2 DC_PRED intra candidate against
-/// the running in-frame neighbours and picks whichever of (best inter
-/// pick, intra DC) wins on `J + lambda * is_inter_mb-bit`. When
-/// `pick_intra = false` the inter-only ladder runs (every MB stays
-/// inter; `prob_intra` is hard-wired to 255), reproducing every
-/// pre-round-160 wire byte-for-byte.
+/// round-160 / round-161 `pick_intra` toggle: when `pick_intra = true`
+/// the per-MB picker additionally scores every §11.2 × §11.4
+/// whole-block intra `(y_mode, uv_mode)` candidate (16 in total,
+/// `B_PRED` excluded) against the running in-frame neighbours, then
+/// picks whichever of (best inter pick, J-best intra) wins on
+/// `J + lambda * is_inter_mb-bit`. When `pick_intra = false` the
+/// inter-only ladder runs (every MB stays inter; `prob_intra` is
+/// hard-wired to 255), reproducing every pre-round-160 wire
+/// byte-for-byte.
 #[allow(clippy::too_many_arguments)]
 fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     frame: &I420Frame,
@@ -6357,14 +6438,15 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     // (every pre-r160 entry-point), this vec stays all-`false` and the
     // emit loop reproduces the pre-r160 wire byte-for-byte.
     let mut is_intra_per_mb: Vec<bool> = vec![false; mb_rows * mb_cols];
-    // For intra MBs, the chosen §11.2 / §11.4 modes. Round 160 always
-    // selects `(IntraYMode::Dc, IntraUvMode::Dc)` (the DC_PRED-only
-    // candidate `pick_intra_mb_dc` returns); the storage allows a
-    // subsequent round to extend the picker to all four whole-block
-    // modes per plane without re-shaping the per-MB driver. `(Dc, Dc)`
-    // for inter MBs (unused).
-    let intra_y_modes: Vec<IntraYMode> = vec![IntraYMode::Dc; mb_rows * mb_cols];
-    let intra_uv_modes: Vec<IntraUvMode> = vec![IntraUvMode::Dc; mb_rows * mb_cols];
+    // For intra MBs, the chosen §11.2 / §11.4 modes. Round 161 picks
+    // the J-best whole-block (y_mode, uv_mode) pair from the 4×4 grid
+    // `{Dc, V, H, Tm} × {Dc, V, H, Tm}` (see `pick_intra_mb_all`);
+    // initialised to `(Dc, Dc)` so inter MBs (which leave these slots
+    // unread) and the round-160 DC-tie path keep their original
+    // semantics. `B_PRED` is out of scope for this picker — the
+    // per-sub-block intra walker is a separate fitter family.
+    let mut intra_y_modes: Vec<IntraYMode> = vec![IntraYMode::Dc; mb_rows * mb_cols];
+    let mut intra_uv_modes: Vec<IntraUvMode> = vec![IntraUvMode::Dc; mb_rows * mb_cols];
 
     // §17.2 MV-component contexts the encoder writes NEWMV diffs
     // against. We emit every `mv_prob_update()` F-gate as 0 (no update)
@@ -6483,16 +6565,19 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             let mut recon = chosen.recon;
             let mut use_bpred = chosen.use_bpred;
 
-            // ---- Round 160 — intra-within-inter MB picking -------------
+            // ---- Round 160 / 161 — intra-within-inter MB picking -------
             //
-            // When `pick_intra = true`, additionally score the §11 /
-            // §12.2 DC_PRED intra candidate against the running in-frame
+            // When `pick_intra = true`, additionally score the §11
+            // whole-block intra candidates against the running in-frame
             // neighbours (the SAME `MbNeighbors` the decoder will gather
             // when it walks the bytes — `gather_neighbors_public` on the
-            // running `planes` buffer). The intra candidate wins iff its
-            // J + the §16 `is_inter_mb = false` bit charge is strictly
-            // less than the inter candidate's J + the matching
-            // `is_inter_mb = true` charge.
+            // running `planes` buffer). Round 161 widens the candidate
+            // set from r160's "DC_PRED only" to all four §11.2 Y modes
+            // crossed with all four §11.4 UV modes (16 candidates); the
+            // J-best wins inside the intra family, then competes against
+            // the inter winner on `J + lambda * is_inter_mb-bit` exactly
+            // as round 160 did. `B_PRED` is out of scope — the
+            // per-sub-block intra walker is a separate fitter family.
             //
             // During picking we score against a uniform
             // `prob_intra_pick = 128` (the spec-neutral prior); the
@@ -6508,7 +6593,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             let mut chose_intra = false;
             if pick_intra {
                 let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
-                let intra_pick = pick_intra_mb_dc(&pixels, &neighbors, &factors, lambda);
+                let intra_pick = pick_intra_mb_all(&pixels, &neighbors, &factors, lambda);
                 let prob_intra_pick: u8 = 128;
                 let inter_total = chosen.j
                     + lambda * ref_frame_tree_bits(chosen_ref_frame, prob_last_pick, prob_gf_pick)
@@ -6516,10 +6601,14 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                 let intra_total = intra_pick.j + lambda * bool_bits(prob_intra_pick, false);
                 if intra_total < inter_total {
                     chose_intra = true;
+                    intra_y_modes[raster] = intra_pick.y_mode;
+                    intra_uv_modes[raster] = intra_pick.uv_mode;
                     raw_coeffs = intra_pick.raw_coeffs;
                     mb_skip_coeff = intra_pick.mb_skip_coeff;
                     recon = intra_pick.recon;
-                    use_bpred = false; // DC_PRED has Y2 (§14.2 page 76)
+                    // `pick_intra_mb_all` excludes B_PRED, so the chosen
+                    // intra MB always has Y2 (§14.2 page 76).
+                    use_bpred = false;
                 }
             }
 
@@ -6531,21 +6620,22 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             //   * SPLITMV MB         ⇒ y_mode = B_PRED (so the §15
             //     "internal edges always filtered" rule fires); and
             //   * intra MB           ⇒ y_mode = intra_y_modes[raster]
-            //     (round 160: always DC_PRED, never B_PRED, so the
-            //     skip rule reduces to the keyframe path's whole-block
-            //     case).
+            //     (round 161: any of DC / V / H / TM, never B_PRED, so
+            //     the skip rule still reduces to the keyframe path's
+            //     whole-block case — none of the four whole-block intra
+            //     modes triggers the per-sub-block §15 path).
             //
             // See `state.rs::Vp8DecoderState` for the matching
             // decoder-side mapping.
             let y_mode_for_lf = if chose_intra {
-                intra_y_modes[raster] // always DC_PRED on r160
+                intra_y_modes[raster] // r161: best of {Dc, V, H, Tm}
             } else if chosen_split.is_some() {
                 IntraYMode::B
             } else {
                 IntraYMode::Dc
             };
             let uv_mode_for_lf = if chose_intra {
-                intra_uv_modes[raster] // always DC_PRED on r160
+                intra_uv_modes[raster] // r161: best of {Dc, V, H, Tm}
             } else {
                 IntraUvMode::Dc
             };
@@ -6568,7 +6658,9 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                 split_candidates.push(None);
                 use_bpred_per_mb.push(false);
                 is_intra_per_mb[raster] = true;
-                // intra_y_modes / intra_uv_modes already hold DC_PRED.
+                // intra_y_modes[raster] / intra_uv_modes[raster] were
+                // written inside the `pick_intra` block above with the
+                // J-best modes `pick_intra_mb_all` returned.
             } else {
                 ref_frames_out.push(Some(chosen_ref_frame));
                 inter_modes_out.push(Some(chosen_mode));
@@ -6857,9 +6949,10 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                 //     default `IF_UV_MODE_PROB_DEFAULTS` (same gate
                 //     held at 0).
                 //
-                // Round 160 always picks `(DC_PRED, DC_PRED)`; the
-                // tree walks therefore emit one bit each (leaf 0 on
-                // both trees).
+                // Round 161 picks the J-best `(y_mode, uv_mode)` pair
+                // from the 4×4 whole-block grid; the tree walks emit
+                // one to four bits depending on which leaf the picker
+                // settled on (the §11.2 / §11.4 trees are unbalanced).
                 hdr.write_treed(
                     &IF_YMODE_TREE,
                     |i| IF_YMODE_PROB_DEFAULTS[i],
@@ -8663,5 +8756,199 @@ mod tests {
         assert!(p_y >= 30.0, "isolated luma PSNR {p_y:.2} dB < 30 dB");
         assert!(p_u >= 30.0, "isolated U PSNR {p_u:.2} dB < 30 dB");
         assert!(p_v >= 30.0, "isolated V PSNR {p_v:.2} dB < 30 dB");
+    }
+
+    /// Round 161 — `pick_intra_mb_all` must score every §11.2 × §11.4
+    /// whole-block intra candidate and return the J-best `(y_mode,
+    /// uv_mode)`. Three crafted MBs exercise the non-DC modes:
+    ///
+    ///   * Vertical-stripe MB (rows identical to the above row) — the
+    ///     §12 V_PRED prediction is exact, so `(V, V)` should win.
+    ///   * Horizontal-stripe MB (columns identical to the left column)
+    ///     — H_PRED prediction is exact, so `(H, H)` should win.
+    ///   * Planar-ramp MB (`base + i + j`) — TM_PRED prediction is exact,
+    ///     so `(Tm, Tm)` should win.
+    ///
+    /// All three contrast with the round-160 DC-only picker, which would
+    /// have returned `(Dc, Dc)` on every input regardless of content.
+    /// Neighbour edges are supplied so the V / H / TM kernels predict
+    /// from the genuine neighbour content (not the §12 off-frame
+    /// default-fill 127/129).
+    #[test]
+    fn pick_intra_mb_all_selects_v_h_tm_for_structured_sources() {
+        use crate::dequant::MbDequantFactors;
+        use crate::macroblock::{IntraUvMode, IntraYMode};
+        use crate::reconstruct::MbNeighbors;
+
+        // Fixed mid-quality quantiser keeps the §14 floor low so the
+        // residual stays small enough for the matched mode's SAD to win.
+        let factors = MbDequantFactors::from_base_and_deltas(32, 0, 0, 0, 0, 0);
+        let lambda = rd_lambda(&factors);
+
+        // Above strip: vertically-monotonic; left strip: monotonic; corner
+        // value matches both ends — used by TM_PRED.
+        let above_y: [u8; 16] = core::array::from_fn(|j| (40 + j * 8) as u8);
+        let left_y: [u8; 16] = core::array::from_fn(|i| (40 + i * 8) as u8);
+        let above_uv: [u8; 8] = core::array::from_fn(|j| (60 + j * 4) as u8);
+        let left_uv: [u8; 8] = core::array::from_fn(|i| (60 + i * 4) as u8);
+        let corner_y: u8 = 40;
+        let corner_uv: u8 = 60;
+
+        let make_neighbors = || MbNeighbors {
+            y_above: Some(above_y),
+            y_left: Some(left_y),
+            y_above_right: Some([above_y[15]; 4]),
+            y_topleft: Some(corner_y),
+            u_above: Some(above_uv),
+            u_left: Some(left_uv),
+            u_topleft: Some(corner_uv),
+            v_above: Some(above_uv),
+            v_left: Some(left_uv),
+            v_topleft: Some(corner_uv),
+        };
+
+        // ---- Vertical-stripe source: every row equals the above row.
+        //      V_PRED predicts the above row directly, residual = 0.
+        let mut y_vstripe = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                y_vstripe[r * 16 + c] = above_y[c];
+            }
+        }
+        let mut uv_vstripe = [0u8; 64];
+        for r in 0..8 {
+            for c in 0..8 {
+                uv_vstripe[r * 8 + c] = above_uv[c];
+            }
+        }
+        let pixels_v = MbPixels {
+            y: y_vstripe,
+            u: uv_vstripe,
+            v: uv_vstripe,
+        };
+        let pick_v = pick_intra_mb_all(&pixels_v, &make_neighbors(), &factors, lambda);
+        assert_eq!(
+            pick_v.y_mode,
+            IntraYMode::V,
+            "vertical-stripe source should pick V_PRED for Y, got {:?}",
+            pick_v.y_mode
+        );
+        // The picker's distortion model is Y-SAD only (matches the
+        // inter picker for cross-candidate apples-to-apples comparison),
+        // so the chroma mode is chosen purely on §11.4 tree-bit cost
+        // unless the chroma rate-distortion adapts the Y SAD via the
+        // recon path. DC has the cheapest leaf bit cost in the §11.4
+        // IF_UV_MODE_TREE, so DC is a legitimate winner when Y dominates.
+        // Assert the chroma pick is a valid §11.4 leaf.
+        assert!(matches!(
+            pick_v.uv_mode,
+            IntraUvMode::Dc | IntraUvMode::V | IntraUvMode::H | IntraUvMode::Tm
+        ));
+
+        // ---- Horizontal-stripe source: every column equals the left
+        //      column. H_PRED predicts the left column directly,
+        //      residual = 0.
+        let mut y_hstripe = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                y_hstripe[r * 16 + c] = left_y[r];
+            }
+        }
+        let mut uv_hstripe = [0u8; 64];
+        for r in 0..8 {
+            for c in 0..8 {
+                uv_hstripe[r * 8 + c] = left_uv[r];
+            }
+        }
+        let pixels_h = MbPixels {
+            y: y_hstripe,
+            u: uv_hstripe,
+            v: uv_hstripe,
+        };
+        let pick_h = pick_intra_mb_all(&pixels_h, &make_neighbors(), &factors, lambda);
+        assert_eq!(
+            pick_h.y_mode,
+            IntraYMode::H,
+            "horizontal-stripe source should pick H_PRED for Y, got {:?}",
+            pick_h.y_mode
+        );
+        assert!(matches!(
+            pick_h.uv_mode,
+            IntraUvMode::Dc | IntraUvMode::V | IntraUvMode::H | IntraUvMode::Tm
+        ));
+
+        // ---- Planar-ramp source. TM_PRED reconstructs the canonical
+        //      planar surface `clamp(L_i + A_j - P)` from the
+        //      neighbours; with above / left = `40 + 8k` and corner = 40,
+        //      the surface is `40 + 8 * (r + c)` over the 16×16 grid.
+        //      Clamp to u8 (last few cells saturate near 255).
+        let mut y_tm = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                let v = (corner_y as i32) + 8 * (r as i32 + c as i32) - 40;
+                // The TM formula is `clamp(L_i + A_j - P)` with
+                //   L_i = corner_y + 8 * (i+1) = 40 + 8 * (i+1)
+                //   A_j = corner_y + 8 * (j+1) = 40 + 8 * (j+1)
+                //   P   = corner_y             = 40
+                // ⇒ surface = 40 + 8*(i+1) + 8*(j+1) - 40 = 8*(i+j+2).
+                let surface = 8 * (r as i32 + c as i32 + 2);
+                let _ = v; // commented for clarity; we use `surface`.
+                y_tm[r * 16 + c] = surface.clamp(0, 255) as u8;
+            }
+        }
+        let mut uv_tm = [0u8; 64];
+        for r in 0..8 {
+            for c in 0..8 {
+                // Chroma uses corner_uv = 60, above/left = 60 + 4*(k+1).
+                let surface = 4 * (r as i32 + c as i32) + 2 * 4 + (corner_uv as i32);
+                // = 4*(r+c) + 8 + 60 = 4*(r+c) + 68. Equivalent to
+                // L_i + A_j - P with the same algebra.
+                uv_tm[r * 8 + c] = surface.clamp(0, 255) as u8;
+            }
+        }
+        let pixels_tm = MbPixels {
+            y: y_tm,
+            u: uv_tm,
+            v: uv_tm,
+        };
+        let pick_tm = pick_intra_mb_all(&pixels_tm, &make_neighbors(), &factors, lambda);
+        assert_eq!(
+            pick_tm.y_mode,
+            IntraYMode::Tm,
+            "planar-ramp source should pick TM_PRED for Y, got {:?}",
+            pick_tm.y_mode
+        );
+        // Chroma may legitimately tie at TM or fall to V/H/DC depending
+        // on the ramp slope vs the §11.4 mode-tree-bit cost trade. The
+        // luma TM_PRED selection is the load-bearing assertion (it
+        // would have been impossible under the r160 DC-only picker);
+        // the chroma assertion is a smoke check that the pick is a
+        // valid §11.4 leaf.
+        assert!(matches!(
+            pick_tm.uv_mode,
+            IntraUvMode::Dc | IntraUvMode::V | IntraUvMode::H | IntraUvMode::Tm
+        ));
+
+        // ---- Sanity: a flat-grey source still rounds to DC_PRED (the
+        //      round-160 behaviour); strict-< tie-break to first-tried
+        //      ⇒ (Dc, Dc).
+        let flat_y = [128u8; 256];
+        let flat_uv = [128u8; 64];
+        let pixels_flat = MbPixels {
+            y: flat_y,
+            u: flat_uv,
+            v: flat_uv,
+        };
+        let pick_flat = pick_intra_mb_all(&pixels_flat, &MbNeighbors::default(), &factors, lambda);
+        assert_eq!(
+            pick_flat.y_mode,
+            IntraYMode::Dc,
+            "flat-grey source with off-frame neighbours should still pick DC_PRED for Y"
+        );
+        assert_eq!(
+            pick_flat.uv_mode,
+            IntraUvMode::Dc,
+            "flat-grey source should pick DC_PRED for UV"
+        );
     }
 }

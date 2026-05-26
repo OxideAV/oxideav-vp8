@@ -6,6 +6,36 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§11 intra-within-inter MB picker widened from DC-only to the full
+  4 Y modes × 4 UV modes whole-block grid (RFC 6386 §11.2 / §11.4 /
+  §16.1)** — round 161 extends the round-160 picker per its own
+  next-step ladder item #2 ("intra all-four-Y + all-four-UV mode RD
+  picking"). The per-MB picker now scores every
+  (`y_mode ∈ {Dc, V, H, Tm}`, `uv_mode ∈ {Dc, V, H, Tm}`)
+  whole-block intra combination — 16 candidates in total, `B_PRED`
+  excluded (the per-sub-block intra walker is a separate fitter
+  family) — picks the J-best, and only then trades it against the
+  inter winner on `J + lambda * is_inter_mb-bit` exactly the way
+  r160 did. No new public entry-points: the round-160
+  `encode_p_frame_multi_ref_with_intra_pick` and
+  `encode_p_frame_multi_ref_with_refresh_and_intra_pick` callers get
+  the widened picker transparently. The picker's strict-`<` tie-break
+  on J means encode-wire bytes stay byte-identical to round 160 on
+  any source where `(Dc, Dc)` would have won there; sources with
+  structured content (vertical gradients, horizontal stripes, planar
+  ramps) now select V / H / TM luma respectively, dropping the §14
+  residual magnitude where the matched mode's prediction is
+  accurate. Decoder side: zero changes — the §16.1
+  `IF_YMODE_TREE` / `UV_MODE_TREE` walks already emitted
+  `intra_y_modes[raster].leaf()` / `intra_uv_modes[raster].leaf()`,
+  so the only change downstream of the picker is the value range
+  those slots can hold (`{Dc, V, H, Tm}` instead of always `Dc`).
+  Pinned by `encoder::tests::pick_intra_mb_all_selects_v_h_tm_for_structured_sources`
+  (V_PRED / H_PRED / TM_PRED matched-source asserts plus the
+  flat-grey ⇒ `(Dc, Dc)` smoke check on which r160 wire compatibility
+  hinges). All round-160 self-decode + wire-non-growth pins in
+  `encoder_pframe_intra_pick.rs` still pass unchanged.
+
 * **§11 / §12.2 intra-within-inter MB picking — first cut (DC_PRED Y +
   DC_PRED UV, RFC 6386 §11 / §12.2 / §16.1)** — round 160 lands the
   opt-in bit of round 159's next-step ladder item #1: the per-MB

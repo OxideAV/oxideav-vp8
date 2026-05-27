@@ -166,6 +166,24 @@ Fixture `expected.yuv` reference pictures are produced by black-box
 invocations of the reference decoder *binary*; no third-party codec
 library source is consulted.
 
+## Interop test coverage
+
+The crate ships two interop suites layered on top of the per-stage
+unit tests:
+
+* [`tests/standalone_e2e.rs`](./tests/standalone_e2e.rs) — keyframe,
+  multi-frame inter, two-pass, IVF container, and `quality_to_qindex`
+  end-to-end checks against the `default-features = false` standalone
+  surface. Every imported symbol must resolve without the `registry`
+  feature; passes under both feature configurations.
+* [`tests/ffmpeg_oracle.rs`](./tests/ffmpeg_oracle.rs) — bidirectional
+  cross-validation against `ffmpeg` as a black-box oracle. Direction A
+  is *our encode → ffmpeg decode* (PSNR-Y ≥ 30 dB on the recovered
+  picture); direction B is *ffmpeg encode → our decode* via the
+  crate's own `ivf::parse_header` walker (PSNR-Y ≥ 25 dB). Skips
+  cleanly via `eprintln! + return` when `ffmpeg` isn't on `$PATH` —
+  never `#[ignore]`.
+
 ## License
 
 MIT. See [`LICENSE`](./LICENSE).

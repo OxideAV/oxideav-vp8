@@ -4,6 +4,42 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — end-to-end interop + standalone-API tests (round 169, 2026-05-27)
+
+Two new test files extend the crate's interop coverage:
+
+* **`tests/standalone_e2e.rs`** — 8 tests that drive the public surface
+  reachable under `cargo test -p oxideav-vp8 --no-default-features`.
+  Covers the keyframe roundtrip (`encode_keyframe` → `decode_vp8`,
+  PSNR-Y ≥ 30 dB), the multi-frame inter roundtrip
+  (`Vp8TwoPassEncoder::encode_frame` → `Vp8DecoderState::decode_frame`,
+  PSNR-Y ≥ 28 dB), the two-pass schedule (`first_pass_analyze` +
+  `two_pass_qindices` must vary across complexity-varied frames), the
+  IVF container roundtrip (`ivf::write_header` + `ivf::write_frame` →
+  `ivf::parse_header` + `ivf::parse_frame_header`), the `quality_to_qindex`
+  table (0 → 127, 75 → 32, 100 → 0, NaN → 127, out-of-range clamps),
+  and empty / single-frame two-pass edge cases. Compiles + passes
+  under both `--no-default-features` and the default-features build —
+  every imported symbol resolves without the `registry` feature.
+
+* **`tests/ffmpeg_oracle.rs`** — 4 tests that cross-validate against
+  `ffmpeg` as a black-box oracle. Direction A drives the real
+  `encode_keyframe` (the §11 + §13 + §14 RD encoder, not the Phase-1
+  silent path that `encoder_external_decode.rs` already covers) →
+  IVF-wrap → `ffmpeg -i pipe:0 -f rawvideo` and asserts the recovered
+  YUV420P planes clear PSNR-Y ≥ 30 dB. Direction B is the reverse:
+  synthetic source → `ffmpeg -c:v vp8 -f ivf` → `ivf::parse_header` +
+  `ivf::parse_frame_header` → `Vp8DecoderState::decode_frame`, with
+  PSNR-Y ≥ 25 dB on the recovered frames. Two fixture sizes per
+  direction (64×64 and 320×240). Both directions skip via
+  `eprintln! + return` when `ffmpeg` isn't on `$PATH` (never
+  `#[ignore]`). Locally observed PSNR-Y: direction A 42.34 dB
+  (64×64) / 48.99 dB (320×240); direction B 61.54 dB / 52.11 dB.
+
+`ffmpeg` is invoked only as a binary; its source remains off-limits
+per the workspace clean-room policy. No third-party Rust crate, no
+`libvpx` / `libavcodec` source, no web search, no `WebFetch`.
+
 ### Added — two-pass encoder real bodies (round 168, 2026-05-27)
 
 Round 167 landed the `Vp8TwoPass*` family as type-shape stubs whose

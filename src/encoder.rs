@@ -7802,7 +7802,7 @@ pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_qual
 // public *shape* (struct fields, enum variants, function signatures,
 // constants) so historical consumers keep building. The bodies of the
 // two-pass-encoder family stub to [`Vp8Error::Unsupported`] per the
-// Tier-3 caveat in `API-COMPAT-0.1.13.md` — the rate-control algorithm
+// Tier-3 caveat from the round-167 widen — the rate-control algorithm
 // is intentionally future work; this round locks the symbol surface.
 //
 // All items here are reachable under `default-features = false` unless

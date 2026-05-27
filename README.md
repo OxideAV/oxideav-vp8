@@ -12,7 +12,7 @@ production status as of 2026-05-27.
   rate-control family.
 * The full crates.io `0.1.13` public surface is reachable, both with
   the default `registry` build and under `--no-default-features`.
-  See [`API-COMPAT-0.1.13.md`](./API-COMPAT-0.1.13.md) for the
+  Compile-only assertion suite:
   per-symbol contract and [`tests/api_compat_0_1_13.rs`](./tests/api_compat_0_1_13.rs)
   for the compile-only assertion suite.
 

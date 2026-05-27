@@ -3,7 +3,7 @@
 //! `quality_to_qindex`).
 //!
 //! Downstream consumers (notably `oxideav-webp`'s lossy VP8 path per
-//! `crates/oxideav-webp/API-COMPAT-0.1.2.md`) build their RIFF-VP8 image
+//! `oxideav-webps published 0.1.2 surface`) build their RIFF-VP8 image
 //! encoder against these factory signatures. This test imports them via
 //! the documented paths AND drives one end-to-end encode through each
 //! so a regression that changes a signature, drops a re-export, or

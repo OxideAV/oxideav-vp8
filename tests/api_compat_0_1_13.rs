@@ -1,7 +1,7 @@
 //! Compile-only assertion that the crates.io `oxideav-vp8 0.1.13`
 //! public surface stays reachable on the post-0.2 master.
 //!
-//! Every public symbol enumerated by `API-COMPAT-0.1.13.md` is bound
+//! Every public symbol enumerated by the published 0.1.13 surface is bound
 //! here by fully-qualified name. If a future change removes or
 //! re-shapes any of them, this file stops compiling — that is the
 //! signal to bump the major version and revisit the upgrade-transparent

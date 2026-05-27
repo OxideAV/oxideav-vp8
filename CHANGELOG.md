@@ -4,6 +4,21 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.1...v0.2.2) - 2026-05-27
+
+### Other
+
+- remove API-COMPAT-0.1.13.md spec file; tests/api_compat_0_1_13.rs is the contract
+- second pass — remove libvpx from src/state.rs (×5) + tests/fixtures/README.md (×2)
+- remove libvpx fixture-provenance attestations from src/lib.rs + src/decoder.rs
+- round 170: criterion benches + sample-profile-driven optimisations + real simd feature
+- remove remaining libwebp-style mentions from src/encoder.rs + tests/public_quality_mapping.rs
+- scrub libwebp-style → WebP-canonical naming
+- add standalone-API + ffmpeg-oracle end-to-end interop suites
+- replace hand-waved imports with real working API examples
+- rewrite as production-ready overview, drop per-round chronology
+- encoder TwoPass r168: real two-pass rate control replaces Tier-3 stub
+
 ### Added — criterion benches, sample-profile-driven optimisations, real `simd` feature (round 170, 2026-05-27)
 
 New `benches/` directory ships seven criterion micro/macro benches —

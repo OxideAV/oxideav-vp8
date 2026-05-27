@@ -6245,6 +6245,138 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick(
     )
 }
 
+/// §16.2 multi-reference P-frame encoder composing the round-160 / 161 §11
+/// intra-within-inter MB picker **with** the round-157 / 158 §13.4 token-
+/// prob observed-counts fitter, on top of the caller-driven §9.7 / §9.8
+/// reference-slot refresh control and the §9.4 per-reference / per-mode
+/// loop-filter delta layer.
+///
+/// Composition of:
+///
+/// * [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`]
+///   (round-163 §11 picker toggle on the refresh + §9.4 deltas axis), and
+/// * [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+///   (round-158 two-pass fitter on the refresh + §9.4 deltas axis).
+///
+/// Closes round-164 follow-up item (5): the §11 picker and the §13.4
+/// fitter were each composed individually with the refresh + lf-deltas
+/// axis, but never together. This entry-point drives both knobs in the
+/// same call — same shape as the two single-knob siblings, with `pick_intra`
+/// engaged on both fitter passes.
+///
+/// Internally takes two passes:
+///
+///   1. Encode with the §13.5 defaults — `token_updates = None` — and
+///      `pick_intra = true`, collecting per-position branch counts via
+///      [`encode_p_frame_multi_ref_inner_with_counts_and_pick`]'s
+///      `counts` side-channel.
+///   2. Run [`fit_token_prob_updates`] (slack 2.0 — matches every other
+///      inter fitter) to derive a [`TokenProbUpdates`] payload that nets
+///      a positive saving, then re-encode with that payload and
+///      `pick_intra = true`.
+///
+/// If the fitter returns an all-`None` payload (no slot crossed the
+/// saving threshold) **or** the fitted re-encode is larger than the
+/// default-encode wire (the saving estimate is against pass-1's
+/// coefficient distribution; pass-2's RD pick perturbs it slightly), the
+/// default-encode bytes / planes are returned instead — so this entry-
+/// point is guaranteed `<=` the
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`]
+/// wire on every input. **When the fallback fires we also fall back to
+/// the pass-1 planes** (matching the round-158 sibling) so a streaming
+/// caller's LAST never mis-matches the decoder's reconstruction.
+///
+/// `refresh` is validated up front via [`RefreshControls::validate`];
+/// `lf_deltas` is validated via [`LoopFilterDeltas::validate`].
+///
+/// **Carried-base assumption.** Same as the round-158 sibling: this
+/// function assumes the prior key frame was emitted with the §13.5
+/// defaults (i.e. either [`encode_keyframe`] /
+/// [`encode_keyframe_with_reconstruction`], or
+/// [`encode_keyframe_with_token_prob_updates`] called with an all-`None`
+/// array). Mixing a non-default-base keyframe with this entry-point is
+/// out of round-165 scope.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    refresh.validate()?;
+    lf_deltas.validate()?;
+
+    // Pass 1 — §13.5 defaults + observed branch counts. The §11 intra
+    // picker runs on this pass so the recorded counts already reflect
+    // the intra/inter MB mix that will reappear on pass 2.
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        None,
+        Some(&mut counts),
+        true,
+    )?;
+
+    // Fit. 2.0 bits of slack — matches every other inter fitter and
+    // guards against the small overstatement of saving that comes from
+    // pass-2's RD pick perturbing the coefficient distribution slightly
+    // relative to pass-1's counts.
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+
+    // If no slot crossed the threshold, the default encode wins trivially
+    // (the all-`None` path is byte-identical to the round-163
+    // _intra_pick wire).
+    let any_update = fitted.iter().any(|p| {
+        p.iter()
+            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
+    });
+    if !any_update {
+        return Ok((bytes_default, planes_default));
+    }
+
+    // Pass 2 — re-encode with the fitted updates AND `pick_intra = true`
+    // so the picker re-runs against the merged probabilities (the RD
+    // estimator uses the merged table). The encoder remains self-
+    // consistent: the decoder rebuilds the same merged table from the
+    // on-wire updates and reconstructs the same picture.
+    let (bytes_fitted, planes_fitted) = encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        Some(&fitted),
+        None,
+        true,
+    )?;
+
+    // Bytes-vs-default safety guard. Falling back also drops the pass-2
+    // planes — a streaming caller's next-frame LAST slot must match the
+    // decoder's reconstruction from the bytes we just shipped.
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_p_frame_multi_ref_inner(
     frame: &I420Frame,

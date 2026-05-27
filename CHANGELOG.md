@@ -6,6 +6,61 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§11 intra-pick parallel-composed with the §13.4 fitter on the
+  stream-driver refresh + §9.4 deltas axis (RFC 6386 §11 / §13.4 /
+  §13.5 / §9.4 / §9.7)** — round 165 closes the r164 next-step ladder
+  item (5) ("parallel fitter composition on the intra-pick + refresh +
+  lf-deltas axis (combining r163 + r164 — the picker on the fitted
+  refresh path)"). Two new entry-points:
+  * **Bare encoder:**
+    `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`
+    — argument shape matches
+    `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+    exactly. Two-pass: pass-1 encodes with §13.5 defaults + `pick_intra
+    = true` and collects per-position branch counts via the
+    `encode_p_frame_multi_ref_inner_with_counts_and_pick` `counts`
+    side-channel; pass-2 re-encodes with the fitted
+    `TokenProbUpdates` payload, `pick_intra = true` again, so the RD
+    picker re-scores against the merged probability table. The
+    round-158 `bytes_fitted <= bytes_default` safety guard carries
+    through unchanged — on fall-back we also drop the pass-2 planes so
+    a streaming caller's next-frame LAST never mis-matches the
+    decoder's reconstruction.
+  * **Stream driver:**
+    `Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`
+    — threads the across-frame §9.4 carried-delta state per RFC 6386
+    §9.4 identically to every other refresh + lf-deltas sibling
+    (adj-enabled frames write back the effective deltas; adj-disabled
+    frames leave the carry untouched). Neither the §11 picker nor the
+    §13.4 fitter perturbs the §9.4 carry — both govern per-MB /
+    residual decisions only. Pre-conditions, slot-rotation
+    (§20 page-147 walk), and error surface (`NoLastReference`,
+    `DimensionsChanged`) match `encode_p_frame_with_refresh` exactly.
+  Wire compatibility:
+    * Whenever the fitter falls back (no slot crossed the saving
+      threshold or pass-2 grew the wire), the bytes are byte-equal to
+      `encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick` on
+      the same inputs.
+    * Whenever the fitter wins, the bytes are byte-equal to the
+      bare-encoder composition.
+    * In every case the wire is `<=` the round-163 intra-pick default
+      — the round-158 bare-encoder safety guard lifted into the
+      composed stream driver.
+  Same carried-base assumption as the round-158 / round-164 siblings:
+  the prior key frame must have been emitted with the §13.5 defaults
+  (i.e. via `encode_keyframe` /
+  `encode_keyframe_with_reconstruction` / the stream driver's
+  `encode_frame` ladder, which satisfy this). Mixing a fitted keyframe
+  (`encode_frame_with_fitted_token_prob_updates`) with this entry-
+  point is out of round-165 scope.
+  Pins (`tests/encoder_inter_stream_intra_pick_fitted_lf_deltas.rs`,
+  5 cases): bare-encoder composition byte-equality on a K+P sequence
+  with self-decode round-trip; per-frame fitted-composed wire never
+  grows vs. round-163 caller-driven intra-pick default; §9.4 carry
+  advance / persist / partial-update / adj-disabled / keyframe-reset
+  semantics under both intra-pick and fitter engaged; `NoLastReference`
+  + `DimensionsChanged` guards.
+  Tests: 549 → 554 (+5).
 * **§13.4 fitter composed with §9.4 deltas on the stream-driver refresh
   path (RFC 6386 §13.4 / §13.5 / §9.4 / §9.7)** — round 164 closes
   the r163 next-step ladder item (5) ("analogous

@@ -2,6 +2,119 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 165)
+
+**§11 intra-pick parallel-composed with the §13.4 fitter on the
+stream-driver refresh + §9.4 deltas axis.** Round 163 wired the §11
+intra-within-inter MB picker through the refresh + §9.4 deltas axis
+(`encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`). Round
+164 wired the §13.4 token-prob observed-counts fitter through the
+same axis
+(`encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`).
+Each composed individually with the lf-deltas axis but neither
+composed with the other — exactly the gap r164's next-step ladder item
+(5) named: *"parallel fitter composition on the intra-pick + refresh +
+lf-deltas axis (combining r163 + r164 — the picker on the fitted
+refresh path)"*. Round 165 lands that composition: two new entry-points
+sit at the intersection of all three knobs (refresh, §9.4 deltas,
+intra-pick, and §13.4 fitter).
+
+* **Bare encoder:**
+  `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`
+  — argument shape matches
+  `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+  exactly. Two-pass: pass-1 encodes with §13.5 defaults + `pick_intra
+  = true` and collects per-position branch counts via the
+  `encode_p_frame_multi_ref_inner_with_counts_and_pick` `counts`
+  side-channel (so the recorded counts already reflect the intra/inter
+  MB mix that will reappear on pass 2); pass-2 re-encodes with the
+  fitted `TokenProbUpdates` payload, `pick_intra = true` again, so the
+  RD picker re-scores against the merged probability table.
+* **Stream driver:**
+  `Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`
+  — threads the across-frame §9.4 carried-delta state per RFC 6386
+  §9.4 identically to every other refresh + lf-deltas sibling
+  (adj-enabled frames write back the effective deltas; adj-disabled
+  frames leave the carry untouched). Neither the §11 picker nor the
+  §13.4 fitter perturbs the §9.4 carry — both govern per-MB /
+  residual decisions only.
+
+The round-158 `bytes_fitted <= bytes_default` safety guard carries
+through unchanged — on fall-back we also drop the pass-2 planes so a
+streaming caller's next-frame LAST never mis-matches the decoder's
+reconstruction. Pre-conditions, slot-rotation (§20 page-147 walk
+`copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`), and
+error surface (`NoLastReference`, `DimensionsChanged`) match
+`encode_p_frame_with_refresh` exactly. `last_keyframe_index` is **not**
+touched.
+
+Wire compatibility:
+
+* Whenever the fitter's safety guard falls back (no slot crossed the
+  saving threshold, **or** the fitted re-encode is larger than the
+  default-encode wire), the stream bytes are byte-equal to
+  `encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick` on the
+  same inputs. Pass-1 planes are returned in the fallback.
+* Whenever the fitter wins, the bytes are byte-equal to the bare-
+  encoder composition.
+* In every case the wire is `<=` the round-163 intra-pick default —
+  round-158 safety guard lifted into the composed stream driver.
+
+Same carried-base assumption as the round-158 / round-164 siblings:
+the prior key frame must have been emitted with the §13.5 defaults
+(i.e. via `encode_keyframe` / `encode_keyframe_with_reconstruction` /
+the stream driver's `encode_frame` ladder, which satisfy this).
+Mixing a fitted keyframe with this entry-point is out of round-165
+scope.
+
+New test pins
+(`tests/encoder_inter_stream_intra_pick_fitted_lf_deltas.rs`, 5
+cases):
+
+  1. **`bare_encoder_byte_match_on_composition`** — a K + P sequence
+     with the §11 picker and §13.4 fitter both engaged byte-matches
+     the bare-encoder composition
+     (`encode_keyframe_with_reconstruction` +
+     `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`).
+     Stream-side carry advances to the effective transmitted values;
+     self-decode through `Vp8DecoderState` clears the round PSNR
+     target on both K and P.
+  2. **`never_grows_wire_vs_caller_driven_intra_pick_default`** — over
+     a 4-P synthetic sequence with `lf_deltas` engaged, the fitted-
+     composed stream bytes are never larger than the round-163
+     `encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`
+     default — round-158 safety guard lifted into the composed
+     stream driver.
+  3. **`carries_deltas_and_resets_on_keyframe`** — the §9.4
+     across-frame carry rule applies identically to every other
+     refresh + lf-deltas sibling: fresh deltas advance the carry,
+     `update = false` carries through, partial updates merge per-slot,
+     adj-disabled frames leave the carry untouched, keyframes reset
+     to zero. Six-frame run pins all transitions through both intra-
+     pick and fitter being engaged.
+  4. **`refresh_errors_when_no_last`** — refusing a refresh-driven
+     P-frame before any `LAST` exists surfaces
+     `StreamEncodeError::NoLastReference`; frame counter is not
+     advanced.
+  5. **`dimensions_change_rejected`** — dimensions-lock preserved on
+     the composed path; counter is not advanced on rejection.
+
+Tests: 549 → 554 (+5 in
+`tests/encoder_inter_stream_intra_pick_fitted_lf_deltas.rs`). The 549
+pre-r165 cases are unchanged — round 165 is a pure composition layer,
+no existing wire moves.
+
+The next-step ladder for the encoder is now: (1) §9.3 segmentation
+header support (long-standing — round 159 follow-up's #2), (2) intra
+`B_PRED` (per-sub-block) within the inter picker — a separate fitter
+family extending the §11.3 sub-block walker that already lives on the
+keyframe path, (3) end-to-end libvpx / vpxdec black-box cross-decode
+validation, (4) deeper §18.3 sub-pel ME / RD refinement, (5) the
+bare-encoder + scheduler-driven (`encode_frame_*`) parallel
+composition mirroring round 165 on the no-refresh / no-§9.4-deltas
+scheduler axis (round 165 closes the *caller-driven* refresh axis;
+the scheduler ladder is the next natural composition).
+
 ## Status — 2026-05-27 (round 164)
 
 **§13.4 fitter composed with §9.4 deltas on the stream-driver refresh

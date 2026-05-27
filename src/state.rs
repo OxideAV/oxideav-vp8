@@ -1194,9 +1194,9 @@ mod tests {
 
     /// The end-to-end multi-frame test: feed the
     /// `i-frame-then-p-frame-64x64` fixture (one key frame + one P frame,
-    /// libvpx-encoded ffmpeg fixture) through the stateful driver and
+    /// produced by the reference encoder) through the stateful driver and
     /// require the concatenated I420 output bytes to be byte-for-byte
-    /// identical to the reference YUV from `vpxdec` / `ffmpeg`. This is
+    /// identical to the reference YUV. This is
     /// the multi-frame pixel-match goal of the round: it exercises the
     /// §9 reference-frame slot rotation (the §9.7 / §9.8 `refresh_last`
     /// reading the just-decoded I frame in as `LAST`), the §16
@@ -1278,7 +1278,7 @@ mod tests {
     /// Five-frame fixture (one key + four P frames) exercising the
     /// §9.7 `refresh_golden_frame` cycle (the encoder cycles which
     /// reference frame it refreshes mid-GOP). End-to-end bit-exact
-    /// against the libvpx YUV.
+    /// against the reference YUV.
     #[test]
     fn golden_update_cycle_decodes_bit_exact() {
         const IVF: &[u8] = include_bytes!("../tests/fixtures/golden-update-cycle/input.ivf");
@@ -1302,7 +1302,7 @@ mod tests {
         );
     }
 
-    /// Ten-frame fixture with libvpx's `auto-alt-ref` enabled — exercises
+    /// Ten-frame fixture with the reference encoder's `auto-alt-ref` enabled — exercises
     /// the §9.7 `refresh_alternate_frame` / `copy_buffer_to_alternate`
     /// ALTREF rotation and the §16.2 `prob_gf` reference-frame selector.
     #[test]
@@ -1310,7 +1310,7 @@ mod tests {
         const IVF: &[u8] = include_bytes!("../tests/fixtures/altref-arnr-on/input.ivf");
         const EXPECTED: &[u8] = include_bytes!("../tests/fixtures/altref-arnr-on/expected.yuv");
         let frames = iter_ivf_frames(IVF);
-        // libvpx with auto-alt-ref encodes "invisible" altref frames
+        // The reference encoder with auto-alt-ref produces "invisible" altref frames
         // (show_frame = 0); the visible output count may differ from
         // frame_count. We decode every encoded frame and emit visible
         // ones; the reference YUV is the visible plane sequence.
@@ -1370,7 +1370,7 @@ mod tests {
         assert_eq!(got.len(), EXPECTED.len(), "byte-count mismatch");
         assert_eq!(
             &got, EXPECTED,
-            "stateful multi-frame decode must be bit-exact vs libvpx reference"
+            "stateful multi-frame decode must be bit-exact vs reference"
         );
     }
 }

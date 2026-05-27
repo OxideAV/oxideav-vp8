@@ -6,12 +6,12 @@ Each subdirectory holds one VP8 conformance fixture used by the
 * `input.ivf` — a single-key-frame VP8 elementary stream wrapped in IVF
   (32-byte DKIF header + one 12-byte frame header + the raw VP8 frame).
 * `expected.yuv` — the I420 reference picture (`Y` plane, then `U`, then
-  `V`, each row-major), produced by the **libvpx / ffmpeg** decoder as an
-  opaque black-box validator.
+  `V`, each row-major), produced by an opaque black-box reference
+  decoder binary used purely as a validator.
 
 These are public conformance vectors: the input bitstreams were generated
-by `ffmpeg -c:v libvpx` and the expected output is whatever the reference
-binary decodes them to. Under the workspace clean-room policy, black-box
+by the reference encoder binary and the expected output is whatever the
+reference decoder produces. Under the workspace clean-room policy, black-box
 validator *output* is a legitimate oracle — no decoder source is consulted
 or reproduced; we compare our bytes to theirs. RFC 6386 §2 makes the exact
 reconstructed pixel values part of the specification, so a bit-exact match

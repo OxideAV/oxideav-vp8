@@ -235,7 +235,7 @@
 //! the §14.1 dequant scaling ([`dequant::decode_and_dequantize_mb`]), the
 //! per-key-frame [`decode_vp8`] driver, the §16.4 SPLITMV walk, and now
 //! the multi-frame [`state::Vp8DecoderState`] all landed, the full
-//! key+inter decode chain is bit-exact against the libvpx/ffmpeg reference
+//! key+inter decode chain is bit-exact against the reference decoder output
 //! on multi-frame fixtures (single I + P; 5-frame mid-GOP golden refresh;
 //! 10-frame `auto-alt-ref` + ARNR).
 //!

@@ -804,9 +804,9 @@ mod tests {
     /// stream packaged in IVF; decoding the contained 57-byte frame should
     /// produce a 16x16 I420 picture.
     ///
-    /// `expected.yuv` from the fixture set is the **ffmpeg/libvpx**
-    /// black-box reference output for the same input (the `ffmpeg`
-    /// invocation is recorded in the fixture's `notes.md`). The decode is
+    /// `expected.yuv` from the fixture set is the reference decoder's
+    /// black-box output for the same input (the `ffmpeg` invocation that
+    /// produced it is recorded in the fixture's `notes.md`). The decode is
     /// **bit-exact** against that reference — the whole point of VP8's
     /// "exact pixel values are part of the specification" guarantee (RFC
     /// 6386 §2). We assert the full I420 byte stream (Y then U then V)
@@ -823,8 +823,7 @@ mod tests {
             "fixture VP8 frame size changed"
         );
         // Concatenate the planes in I420 order and require a byte-exact
-        // match against the libvpx reference (384 bytes = 256 Y + 64 U +
-        // 64 V).
+        // match against the reference (384 bytes = 256 Y + 64 U + 64 V).
         assert_fixture_bit_exact(IVF, EXPECTED, 16, 16);
     }
 
@@ -834,7 +833,7 @@ mod tests {
     /// strips), the §13.3 above/left non-zero predictor threading across a
     /// full raster of macroblocks, and the §15.1 loop-filter geometry over
     /// internal macroblock edges — none of which the single-MB 16×16
-    /// fixture touches. Bit-exact against the libvpx reference YUV.
+    /// fixture touches. Bit-exact against the reference YUV.
     #[test]
     fn i_only_64x64_fixture_decodes_bit_exact() {
         const IVF: &[u8] = include_bytes!("../tests/fixtures/i-only-64x64/input.ivf");
@@ -861,7 +860,7 @@ mod tests {
     /// A 16×16 key frame coded with **four DCT partitions** (the
     /// `log2_nbr_of_dct_partitions = 2` case, §9.5). Exercises the 3-byte
     /// little-endian partition-size table parse and the round-robin row
-    /// striping (one MB row → partition 0). Bit-exact against the libvpx
+    /// striping (one MB row → partition 0). Bit-exact against the
     /// reference.
     #[test]
     fn partition_padding_16x16_4parts_decodes_bit_exact() {
@@ -887,7 +886,7 @@ mod tests {
     }
 
     /// A batch of single-key-frame fixtures, each decoded bit-exact
-    /// against its libvpx reference YUV. These cover decode behaviours the
+    /// against its reference YUV. These cover decode behaviours the
     /// 16×16 / 64×64 / partition fixtures above don't reach:
     ///
     /// * `q-high` — `loop_filter_level = 38` (heavy normal deblocking)
@@ -962,7 +961,7 @@ mod tests {
             got.extend_from_slice(&decoded.v);
             assert_eq!(
                 &got, expected,
-                "fixture {name} must be bit-exact against the libvpx reference"
+                "fixture {name} must be bit-exact against the reference"
             );
         }
     }

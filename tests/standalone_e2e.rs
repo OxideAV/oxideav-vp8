@@ -4,8 +4,8 @@
 //!
 //! The crate's README documents a no-`oxideav-core` build that exposes
 //! the keyframe encoder, the stateful multi-frame decoder, the two-pass
-//! encoder family, the IVF container helpers and the libwebp-style
-//! `quality_to_qindex` knob. This file pins that the standalone-build
+//! encoder family, the IVF container helpers and the WebP-canonical
+//! `0..=100` → qindex `quality_to_qindex` knob. This file pins that the standalone-build
 //! contract is **runtime**-correct, not just compile-time: each of those
 //! entry points is driven against a synthetic I420 source and the
 //! result is checked numerically.
@@ -399,7 +399,7 @@ fn standalone_quality_to_qindex_table() {
     assert_eq!(
         quality_to_qindex(75.0),
         32,
-        "quality 75 → libwebp default 32"
+        "quality 75 → WebP-canonical default qindex 32"
     );
     assert_eq!(quality_to_qindex(100.0), 0, "quality 100 → best qindex 0");
     assert_eq!(quality_to_qindex(50.0), 64, "quality 50 → mid qindex 64");

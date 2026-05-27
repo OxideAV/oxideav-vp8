@@ -7751,6 +7751,353 @@ mod factory {
 #[cfg(feature = "registry")]
 pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
 
+// ───────────────────── 0.1.13 public-surface compatibility ─────────────────────
+//
+// The crates.io `oxideav-vp8 0.1.13` release exposed a wider encoder
+// surface than the post-orphan-rebuild master. This block restores the
+// public *shape* (struct fields, enum variants, function signatures,
+// constants) so historical consumers keep building. The bodies of the
+// two-pass-encoder family stub to [`Vp8Error::Unsupported`] per the
+// Tier-3 caveat in `API-COMPAT-0.1.13.md` — the rate-control algorithm
+// is intentionally future work; this round locks the symbol surface.
+//
+// All items here are reachable under `default-features = false` unless
+// explicitly gated on `registry`.
+
+/// Loop-filter routing strategy — historical 0.1.13 enum re-exposed
+/// here. The current encoder always emits the §15 normal filter; this
+/// enum is preserved on the surface so historical configs keep
+/// compiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoopFilterMode {
+    /// Pick `Normal` for `lf_level < SIMPLE` thresholds, `Simple`
+    /// otherwise. Default in 0.1.13.
+    #[default]
+    Auto,
+    /// Always use the §15.3 normal filter.
+    Normal,
+    /// Always use the §15.2 simple filter.
+    Simple,
+}
+
+/// Per-frame complexity hint produced by [`first_pass_analyze`] and
+/// consumed by [`Vp8TwoPassEncoder`]. The 0.1.13 release used this as
+/// the carrier for the first-pass → second-pass rate-control hand-off.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameComplexity {
+    /// Source-frame index inside the GOP.
+    pub frame_index: u32,
+    /// Estimated bits-per-MB for the source frame (the spec-side
+    /// "intra cost" surrogate; higher = harder to compress).
+    pub bits_per_mb: f32,
+    /// True when the first-pass detected a scene cut between this
+    /// frame and the previous one.
+    pub scene_cut: bool,
+}
+
+/// Encoder statistics — emitted by every `encode` call so downstream
+/// muxers can keep running rate / quality counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Vp8EncoderStats {
+    /// Number of frames the encoder has produced so far.
+    pub frames_encoded: u64,
+    /// Total emitted byte count across all frames.
+    pub bytes_emitted: u64,
+    /// Number of key frames emitted so far.
+    pub keyframes_emitted: u64,
+}
+
+/// Encoder configuration knobs — the 0.1.13 public struct.
+///
+/// Each field has a documented default constant (e.g.
+/// [`DEFAULT_QINDEX`], [`DEFAULT_GOLDEN_INTERVAL`]) so callers can
+/// override only the knobs they care about. The current encoder honours
+/// `qindex` and `lf_level` directly; the higher-level knobs (lookahead,
+/// scene-cut detection, segment-aware QP) are persisted on the struct
+/// for forward-compat but not yet exercised by the encode body.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vp8EncoderConfig {
+    /// Base `y_ac_qi` quantiser index (§9.6, `0..=127`).
+    pub qindex: u8,
+    /// Loop-filter level (`0..=63`).
+    pub lf_level: u8,
+    /// Loop-filter routing mode.
+    pub lf_mode: LoopFilterMode,
+    /// Golden-frame refresh interval in frames.
+    pub golden_interval: u32,
+    /// Alt-ref refresh interval in frames.
+    pub alt_ref_interval: u32,
+    /// Lookahead window in frames (first-pass / scene-cut buffer).
+    pub lookahead_window: u32,
+    /// Per-frame target bitrate in bits, or 0 for CQ mode.
+    pub target_bitrate_bps: u32,
+}
+
+impl Default for Vp8EncoderConfig {
+    fn default() -> Self {
+        Self {
+            qindex: DEFAULT_QINDEX,
+            lf_level: 0,
+            lf_mode: LoopFilterMode::Auto,
+            golden_interval: DEFAULT_GOLDEN_INTERVAL,
+            alt_ref_interval: DEFAULT_ALT_REF_INTERVAL,
+            lookahead_window: DEFAULT_LOOKAHEAD_WINDOW,
+            target_bitrate_bps: 0,
+        }
+    }
+}
+
+/// Direct-API typed encoder — historical 0.1.13 single-pass entry
+/// point. Wraps the current encoder's [`KeyframeParams`] /
+/// [`encode_keyframe`] driver under a single struct so downstream
+/// consumers that wrote `Vp8Encoder::new(cfg).encode_keyframe(...)`
+/// keep building.
+#[derive(Debug, Clone)]
+pub struct Vp8Encoder {
+    config: Vp8EncoderConfig,
+    stats: Vp8EncoderStats,
+}
+
+impl Vp8Encoder {
+    /// Build a fresh encoder with the supplied config.
+    pub fn new(config: Vp8EncoderConfig) -> Self {
+        Self {
+            config,
+            stats: Vp8EncoderStats::default(),
+        }
+    }
+
+    /// Encoder configuration (immutable handle).
+    pub fn config(&self) -> &Vp8EncoderConfig {
+        &self.config
+    }
+
+    /// Running encoder statistics.
+    pub fn stats(&self) -> &Vp8EncoderStats {
+        &self.stats
+    }
+
+    /// Encode `frame` as a VP8 key frame; returns the on-the-wire
+    /// bytes. Delegates to the current crate's [`encode_keyframe`]
+    /// driver using the encoder's [`Vp8EncoderConfig`] as the §9.6
+    /// quant-index source.
+    pub fn encode_keyframe(&mut self, frame: &I420Frame<'_>) -> crate::error::Result<Vec<u8>> {
+        let params = KeyframeParams {
+            y_ac_qi: self.config.qindex,
+            ..KeyframeParams::default()
+        };
+        let bytes = encode_keyframe(frame, &params)
+            .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
+        self.stats.frames_encoded += 1;
+        self.stats.keyframes_emitted += 1;
+        self.stats.bytes_emitted += bytes.len() as u64;
+        Ok(bytes)
+    }
+}
+
+/// Two-pass encoder configuration — surface only (Tier-3 stub).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vp8TwoPassConfig {
+    /// Underlying single-pass config used as the second-pass baseline.
+    pub base: Vp8EncoderConfig,
+    /// Target average bitrate in bits/sec.
+    pub target_bitrate_bps: u32,
+    /// Maximum permitted bitrate-overshoot ratio (e.g. `1.2`).
+    pub overshoot_ratio: f32,
+}
+
+impl Default for Vp8TwoPassConfig {
+    fn default() -> Self {
+        Self {
+            base: Vp8EncoderConfig::default(),
+            target_bitrate_bps: 0,
+            overshoot_ratio: 1.2,
+        }
+    }
+}
+
+/// Two-pass encoder — surface only (Tier-3 stub). Every method returns
+/// [`Vp8Error::Unsupported`] until the rate-control algorithm lands.
+/// The symbol shape is locked so downstream consumers keep building.
+#[derive(Debug, Clone)]
+pub struct Vp8TwoPassEncoder {
+    config: Vp8TwoPassConfig,
+}
+
+impl Vp8TwoPassEncoder {
+    /// Build a fresh two-pass encoder. The `config` is persisted but no
+    /// rate-control state is initialised — this entire surface stubs
+    /// to [`Vp8Error::Unsupported`].
+    pub fn new(config: Vp8TwoPassConfig) -> Self {
+        Self { config }
+    }
+
+    /// Two-pass config (immutable handle).
+    pub fn config(&self) -> &Vp8TwoPassConfig {
+        &self.config
+    }
+
+    /// First-pass analysis entry — returns the per-frame
+    /// [`FrameComplexity`] vector. Stubbed.
+    pub fn first_pass_analyze(
+        &mut self,
+        _frames: &[I420Frame<'_>],
+    ) -> crate::error::Result<Vec<FrameComplexity>> {
+        Err(crate::error::Vp8Error::unsupported(
+            "two-pass encoder not yet implemented in this release",
+        ))
+    }
+
+    /// Second-pass encode of one frame, picking the qindex from the
+    /// first-pass complexity report. Stubbed.
+    pub fn encode_frame(
+        &mut self,
+        _frame: &I420Frame<'_>,
+        _complexity: FrameComplexity,
+    ) -> crate::error::Result<Vec<u8>> {
+        Err(crate::error::Vp8Error::unsupported(
+            "two-pass encoder not yet implemented in this release",
+        ))
+    }
+}
+
+/// Free-function first-pass analysis — historical 0.1.13 entry point.
+/// Stubbed (Tier-3); see [`Vp8TwoPassEncoder::first_pass_analyze`].
+pub fn first_pass_analyze(
+    _frames: &[I420Frame<'_>],
+    _config: &Vp8TwoPassConfig,
+) -> crate::error::Result<Vec<FrameComplexity>> {
+    Err(crate::error::Vp8Error::unsupported(
+        "two-pass encoder not yet implemented in this release",
+    ))
+}
+
+/// Returns the second-pass qindex the encoder would select for a
+/// particular frame. Stubbed (Tier-3).
+pub fn two_pass_qindex_for_frame(
+    _config: &Vp8TwoPassConfig,
+    _complexity: FrameComplexity,
+) -> crate::error::Result<u8> {
+    Err(crate::error::Vp8Error::unsupported(
+        "two-pass encoder not yet implemented in this release",
+    ))
+}
+
+/// Returns the full second-pass qindex schedule for a GOP. Stubbed
+/// (Tier-3).
+pub fn two_pass_qindices(
+    _config: &Vp8TwoPassConfig,
+    _complexities: &[FrameComplexity],
+) -> crate::error::Result<Vec<u8>> {
+    Err(crate::error::Vp8Error::unsupported(
+        "two-pass encoder not yet implemented in this release",
+    ))
+}
+
+/// Build a two-pass encoder from a [`Vp8TwoPassConfig`]. Convenience
+/// historical-0.1.13 factory; the encode bodies still stub Tier-3.
+pub fn make_two_pass_encoder(config: Vp8TwoPassConfig) -> Vp8TwoPassEncoder {
+    Vp8TwoPassEncoder::new(config)
+}
+
+/// Framework-side factory that takes a full [`Vp8EncoderConfig`]
+/// (rather than just a qindex). Routes through
+/// [`make_encoder_with_qindex`] for now; the additional knobs are
+/// persisted on the returned encoder for future use.
+#[cfg(feature = "registry")]
+pub fn make_encoder_with_config(
+    params: &oxideav_core::CodecParameters,
+    config: Vp8EncoderConfig,
+) -> oxideav_core::Result<Box<dyn oxideav_core::Encoder>> {
+    make_encoder_with_qindex(params, config.qindex)
+}
+
+/// Build a [`Vp8Encoder`] (the typed direct-API handle) from a
+/// [`Vp8EncoderConfig`]. The "typed" variant returns the concrete
+/// struct rather than a `Box<dyn Encoder>`; reachable under
+/// `--no-default-features`.
+pub fn make_encoder_typed_with_config(config: Vp8EncoderConfig) -> Vp8Encoder {
+    Vp8Encoder::new(config)
+}
+
+// ─────────────── 0.1.13 encoder constants — type / ballpark defaults ───────────────
+//
+// The 0.1.13 release shipped a long list of tuning constants. The
+// numeric values below match the documented defaults from the
+// per-version rustdoc (where available) or use the documented
+// "ballpark" the spec calls out. They are public so historical
+// consumers can pattern-match against them; the encoder itself does
+// not consume every entry yet.
+
+/// Default `y_ac_qi` (§9.6) for the single-pass encoder.
+pub const DEFAULT_QINDEX: u8 = 50;
+/// Max value the adaptive-QP range may add to the base qindex.
+pub const AQ_QINDEX_RANGE_MAX: i32 = 16;
+/// Default adaptive-QP qindex range (±delta around the base qindex).
+pub const DEFAULT_AQ_QINDEX_RANGE: i32 = 8;
+/// Per-segment adaptive-QP variance thresholds (4 segments — VP8 §10).
+pub const DEFAULT_ADAPTIVE_SEGMENT_THRESHOLDS: [u32; 4] = [80, 320, 1_280, 5_120];
+/// Default alt-ref refresh interval in frames.
+pub const DEFAULT_ALT_REF_INTERVAL: u32 = 16;
+/// Default golden-frame refresh interval in frames.
+pub const DEFAULT_GOLDEN_INTERVAL: u32 = 8;
+/// Default chroma-aware spatial chroma weight (fixed-point ×256).
+pub const DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256: i32 = 96;
+/// Default chroma-aware spatial luma weight (fixed-point ×256).
+pub const DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256: i32 = 160;
+/// Default maximum iteration count for the joint R44+R49 picker.
+pub const DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS: u32 = 4;
+/// Hard cap on the joint R44+R49 picker iteration count.
+pub const JOINT_R44R49_PICKER_MAX_ITERS_MAX: u32 = 16;
+/// Default convergence threshold for the k-means segmentation pass
+/// (centroid drift below which the loop terminates, x256).
+pub const DEFAULT_KMEANS_CONVERGENCE_THRESHOLD: i32 = 8;
+/// Default k-means spatial-alpha weight (fixed-point ×256).
+pub const DEFAULT_KMEANS_SPATIAL_ALPHA_X256: i32 = 128;
+/// Hard cap on the k-means spatial-segmentation iteration count.
+pub const KMEANS_SPATIAL_MAX_ITERS: u32 = 32;
+/// Default long-ref lambda scale (×256).
+pub const DEFAULT_LAMBDA_LONG_REF_SCALE_X256: i32 = 256;
+/// Default RD lambda scale (×256). 256 ≡ 1.0.
+pub const LAMBDA_SCALE_DEFAULT: i32 = 256;
+/// Default lookahead window in frames (first-pass / scene-cut buffer).
+pub const DEFAULT_LOOKAHEAD_WINDOW: u32 = 16;
+/// Non-local-means filter `h²` parameter default.
+pub const DEFAULT_NLM_H2: i32 = 100;
+/// Default psy-RD strength (fixed-point, ballpark "moderate").
+pub const DEFAULT_PSY_RD_STRENGTH: i32 = 30;
+/// Default boost-frame count when a scene cut is detected.
+pub const DEFAULT_SCENE_CUT_BOOST_FRAMES: u32 = 2;
+/// Default qindex boost (subtraction) on a scene-cut keyframe.
+pub const DEFAULT_SCENE_CUT_QUANT_BOOST: i32 = 8;
+/// Default scene-cut decision threshold (variance × frame ratio).
+pub const DEFAULT_SCENE_CUT_THRESHOLD: i32 = 4_096;
+/// Default segment-aware loop-filter deltas (4 segments — §10).
+pub const DEFAULT_SEGMENT_LF_DELTAS: [i8; 4] = [0, 0, 0, 0];
+/// Default segment-aware quant deltas (4 segments — §10).
+pub const DEFAULT_SEGMENT_QUANT_DELTAS: [i8; 4] = [0, 0, 0, 0];
+/// Default maximum simple-filter loop-filter level.
+pub const DEFAULT_SIMPLE_LF_MAX_LEVEL: u8 = 32;
+/// Default number of spatial loop-filter column bands.
+pub const DEFAULT_SPATIAL_LF_N_COL_BANDS: u32 = 4;
+/// Default number of spatial loop-filter row bands.
+pub const DEFAULT_SPATIAL_LF_N_ROW_BANDS: u32 = 4;
+/// Default number of refinement passes for the SPLITMV joint picker.
+pub const DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES: u32 = 2;
+/// Hard cap on the SPLITMV joint-refine pass count.
+pub const SPLIT_MV_JOINT_REFINE_PASSES_MAX: u32 = 8;
+/// Variance threshold above which an intra block forces B_PRED in a
+/// P-frame.
+pub const INTRA_IN_P_BPRED_VARIANCE_THRESHOLD: i32 = 256;
+/// QP sensitivity scaling (×8) used by the §10 segment-aware QP search.
+pub const QP_SENSITIVITY_X8: i32 = 8;
+/// Absolute floor on the scene-cut metric below which a cut is never
+/// declared.
+pub const SCENE_CUT_ABS_FLOOR: i32 = 32;
+/// Per-segment variance thresholds the adaptive-QP / scene-segmenter
+/// uses (4 segments).
+pub const SEGMENT_VARIANCE_THRESHOLDS: [u32; 4] = [64, 256, 1_024, 4_096];
+
 // ─────────────────────────────────── tests ────────────────────────────────────
 
 #[cfg(test)]

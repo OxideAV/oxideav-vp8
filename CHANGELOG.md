@@ -4,6 +4,68 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — 0.1.13 public-surface widen (round 167, 2026-05-27)
+
+Per `crates/oxideav-vp8/API-COMPAT-0.1.13.md` (the parent's contract
+landed at `d2d6b12`), this round restores every public symbol the
+crates.io `oxideav-vp8 0.1.13` release exposed so historical consumers
+pinned to `oxideav-vp8 = "0.1"` can upgrade transparently. The earlier
+round 166 finalize covered only the webp-binding subset; this widens it
+to the full pre-orphan surface.
+
+* **`CODEC_ID_STR`** — crate-root constant set to `"vp8"`.
+* **`Vp8Frame`** — public type alias for `Vp8DecodedFrame`.
+* **`Result`** — re-export of `error::Result<T>` at the crate root.
+* **`decode_frame`** (registry-gated) — legacy alias of `decode_vp8`
+  returning `oxideav_core::VideoFrame`.
+* **`frame_tag` module** — new module with `FrameTag`, `FrameType`,
+  `KeyframeHeader`, `ParsedHeader`, `parse_header`,
+  `parse_keyframe_header`. Delegates to `Vp8FrameHeader::parse`.
+* **`ivf` module** — IVF container helpers (`IvfHeader`, `IvfFrameHeader`,
+  `parse_header`, `write_header`, `write_frame`, `parse_frame_header`).
+  Reachable under `--no-default-features`.
+* **`registry` module** (registry-gated) — `register`, `register_codecs`,
+  `register_containers` (the last is a tolerated no-op since container
+  layers live in sibling crates today).
+* **Module-path aliases** (`fdct`, `inter`, `intra`, `loopfilter`, `mv`,
+  `tables`, `tokens`, `transform`, `bool_encoder`) — re-export shells
+  over the current master's module layout so the historical 0.1.13
+  paths keep resolving without renaming the underlying files.
+* **`Vp8Encoder` / `Vp8EncoderConfig` / `Vp8EncoderStats`** — typed
+  direct-API encoder handle plus its config + running statistics.
+  `Vp8Encoder::encode_keyframe` delegates to the existing
+  `encode_keyframe` driver; reachable under `--no-default-features`.
+* **`LoopFilterMode`** — `Auto` / `Normal` / `Simple` enum (default
+  `Auto`). Persisted on `Vp8EncoderConfig`; the encoder body still emits
+  the current single behaviour (the enum locks the surface).
+* **`Vp8TwoPassEncoder` / `Vp8TwoPassConfig` / `FrameComplexity`** —
+  surface only (Tier-3 stub). Every two-pass method / free fn
+  (`first_pass_analyze`, `two_pass_qindex_for_frame`,
+  `two_pass_qindices`, `make_two_pass_encoder`, `encode_frame`) returns
+  `Vp8Error::Unsupported("two-pass encoder not yet implemented in this
+  release")`. The rate-control algorithm is intentionally deferred —
+  this round locks the type shapes only.
+* **`make_encoder_with_config`** (registry-gated) — framework-side
+  factory taking a full `Vp8EncoderConfig`. Routes through
+  `make_encoder_with_qindex` for now.
+* **`make_encoder_typed_with_config`** — `Vp8Encoder::new` convenience.
+* **Encoder constants** — 28 documented `DEFAULT_*` / `*_MAX` / `*_MIN`
+  literals (`DEFAULT_QINDEX = 50`, `DEFAULT_GOLDEN_INTERVAL = 8`,
+  `DEFAULT_ALT_REF_INTERVAL = 16`, etc.) for downstream pattern-matching.
+* **Cargo feature `simd`** — no-op flag declared verbatim from the
+  0.1.13 manifest so historical consumers that set it explicitly keep
+  building.
+* **`FrameHeader`** — type alias for `Vp8FrameHeader` at the crate root.
+* **`tests/api_compat_0_1_13.rs`** — compile-only assertion suite that
+  binds every Crate-root re-export under both feature configurations.
+  Locks the API in place; if a future change removes or re-shapes any
+  symbol, this file stops compiling.
+
+Verified under both `cargo build -p oxideav-vp8` and
+`cargo build -p oxideav-vp8 --no-default-features` (the latter pulls
+zero deps per `cargo tree --no-default-features`). All pre-existing
+447 / 442 in-tree tests still pass.
+
 ### Added — public-API finalize (round 166, 2026-05-27)
 
 * **`oxideav_vp8::error` module + flat `Vp8Error`** — public-surface

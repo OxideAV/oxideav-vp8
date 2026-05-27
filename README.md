@@ -2,6 +2,47 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 167 — 0.1.13 public-surface widen)
+
+The earlier round-166 finalize closed only the webp-binding subset of the
+crates.io `oxideav-vp8 0.1.13` surface. Round 167 widens it to the
+complete pre-orphan public surface so historical consumers pinned to
+`oxideav-vp8 = "0.1"` (not just webp) upgrade transparently. See
+`API-COMPAT-0.1.13.md` for the per-symbol contract and
+`tests/api_compat_0_1_13.rs` for the compile-only assertion suite that
+locks every restored symbol in place.
+
+Newly reachable at the crate root (every item in BOTH the default
+`registry` build and the `--no-default-features` standalone build unless
+explicitly noted):
+
+* Constant `CODEC_ID_STR = "vp8"`.
+* Type alias `Vp8Frame = Vp8DecodedFrame`.
+* Type alias `FrameHeader = Vp8FrameHeader`.
+* Re-export `Result = error::Result<T>`.
+* `frame_tag` module — `FrameTag` / `FrameType` / `KeyframeHeader` /
+  `ParsedHeader` / `parse_header` / `parse_keyframe_header`.
+* `ivf` module — `IvfHeader` / `parse_header` / `write_header` /
+  `write_frame` / `parse_frame_header`.
+* `Vp8Encoder` / `Vp8EncoderConfig` / `Vp8EncoderStats` direct-API
+  encoder handle (the `encode_keyframe` body wires through the existing
+  driver).
+* `LoopFilterMode { Auto, Normal, Simple }` (default `Auto`).
+* `Vp8TwoPassEncoder` / `Vp8TwoPassConfig` / `FrameComplexity` (Tier-3
+  stub — type shapes locked, bodies return
+  `Vp8Error::Unsupported("two-pass encoder not yet implemented in this
+  release")`).
+* 28 encoder constants (`DEFAULT_QINDEX`, `DEFAULT_GOLDEN_INTERVAL`,
+  `DEFAULT_ALT_REF_INTERVAL`, `DEFAULT_LOOKAHEAD_WINDOW`, …).
+* Module-path aliases `fdct`, `inter`, `intra`, `loopfilter`, `mv`,
+  `tables`, `tokens`, `transform`, `bool_encoder` over the current
+  master's module tree.
+* Registry-gated: `Vp8Decoder` (re-export), `decode_frame`, `registry`
+  module with `register` / `register_codecs` / `register_containers`,
+  `make_encoder_with_config`.
+* Cargo feature `simd` declared as a no-op so historical consumers that
+  set `simd = true` keep building.
+
 ## Status — 2026-05-27 (round 166 — public-API finalize)
 
 **Public API surface finalized for binding-compatible downstream

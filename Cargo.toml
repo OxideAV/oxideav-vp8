@@ -19,3 +19,8 @@ oxideav-core = { version = "0.1", optional = true }
 [features]
 default = ["registry"]
 registry = ["dep:oxideav-core"]
+# `simd` is a reserved no-op flag carried over from the crates.io
+# `oxideav-vp8 0.1.13` manifest. Historical consumers set this feature
+# explicitly; the current build has no SIMD code-paths gated on it, but
+# the flag MUST stay declared so those consumers keep building.
+simd = []

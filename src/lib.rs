@@ -282,8 +282,10 @@ pub mod error;
 pub mod forward_transform;
 pub mod frame;
 pub mod frame_header;
+pub mod frame_tag;
 pub mod intra_predict;
 pub mod inverse_transform;
+pub mod ivf;
 pub mod loop_filter;
 pub mod macroblock;
 pub mod motion_comp;
@@ -293,6 +295,91 @@ pub mod near_mv;
 pub mod reconstruct;
 pub mod state;
 pub mod stream;
+
+#[cfg(feature = "registry")]
+pub mod registry;
+
+// ───────────────────── 0.1.13 module-path aliases ─────────────────────
+//
+// The crates.io `oxideav-vp8 0.1.13` release organised its public
+// modules under a slightly different naming scheme. The aliases below
+// restore the historical module paths without renaming the underlying
+// files, so downstream consumers that wrote
+// `oxideav_vp8::loopfilter::LoopFilterParams` keep building.
+
+/// 0.1.13 alias of [`crate::forward_transform`] — the §14 forward 4×4
+/// DCT / WHT primitives.
+pub mod fdct {
+    pub use crate::forward_transform::*;
+}
+
+/// 0.1.13 alias of [`crate::inverse_transform`] — the §14 inverse 4×4
+/// DCT / WHT primitives and §14.5 predictor+residue summation.
+pub mod transform {
+    pub use crate::inverse_transform::*;
+}
+
+/// 0.1.13 alias of [`crate::intra_predict`] — the §12 intra-prediction
+/// pixel kernels.
+pub mod intra {
+    pub use crate::intra_predict::*;
+}
+
+/// 0.1.13 alias of [`crate::loop_filter`] — the §15 loop-filter
+/// primitives.
+pub mod loopfilter {
+    pub use crate::loop_filter::*;
+}
+
+/// 0.1.13 alias of [`crate::motion_vector`] — the §17 motion-vector
+/// primitives.
+pub mod mv {
+    pub use crate::motion_vector::*;
+}
+
+/// 0.1.13 alias of [`crate::dct_tokens`] — the §13 DCT-token decoding /
+/// classification.
+pub mod tokens {
+    pub use crate::dct_tokens::*;
+}
+
+/// 0.1.13 grouped alias of the inter-prediction modules
+/// ([`crate::motion_comp`] + [`crate::motion_search`] +
+/// [`crate::motion_vector`] + [`crate::near_mv`]).
+pub mod inter {
+    pub use crate::motion_comp::*;
+    pub use crate::motion_search::*;
+    pub use crate::motion_vector::*;
+    pub use crate::near_mv::*;
+}
+
+/// 0.1.13 alias surface for the §7.3 bool encoder. The current
+/// [`BoolEncoder`](crate::encoder::BoolEncoder) lives in
+/// [`crate::encoder`]; this module re-exposes it (and the
+/// classification helper) under the original 0.1.13 path.
+pub mod bool_encoder {
+    pub use crate::encoder::BoolEncoder;
+    pub use crate::encoder::{
+        classify_coeff_token, encode_coeff_block, TokenEncodeError, TokenEncoder,
+    };
+}
+
+/// 0.1.13 grouping module for the in-tree default-probability / scan
+/// / dequant tables. Today these tables live next to the layer that
+/// consumes them; this module re-exports them under the original
+/// `tables` path.
+pub mod tables {
+    pub use crate::coded_header::{DEFAULT_MV_CONTEXT, MV_PROB_COUNT};
+    pub use crate::dct_tokens::{COEFF_BANDS, DEFAULT_COEFF_PROBS, MB_ENTROPY_CTX_LEN, ZIGZAG};
+    pub use crate::inverse_transform::{AC_QLOOKUP, DC_QLOOKUP, QINDEX_RANGE};
+    pub use crate::loop_filter::{MAX_MB_SEGMENTS, MAX_MODE_LF_DELTAS, MAX_REF_LF_DELTAS};
+    pub use crate::macroblock::{IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS};
+    pub use crate::motion_comp::{BILINEAR_FILTERS, SIXTAP_FILTERS};
+    pub use crate::near_mv::{
+        MV_COUNTS_TO_PROBS, MV_PARTITIONS, MV_PARTITION_PROBS, MV_PARTITION_TREE, MV_REF_TREE,
+        SUBMV_REF_PROBS, SUBMV_REF_TREE,
+    };
+}
 
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
@@ -305,6 +392,29 @@ pub use dct_tokens::{
     MB_ENTROPY_CTX_LEN, ZIGZAG,
 };
 pub use decoder::{decode_vp8, DecodeError, Vp8DecodedFrame};
+
+/// 0.1.13 alias for [`decoder::Vp8DecodedFrame`] — the per-frame
+/// reconstructed I420 picture is now named `Vp8Frame` at the crate root
+/// to match the historical `oxideav_vp8::Vp8Frame` path that downstream
+/// consumers wrote against. The underlying struct is unchanged.
+pub type Vp8Frame = decoder::Vp8DecodedFrame;
+
+/// 0.1.13 alias for the registry-gated [`decoder::Vp8Decoder`] handle.
+/// Re-exported at the crate root so `use oxideav_vp8::Vp8Decoder;`
+/// works. Standalone callers without `oxideav-core` should use
+/// [`state::Vp8DecoderState`] instead.
+#[cfg(feature = "registry")]
+pub use decoder::Vp8Decoder;
+
+/// Legacy alias of [`decode_vp8`] yielding the framework's
+/// [`oxideav_core::VideoFrame`] instead of [`Vp8Frame`]. Gated on the
+/// `registry` feature; standalone callers should use [`decode_vp8`].
+#[cfg(feature = "registry")]
+pub fn decode_frame(
+    bytes: &[u8],
+) -> core::result::Result<oxideav_core::VideoFrame, decoder::DecodeError> {
+    decode_vp8(bytes).map(Into::into)
+}
 pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
 pub use encoder::{
     classify_coeff_token, count_block_branches, count_inter_frame_branches,
@@ -430,6 +540,50 @@ impl std::error::Error for Error {}
 /// and the rationale behind the flat-four design.
 pub use error::Vp8Error;
 
+/// Crate-wide [`Result`](core::result::Result) alias — every fallible
+/// entry point that surfaces a [`Vp8Error`] uses this.
+pub use error::Result;
+
+// ── 0.1.13 frame_header / frame_tag re-exports ──
+pub use frame_tag::{
+    parse_header, parse_keyframe_header, FrameTag, FrameType, KeyframeHeader, ParsedHeader,
+};
+
+/// 0.1.13 alias of [`frame_header::Vp8FrameHeader`] under the historical
+/// name `FrameHeader`. The struct is unchanged.
+pub type FrameHeader = frame_header::Vp8FrameHeader;
+
+// ── 0.1.13 encoder surface re-exports ──
+pub use encoder::{
+    first_pass_analyze, make_encoder_typed_with_config, make_two_pass_encoder,
+    two_pass_qindex_for_frame, two_pass_qindices, FrameComplexity, LoopFilterMode, Vp8Encoder,
+    Vp8EncoderConfig, Vp8EncoderStats, Vp8TwoPassConfig, Vp8TwoPassEncoder, AQ_QINDEX_RANGE_MAX,
+    DEFAULT_ADAPTIVE_SEGMENT_THRESHOLDS, DEFAULT_ALT_REF_INTERVAL, DEFAULT_AQ_QINDEX_RANGE,
+    DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256, DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
+    DEFAULT_GOLDEN_INTERVAL, DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
+    DEFAULT_KMEANS_CONVERGENCE_THRESHOLD, DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
+    DEFAULT_LAMBDA_LONG_REF_SCALE_X256, DEFAULT_LOOKAHEAD_WINDOW, DEFAULT_NLM_H2,
+    DEFAULT_PSY_RD_STRENGTH, DEFAULT_QINDEX, DEFAULT_SCENE_CUT_BOOST_FRAMES,
+    DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SEGMENT_LF_DELTAS,
+    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL, DEFAULT_SPATIAL_LF_N_COL_BANDS,
+    DEFAULT_SPATIAL_LF_N_ROW_BANDS, DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
+    INTRA_IN_P_BPRED_VARIANCE_THRESHOLD, JOINT_R44R49_PICKER_MAX_ITERS_MAX,
+    KMEANS_SPATIAL_MAX_ITERS, LAMBDA_SCALE_DEFAULT, QP_SENSITIVITY_X8, SCENE_CUT_ABS_FLOOR,
+    SEGMENT_VARIANCE_THRESHOLDS, SPLIT_MV_JOINT_REFINE_PASSES_MAX,
+};
+
+#[cfg(feature = "registry")]
+pub use encoder::make_encoder_with_config;
+
+/// Crate-root codec id string. Matches the registry id installed by
+/// the `oxideav_core::register!` hook below and the
+/// `oxideav-vp8 0.1.13` constant of the same name.
+pub const CODEC_ID_STR: &str = "vp8";
+
+// ── 0.1.13 registry surface re-exports ──
+#[cfg(feature = "registry")]
+pub use registry::{register_codecs, register_containers};
+
 /// Encode a VP8 keyframe.
 ///
 /// Phase 1 of the encoder is implemented: this routes to
@@ -443,7 +597,11 @@ pub use error::Vp8Error;
 /// callers that already pattern-match against it. To consume the
 /// richer [`EncodeError`] surface directly, call
 /// [`encode_silent_keyframe`] instead.
-pub fn encode_vp8_keyframe(_pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
+pub fn encode_vp8_keyframe(
+    _pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> core::result::Result<Vec<u8>, Error> {
     encode_silent_keyframe(SilentKeyframeParams::new(width, height))
         .map_err(|_| Error::NotImplemented)
 }

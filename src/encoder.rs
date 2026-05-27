@@ -1826,12 +1826,56 @@ fn block_ssd(recon: &[u8], src: &[u8]) -> u64 {
 /// `prob` (the chance the bit is 0) carrying `value`. `-log2` of the
 /// event probability. `prob` is clamped to `1..=255` so the logarithm is
 /// always finite (the spec's probabilities are themselves in `1..=255`).
+///
+/// Round-170 perf note: this function is on the per-token-bit hot path
+/// of the encoder's RD scoring (`estimate_block_bits` calls it for every
+/// emitted bit of every candidate block, and the per-MB mode picker
+/// scores many candidates). The per-call `f64::log2` was the single
+/// dominant self-time symbol on a `sample` profile of the
+/// `inter_encode_short_clip` bench (60 / 12,721 samples — see
+/// `BENCHMARKS.md`). The implementation now consults a precomputed
+/// 256-entry table: `BIT_COST_BY_FALSE_PROB[p]` stores
+/// `-log2(p / 256)` (the bit-cost when the encoded bit is 0 and the
+/// frame's table assigns it probability `p`), with the `p = 0` slot
+/// clamped to `-log2(1/256) = 8.0` to match the original `prob.max(1)` +
+/// floor-at-`1/256` clamp. The `true` branch reads slot `256 - p` (i.e.
+/// `-log2(1 - p / 256)`), with the `p = 256` (encoded bit guaranteed 1)
+/// case naturally handled by reading slot 0 of the same table — and the
+/// `p = 0` (encoded bit guaranteed 0, asked for true) case staying at
+/// the same `8.0` floor for symmetry.
 #[inline]
 fn bool_bits(prob: u8, value: bool) -> f64 {
-    let p0 = (prob.max(1) as f64) / 256.0;
-    let p = if value { 1.0 - p0 } else { p0 };
-    -p.max(1.0 / 256.0).log2()
+    if value {
+        // -log2(1 - prob/256). prob == 0 ⇒ index = 256, but we clamp
+        // it to 255 (i.e. -log2(1/256) = 8.0) so the asymmetric
+        // 1/256-floor of the original `p.max(1.0 / 256.0).log2()`
+        // survives the rewrite without an extra branch.
+        let idx = 256usize - prob as usize;
+        BIT_COST_BY_FALSE_PROB[idx.min(255)]
+    } else {
+        BIT_COST_BY_FALSE_PROB[prob as usize]
+    }
 }
+
+/// `BIT_COST_BY_FALSE_PROB[p] = -log2(p / 256)` in fractional bits.
+///
+/// 257 entries are conceptually needed (`p ∈ 0..=256`), but the original
+/// `bool_bits` clamps `prob` into `1..=255` and floors the resulting
+/// probability at `1/256`, so the `p = 0` slot stores the same `8.0` as
+/// `p = 1` (and the `value == true` branch's `256 - 0 = 256` index is
+/// pre-clamped to `255` so we only ever read in-bounds). This table is
+/// precomputed at module-load (`std::sync::OnceLock`) so the only
+/// arithmetic on the hot path is the bool / index pair above.
+static BIT_COST_BY_FALSE_PROB: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
+    let mut t = [0f64; 256];
+    // p = 0 ⇒ same floor as the original `.max(1.0 / 256.0)` (i.e. 1/256).
+    t[0] = -((1.0f64 / 256.0).log2());
+    for (p, slot) in t.iter_mut().enumerate().skip(1) {
+        // -log2(p / 256). `slot` is the lvalue.
+        *slot = -((p as f64) / 256.0).log2();
+    }
+    t
+});
 
 /// Cost in fractional bits of writing `value` through `tree` with the
 /// per-node probability `prob_lookup`, mirroring [`BoolEncoder::write_treed`]

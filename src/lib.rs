@@ -270,6 +270,7 @@
 //!   wiring (Y2 DC seeding, 24/25-block walk, RD-driven mode +
 //!   quant-step selection) is the next encoder round.
 
+#![cfg_attr(feature = "simd", feature(portable_simd))]
 #![warn(missing_debug_implementations)]
 
 pub mod bool_decoder;

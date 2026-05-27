@@ -554,17 +554,35 @@ pub fn fetch_block_whole_pixel(
     let src_x0 = blk_x as isize + off_x;
     let src_y0 = blk_y as isize + off_y;
 
-    let w = w as isize;
-    let h = h as isize;
+    let w_i = w as isize;
+    let h_i = h as isize;
     let mut out = [0u8; 16];
+
+    // Round-170 fast path: when all 16 source positions land strictly
+    // inside the plane, no per-pixel `.clamp()` or bounds checks are
+    // needed and each output row is a contiguous 4-byte slice of the
+    // reference. This is the common case mid-frame; the edge-replication
+    // fallback below stays bit-identical to the slow path for MBs that
+    // straddle the picture border. (§20.14 `build_mc_border` semantics
+    // are preserved — only the in-bounds branch is specialised.)
+    if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 4 <= w_i && src_y0 + 4 <= h_i {
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        for r in 0..4 {
+            let row_start = (y0 + r) * stride + x0;
+            out[r * 4..r * 4 + 4].copy_from_slice(&plane[row_start..row_start + 4]);
+        }
+        return out;
+    }
+
     for r in 0..4 {
         // §20.14 build_mc_border: rows past the top / bottom edge read
         // the first / last in-bounds row (edge replication).
-        let sy = (src_y0 + r as isize).clamp(0, h - 1);
+        let sy = (src_y0 + r as isize).clamp(0, h_i - 1);
         for c in 0..4 {
             // Columns past the left / right edge read the first / last
             // in-bounds column.
-            let sx = (src_x0 + c as isize).clamp(0, w - 1);
+            let sx = (src_x0 + c as isize).clamp(0, w_i - 1);
             out[r * 4 + c] = plane[sy as usize * stride + sx as usize];
         }
     }
@@ -605,13 +623,30 @@ pub fn fetch_block_halo(
     let src_x0 = blk_x as isize + off_x - 2;
     let src_y0 = blk_y as isize + off_y - 2;
 
-    let w = w as isize;
-    let h = h as isize;
+    let w_i = w as isize;
+    let h_i = h as isize;
     let mut out = [0u8; 81];
+
+    // Round-170 fast path: when the 9×9 halo lands strictly inside the
+    // plane (the dominant case for inter-MBs that don't touch the
+    // picture border), each output row is a contiguous 9-byte slice of
+    // the reference plane — no `.clamp()` per pixel, no per-byte bound
+    // checks. The fallback below is bit-identical for halos that
+    // straddle the border.
+    if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 9 <= w_i && src_y0 + 9 <= h_i {
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        for r in 0..9 {
+            let row_start = (y0 + r) * stride + x0;
+            out[r * 9..r * 9 + 9].copy_from_slice(&plane[row_start..row_start + 9]);
+        }
+        return out;
+    }
+
     for r in 0..9 {
-        let sy = (src_y0 + r as isize).clamp(0, h - 1);
+        let sy = (src_y0 + r as isize).clamp(0, h_i - 1);
         for c in 0..9 {
-            let sx = (src_x0 + c as isize).clamp(0, w - 1);
+            let sx = (src_x0 + c as isize).clamp(0, w_i - 1);
             out[r * 9 + c] = plane[sy as usize * stride + sx as usize];
         }
     }

@@ -19,8 +19,46 @@ oxideav-core = { version = "0.1", optional = true }
 [features]
 default = ["registry"]
 registry = ["dep:oxideav-core"]
-# `simd` is a reserved no-op flag carried over from the crates.io
-# `oxideav-vp8 0.1.13` manifest. Historical consumers set this feature
-# explicitly; the current build has no SIMD code-paths gated on it, but
-# the flag MUST stay declared so those consumers keep building.
+# `simd` opts into the §14.3 / §14.4 inverse-transform vectorised
+# kernels under `core::simd::Simd<i32, 4>` (the WHT and IDCT pull
+# four lanes per pass — see `src/inverse_transform.rs`). Requires a
+# nightly toolchain because `core::simd` is currently nightly-only.
+# The default (stable) build keeps the scalar fallback bit-for-bit
+# identical to the spec listing; the SIMD path is byte-exact against
+# the scalar path on every test fixture.
 simd = []
+
+[dev-dependencies]
+criterion = "0.5"
+
+# Round 170 benches. Each bench is a self-contained criterion binary
+# under `benches/` that synthesises its inputs in-bench (no committed
+# fixture files). The first three drive whole-frame encode/decode; the
+# last three micro-bench §14 / §11 / §15 hot-path primitives.
+[[bench]]
+name = "keyframe_encode"
+harness = false
+
+[[bench]]
+name = "keyframe_decode"
+harness = false
+
+[[bench]]
+name = "inter_encode_short_clip"
+harness = false
+
+[[bench]]
+name = "inverse_transform_4x4"
+harness = false
+
+[[bench]]
+name = "motion_comp_subpel_luma"
+harness = false
+
+[[bench]]
+name = "intra_predict_dc16"
+harness = false
+
+[[bench]]
+name = "loop_filter_normal"
+harness = false

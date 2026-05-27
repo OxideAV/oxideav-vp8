@@ -31,7 +31,7 @@ oxideav-vp8 = { version = "0.2", default-features = false }
 | Feature | Default | What it does |
 |---|---|---|
 | `registry` | ✅ on | Pulls `oxideav-core` and the framework-trait factories (`make_encoder` / `make_decoder` returning `Box<dyn Encoder>` / `Box<dyn Decoder>`) plus `Vp8Decoder` (the `oxideav_core::Decoder` impl) and the `register*` entry points. |
-| `simd` | — | Reserved no-op carried over from the `0.1.13` manifest; declared so historical consumers that set it explicitly keep building. |
+| `simd` | — | **Nightly-only.** Switches the §14.3 inverse 4×4 WHT (`inverse_wht_4x4`) over to a `core::simd::Simd<i32, 4>` rewrite; byte-exact against the scalar path on every test fixture, ≈ −20 % on the `inverse_transform_4x4/inverse_wht_4x4` criterion micro-bench (9.4 ns → 7.5 ns on `aarch64-apple-darwin`). Requires a nightly toolchain because `core::simd` is itself nightly. Default (stable) builds use the scalar §14.3 path unchanged. See `BENCHMARKS.md` for the A/B numbers + the round-170 profile that motivated this primitive's vectorisation. |
 
 ## Standalone use (no `oxideav-core`)
 

@@ -168,6 +168,26 @@ pub fn clamp255(v: i32) -> u8 {
 /// (two passes, the `(x + 3) >> 3` rounding in the second pass), so the
 /// rounding matches bit-for-bit.
 pub fn inverse_wht_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
+    // Dispatch: SIMD path on nightly+`simd`, scalar otherwise.
+    #[cfg(feature = "simd")]
+    {
+        inverse_wht_4x4_simd(input, output);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        inverse_wht_4x4_scalar(input, output);
+    }
+}
+
+/// Scalar §14.3 inverse WHT — the literal RFC 6386 listing.
+///
+/// Bit-for-bit byte-exact with the spec C source. The public
+/// [`inverse_wht_4x4`] dispatches here on stable builds (and on nightly
+/// without the `simd` feature); the `simd` feature swaps in
+/// [`inverse_wht_4x4_simd`], which is itself byte-exact against this
+/// implementation.
+#[allow(dead_code)] // Used by `inverse_wht_4x4` only on the !simd path.
+fn inverse_wht_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
     // First pass: operate down each column (spec: ip[0], ip[4], ip[8],
     // ip[12] with ip++ stepping across the four columns). Intermediate
     // results are written back into `output` at the matching column.
@@ -212,6 +232,118 @@ pub fn inverse_wht_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
         output[base + 1] = ((b2 + 3) >> 3) as i16;
         output[base + 2] = ((c2 + 3) >> 3) as i16;
         output[base + 3] = ((d2 + 3) >> 3) as i16;
+    }
+}
+
+/// SIMD §14.3 inverse WHT — `core::simd::Simd<i32, 4>` rewrite of
+/// [`inverse_wht_4x4_scalar`].
+///
+/// The §14.3 WHT first pass operates "down each column" on four
+/// independent columns; that maps directly onto a 4-lane vector where
+/// each lane holds one column. We load the four `(i0, i4, i8, i12)`
+/// row-vectors as four `Simd<i32, 4>` lanes, apply the §14.3
+/// add/subtract butterfly across them, transpose the 4×4 result so the
+/// second pass (which operates "across each row") can again run as four
+/// lane-wide adds/subs, apply the `(x + 3) >> 3` rounding, and store the
+/// result as `i16`. No external SIMD layout reference was consulted —
+/// the layout is derived from the §14.3 listing in RFC 6386 directly
+/// (one lane per column ⇒ first-pass vectorises; transpose ⇒
+/// second-pass vectorises).
+///
+/// Byte-exact against [`inverse_wht_4x4_scalar`] on every test fixture.
+#[cfg(feature = "simd")]
+fn inverse_wht_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
+    use core::simd::Simd;
+
+    // Each row-vector holds the four columns of one input row. Promote
+    // to i32 once, up-front, so the lane butterflies stay in i32 (the
+    // intermediate can exceed i16 range — the scalar path uses i32 too).
+    let row0 = Simd::<i32, 4>::from_array([
+        input[0] as i32,
+        input[1] as i32,
+        input[2] as i32,
+        input[3] as i32,
+    ]);
+    let row1 = Simd::<i32, 4>::from_array([
+        input[4] as i32,
+        input[5] as i32,
+        input[6] as i32,
+        input[7] as i32,
+    ]);
+    let row2 = Simd::<i32, 4>::from_array([
+        input[8] as i32,
+        input[9] as i32,
+        input[10] as i32,
+        input[11] as i32,
+    ]);
+    let row3 = Simd::<i32, 4>::from_array([
+        input[12] as i32,
+        input[13] as i32,
+        input[14] as i32,
+        input[15] as i32,
+    ]);
+
+    // First pass — §14.3 column butterfly across the four lanes.
+    let a1 = row0 + row3;
+    let b1 = row1 + row2;
+    let c1 = row1 - row2;
+    let d1 = row0 - row3;
+
+    let t0 = a1 + b1;
+    let t1 = c1 + d1;
+    let t2 = a1 - b1;
+    let t3 = d1 - c1;
+
+    // Transpose the 4×4 i32 matrix so each row-vector now holds a row
+    // of the intermediate (rather than a column). `Simd::from_array` is
+    // free at compile time; we materialise the rows explicitly to keep
+    // the layout obvious. r_i[j] = t_j[i].
+    let t0a = t0.to_array();
+    let t1a = t1.to_array();
+    let t2a = t2.to_array();
+    let t3a = t3.to_array();
+
+    let r0 = Simd::<i32, 4>::from_array([t0a[0], t1a[0], t2a[0], t3a[0]]);
+    let r1 = Simd::<i32, 4>::from_array([t0a[1], t1a[1], t2a[1], t3a[1]]);
+    let r2 = Simd::<i32, 4>::from_array([t0a[2], t1a[2], t2a[2], t3a[2]]);
+    let r3v = Simd::<i32, 4>::from_array([t0a[3], t1a[3], t2a[3], t3a[3]]);
+
+    // Second pass — §14.3 row butterfly. Same shape as the first pass,
+    // operating on (r0, r1, r2, r3v).
+    let a2 = r0 + r3v;
+    let b2 = r1 + r2;
+    let c2 = r1 - r2;
+    let d2 = r0 - r3v;
+
+    let u0 = a2 + b2;
+    let u1 = c2 + d2;
+    let u2 = a2 - b2;
+    let u3 = d2 - c2;
+
+    // §14.3 rounding: (x + 3) >> 3. Apply as lane-wide adds + shifts.
+    let three = Simd::<i32, 4>::splat(3);
+    let o0 = (u0 + three) >> Simd::<i32, 4>::splat(3);
+    let o1 = (u1 + three) >> Simd::<i32, 4>::splat(3);
+    let o2 = (u2 + three) >> Simd::<i32, 4>::splat(3);
+    let o3 = (u3 + three) >> Simd::<i32, 4>::splat(3);
+
+    // Now: o_i[j] is the second-pass result of the i-th source row's
+    // j-th column → output[i*4 + j]. Re-transpose back so output writes
+    // one row at a time.
+    let o0a = o0.to_array();
+    let o1a = o1.to_array();
+    let o2a = o2.to_array();
+    let o3a = o3.to_array();
+
+    // o_i was computed from r_{0..3v}, each of which holds the i-th
+    // *column* of the post-first-pass matrix. So o0[j] is the
+    // butterfly output for row j, col 0 — i.e. output[j*4 + 0]. The
+    // store therefore stripes across o_i:
+    for j in 0..4 {
+        output[j * 4] = o0a[j] as i16;
+        output[j * 4 + 1] = o1a[j] as i16;
+        output[j * 4 + 2] = o2a[j] as i16;
+        output[j * 4 + 3] = o3a[j] as i16;
     }
 }
 

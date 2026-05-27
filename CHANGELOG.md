@@ -4,6 +4,65 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — criterion benches, sample-profile-driven optimisations, real `simd` feature (round 170, 2026-05-27)
+
+New `benches/` directory ships seven criterion micro/macro benches —
+`keyframe_encode` (320×240 keyframe at qi32), `keyframe_decode`
+(consuming the same), `inter_encode_short_clip` (4-frame 128×128 inter
+through `Vp8InterStreamEncoder`), `inverse_transform_4x4`,
+`motion_comp_subpel_luma`, `intra_predict_dc16`,
+`loop_filter_normal` — wired to `criterion = "0.5"` as a
+dev-dependency. Each bench synthesises its inputs in-bench (no
+committed fixtures). The bench harness is `cargo bench -p oxideav-vp8
+--bench <name> -- --quick`; see `BENCHMARKS.md` for the running command
+matrix + baseline + post-optimisation numbers.
+
+A `sample(1)`-based PID-attach profile of the slowest benches revealed
+three concrete optimisation targets:
+
+1. **`encoder::bool_bits` `log2` lookup table.** RD scoring calls
+   `bool_bits` for every emitted bit of every candidate block;
+   `f64::log2` was the #1 self-time symbol on the inter encode and
+   the #6 on the keyframe encode. Replaced the per-call `log2` with a
+   precomputed 256-entry `LazyLock<[f64; 256]>` table
+   (`BIT_COST_BY_FALSE_PROB[p] = -log2(p / 256)`, p = 0 floored at
+   8.0 to preserve the original `prob.max(1)` + `1/256` clamp). Drove
+   −21.7 % on `inter_encode_short_clip` and −8.4 % on
+   `keyframe_encode`. Bit-identical encoder output.
+
+2. **`motion_comp::fetch_block_whole_pixel` / `fetch_block_halo`
+   in-bounds fast paths.** Profile evidence: ~90 self-samples between
+   them on the inter bench. Added an `src_x0 >= 0 && src_y0 >= 0 &&
+   src_x0 + N <= w && src_y0 + N <= h` early branch that issues each
+   output row as a single `copy_from_slice` — no per-pixel
+   `isize.clamp()`, no per-byte bounds checks. The edge-replication
+   slow path is preserved for border MBs. Drove −30 % on
+   `filter_block_4x4` and contributed to the inter-encode delta.
+   Byte-exact reconstruction on every existing test.
+
+3. **`inverse_wht_4x4` `core::simd::Simd<i32, 4>` rewrite, gated
+   `simd` feature, nightly-only.** §14.3's two-pass butterfly maps
+   directly onto a 4-lane `Simd<i32, 4>` layout (one lane per column
+   in the first pass; transpose; one lane per row in the second
+   pass; lane-wide `(x + 3) >> 3` rounding). Public
+   `inverse_wht_4x4` dispatches at compile time between the scalar
+   and SIMD kernels; both are byte-exact on every fixture. The
+   `simd` feature, previously a reserved no-op carried over from
+   0.1.13, now gates this path and ships behind a
+   `#![cfg_attr(feature = "simd", feature(portable_simd))]` lib-root
+   attribute. −24 % on the `inverse_wht_4x4` micro-bench
+   (9.83 ns → 7.48 ns on `aarch64-apple-darwin`).
+
+All optimisations were designed from RFC 6386 directly — no external
+codec / SIMD reference consulted. The SIMD layout is derived from the
+§14.3 listing's structure (column-independent first pass, row-
+independent second pass after transpose). The scalar path stays
+bit-for-bit identical to the spec listing.
+
+`Cargo.toml` gains `[dev-dependencies] criterion = "0.5"` + seven
+`[[bench]] harness = false` stanzas. The `simd` feature comment is
+rewritten to reflect its new role.
+
 ### Added — end-to-end interop + standalone-API tests (round 169, 2026-05-27)
 
 Two new test files extend the crate's interop coverage:

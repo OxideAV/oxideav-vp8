@@ -115,19 +115,33 @@ fn api_compat_0_1_13_encoder_constructors() {
     let _: Vp8Encoder = Vp8Encoder::new(cfg);
     let _: Vp8Encoder = make_encoder_typed_with_config(cfg);
 
+    // Two-pass family — the bodies are real (round 168 drive-to-100%),
+    // so the surface-lock test now checks the live signatures + the
+    // documented behaviour: empty input produces an empty schedule and
+    // does not error; a single-frame complexity record produces a
+    // valid `0..=127` qindex; the encoder factory hands back a working
+    // instance.
     let two = Vp8TwoPassConfig::default();
     let mut tp: Vp8TwoPassEncoder = make_two_pass_encoder(two);
-    assert!(tp.first_pass_analyze(&[]).is_err());
+    let empty: Vec<FrameComplexity> = tp
+        .first_pass_analyze(&[])
+        .expect("empty input must succeed");
+    assert!(empty.is_empty(), "empty input must produce empty stats");
 
-    // Free-fn two-pass surface stubs to Err.
-    assert!(first_pass_analyze(&[], &two).is_err());
+    let empty_free: Vec<FrameComplexity> =
+        first_pass_analyze(&[], &two).expect("free-fn empty input must succeed");
+    assert!(empty_free.is_empty());
+
     let fake = FrameComplexity {
         frame_index: 0,
         bits_per_mb: 0.0,
         scene_cut: false,
     };
-    assert!(two_pass_qindex_for_frame(&two, fake).is_err());
-    assert!(two_pass_qindices(&two, &[fake]).is_err());
+    let qi = two_pass_qindex_for_frame(&two, fake).expect("stateless picker must succeed");
+    assert!(qi <= 127, "qindex must respect RFC 6386 §9.6 0..=127");
+    let sched = two_pass_qindices(&two, &[fake]).expect("schedule must succeed");
+    assert_eq!(sched.len(), 1);
+    assert!(sched[0] <= 127);
 
     // LoopFilterMode default is `Auto`.
     let lfm: LoopFilterMode = LoopFilterMode::default();

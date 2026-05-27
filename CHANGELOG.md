@@ -4,6 +4,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — two-pass encoder real bodies (round 168, 2026-05-27)
+
+Round 167 landed the `Vp8TwoPass*` family as type-shape stubs whose
+bodies returned `Vp8Error::Unsupported("two-pass encoder not yet
+implemented in this release")`.  This round replaces every stub body
+with a real implementation built from a clean-room rate-control design
+sourced exclusively from RFC 6386 §9.6 + the in-tree single-pass
+primitives.
+
+* **`first_pass_analyze`** (both the free function and
+  `Vp8TwoPassEncoder::first_pass_analyze`) — single linear pass over
+  each input frame's luma plane computing mean-absolute-deviation vs
+  the previous frame (motion proxy) and per-frame variance (spatial
+  activity proxy).  Combined into a `bits_per_mb` cost surrogate
+  (`α·log2(1+mad) + β·log2(1+var)`).  Scene-cut detection is gated on
+  `DEFAULT_SCENE_CUT_THRESHOLD` and `SCENE_CUT_ABS_FLOOR`.
+* **`two_pass_qindices`** — distributes per-frame `qindex` around
+  `config.base.qindex` so heavier-than-mean frames receive lower qindex
+  (better quality) and lighter-than-mean frames receive higher qindex,
+  with the delta clamped to `DEFAULT_AQ_QINDEX_RANGE` either side of the
+  baseline and again to RFC 6386 §9.6 `0..=127`.  Scene-cut frames
+  subtract `DEFAULT_SCENE_CUT_QUANT_BOOST`.
+* **`two_pass_qindex_for_frame`** — stateless single-frame picker;
+  applies the scene-cut boost and validates `config.base.qindex`.
+* **`Vp8TwoPassEncoder::encode_frame`** — selects keyframe vs P-frame
+  (first call, scene cut, or `golden_interval` elapsed → keyframe),
+  builds a `KeyframeParams` at the resolved per-frame qindex, drives
+  `encode_keyframe_with_reconstruction` or `encode_p_frame_multi_ref`,
+  and stashes the reconstruction as the next-frame `LAST` reference.
+
+Tests: `tests/two_pass_roundtrip.rs` — nine tests covering the four-
+frame solid→gradient→checker→noise clip (per-frame stats + schedule +
+end-to-end decode through `Vp8DecoderState`), scene-cut boost,
+out-of-range rejection, empty-input handling, and the fallback
+"encode_frame without prior first_pass_analyze" path.
+
+`tests/api_compat_0_1_13.rs::api_compat_0_1_13_encoder_constructors`
+updated: the surface-lock test now asserts the **live** two-pass
+behaviour (empty input succeeds, single-frame complexity returns a
+valid 0..=127 qindex) instead of the previous "must return Err" stub
+contract.
+
 ## [0.2.1](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.0...v0.2.1) - 2026-05-27
 
 ### Other

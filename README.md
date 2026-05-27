@@ -28,10 +28,14 @@ explicitly noted):
   encoder handle (the `encode_keyframe` body wires through the existing
   driver).
 * `LoopFilterMode { Auto, Normal, Simple }` (default `Auto`).
-* `Vp8TwoPassEncoder` / `Vp8TwoPassConfig` / `FrameComplexity` (Tier-3
-  stub — type shapes locked, bodies return
-  `Vp8Error::Unsupported("two-pass encoder not yet implemented in this
-  release")`).
+* `Vp8TwoPassEncoder` / `Vp8TwoPassConfig` / `FrameComplexity` plus the
+  free-function family `first_pass_analyze` / `two_pass_qindices` /
+  `two_pass_qindex_for_frame` (round 168 drive-to-100% — bodies are now
+  real; complexity-aware constant-quality scheduler distributes per-frame
+  qindex around `config.base.qindex` from log-MAD + log-variance first-
+  pass stats; first frame keyframe, P-frames thereafter against the
+  reference reconstruction stashed inside the driver; scene-cut detection
+  forces extra-quality keyframes via `DEFAULT_SCENE_CUT_QUANT_BOOST`).
 * 28 encoder constants (`DEFAULT_QINDEX`, `DEFAULT_GOLDEN_INTERVAL`,
   `DEFAULT_ALT_REF_INTERVAL`, `DEFAULT_LOOKAHEAD_WINDOW`, …).
 * Module-path aliases `fdct`, `inter`, `intra`, `loopfilter`, `mv`,

@@ -7895,14 +7895,28 @@ impl Vp8Encoder {
     }
 }
 
-/// Two-pass encoder configuration — surface only (Tier-3 stub).
+/// Two-pass encoder configuration.
+///
+/// The two-pass rate-control algorithm uses [`base`](Self::base) as the
+/// **target** single-pass configuration: `base.qindex` is the per-GOP
+/// average qindex the second pass aims at, and complexity-driven deltas
+/// distribute around it (heavier frames → lower qindex / higher quality,
+/// lighter frames → higher qindex / smaller bytes).
+///
+/// [`target_bitrate_bps`](Self::target_bitrate_bps) and
+/// [`overshoot_ratio`](Self::overshoot_ratio) are persisted on the
+/// config for downstream callers but are **advisory** in the current
+/// implementation: the second pass is a complexity-aware constant-quality
+/// scheduler, not a strict bitrate-constrained CBR loop, so they do not
+/// alter the emitted bytes today. A future round may use them to clamp
+/// the per-frame qindex within a bitrate envelope.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vp8TwoPassConfig {
     /// Underlying single-pass config used as the second-pass baseline.
     pub base: Vp8EncoderConfig,
-    /// Target average bitrate in bits/sec.
+    /// Target average bitrate in bits/sec. Advisory — see struct docs.
     pub target_bitrate_bps: u32,
-    /// Maximum permitted bitrate-overshoot ratio (e.g. `1.2`).
+    /// Maximum permitted bitrate-overshoot ratio (e.g. `1.2`). Advisory.
     pub overshoot_ratio: f32,
 }
 
@@ -7916,20 +7930,89 @@ impl Default for Vp8TwoPassConfig {
     }
 }
 
-/// Two-pass encoder — surface only (Tier-3 stub). Every method returns
-/// [`Vp8Error::Unsupported`] until the rate-control algorithm lands.
-/// The symbol shape is locked so downstream consumers keep building.
+/// Two-pass encoder driver.
+///
+/// # Algorithm (clean-room, RFC 6386 §9.6 + in-tree primitives only)
+///
+/// RFC 6386 is intentionally silent on rate-control — the algorithm is
+/// the encoder's choice. This implementation is a **complexity-aware
+/// constant-quality scheduler** built from a single linear pass over the
+/// luma plane:
+///
+/// 1. **First pass** ([`first_pass_analyze`] / the free fn of the same
+///    name): for each input frame, compute a lightweight cost surrogate
+///    from per-pixel luma arithmetic:
+///    * `mad`  — mean absolute deviation vs the previous frame's luma
+///      (motion proxy; first frame uses `mad = 0`).
+///    * `var`  — luma variance vs the per-frame mean (spatial activity
+///      proxy).
+///    * `bits_per_mb` (the surrogate) ≈ `α·log2(1+mad) + β·log2(1+var)`,
+///      multiplied by 100 and clamped non-negative.  A pure-flat frame
+///      lands near 0; a noise-saturated moving frame lands near 1000.
+///    * Scene cut: declared when `mad * 1024 / (prev_var + 1)` exceeds
+///      [`DEFAULT_SCENE_CUT_THRESHOLD`] **and** `mad >=
+///      SCENE_CUT_ABS_FLOOR / 1024`.
+///
+/// 2. **Second pass** ([`two_pass_qindices`] / the free fn of the same
+///    name): distribute per-frame `qindex` around `config.base.qindex`
+///    so heavier frames get **lower** qindex (better quality, more
+///    bytes) and lighter frames get **higher** qindex (lower quality,
+///    fewer bytes):
+///    * `mean = mean(bits_per_mb)` across the GOP.
+///    * `delta = clamp((cost - mean) / max(mean, 1.0) * range, -range, range)`
+///      where `range = DEFAULT_AQ_QINDEX_RANGE`.
+///    * `qindex = clamp(base + round(delta), 0, 127)` per RFC 6386 §9.6.
+///    * Scene cuts subtract an additional [`DEFAULT_SCENE_CUT_QUANT_BOOST`]
+///      to give those frames extra quality.
+///
+/// 3. **Encode pass** ([`Self::encode_frame`]): for each input frame,
+///    look up its per-frame qindex, build a [`KeyframeParams`] with
+///    that `y_ac_qi`, and drive the in-tree key/P encoders against the
+///    reference [`KeyframePlanes`] stashed inside the driver.  The
+///    first call always emits a key frame; subsequent calls emit P
+///    frames against the previous reconstruction.
+///
+/// The per-frame `qindex` is sourced purely from the supplied
+/// `complexity` and the `global_mean_cost` cached during the most
+/// recent [`Self::first_pass_analyze`] call.  A caller that bypasses
+/// `first_pass_analyze` falls back to a no-delta schedule (every
+/// frame gets `config.base.qindex`).
 #[derive(Debug, Clone)]
 pub struct Vp8TwoPassEncoder {
     config: Vp8TwoPassConfig,
+    /// Mean of `bits_per_mb` across the last [`Self::first_pass_analyze`]
+    /// call.  `None` until first_pass_analyze runs; in that case
+    /// [`Self::encode_frame`] falls back to `config.base.qindex` (no
+    /// per-frame delta).
+    global_mean_cost: Option<f32>,
+    /// Most-recent reconstruction kept as the `LAST` reference for the
+    /// next P-frame encode.  Cleared until the first key frame lands.
+    last_reconstruction: Option<crate::frame::KeyframePlanes>,
+    /// Number of frames emitted so far in this stream — determines
+    /// keyframe vs P-frame and is used by the `golden_interval` /
+    /// `alt_ref_interval` scheduler (not yet wired into the §9.7
+    /// refresh ladder; today every P-frame uses
+    /// [`RefreshControls::default`]).
+    frame_count: u64,
+    /// Frame index of the most recent emitted key frame.  Anchors the
+    /// `golden_interval` / scene-cut keyframe scheduler.
+    last_keyframe_index: Option<u64>,
 }
 
 impl Vp8TwoPassEncoder {
-    /// Build a fresh two-pass encoder. The `config` is persisted but no
-    /// rate-control state is initialised — this entire surface stubs
-    /// to [`Vp8Error::Unsupported`].
+    /// Build a fresh two-pass encoder.
+    ///
+    /// The encoder starts with no first-pass state and no reference
+    /// reconstruction — call [`Self::first_pass_analyze`] before
+    /// [`Self::encode_frame`] to populate the rate-control mean.
     pub fn new(config: Vp8TwoPassConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            global_mean_cost: None,
+            last_reconstruction: None,
+            frame_count: 0,
+            last_keyframe_index: None,
+        }
     }
 
     /// Two-pass config (immutable handle).
@@ -7938,66 +8021,335 @@ impl Vp8TwoPassEncoder {
     }
 
     /// First-pass analysis entry — returns the per-frame
-    /// [`FrameComplexity`] vector. Stubbed.
+    /// [`FrameComplexity`] vector **and** caches the GOP-mean cost on
+    /// `self` so the subsequent [`Self::encode_frame`] calls can pick
+    /// per-frame qindex deltas relative to it.
+    ///
+    /// Delegates to the free function [`first_pass_analyze`] for the
+    /// core arithmetic; this method exists so a streaming consumer
+    /// can keep the analysis state on the encoder handle rather than
+    /// threading the mean by hand.
     pub fn first_pass_analyze(
         &mut self,
-        _frames: &[I420Frame<'_>],
+        frames: &[I420Frame<'_>],
     ) -> crate::error::Result<Vec<FrameComplexity>> {
-        Err(crate::error::Vp8Error::unsupported(
-            "two-pass encoder not yet implemented in this release",
-        ))
+        let stats = first_pass_analyze(frames, &self.config)?;
+        self.global_mean_cost = Some(mean_complexity_cost(&stats));
+        Ok(stats)
     }
 
     /// Second-pass encode of one frame, picking the qindex from the
-    /// first-pass complexity report. Stubbed.
+    /// first-pass complexity report.
+    ///
+    /// The first call always emits a key frame; subsequent calls emit
+    /// a P-frame against the previous reconstruction.  The complexity
+    /// report's `scene_cut` flag forces a key frame even mid-stream.
+    /// Returns the raw VP8 bitstream bytes for the frame.
     pub fn encode_frame(
         &mut self,
-        _frame: &I420Frame<'_>,
-        _complexity: FrameComplexity,
+        frame: &I420Frame<'_>,
+        complexity: FrameComplexity,
     ) -> crate::error::Result<Vec<u8>> {
-        Err(crate::error::Vp8Error::unsupported(
-            "two-pass encoder not yet implemented in this release",
-        ))
+        let qindex = self.qindex_for(complexity);
+        let params = KeyframeParams {
+            y_ac_qi: qindex,
+            loop_filter_level: self.config.base.lf_level,
+            ..KeyframeParams::default()
+        };
+
+        // Schedule key vs P frame.  Force-keyframe conditions:
+        //   * No prior reference (first call or right after a complexity
+        //     report that demanded a key frame).
+        //   * Scene cut flagged in the supplied complexity.
+        //   * Golden interval elapsed since the last keyframe (acts as
+        //     a max-GOP guard so a long P-chain doesn't accumulate
+        //     drift).
+        let force_key = self.last_reconstruction.is_none()
+            || complexity.scene_cut
+            || self
+                .last_keyframe_index
+                .map(|anchor| {
+                    self.frame_count.saturating_sub(anchor)
+                        >= self.config.base.golden_interval.max(1) as u64
+                })
+                .unwrap_or(false);
+
+        let (bytes, planes) = if force_key {
+            encode_keyframe_with_reconstruction(frame, &params)
+                .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
+        } else {
+            let reference = self
+                .last_reconstruction
+                .as_ref()
+                .expect("force_key=false implies a reference exists");
+            encode_p_frame_multi_ref(frame, reference, None, None, &params)
+                .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
+        };
+
+        self.last_reconstruction = Some(planes);
+        if force_key {
+            self.last_keyframe_index = Some(self.frame_count);
+        }
+        self.frame_count += 1;
+        Ok(bytes)
+    }
+
+    /// Resolve the per-frame qindex from the cached first-pass mean
+    /// (falling back to `config.base.qindex` when first_pass_analyze
+    /// hasn't been called).  Centralised so the [`Self::encode_frame`]
+    /// path and the public [`two_pass_qindex_for_frame`] free function
+    /// agree on the formula.
+    fn qindex_for(&self, complexity: FrameComplexity) -> u8 {
+        match self.global_mean_cost {
+            Some(mean) => qindex_from_complexity(&self.config, complexity, mean),
+            None => qindex_from_complexity(&self.config, complexity, complexity.bits_per_mb),
+        }
     }
 }
 
 /// Free-function first-pass analysis — historical 0.1.13 entry point.
-/// Stubbed (Tier-3); see [`Vp8TwoPassEncoder::first_pass_analyze`].
+///
+/// Walks `frames` end-to-end and produces one [`FrameComplexity`] per
+/// input.  The cost surrogate is documented on [`Vp8TwoPassEncoder`]:
+/// a lightweight log-MAD + log-variance combination on the 8-bit luma
+/// plane.  Pure RFC 6386 §9.6-qindex-range math; no transform, no
+/// entropy coding, no reference-encoder consultation.
+///
+/// Returns an empty `Vec` for an empty input slice.  Caller-supplied
+/// frame dimensions are honoured frame-by-frame (varying dimensions
+/// across the slice are allowed — only the per-frame stats use the
+/// dimensions; no cross-frame pixel arithmetic crosses dimension
+/// boundaries).
 pub fn first_pass_analyze(
-    _frames: &[I420Frame<'_>],
+    frames: &[I420Frame<'_>],
     _config: &Vp8TwoPassConfig,
 ) -> crate::error::Result<Vec<FrameComplexity>> {
-    Err(crate::error::Vp8Error::unsupported(
-        "two-pass encoder not yet implemented in this release",
-    ))
+    let mut out = Vec::with_capacity(frames.len());
+    let mut prev_luma_sample: Option<(Vec<u8>, u32, u32)> = None;
+    let mut prev_variance: f32 = 0.0;
+    for (idx, frame) in frames.iter().enumerate() {
+        let (_mean, variance) = luma_mean_and_variance(frame);
+        let mad = match &prev_luma_sample {
+            Some((prev, pw, ph)) if *pw == frame.width && *ph == frame.height => {
+                luma_mad(frame, prev)
+            }
+            _ => 0.0,
+        };
+        // Cost surrogate: scale-invariant log combination so a flat
+        // frame lands near zero and a textured / fast-motion frame
+        // lands at a few hundred.  α / β picked so a frame with
+        // mad=10, var=200 lands around 100 bits/MB (matches the
+        // ballpark "expected" per-MB cost at the default qindex).
+        let cost = 30.0 * (1.0 + mad).log2() + 25.0 * (1.0 + variance).log2();
+        let cost = cost.max(0.0);
+        // Scene-cut decision: the §9.4 / §20.6 spec is silent; the
+        // surrogate compares mad-vs-prev-variance against the
+        // `DEFAULT_SCENE_CUT_THRESHOLD` knob, gated by the
+        // `SCENE_CUT_ABS_FLOOR` minimum so a static scene with tiny
+        // numerical noise doesn't false-positive.
+        let scene_cut = if idx == 0 {
+            false
+        } else {
+            let ratio = (mad * 1024.0) / (prev_variance + 1.0);
+            ratio >= DEFAULT_SCENE_CUT_THRESHOLD as f32
+                && (mad * 1024.0) >= SCENE_CUT_ABS_FLOOR as f32
+        };
+        out.push(FrameComplexity {
+            frame_index: idx as u32,
+            bits_per_mb: cost,
+            scene_cut,
+        });
+        // Snapshot the luma plane for the next iteration's MAD calc.
+        // We copy because the borrow of `frame.y` doesn't survive the
+        // next loop iteration.
+        let plane_len = (frame.height as usize) * frame.y_stride;
+        let mut buf = vec![0u8; plane_len];
+        let take = plane_len.min(frame.y.len());
+        buf[..take].copy_from_slice(&frame.y[..take]);
+        prev_luma_sample = Some((buf, frame.width, frame.height));
+        prev_variance = variance;
+    }
+    Ok(out)
 }
 
 /// Returns the second-pass qindex the encoder would select for a
-/// particular frame. Stubbed (Tier-3).
+/// particular frame, given just the per-frame [`FrameComplexity`].
+///
+/// This is the **stateless** variant: it has no access to a GOP-mean,
+/// so it treats `complexity.bits_per_mb` as both the per-frame cost
+/// *and* the reference mean — which collapses the rate-control delta
+/// to zero for every non-scene-cut frame.  Useful when a caller only
+/// has one frame's worth of data; for a full GOP the schedule
+/// produced by [`two_pass_qindices`] (which uses the actual mean)
+/// is what [`Vp8TwoPassEncoder::encode_frame`] consumes.
+///
+/// Scene-cut frames receive a [`DEFAULT_SCENE_CUT_QUANT_BOOST`]-sized
+/// qindex *reduction* (better quality) on top of the baseline.
+///
+/// Returns `Err(Vp8Error::InvalidData)` if `config.base.qindex` is
+/// outside the RFC 6386 §9.6 `0..=127` range.
 pub fn two_pass_qindex_for_frame(
-    _config: &Vp8TwoPassConfig,
-    _complexity: FrameComplexity,
+    config: &Vp8TwoPassConfig,
+    complexity: FrameComplexity,
 ) -> crate::error::Result<u8> {
-    Err(crate::error::Vp8Error::unsupported(
-        "two-pass encoder not yet implemented in this release",
+    if config.base.qindex > 127 {
+        return Err(crate::error::Vp8Error::invalid(format!(
+            "vp8 two-pass: config.base.qindex={} out of RFC 6386 §9.6 range 0..=127",
+            config.base.qindex
+        )));
+    }
+    Ok(qindex_from_complexity(
+        config,
+        complexity,
+        complexity.bits_per_mb,
     ))
 }
 
-/// Returns the full second-pass qindex schedule for a GOP. Stubbed
-/// (Tier-3).
+/// Returns the full second-pass qindex schedule for a GOP.
+///
+/// Computes the GOP mean from `complexities` and emits one
+/// `0..=127` qindex per entry per the algorithm documented on
+/// [`Vp8TwoPassEncoder`].  An empty input yields an empty schedule.
+///
+/// Returns `Err(Vp8Error::InvalidData)` if `config.base.qindex` is
+/// outside `0..=127`.
 pub fn two_pass_qindices(
-    _config: &Vp8TwoPassConfig,
-    _complexities: &[FrameComplexity],
+    config: &Vp8TwoPassConfig,
+    complexities: &[FrameComplexity],
 ) -> crate::error::Result<Vec<u8>> {
-    Err(crate::error::Vp8Error::unsupported(
-        "two-pass encoder not yet implemented in this release",
-    ))
+    if config.base.qindex > 127 {
+        return Err(crate::error::Vp8Error::invalid(format!(
+            "vp8 two-pass: config.base.qindex={} out of RFC 6386 §9.6 range 0..=127",
+            config.base.qindex
+        )));
+    }
+    if complexities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mean = mean_complexity_cost(complexities);
+    Ok(complexities
+        .iter()
+        .map(|c| qindex_from_complexity(config, *c, mean))
+        .collect())
 }
 
-/// Build a two-pass encoder from a [`Vp8TwoPassConfig`]. Convenience
-/// historical-0.1.13 factory; the encode bodies still stub Tier-3.
+/// Build a two-pass encoder from a [`Vp8TwoPassConfig`].  Convenience
+/// historical-0.1.13 factory; equivalent to
+/// [`Vp8TwoPassEncoder::new`].
 pub fn make_two_pass_encoder(config: Vp8TwoPassConfig) -> Vp8TwoPassEncoder {
     Vp8TwoPassEncoder::new(config)
+}
+
+// ──────────────────── two-pass helpers (private) ────────────────────
+
+/// Mean cost across a per-frame complexity vector — empty input maps
+/// to `0.0` so the caller's downstream division-by-mean falls back to
+/// the fallback path.
+fn mean_complexity_cost(stats: &[FrameComplexity]) -> f32 {
+    if stats.is_empty() {
+        0.0
+    } else {
+        let sum: f32 = stats.iter().map(|c| c.bits_per_mb).sum();
+        sum / stats.len() as f32
+    }
+}
+
+/// Mean luma value and variance for one frame.  Single linear pass
+/// over `frame.y` honouring `frame.y_stride`.
+fn luma_mean_and_variance(frame: &I420Frame<'_>) -> (f32, f32) {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 {
+        return (0.0, 0.0);
+    }
+    let stride = frame.y_stride.max(w);
+    let mut sum: u64 = 0;
+    let mut sumsq: u64 = 0;
+    let mut count: u64 = 0;
+    for r in 0..h {
+        let row_off = r * stride;
+        // The luma slice may be sized for fewer rows than `h` (the
+        // I420Frame::packed builder enforces tight packing but defensive
+        // callers may pass shorter slices); clamp at the slice length.
+        if row_off >= frame.y.len() {
+            break;
+        }
+        let row_end = (row_off + w).min(frame.y.len());
+        for &px in &frame.y[row_off..row_end] {
+            sum += px as u64;
+            sumsq += (px as u64) * (px as u64);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return (0.0, 0.0);
+    }
+    let count_f = count as f32;
+    let mean = sum as f32 / count_f;
+    // var = E[X²] - E[X]² (one-pass formula; numerically OK for u8
+    // pixel values where the dynamic range is bounded).
+    let var = (sumsq as f32 / count_f) - (mean * mean);
+    (mean, var.max(0.0))
+}
+
+/// Mean absolute deviation of `frame.y` vs the supplied previous
+/// luma plane (assumed identical layout).
+fn luma_mad(frame: &I420Frame<'_>, prev: &[u8]) -> f32 {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let stride = frame.y_stride.max(w);
+    let mut sum: u64 = 0;
+    let mut count: u64 = 0;
+    for r in 0..h {
+        let row_off = r * stride;
+        if row_off >= frame.y.len() || row_off >= prev.len() {
+            break;
+        }
+        let row_end = (row_off + w).min(frame.y.len()).min(prev.len());
+        let cur = &frame.y[row_off..row_end];
+        let pre = &prev[row_off..row_end];
+        for (a, b) in cur.iter().zip(pre.iter()) {
+            sum += (*a as i32 - *b as i32).unsigned_abs() as u64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        sum as f32 / count as f32
+    }
+}
+
+/// Compute the per-frame qindex from a complexity record and a
+/// reference mean cost.  Higher-than-mean cost ⇒ negative delta ⇒
+/// lower qindex (better quality).  The delta is clamped to the
+/// configured [`DEFAULT_AQ_QINDEX_RANGE`] either side of
+/// `config.base.qindex`, then to the RFC 6386 §9.6 `0..=127` range.
+/// Scene cuts add a [`DEFAULT_SCENE_CUT_QUANT_BOOST`] quality
+/// boost (subtraction).
+fn qindex_from_complexity(
+    config: &Vp8TwoPassConfig,
+    complexity: FrameComplexity,
+    reference_mean: f32,
+) -> u8 {
+    let base = config.base.qindex as i32;
+    let range = DEFAULT_AQ_QINDEX_RANGE.max(0);
+    let delta = if reference_mean > 1.0 {
+        let normed = (complexity.bits_per_mb - reference_mean) / reference_mean;
+        // Negate: higher cost ⇒ lower qindex.
+        let raw = -(normed * range as f32);
+        raw.round() as i32
+    } else {
+        0
+    };
+    let mut qindex = base + delta.clamp(-range, range);
+    if complexity.scene_cut {
+        qindex -= DEFAULT_SCENE_CUT_QUANT_BOOST;
+    }
+    qindex.clamp(0, 127) as u8
 }
 
 /// Framework-side factory that takes a full [`Vp8EncoderConfig`]

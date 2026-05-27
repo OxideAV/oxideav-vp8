@@ -65,8 +65,9 @@ use crate::coded_header::TokenProbUpdates;
 use crate::encoder::{
     encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
-    encode_p_frame_multi_ref_with_fitted_token_prob_updates, EncodeError, I420Frame,
-    KeyframeParams, LoopFilterDeltas, RefreshControls,
+    encode_p_frame_multi_ref_with_fitted_token_prob_updates,
+    encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh_and_intra_pick,
+    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
 use crate::state::RefFrameSlot;
@@ -680,6 +681,133 @@ impl Vp8InterStreamEncoder {
     }
 
     /// Encode one frame using the configured keyframe interval to pick
+    /// K vs P, with the round-160 / round-161 §11 intra-within-inter
+    /// MB picker engaged on every P-frame.
+    ///
+    /// Drop-in `intra-pick` companion to [`Self::encode_frame`]: the
+    /// scheduling decision (K vs P) and the §9.7 reference-slot ladder
+    /// are identical to the non-intra-pick path; only the per-MB picker
+    /// changes. On every emitted P-frame the per-MB picker scores the
+    /// full §11.2 × §11.4 whole-block intra grid (4 luma × 4 chroma =
+    /// 16 candidates, `B_PRED` excluded) against the running in-frame
+    /// neighbours in addition to the §16 inter ladder, and picks
+    /// whichever of (best inter pick, J-best intra) wins on
+    /// `J + lambda * is_inter_mb-bit`. When the intra candidate wins
+    /// on at least one MB the §9.10 `prob_intra` byte drops below 255
+    /// and the §16.1 intra-mode-tree path emits on those MBs.
+    ///
+    /// K-frames go through the same
+    /// [`encode_keyframe_with_reconstruction`] path as
+    /// [`Self::encode_frame`] — the intra-pick flag only affects the
+    /// inter (P-frame) arm. The §9.4 carried-delta state, the §9.7
+    /// reference-slot rotation, and the dimensions-lock semantics are
+    /// unchanged.
+    ///
+    /// Wire compatibility: on any source where the round-161 picker
+    /// never selects an intra MB (e.g. a slow-translation flat
+    /// gradient where ZERO_MV already absorbs the residual), the
+    /// emitted bytes match [`Self::encode_frame`] modulo the
+    /// `prob_intra` byte's drop from 255 to 1 (≈ 6 extra bits ≈ 1
+    /// extra byte per P-frame). This is the same bound the bare
+    /// `encode_p_frame_multi_ref_with_intra_pick` entry-point already
+    /// pins under `tests/encoder_pframe_intra_pick.rs`.
+    pub fn encode_frame_with_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        self.encode_frame_with_force_and_intra_pick(frame, false)
+    }
+
+    /// Encode one frame with the round-160 / round-161 intra-pick
+    /// engaged **and** an optional `force_keyframe` override that
+    /// re-anchors the keyframe interval, exactly mirroring
+    /// [`Self::encode_frame_with_force`].
+    ///
+    /// Companion to [`Self::encode_frame_with_intra_pick`]: the
+    /// `force_keyframe` semantics (re-anchoring the interval after a
+    /// forced K-frame at frame index `i` so the next automatic K-frame
+    /// lands at `i + keyframe_interval`) match
+    /// [`Self::encode_frame_with_force`] exactly. On the K-frame arm
+    /// the intra-pick flag is a no-op — every MB in a key frame is
+    /// intra by construction.
+    pub fn encode_frame_with_force_and_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+        force_keyframe: bool,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+
+        let scheduled = self.next_frame_is_keyframe();
+        let must_be_key = scheduled == FrameKind::Key || force_keyframe;
+        let emit_key = must_be_key || self.last.is_none();
+
+        let (bytes, planes, kind) = if emit_key {
+            let (b, p) = encode_keyframe_with_reconstruction(frame, &self.params)?;
+            (b, p, FrameKind::Key)
+        } else {
+            // Inter arm — same LAST/GOLDEN/ALTREF plane harvesting as
+            // `encode_frame_with_force`, but the per-MB picker is the
+            // round-160 / round-161 intra-within-inter widened
+            // candidate set.
+            let last_planes = ref_slot_to_keyframe_planes(
+                self.last.as_ref().expect("LAST slot present for P-frame"),
+            );
+            let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+            let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+            let (b, p) = encode_p_frame_multi_ref_with_intra_pick(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+            )?;
+            (b, p, FrameKind::InterZeroMv)
+        };
+
+        let frame_index = self.frame_count;
+
+        // ---- Reference-slot update (§9.7) — identical to
+        // `encode_frame_with_force`. The intra-pick flag does NOT
+        // affect the §9.7 ladder; `planes` is the reconstruction that
+        // matches `bytes` regardless of which per-MB pick won.
+        let new_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        match kind {
+            FrameKind::Key => {
+                self.last = Some(new_slot.clone());
+                self.golden = Some(new_slot.clone());
+                self.altref = Some(new_slot);
+                self.last_keyframe_index = Some(frame_index);
+                // §9.4 — key frames start a fresh delta sequence.
+                self.carried_ref_deltas = [0; 4];
+                self.carried_mode_deltas = [0; 4];
+            }
+            FrameKind::InterZeroMv => {
+                // §9.7 inter refresh ladder used by the multi-ref
+                // P-frame encoder's default `RefreshControls`:
+                // refresh_last = 1 only.
+                self.last = Some(new_slot);
+            }
+        }
+
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind,
+            frame_index,
+        })
+    }
+
+    /// Encode one frame using the configured keyframe interval to pick
     /// K vs P, with an automatically-fitted §13.4 `token_prob_update()`
     /// payload on every emitted frame.
     ///
@@ -853,6 +981,129 @@ impl Vp8InterStreamEncoder {
         refresh: &RefreshControls,
     ) -> Result<EncodedStreamFrame, StreamEncodeError> {
         self.encode_p_frame_with_refresh_and_lf_deltas(frame, refresh, &LoopFilterDeltas::default())
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, with the round-160 / round-161
+    /// §11 intra-within-inter MB picker engaged.
+    ///
+    /// Combines [`Self::encode_p_frame_with_refresh`] (caller-driven
+    /// refresh ladder + stream-side slot rotation per §20 page-147)
+    /// with the round-161 picker. On every MB the picker scores the
+    /// full §11.2 × §11.4 whole-block intra grid (4 luma × 4 chroma)
+    /// against the running in-frame neighbours in addition to the §16
+    /// inter ladder, and picks whichever of (best inter, J-best intra)
+    /// wins on `J + lambda * is_inter_mb-bit`.
+    ///
+    /// Pre-conditions and slot-rotation mirror
+    /// [`Self::encode_p_frame_with_refresh`] exactly:
+    ///
+    /// * A `LAST` slot must be present —
+    ///   [`StreamEncodeError::NoLastReference`] otherwise.
+    /// * Dimensions must match the stream's locked dimensions —
+    ///   [`StreamEncodeError::DimensionsChanged`] otherwise.
+    /// * `refresh` is forwarded to
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_intra_pick`],
+    ///   which runs [`RefreshControls::validate`]; invalid selectors
+    ///   surface as [`EncodeError::InvalidCopyBufferSelector`] wrapped
+    ///   in [`StreamEncodeError::Frame`].
+    /// * The keyframe scheduler is **bypassed** (the caller is asking
+    ///   for a P-frame with a specific refresh).
+    ///
+    /// Slot-rotation runs after the bitstream is emitted, mirroring
+    /// the §20 page-147 walk (`copy_arf → copy_gf → refresh_gf →
+    /// refresh_arf → refresh_last`). `last_keyframe_index` is **not**
+    /// touched. The §9.4 carried-delta state is **not** updated this
+    /// round — the picker engages the round-160 inter path with
+    /// [`LoopFilterDeltas::default`] (matching the bare-encoder
+    /// `encode_p_frame_multi_ref_with_refresh_and_intra_pick`
+    /// signature), so the effective deltas resolve to `0` and there
+    /// is no fresh value to carry. Callers that need both intra-pick
+    /// AND §9.4 deltas should sit one round above this — the
+    /// composition fits naturally into the
+    /// `…_intra_pick_and_lf_deltas` companion that a follow-up round
+    /// will expose; this round's scope is exactly the intra-pick
+    /// thread, not the full Cartesian product.
+    pub fn encode_p_frame_with_refresh_and_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) = encode_p_frame_multi_ref_with_refresh_and_intra_pick(
+            frame,
+            &last_planes,
+            golden_planes.as_ref(),
+            altref_planes.as_ref(),
+            &self.params,
+            refresh,
+        )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas`: the
+        // intra-pick flag governs per-MB candidate scoring only and
+        // does NOT alter the §9.7 slot ladder. The §20 page-147 walk
+        // is `copy_arf → copy_gf → refresh_gf → refresh_arf →
+        // refresh_last`; the "copy" cases consult pre-refresh state,
+        // so capture the pre-rotation slots into temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
     }
 
     /// Encode one P-frame with a caller-supplied §9.7 / §9.8

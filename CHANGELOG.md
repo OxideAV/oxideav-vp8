@@ -6,6 +6,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§11 intra-within-inter MB picker threaded into
+  `Vp8InterStreamEncoder` (RFC 6386 §11 / §9.7 / §9.8 / §16.1)** —
+  round 162 closes the r161 follow-up's #2 ("thread the intra-pick
+  into the `Vp8InterStreamEncoder` stream driver — currently only
+  the bare-encoder entry-points carry the toggle"). Three new opt-in
+  entry-points on `Vp8InterStreamEncoder` mirror the existing
+  `encode_frame*` family:
+  * `encode_frame_with_intra_pick(frame)` — scheduler-driven
+    drop-in companion to `encode_frame`. K-frames go through
+    `encode_keyframe_with_reconstruction`; every emitted P-frame
+    engages the round-161 picker. §9.7 reference-slot ladder,
+    dimensions-lock, and §9.4 carried-delta reset match
+    `encode_frame` exactly.
+  * `encode_frame_with_force_and_intra_pick(frame, force_keyframe)`
+    — same plus the `force_keyframe` override that re-anchors the
+    keyframe interval, mirroring `encode_frame_with_force`.
+  * `encode_p_frame_with_refresh_and_intra_pick(frame, refresh)` —
+    direct P-frame call with caller-driven §9.7 / §9.8 refresh
+    pattern. Bypasses the keyframe scheduler. Pre-conditions, the
+    §20 page-147 slot rotation, and the error surface
+    (`NoLastReference`, `DimensionsChanged`) match
+    `encode_p_frame_with_refresh` exactly.
+
+  Pure plumbing — no new picker logic. Each new entry-point harvests
+  the §9 reference-slot trio into the `KeyframePlanes` shape, calls
+  the matching bare-encoder intra-pick entry-point
+  (`encode_p_frame_multi_ref_with_intra_pick` /
+  `encode_p_frame_multi_ref_with_refresh_and_intra_pick`), and runs
+  the §9.7 / §9.8 slot-rotation walk. Composition is byte-identical
+  to a caller that drives the bare-encoder entry-point through the
+  same slot-harvest steps by hand. The intra-pick is opt-in: existing
+  entry-points are unchanged, so every pre-r162 caller keeps the
+  exact wire it had.
+
+  Six new test pins in `tests/encoder_inter_stream_intra_pick.rs`:
+  byte-equality with the bare-encoder composition on a K + P
+  sequence; scheduler invariants on `interval = 4`; force-keyframe
+  re-anchoring on the intra-pick path; refresh-driven slot rotation
+  (`refresh_golden_frame = true` updates GOLDEN to the P-frame
+  reconstruction); `NoLastReference` error before any LAST exists;
+  dimensions-lock preserved. Tests: 533 → 539.
+
 * **§11 intra-within-inter MB picker widened from DC-only to the full
   4 Y modes × 4 UV modes whole-block grid (RFC 6386 §11.2 / §11.4 /
   §16.1)** — round 161 extends the round-160 picker per its own

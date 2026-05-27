@@ -2,6 +2,120 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 162)
+
+**§11 intra-within-inter MB picker threaded into
+`Vp8InterStreamEncoder`.** Round 160 / round 161 widened the per-MB
+picker to score the full §11.2 × §11.4 whole-block intra grid (4
+luma × 4 chroma = 16 candidates, `B_PRED` excluded) against the
+running in-frame neighbours and trade it against the inter winner on
+`J + lambda * is_inter_mb-bit`. R161's next-step ladder identified
+the missing thread: the toggle only lived on the bare-encoder
+entry-points (`encode_p_frame_multi_ref_with_intra_pick` /
+`encode_p_frame_multi_ref_with_refresh_and_intra_pick`). Round 162
+lands that thread — three new opt-in entry-points on
+`Vp8InterStreamEncoder` that mirror the existing `encode_frame*`
+family:
+
+  * **`encode_frame_with_intra_pick(frame)`** — scheduler-driven
+    drop-in companion to `encode_frame`. K-frames go through the
+    unchanged `encode_keyframe_with_reconstruction` path; every
+    emitted P-frame engages the round-161 picker. The §9.7
+    reference-slot ladder (`refresh_last = 1` only on P-frames,
+    all-three on K-frames), the dimensions-lock semantics, and the
+    §9.4 carried-delta reset on every key frame match
+    `encode_frame` exactly.
+  * **`encode_frame_with_force_and_intra_pick(frame,
+    force_keyframe)`** — same plus the `force_keyframe` override that
+    re-anchors the keyframe interval (next automatic K-frame lands
+    at `forced_index + keyframe_interval`, not at the original
+    multiple of `keyframe_interval` from the absolute start). Matches
+    `encode_frame_with_force` byte-for-byte on K-frame arms.
+  * **`encode_p_frame_with_refresh_and_intra_pick(frame, refresh)`**
+    — direct P-frame call with caller-driven §9.7 / §9.8 refresh
+    pattern. Bypasses the keyframe scheduler. Pre-conditions, slot
+    rotation (§20 page-147 walk: `copy_arf → copy_gf → refresh_gf →
+    refresh_arf → refresh_last`), and error surface (`NoLastReference`,
+    `DimensionsChanged`) match `encode_p_frame_with_refresh` exactly.
+
+Pure plumbing — no new picker logic. Each new entry-point harvests
+the §9 reference-slot trio (`LAST` / `GOLDEN` / `ALTREF`) into the
+[`KeyframePlanes`] shape the inter encoder expects, calls the
+matching bare-encoder intra-pick entry-point, and runs the §9.7 /
+§9.8 slot-rotation walk (the K-frame all-three-refresh on
+`emit_key`; the default `refresh_last = 1` on the scheduler-driven
+P-frame arm; the §20 page-147 walk on the caller-driven refresh
+arm). The composition is byte-identical to a caller that drives the
+bare-encoder entry-point through the same slot-harvest steps by
+hand — `tests/encoder_inter_stream_intra_pick.rs` pins this with a
+direct byte-equality check on both the scheduler arm and the
+refresh arm.
+
+The intra-pick is opt-in: the existing `encode_frame` /
+`encode_frame_with_force` /
+`encode_frame_with_fitted_token_prob_updates` /
+`encode_frame_with_force_and_fitted_token_prob_updates` /
+`encode_p_frame_with_refresh*` entry-points are unchanged, so every
+pre-r162 caller keeps the exact wire it had. A caller that wants
+the round-161 picker simply switches to the `_with_intra_pick`
+variant of the entry-point it was already using.
+
+The §9.4 carried-delta state is **not** updated on the
+`encode_p_frame_with_refresh_and_intra_pick` path this round (the
+underlying bare-encoder entry-point takes `LoopFilterDeltas::default`
+internally, so the effective deltas resolve to 0 and there's no
+fresh value to carry). The natural follow-up is an
+`encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`
+composition that exposes both knobs together — that fits the same
+shape as the existing
+`encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`
+composition, and is a single round's task once a caller actually
+requests both.
+
+New test pins (`tests/encoder_inter_stream_intra_pick.rs`, 6 cases):
+
+  1. **`stream_intra_pick_bytes_match_bare_encoder_composition`** —
+     a K + P run through `encode_frame_with_intra_pick` is
+     byte-equal to `encode_keyframe_with_reconstruction` +
+     `encode_p_frame_multi_ref_with_intra_pick` on the same source.
+     The §9.10 `prob_intra` byte is `> 1`, confirming the picker
+     activated (it lands on `255` for this all-intra source — the
+     same value the bare-encoder test
+     `intra_pick_selects_intra_when_inter_residual_is_large` pins).
+  2. **`stream_intra_pick_scheduler_keyframe_interval_4`** — K at
+     index 0, P at 1 / 2 / 3, K at 4 with `interval = 4`; same
+     scheduler shape as `inter_stream_picks_p_after_first_with_interval_4`
+     but driving through the intra-pick entry-point.
+  3. **`stream_intra_pick_force_keyframe_reanchors_interval`** —
+     K, P, P-forced-K, P, P, P, K (re-anchored at frame 2); mirrors
+     `inter_stream_force_keyframe_reanchors_interval` for the
+     intra-pick path.
+  4. **`stream_intra_pick_refresh_drives_slot_rotation`** — a
+     `refresh_golden_frame = true` call updates GOLDEN to the
+     just-emitted P-frame reconstruction (not the prior K's). The
+     bytes match the equivalent bare-encoder call.
+  5. **`stream_intra_pick_refresh_errors_when_no_last`** — refusing
+     a refresh-driven P-frame call before any prior frame has
+     populated `LAST` surfaces `StreamEncodeError::NoLastReference`;
+     the frame counter is not advanced.
+  6. **`stream_intra_pick_dimensions_change_rejected`** —
+     dimensions-lock is preserved on the intra-pick path; the
+     counter is not advanced on rejection.
+
+Tests: 533 → 539 (+6 in `tests/encoder_inter_stream_intra_pick.rs`).
+The 533 pre-r162 cases are unchanged — round 162 is a stream-driver
+opt-in, no existing wire moves.
+
+The next-step ladder for the encoder is now: (1) §9.3 segmentation
+header support (the round-159 follow-up's #2), (2) intra `B_PRED`
+(per-sub-block) within the inter picker — a separate fitter family
+extending the §11.3 sub-block walker that already lives on the
+keyframe path, (3) compose the §9.4 `mb_lf_adjustments()` deltas
+with the intra-pick on the refresh path
+(`encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`), (4)
+end-to-end libvpx / vpxdec black-box cross-decode validation, (5)
+deeper §18.3 sub-pel ME / RD refinement.
+
 ## Status — 2026-05-27 (round 161)
 
 **§11 intra-within-inter MB picker — widened from DC-only to the full

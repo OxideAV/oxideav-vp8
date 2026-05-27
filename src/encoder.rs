@@ -7458,18 +7458,6 @@ const MV_UPDATE_PROBS_FLAT: [u8; 38] = [
 
 // ───────────────────────── factory + dual-API surface ─────────────────────────
 
-/// Direct factory entry — paired with the workspace's "dual API"
-/// convention (`<crate>::encoder::make_encoder` alongside the
-/// `oxideav_core::register!` registry path). Phase 1 only emits silent
-/// keyframes, so the factory's `encode_keyframe` method is a thin
-/// wrapper over [`encode_silent_keyframe`]. The signature keeps the
-/// pixel slice in the API for forward compatibility with the §13 /
-/// §14 encoder round (which will actually consume it); for now it is
-/// ignored.
-pub fn make_encoder() -> SilentKeyframeEncoder {
-    SilentKeyframeEncoder
-}
-
 /// Phase 1 encoder handle. Stateless; one-shot
 /// [`encode_keyframe`](Self::encode_keyframe) calls map directly to
 /// [`encode_silent_keyframe`].
@@ -7489,6 +7477,279 @@ impl SilentKeyframeEncoder {
         encode_silent_keyframe(SilentKeyframeParams::new(width, height))
     }
 }
+
+/// Standalone-reachable helper that hands out a [`SilentKeyframeEncoder`].
+///
+/// Pre-dates the framework `make_encoder(params)` factory below. Kept
+/// for the historical direct-API consumer that built against the no-arg
+/// helper; the registry / framework path is now [`make_encoder`].
+pub fn make_silent_keyframe_encoder() -> SilentKeyframeEncoder {
+    SilentKeyframeEncoder
+}
+
+// ───────────────────────── libwebp-style quality mapping ─────────────────────────
+
+/// Map a libwebp-style `quality` scalar (`0.0..=100.0`) onto the VP8
+/// §9.6 `y_ac_qi` quantiser index (`0..=127`, lower = higher quality).
+///
+/// The mapping matches the on-wire convention `oxideav-webp`'s VP8 lossy
+/// path uses: `round((100 - quality) * 1.27)`. Defined precisely:
+///
+/// * Inputs `<= 0.0` clamp to `quality = 0.0`, returning `127` (worst).
+/// * Inputs `>= 100.0` clamp to `quality = 100.0`, returning `0` (best).
+/// * `NaN` returns `127` (the "couldn't tell — keep the file small" choice).
+/// * Otherwise the floating-point result is rounded half-away-from-zero
+///   (the default behaviour of `f32::round`) and then clamped into the
+///   `0..=127` `u8` range, so an out-of-range numeric input cannot trip
+///   an `as u8` truncation overflow.
+///
+/// The function is pure — it does not touch [`crate::Encoder`] or
+/// [`oxideav_core`] — so it is reachable under
+/// `--no-default-features` for an embedded image / video pipeline that
+/// wants to choose a `qindex` without building the framework adapter.
+pub fn quality_to_qindex(quality: f32) -> u8 {
+    if quality.is_nan() {
+        return 127;
+    }
+    let clamped = quality.clamp(0.0, 100.0);
+    let q = ((100.0_f32 - clamped) * 1.27).round();
+    // After the clamp + the constant factor the result is in 0.0..=127.0,
+    // but pin the bounds explicitly so any future change to the formula
+    // can't silently overflow `as u8`.
+    q.clamp(0.0, 127.0) as u8
+}
+
+// ───────────────────────── framework factory (registry-gated) ─────────────────────────
+
+#[cfg(feature = "registry")]
+mod factory {
+    //! [`oxideav_core::Encoder`] adapter for the VP8 encoder.
+    //!
+    //! The historical `oxideav-vp8` direct-API entry points
+    //! ([`encode_keyframe`], [`encode_silent_keyframe`],
+    //! [`encode_p_frame_multi_ref_with_*`] ladder) operate on
+    //! per-frame [`I420Frame`] / [`KeyframeParams`] / [`MbPixels`]
+    //! values and are reachable without `oxideav-core`. This adapter
+    //! plugs that direct API into the framework's
+    //! [`oxideav_core::Encoder`] trait so the registry path
+    //! ([`oxideav_vp8::register`](crate::register)) can hand a
+    //! `Box<dyn Encoder>` to a generic muxer / pipeline.
+
+    use std::collections::VecDeque;
+
+    use oxideav_core::time::TimeBase;
+    use oxideav_core::{
+        CodecId, CodecParameters, Encoder, Error, Frame, MediaType, Packet, PixelFormat, Result,
+        VideoFrame,
+    };
+
+    use super::{encode_keyframe, I420Frame, KeyframeParams};
+    use crate::decoder::VP8_CODEC_ID;
+
+    /// Build a framework-side VP8 encoder bound to `params` with all
+    /// defaults: `y_ac_qi = 32`, no loop filter, 1 DCT partition,
+    /// normal filter. Equivalent to
+    /// `make_encoder_with_qindex(params, 32)`.
+    ///
+    /// `params` must declare a positive `width` and `height`;
+    /// `pixel_format` defaults to [`PixelFormat::Yuv420P`] when absent
+    /// and is the only format the encoder currently accepts.
+    pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+        make_encoder_with_qindex(params, KeyframeParams::default().y_ac_qi)
+    }
+
+    /// Build a framework-side VP8 encoder with the libwebp-style
+    /// `quality` (`0.0..=100.0`, higher = better) translated into a
+    /// `y_ac_qi` via [`super::quality_to_qindex`].
+    pub fn make_encoder_with_quality(
+        params: &CodecParameters,
+        quality: f32,
+    ) -> Result<Box<dyn Encoder>> {
+        make_encoder_with_qindex(params, super::quality_to_qindex(quality))
+    }
+
+    /// Build a framework-side VP8 encoder with an explicit VP8 §9.6
+    /// `y_ac_qi` quantiser index (`0..=127`, lower = better).
+    pub fn make_encoder_with_qindex(
+        params: &CodecParameters,
+        qindex: u8,
+    ) -> Result<Box<dyn Encoder>> {
+        let width = params
+            .width
+            .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
+        if width == 0 || height == 0 {
+            return Err(Error::invalid(
+                "vp8 encoder: width and height must be positive",
+            ));
+        }
+        if width > 0x3FFF || height > 0x3FFF {
+            return Err(Error::invalid(
+                "vp8 encoder: width/height exceed VP8 14-bit field (max 16383)",
+            ));
+        }
+        let pixel_format = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        if pixel_format != PixelFormat::Yuv420P {
+            return Err(Error::unsupported(
+                "vp8 encoder: only PixelFormat::Yuv420P is supported",
+            ));
+        }
+        if qindex > 127 {
+            return Err(Error::invalid(
+                "vp8 encoder: qindex out of range (must be 0..=127)",
+            ));
+        }
+        let keyframe = KeyframeParams {
+            y_ac_qi: qindex,
+            ..KeyframeParams::default()
+        };
+
+        let mut output_params = params.clone();
+        output_params.media_type = MediaType::Video;
+        output_params.codec_id = CodecId::new(VP8_CODEC_ID);
+        output_params.width = Some(width);
+        output_params.height = Some(height);
+        output_params.pixel_format = Some(pixel_format);
+
+        let time_base = params
+            .frame_rate
+            .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num));
+
+        Ok(Box::new(Vp8FrameEncoder {
+            output_params,
+            width,
+            height,
+            keyframe,
+            time_base,
+            pending: VecDeque::new(),
+            eof: false,
+        }))
+    }
+
+    /// [`oxideav_core::Encoder`] adapter around the direct-API
+    /// [`encode_keyframe`] driver. One source [`Frame::Video`]
+    /// produces one keyframe [`Packet`] (the P-frame ladder is wired
+    /// behind the per-frame state machine and is not exercised on this
+    /// adapter yet — each `send_frame` re-keys).
+    pub(crate) struct Vp8FrameEncoder {
+        output_params: CodecParameters,
+        width: u32,
+        height: u32,
+        keyframe: KeyframeParams,
+        time_base: TimeBase,
+        pending: VecDeque<Packet>,
+        eof: bool,
+    }
+
+    impl std::fmt::Debug for Vp8FrameEncoder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Vp8FrameEncoder")
+                .field("width", &self.width)
+                .field("height", &self.height)
+                .field("y_ac_qi", &self.keyframe.y_ac_qi)
+                .field("pending", &self.pending.len())
+                .field("eof", &self.eof)
+                .finish()
+        }
+    }
+
+    impl Encoder for Vp8FrameEncoder {
+        fn codec_id(&self) -> &CodecId {
+            &self.output_params.codec_id
+        }
+
+        fn output_params(&self) -> &CodecParameters {
+            &self.output_params
+        }
+
+        fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+            let v = match frame {
+                Frame::Video(v) => v,
+                _ => return Err(Error::invalid("vp8 encoder: video frames only")),
+            };
+            let bytes = encode_video_frame(v, self.width, self.height, &self.keyframe)?;
+            let mut pkt = Packet::new(0, self.time_base, bytes);
+            pkt.pts = v.pts;
+            pkt.dts = v.pts;
+            pkt.flags.keyframe = true;
+            self.pending.push_back(pkt);
+            Ok(())
+        }
+
+        fn receive_packet(&mut self) -> Result<Packet> {
+            if let Some(p) = self.pending.pop_front() {
+                Ok(p)
+            } else if self.eof {
+                Err(Error::Eof)
+            } else {
+                Err(Error::NeedMore)
+            }
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.eof = true;
+            Ok(())
+        }
+    }
+
+    /// Pull the three I420 planes out of `frame` (validating the layout
+    /// the encoder needs), then drive [`encode_keyframe`] with them.
+    fn encode_video_frame(
+        frame: &VideoFrame,
+        width: u32,
+        height: u32,
+        keyframe: &KeyframeParams,
+    ) -> Result<Vec<u8>> {
+        if frame.planes.len() < 3 {
+            return Err(Error::invalid(
+                "vp8 encoder: VideoFrame must carry 3 planes (Y/U/V)",
+            ));
+        }
+        let w = width as usize;
+        let h = height as usize;
+        let uvw = w.div_ceil(2);
+        let uvh = h.div_ceil(2);
+
+        let y_plane = &frame.planes[0];
+        let u_plane = &frame.planes[1];
+        let v_plane = &frame.planes[2];
+
+        if y_plane.data.len() < y_plane.stride * h
+            || u_plane.data.len() < u_plane.stride * uvh
+            || v_plane.data.len() < v_plane.stride * uvh
+        {
+            return Err(Error::invalid(
+                "vp8 encoder: VideoFrame plane buffers shorter than declared dimensions",
+            ));
+        }
+
+        // The direct-API I420Frame requires tightly-packed planes
+        // (stride == width). Always repack here so the borrow lifetimes
+        // stay simple; zero-copy is a future optimisation when the
+        // supplied frame already matches.
+        let y_packed = repack_plane(&y_plane.data, y_plane.stride, w, h);
+        let u_packed = repack_plane(&u_plane.data, u_plane.stride, uvw, uvh);
+        let v_packed = repack_plane(&v_plane.data, v_plane.stride, uvw, uvh);
+
+        let src = I420Frame::packed(width, height, &y_packed, &u_packed, &v_packed);
+        let bytes = encode_keyframe(&src, keyframe).map_err(|e| Error::invalid(e.to_string()))?;
+        Ok(bytes)
+    }
+
+    fn repack_plane(data: &[u8], stride: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h);
+        for r in 0..h {
+            let off = r * stride;
+            out.extend_from_slice(&data[off..off + w]);
+        }
+        out
+    }
+}
+
+#[cfg(feature = "registry")]
+pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
 
 // ─────────────────────────────────── tests ────────────────────────────────────
 
@@ -7928,11 +8189,12 @@ mod tests {
         }
     }
 
-    /// `make_encoder()` reaches the same byte sequence as
-    /// `encode_silent_keyframe`.
+    /// The historical `make_silent_keyframe_encoder()` factory reaches
+    /// the same byte sequence as the direct
+    /// `encode_silent_keyframe(SilentKeyframeParams::new(...))` call.
     #[test]
-    fn make_encoder_factory_produces_same_bytes_as_top_level_function() {
-        let enc = make_encoder();
+    fn make_silent_keyframe_encoder_produces_same_bytes_as_top_level_function() {
+        let enc = make_silent_keyframe_encoder();
         let from_factory = enc.encode_keyframe(&[], 32, 32).unwrap();
         let from_direct = encode_silent_keyframe(SilentKeyframeParams::new(32, 32)).unwrap();
         assert_eq!(from_factory, from_direct);

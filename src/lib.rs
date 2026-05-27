@@ -278,6 +278,7 @@ pub mod dct_tokens;
 pub mod decoder;
 pub mod dequant;
 pub mod encoder;
+pub mod error;
 pub mod forward_transform;
 pub mod frame;
 pub mod frame_header;
@@ -322,14 +323,23 @@ pub use encoder::{
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates,
     encode_p_frame_multi_ref_with_token_updates, encode_p_frame_zero_mv, encode_silent_keyframe,
-    fit_token_prob_updates, make_encoder, patch_first_partition_size, write_frame_tag,
-    write_loop_filter, write_loop_filter_with_deltas, write_mb_no_skip_coeff,
-    write_no_token_prob_updates, write_quant_indices, write_segment_update_flags,
-    write_token_partition_count, write_token_prob_updates, BoolEncoder, BranchCounts,
-    CopyBufferSelector, EncodeError, EncodedMb, I420Frame, KeyframeParams, LoopFilterDeltaSlot,
-    LoopFilterDeltas, MbPixels, RefreshControls, ScaleCode as EncoderScaleCode,
-    SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError, TokenEncoder,
+    fit_token_prob_updates, make_silent_keyframe_encoder, patch_first_partition_size,
+    quality_to_qindex, write_frame_tag, write_loop_filter, write_loop_filter_with_deltas,
+    write_mb_no_skip_coeff, write_no_token_prob_updates, write_quant_indices,
+    write_segment_update_flags, write_token_partition_count, write_token_prob_updates, BoolEncoder,
+    BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, KeyframeParams,
+    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
+    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
+    TokenEncoder,
 };
+
+/// Framework `make_encoder` / `make_encoder_with_qindex` /
+/// `make_encoder_with_quality` re-exports (registry-gated; require
+/// `oxideav-core`). These mirror the `encoder::` module path so
+/// `use oxideav_vp8::make_encoder;` works for binding-compatible
+/// downstream code (notably `oxideav-webp`'s lossy VP8 path).
+#[cfg(feature = "registry")]
+pub use encoder::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
 pub use forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 pub use frame_header::{
@@ -412,59 +422,13 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Unified top-level error surface for the crate.
+/// Unified top-level error surface for the crate — re-exported here
+/// from [`error::Vp8Error`] so downstream consumers can write
+/// `use oxideav_vp8::Vp8Error;` without naming the submodule.
 ///
-/// `Vp8Error` is the single public error type downstream consumers
-/// (notably `oxideav-webp`'s lossy VP8 path) build their own
-/// `From<oxideav_vp8::Vp8Error>` adapters against. It collapses the
-/// crate's two distinct error sources — the encoder stub
-/// [`Error`] and the decoder pipeline [`decoder::DecodeError`] — into
-/// one shape so a consumer doesn't have to know which sub-API a call
-/// went through.
-///
-/// This is intentionally an **enum wrapping the existing sub-errors**
-/// (not a copy of their variants), so any future variant added to
-/// [`Error`] or [`DecodeError`] surfaces automatically through
-/// `Vp8Error` without a breaking change here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Vp8Error {
-    /// A decoder-side failure — surfaced through the [`decode_vp8`] /
-    /// [`state::Vp8DecoderState`] pipeline.
-    Decode(DecodeError),
-    /// An encoder-side failure — currently always
-    /// [`Error::NotImplemented`] until the §13 / §14 encode round lands.
-    Encode(Error),
-}
-
-impl core::fmt::Display for Vp8Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Vp8Error::Decode(e) => write!(f, "{e}"),
-            Vp8Error::Encode(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for Vp8Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Vp8Error::Decode(e) => Some(e),
-            Vp8Error::Encode(e) => Some(e),
-        }
-    }
-}
-
-impl From<DecodeError> for Vp8Error {
-    fn from(value: DecodeError) -> Self {
-        Vp8Error::Decode(value)
-    }
-}
-
-impl From<Error> for Vp8Error {
-    fn from(value: Error) -> Self {
-        Vp8Error::Encode(value)
-    }
-}
+/// See the [`error`] module for the variant shape, conversion adapters,
+/// and the rationale behind the flat-four design.
+pub use error::Vp8Error;
 
 /// Encode a VP8 keyframe.
 ///

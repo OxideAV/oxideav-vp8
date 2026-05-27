@@ -4,7 +4,62 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
-### Added
+### Added — public-API finalize (round 166, 2026-05-27)
+
+* **`oxideav_vp8::error` module + flat `Vp8Error`** — public-surface
+  finalize for binding-compatible downstream consumers (notably
+  `oxideav-webp`'s lossy VP8 path per
+  `crates/oxideav-webp/API-COMPAT-0.1.2.md`). The new `Vp8Error` is a
+  four-variant flat enum (`InvalidData(String)` / `Unsupported(String)`
+  / `Eof` / `NeedMore`) that maps 1-to-1 to `WebpError`. Reachable via
+  both `oxideav_vp8::Vp8Error` (crate-root re-export) and
+  `oxideav_vp8::error::Vp8Error` (module path). Standalone-compatible —
+  no `oxideav-core` dep, so an embedded image / video pipeline that
+  pulls `oxideav-vp8` with `--no-default-features` still gets a usable
+  public error type. `From<DecodeError>` / `From<Error>` adapters
+  collapse the crate's internal error types into the flat shape so
+  internal call paths bubble through `?`.
+* **`encoder::make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>`**
+  — the framework `oxideav_core::Encoder` factory entry point. Wraps a
+  `Vp8FrameEncoder` adapter around the historical `encode_keyframe`
+  direct API. Each `send_frame(Frame::Video)` produces one keyframe
+  `Packet`. Validates width/height/pixel-format/qindex up-front with
+  clean `Error::invalid` / `Error::unsupported` errors.
+* **`encoder::make_encoder_with_quality(params, quality: f32)`** —
+  libwebp-style `0.0..=100.0` quality (higher = better), translates
+  through `quality_to_qindex`.
+* **`encoder::make_encoder_with_qindex(params, qindex: u8)`** —
+  explicit VP8 §9.6 `y_ac_qi` (`0..=127`, lower = better).
+* **`encoder::quality_to_qindex(quality: f32) -> u8`** — the pure
+  libwebp-style quality → §9.6 `y_ac_qi` mapping
+  (`round((100 - quality) * 1.27)`, NaN → 127, clamped to `0..=127`).
+  Standalone-compatible (no `oxideav-core` dep) so an embedder can
+  pick a qindex without building the framework adapter.
+* **Crate-root re-exports**: `Vp8Error`, `quality_to_qindex` (always
+  reachable); `make_encoder`, `make_encoder_with_quality`,
+  `make_encoder_with_qindex` (`#[cfg(feature = "registry")]`-gated).
+* **Three new lock-test files** (`tests/public_error_surface.rs`,
+  `tests/public_quality_mapping.rs`,
+  `tests/public_factory_surface.rs`) pinning the surface — 31 tests
+  in total. Compile failure / red run = a regression to one of the
+  contracts above.
+
+### Changed — public-API finalize (round 166, 2026-05-27)
+
+* **`encoder::make_encoder()`** — the historical pre-r166 no-arg
+  factory that returned a `SilentKeyframeEncoder` is renamed
+  `encoder::make_silent_keyframe_encoder()`. The
+  `SilentKeyframeEncoder` type and its `encode_keyframe(&[u8], u32, u32)`
+  method are unchanged. The historical lower-level path
+  `encode_silent_keyframe(SilentKeyframeParams::new(w, h))` (the
+  function the helper wrapped) is unaffected.
+* **`Vp8Error`** — flattens from the pre-r166 nested-enum shape
+  (`Decode(DecodeError)` / `Encode(Error)`) to the four-variant flat
+  shape above. `DecodeError` / `Error` remain public types; their
+  `From` adapters into `Vp8Error` now collapse onto `InvalidData(_)` /
+  `Unsupported(_)` per the README mapping table.
+
+### Added — round 165 (2026-05-27, prior)
 
 * **§11 intra-pick parallel-composed with the §13.4 fitter on the
   stream-driver refresh + §9.4 deltas axis (RFC 6386 §11 / §13.4 /

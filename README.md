@@ -2,6 +2,90 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 166 — public-API finalize)
+
+**Public API surface finalized for binding-compatible downstream
+consumers.** The webp lossy path (`oxideav-webp` per
+`crates/oxideav-webp/API-COMPAT-0.1.2.md`) and any future embedder
+binding against the published `0.x` line now have a stable surface to
+target across BOTH the default `registry` build and the
+`--no-default-features` standalone build:
+
+### Reachable on every build (standalone + registry)
+
+```rust
+// Module path or crate root — both work.
+use oxideav_vp8::Vp8Error;
+use oxideav_vp8::error::Vp8Error;
+
+// Four-variant shape that maps 1-to-1 to WebpError.
+pub enum Vp8Error {
+    InvalidData(String),
+    Unsupported(String),
+    Eof,
+    NeedMore,
+}
+
+// Pure libwebp-style quality mapping — `round((100 - quality) * 1.27)`,
+// NaN -> 127, clamped to 0..=127.
+pub fn quality_to_qindex(quality: f32) -> u8;
+```
+
+### Registry-feature-gated (require `oxideav-core`)
+
+```rust
+use oxideav_vp8::{make_encoder, make_encoder_with_quality, make_encoder_with_qindex};
+use oxideav_vp8::decoder::make_decoder;
+
+pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>>;
+pub fn make_encoder_with_quality(params: &CodecParameters, quality: f32) -> Result<Box<dyn Encoder>>;
+pub fn make_encoder_with_qindex(params: &CodecParameters, qindex: u8) -> Result<Box<dyn Encoder>>;
+pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>>;
+```
+
+The factory builds a `Vp8FrameEncoder` adapter around the direct-API
+`encode_keyframe` driver. Each `send_frame(Frame::Video)` produces one
+keyframe `Packet` (the P-frame ladder is wired behind the per-frame
+state machine and not exercised on this adapter yet — each
+`send_frame` re-keys; sub-rounds will widen this to a stateful
+multi-frame encoder using the existing `Vp8InterStreamEncoder` ladder).
+Rejection cases: missing width/height (`Error::invalid`),
+width/height==0, width/height > 16383 (VP8 14-bit field),
+pixel-format != Yuv420P (`Error::unsupported`), qindex > 127.
+
+### Surface lock-tests
+
+Three test files exhaustively pin the surface so a regression
+(signature change, dropped re-export, mis-gated feature) fails to
+compile or runs red:
+
+* `tests/public_error_surface.rs` — 10 tests on `Vp8Error` (both paths,
+  four variants, `From<DecodeError>` / `From<Error>` adapters,
+  `std::error::Error + Send + Sync + 'static`).
+* `tests/public_quality_mapping.rs` — 10 tests on
+  `quality_to_qindex` (both paths, boundary values, NaN, clamping,
+  monotonicity). Runs in both feature configurations.
+* `tests/public_factory_surface.rs` — 11 tests on the
+  `make_encoder*` ladder (signature, gating, end-to-end self-decode).
+  Registry-gated.
+
+### Backwards-compat notes for the historical direct API
+
+* The pre-r166 no-arg `pub fn make_encoder() -> SilentKeyframeEncoder`
+  is now `pub fn make_silent_keyframe_encoder() -> SilentKeyframeEncoder`.
+  The `SilentKeyframeEncoder` type and its `encode_keyframe(&[u8], u32, u32)`
+  method are unchanged. Callers that already use
+  `encode_silent_keyframe(SilentKeyframeParams::new(w, h))` (the
+  direct path that the historical helper wrapped) are unaffected.
+* The pre-r166 `Vp8Error::Decode(DecodeError)` / `Vp8Error::Encode(Error)`
+  nested-enum shape is replaced by the flat four-variant shape above.
+  `DecodeError` / `Error` are STILL public types — their `From` adapters
+  into `Vp8Error` now collapse to the four-variant flat shape per the
+  table:
+  * `DecodeError::Unsupported(msg)` → `Vp8Error::Unsupported(msg)`
+  * any other `DecodeError` → `Vp8Error::InvalidData(error.to_string())`
+  * `Error::NotImplemented` → `Vp8Error::Unsupported("requested operation not implemented")`
+
 ## Status — 2026-05-27 (round 165)
 
 **§11 intra-pick parallel-composed with the §13.4 fitter on the

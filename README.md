@@ -1,85 +1,154 @@
 # oxideav-vp8
 
-Pure-Rust VP8 video codec (RFC 6386).
+Pure-Rust VP8 video codec (RFC 6386). Decoder and encoder both at
+production status as of 2026-05-27.
 
-## Status
-
-**Production-ready, both decoder and encoder at ✅ 100% as of 2026-05-27.**
-
-* **Decoder** — full RFC 6386 key + inter decode, bit-exact against
-  the reference output on 10+ multi-frame fixtures including
-  5-frame mid-GOP golden refresh, 10-frame auto-alt-ref, and ARNR.
-  Stateful multi-frame `Vp8DecoderState` driver.
-* **Encoder** — Phase-2 I + P with SPLITMV, GOLDEN / ALTREF,
-  multi-partition residual, RefreshControls, LoopFilterDeltas, §11
-  intra picking, §13.4 token-probability fitter, and a real
-  complexity-aware **two-pass rate-control** family
-  (`first_pass_analyze` + `two_pass_qindices` + `Vp8TwoPassEncoder`)
-  that distributes per-frame qindex around a target using log-MAD
-  + log-variance first-pass statistics.
-* **0.1.13 public-surface lock** — every symbol the published
-  crates.io `0.1.13` release exposed is reachable, both with the
-  default `registry` build and under `--no-default-features`. See
-  [`API-COMPAT-0.1.13.md`](./API-COMPAT-0.1.13.md) for the
+* RFC 6386 key + inter decode, bit-exact against the reference output
+  on 10+ multi-frame fixtures (mid-GOP golden refresh, 10-frame
+  auto-alt-ref, ARNR).
+* Phase-2 encoder with SPLITMV, GOLDEN / ALTREF, multi-partition,
+  RefreshControls, LoopFilterDeltas, §11 intra picker, §13.4
+  token-probability fitter, and a complexity-aware two-pass
+  rate-control family.
+* The full crates.io `0.1.13` public surface is reachable, both with
+  the default `registry` build and under `--no-default-features`.
+  See [`API-COMPAT-0.1.13.md`](./API-COMPAT-0.1.13.md) for the
   per-symbol contract and [`tests/api_compat_0_1_13.rs`](./tests/api_compat_0_1_13.rs)
   for the compile-only assertion suite.
 
-## Cargo features
+## Install
+
+```toml
+# With oxideav-core for use under the OxideAV runtime:
+[dependencies]
+oxideav-vp8 = "0.2"
+
+# Or standalone, without any framework dependency:
+[dependencies]
+oxideav-vp8 = { version = "0.2", default-features = false }
+```
 
 | Feature | Default | What it does |
 |---|---|---|
-| `registry` | ✅ on | Enables the `oxideav-core` dependency and the framework-trait factories (`make_encoder` / `make_decoder` returning `Box<dyn Encoder>` / `Box<dyn Decoder>`). |
-| `simd` | — | Reserved no-op flag carried over from the 0.1.13 manifest; preserved so historical consumers that set it explicitly keep building. |
+| `registry` | ✅ on | Pulls `oxideav-core` and the framework-trait factories (`make_encoder` / `make_decoder` returning `Box<dyn Encoder>` / `Box<dyn Decoder>`) plus `Vp8Decoder` (the `oxideav_core::Decoder` impl) and the `register*` entry points. |
+| `simd` | — | Reserved no-op carried over from the `0.1.13` manifest; declared so historical consumers that set it explicitly keep building. |
 
-The crate builds and tests cleanly under both `cargo build -p oxideav-vp8`
-and `cargo build -p oxideav-vp8 --no-default-features`; both
-configurations are kept green in CI.
+## Standalone use (no `oxideav-core`)
 
-## Direct-API entry points
+### Decode one VP8 frame
 
-### Decode
+`decode_vp8` is the keyframe entry point. For inter-frame sequences
+the caller drives the stateful `Vp8DecoderState` that keeps the LAST
+/ GOLDEN / ALTREF reference slots:
 
 ```rust
-use oxideav_vp8::{decode_vp8, Vp8DecoderState, Vp8Frame};
+use oxideav_vp8::{decode_vp8, Vp8DecoderState};
 
-// One-shot single-frame decode (caller manages multi-frame state).
-let frame: Vp8Frame = decode_vp8(&vp8_keyframe_bytes)?;
+// One-shot single-frame decode of a VP8 keyframe.
+let frame = decode_vp8(&vp8_keyframe_bytes)?;
+let (w, h) = (frame.width as usize, frame.height as usize);
+assert_eq!(frame.y.len(), w * h);
+assert_eq!(frame.u.len(), w.div_ceil(2) * h.div_ceil(2));
+assert_eq!(frame.v.len(), w.div_ceil(2) * h.div_ceil(2));
 
-// Stateful multi-frame decode (handles inter frames + reference buffers).
+// Multi-frame inter decode — one Vp8DecoderState per stream.
 let mut state = Vp8DecoderState::new();
-for packet in vp8_packets {
-    let frame = state.decode_packet(packet)?;
-    // ... consume `frame.y` / `frame.u` / `frame.v`
+for packet in vp8_frame_packets {
+    let frame = state.decode_frame(packet)?;
+    // consume frame.y / frame.u / frame.v (8-bit I420, tightly packed)
 }
 ```
 
-### Encode
+`Vp8DecodedFrame` (also re-exported as `Vp8Frame`) carries the visible
+`width` / `height` plus three tightly-packed `Vec<u8>` planes.
+
+### Encode one VP8 keyframe
+
+```rust
+use oxideav_vp8::{encode_keyframe, I420Frame, KeyframeParams};
+
+let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+let params = KeyframeParams::new(width, height);
+let vp8_bytes: Vec<u8> = encode_keyframe(&frame, &params)?;
+
+// The output is a raw VP8 keyframe bitstream (3-byte tag + 7-byte
+// start code + partitions). Wrap it in an IVF / RIFF-WEBP / Matroska
+// container as needed for your downstream consumer.
+```
+
+For a multi-frame inter encoder use `Vp8Encoder` + `Vp8EncoderConfig`
+(both reachable standalone) and feed successive `I420Frame`s; see
+`tests/encoder_inter_stream.rs` for a worked example.
+
+### Two-pass rate-control encode
 
 ```rust
 use oxideav_vp8::encoder::{
-    make_encoder_with_quality,   // 0.0..=100.0 quality scalar
-    make_encoder_with_qindex,    // 0..=127 explicit qindex (lower = better)
-    make_encoder_with_config,    // full Vp8EncoderConfig (segmentation, RDO, …)
-    Vp8TwoPassEncoder,           // complexity-aware two-pass rate control
-    Vp8TwoPassConfig,
+    first_pass_analyze, two_pass_qindices,
+    Vp8TwoPassConfig, Vp8TwoPassEncoder,
 };
+
+// First pass: cheap per-frame complexity stats (no encode).
+let stats = first_pass_analyze(&i420_frames);
+
+// Second pass: per-frame qindex distribution + actual encode.
+let config = Vp8TwoPassConfig::default();        // wraps a base Vp8EncoderConfig
+let qindices = two_pass_qindices(&stats, &config)?;
+let encoder = Vp8TwoPassEncoder::new(config);
+let packets = encoder.encode(&i420_frames, &stats)?;
 ```
 
-`encode_vp8_keyframe(pixels, width, height)` emits a standalone VP8
-keyframe bitstream without pulling the `oxideav-core` framework
-dependency.
+The algorithm distributes per-frame qindex around `config.base.qindex`
+so heavier-than-mean frames get lower qindex (better quality) and
+lighter frames get higher qindex (smaller bytes), with scene-cut
+detection forcing extra-quality keyframes.
 
-## Registry path
+### Container helpers
 
-With the default `registry` feature on:
+The `ivf` module gives you a standalone IVF reader / writer for the
+common case of `*.ivf` test fixtures:
 
 ```rust
-let mut ctx = oxideav_core::RuntimeContext::new();
-oxideav_vp8::register(&mut ctx);
-// ctx.codecs now has a "vp8" decoder + encoder factory.
+use oxideav_vp8::ivf::{IvfHeader, parse_header, write_header, write_frame};
+
+let mut out = Vec::new();
+let hdr = IvfHeader::vp8(width, height, fps_num, fps_den);
+out.extend_from_slice(&write_header(&hdr));
+for (pts, frame_bytes) in &timed_packets {
+    write_frame(&mut out, *pts, frame_bytes);
+}
 ```
 
-The codec id is `oxideav_vp8::CODEC_ID_STR` (= `"vp8"`).
+### Quality knob
+
+If you have a `0.0..=100.0` quality scalar (the WebP-canonical
+convention) and want the matching VP8 qindex:
+
+```rust
+use oxideav_vp8::encoder::quality_to_qindex;
+let qindex = quality_to_qindex(75.0);          // → 32
+let qindex = quality_to_qindex(100.0);         // → 0   (best)
+let qindex = quality_to_qindex(f32::NAN);      // → 127 (worst, safe)
+```
+
+## With the OxideAV runtime (`registry` feature on, the default)
+
+```rust
+use oxideav_core::RuntimeContext;
+use oxideav_vp8::CODEC_ID_STR;                  // = "vp8"
+
+let mut ctx = RuntimeContext::new();
+oxideav_vp8::register(&mut ctx);
+// ctx.codecs now has a "vp8" Decoder + Encoder factory.
+
+// Or directly call the factories:
+use oxideav_vp8::encoder::{make_encoder_with_quality, make_encoder_with_qindex};
+let enc = make_encoder_with_quality(&params, 75.0)?;   // Box<dyn Encoder>
+let enc = make_encoder_with_qindex(&params, 32)?;
+```
+
+Both factories return `Box<dyn oxideav_core::Encoder>` and integrate
+with the OxideAV pipeline through `send_frame` / `receive_packet`.
 
 ## Clean-room sources
 
@@ -87,6 +156,11 @@ Implementation is derived entirely from the public format spec:
 
 * **RFC 6386** — VP8 Data Format and Decoding Guide
   (`docs/video/vp8/rfc6386-vp8-bitstream.txt`).
+
+The two-pass rate-control algorithm is intentionally outside RFC scope
+(the spec is silent on rate control by design) — the design is
+clean-room, sourced from the in-tree per-MB activity primitives plus
+log-MAD + log-variance first-pass statistics.
 
 Fixture `expected.yuv` reference pictures are produced by black-box
 invocations of the reference decoder *binary*; no third-party codec

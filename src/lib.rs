@@ -318,6 +318,7 @@ pub use encoder::{
     encode_p_frame_multi_ref_with_refresh_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates,
     encode_p_frame_multi_ref_with_token_updates, encode_p_frame_zero_mv, encode_silent_keyframe,
     fit_token_prob_updates, make_encoder, patch_first_partition_size, write_frame_tag,

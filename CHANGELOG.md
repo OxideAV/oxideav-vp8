@@ -6,6 +6,55 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§9.4 `mb_lf_adjustments()` deltas + §11 intra-pick — composed on
+  the stream-driver refresh path (RFC 6386 §9.4 / §11 / §9.7 / §16.1)**
+  — round 163 closes the r162 next-step ladder item #3 ("compose the
+  §9.4 `mb_lf_adjustments()` deltas with the intra-pick on the refresh
+  path"). Two new entry-points:
+  * **Bare encoder:**
+    `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`
+    — argument shape matches
+    `encode_p_frame_multi_ref_with_refresh_and_lf_deltas` exactly (caller
+    supplies `refresh`, `lf_deltas`, `carried_ref_deltas`,
+    `carried_mode_deltas`); the intra-pick toggle is implicit (always
+    engaged on this entry-point, matching
+    `encode_p_frame_multi_ref_with_refresh_and_intra_pick`).
+  * **Stream driver:**
+    `Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`
+    — threads the across-frame §9.4 carried-delta state per RFC 6386
+    §9.4 the same way
+    `encode_p_frame_with_refresh_and_lf_deltas` /
+    `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates` do
+    (adj-enabled frames write back the effective deltas; adj-disabled
+    frames leave the carry untouched). The §11 picker toggle does NOT
+    affect the §9.4 delta carry — it governs per-MB candidate scoring
+    only.
+
+  Pure composition — no new picker or §9.4 logic. The bare wrapper
+  forwards to `encode_p_frame_multi_ref_inner_with_counts_and_pick`
+  with `pick_intra = true` (matching
+  `encode_p_frame_multi_ref_with_refresh_and_intra_pick`) and the
+  caller-supplied `lf_deltas` + carry inputs (matching
+  `encode_p_frame_multi_ref_with_refresh_and_lf_deltas`); the stream
+  method mirrors the carry-update + §20 page-147 slot-rotation walk
+  used on every refresh-aware sibling. Wire compatibility: calling
+  with `LoopFilterDeltas::default()` reproduces
+  `encode_p_frame_with_refresh_and_intra_pick` byte-for-byte (pinned),
+  so every pre-r163 caller of the round-162 intra-pick refresh path
+  keeps the exact wire it had.
+
+  Five new test pins in
+  `tests/encoder_inter_stream_intra_pick_lf_deltas.rs`:
+  (1) disabled-deltas wire matches the round-162 intra-pick-only path
+  byte-for-byte; (2) composed bytes on a K + P with both knobs engaged
+  match the bare-encoder composition; (3) the §9.4 across-frame carry
+  rule applies on the composed path identically to the non-intra-pick
+  sibling (fresh deltas advance the carry, `update = false` carries
+  through, partial updates merge per-slot, adj-disabled frames leave
+  the carry untouched, keyframes reset to zero); (4) `NoLastReference`
+  error before any LAST exists; (5) dimensions-lock preserved on the
+  composed path. Tests: 539 → 544.
+
 * **§11 intra-within-inter MB picker threaded into
   `Vp8InterStreamEncoder` (RFC 6386 §11 / §9.7 / §9.8 / §16.1)** —
   round 162 closes the r161 follow-up's #2 ("thread the intra-pick

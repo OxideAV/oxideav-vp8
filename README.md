@@ -2,6 +2,91 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 163)
+
+**§9.4 `mb_lf_adjustments()` deltas + §11 intra-pick — composed on
+the stream-driver refresh path.** Round 162 threaded the round-161
+intra-within-inter MB picker into `Vp8InterStreamEncoder` as a family
+of opt-in `_with_intra_pick` entry-points. Its own next-step ladder
+named the missing composition: the §9.4 deltas (round 151) and the
+intra-pick were each exposed individually but never together on the
+caller-driven refresh path. Round 163 lands that composition: two
+new entry-points sit at the intersection of the two axes.
+
+The **bare-encoder wrapper**
+`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`
+takes the same argument shape as the round-151
+`encode_p_frame_multi_ref_with_refresh_and_lf_deltas` (caller-supplied
+`refresh` + `lf_deltas` + carried `[i16; 4]` / `[i16; 4]` carry state)
+and dispatches to `encode_p_frame_multi_ref_inner_with_counts_and_pick`
+with `pick_intra = true` (matching the round-160 / 161
+`encode_p_frame_multi_ref_with_refresh_and_intra_pick`). Both
+`refresh.validate()` and `lf_deltas.validate()` run before the per-MB
+walk.
+
+The **stream-driver method**
+`Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`
+mirrors the existing
+`encode_p_frame_with_refresh_and_lf_deltas_and_token_updates` exactly:
+the across-frame §9.4 carried-delta state is threaded per RFC 6386
+§9.4 (adj-enabled frames write back the effective deltas; adj-disabled
+frames leave the carry untouched), and the §20 page-147 slot-rotation
+walk (`copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`)
+runs after the bitstream is emitted. Pre-conditions and error surface
+(`NoLastReference`, `DimensionsChanged`) match
+`encode_p_frame_with_refresh` exactly; `last_keyframe_index` is **not**
+touched. The §11 intra-pick toggle does NOT affect the §9.4 delta
+carry — it governs per-MB candidate scoring only.
+
+Wire compatibility: passing `LoopFilterDeltas::default()` (with
+`enabled = false`) on the stream-driver path reproduces
+`encode_p_frame_with_refresh_and_intra_pick` byte-for-byte (pinned),
+so every pre-r163 caller of the round-162 intra-pick refresh path
+keeps the exact wire it had. On a source where the picker engages
+and §9.4 deltas are transmitted, the bytes match the bare-encoder
+composition exactly.
+
+New test pins (`tests/encoder_inter_stream_intra_pick_lf_deltas.rs`,
+5 cases):
+
+  1. **`disabled_deltas_byte_match_intra_pick_only_path`** —
+     `encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick(.,
+     refresh, &LoopFilterDeltas::default())` is byte-equal to
+     `encode_p_frame_with_refresh_and_intra_pick(., refresh)`.
+  2. **`bare_encoder_byte_match_on_composition`** — a K + P sequence
+     with both knobs engaged byte-matches the bare-encoder
+     composition (`encode_keyframe_with_reconstruction` +
+     `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`).
+     §9.10 `prob_intra > 1` confirms picker engagement; self-decode
+     PSNR ≥ 25 dB at mid quantiser. Stream-side carry advances to the
+     effective transmitted values.
+  3. **`carries_deltas_and_resets_on_keyframe`** — §9.4 across-frame
+     carry rule applies identically to the non-intra-pick sibling:
+     fresh deltas advance the carry; `update = false` carries through;
+     partial updates merge per-slot; adj-disabled frames leave the
+     carry untouched; keyframes reset to zero. Five-frame run pins all
+     five transitions.
+  4. **`refresh_errors_when_no_last`** — refusing a refresh-driven
+     P-frame before any LAST exists surfaces
+     `StreamEncodeError::NoLastReference`; frame counter is not
+     advanced.
+  5. **`dimensions_change_rejected`** — dimensions-lock preserved on
+     the composed path; counter is not advanced on rejection.
+
+Tests: 539 → 544 (+5 in `tests/encoder_inter_stream_intra_pick_lf_deltas.rs`).
+The 539 pre-r163 cases are unchanged — round 163 is a pure
+composition layer, no existing wire moves.
+
+The next-step ladder for the encoder is now: (1) §9.3 segmentation
+header support (long-standing — round 159 follow-up's #2), (2) intra
+`B_PRED` (per-sub-block) within the inter picker — a separate fitter
+family extending the §11.3 sub-block walker that already lives on the
+keyframe path, (3) end-to-end libvpx / vpxdec black-box cross-decode
+validation, (4) deeper §18.3 sub-pel ME / RD refinement, (5) the
+analogous `_with_fitted_token_prob_updates` composition on the same
+refresh + lf-deltas axis (currently the round-158 fitter is only
+threaded into the no-intra-pick stream method).
+
 ## Status — 2026-05-27 (round 162)
 
 **§11 intra-within-inter MB picker threaded into

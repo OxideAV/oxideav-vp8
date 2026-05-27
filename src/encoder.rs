@@ -6175,6 +6175,76 @@ pub fn encode_p_frame_multi_ref_with_intra_pick(
     )
 }
 
+/// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
+/// §9.8 reference-slot refresh control, caller-driven §9.4 per-
+/// reference / per-mode `loop_filter_delta` layer, **and** round-160 /
+/// round-161 §11 intra-within-inter MB picking.
+///
+/// Composition of
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas`] (round 151
+/// caller-driven §9.4 layer + carried-state inputs) and
+/// [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`] (round
+/// 160 / 161 §11 picker toggle). Closes the round-162 next-step
+/// follow-up that called out the missing composition: the §9.4
+/// deltas and the intra-pick were each exposed individually but never
+/// together. This entry-point lets a caller drive both knobs in the
+/// same call.
+///
+/// Argument shape matches
+/// [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas`] exactly —
+/// the intra-pick toggle is implicit (this function always engages
+/// it, just like
+/// [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`]). Callers
+/// that want the §9.4 layer without the intra picker stay on the
+/// non-intra-pick entry-point.
+///
+/// Wire compatibility:
+///
+/// * Calling with [`LoopFilterDeltas::default`] + carried `[0; 4]` /
+///   `[0; 4]` reproduces
+///   [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`]
+///   byte-for-byte. The §9.4 delta layer is gated on `lf_deltas.enabled`
+///   exactly as on the non-intra-pick path.
+/// * Calling with `pick_intra` engaged on a source where intra never
+///   beats inter (a flat or near-flat P-frame against a populated
+///   LAST) yields a wire whose `prob_intra` byte sits at `1` (the
+///   §16 spec-neutral "no intra MB" value clamped up from the
+///   fitter's `fit_prob_l8(0, count_inter)` output) instead of `255`
+///   — the same ~6 bits ≈ 1 byte frame-constant bound documented on
+///   [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`].
+///
+/// `refresh` is validated up front via [`RefreshControls::validate`];
+/// `lf_deltas` is validated via [`LoopFilterDeltas::validate`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    refresh.validate()?;
+    lf_deltas.validate()?;
+    encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        None,
+        None,
+        true,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_p_frame_multi_ref_inner(
     frame: &I420Frame,

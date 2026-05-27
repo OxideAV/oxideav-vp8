@@ -1366,6 +1366,155 @@ impl Vp8InterStreamEncoder {
         })
     }
 
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter delta
+    /// layer, **and** the round-160 / round-161 §11 intra-within-inter
+    /// MB picker engaged.
+    ///
+    /// Composition of [`Self::encode_p_frame_with_refresh_and_lf_deltas`]
+    /// (round 151 §9.4 layer + across-frame carried-delta state) and
+    /// [`Self::encode_p_frame_with_refresh_and_intra_pick`] (round 162
+    /// stream thread of the round-160 / 161 picker). The round 162 next-
+    /// step ladder named exactly this composition — "compose the §9.4
+    /// `mb_lf_adjustments()` deltas with the intra-pick on the refresh
+    /// path (`encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`)"
+    /// — as the follow-up that would expose both knobs together. Round
+    /// 163 lands it.
+    ///
+    /// Internally calls
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick`]
+    /// (the matching bare-encoder wrapper). The stream encoder threads
+    /// the across-frame carried delta state per RFC 6386 §9.4 ("the
+    /// values from the previous frame are used, unless they are updated
+    /// in the current header") — the caller does not need to track it;
+    /// the carry-update rule is identical to
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] (adj-enabled
+    /// frames write back the effective deltas; adj-disabled frames leave
+    /// the carry untouched). The intra-pick toggle does NOT affect the
+    /// §9.4 delta carry — it governs per-MB candidate scoring only.
+    ///
+    /// Wire compatibility:
+    ///
+    /// * Passing [`crate::encoder::LoopFilterDeltas::default`] (with
+    ///   `enabled = false`) reproduces
+    ///   [`Self::encode_p_frame_with_refresh_and_intra_pick`]
+    ///   byte-for-byte. The §9.4 layer is gated on `lf_deltas.enabled`
+    ///   exactly as on the non-intra-pick path.
+    /// * On a source where intra never beats inter the wire matches
+    ///   [`Self::encode_p_frame_with_refresh_and_lf_deltas`] modulo a
+    ///   ~6 bits ≈ 1 byte frame-constant difference at the §9.10
+    ///   `prob_intra` byte (sentinel `255` → fitted `1`), matching the
+    ///   bound documented on the bare-encoder intra-pick path.
+    ///
+    /// Pre-conditions, slot-rotation (§20 page-147 walk
+    /// `copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`),
+    /// and error surface (`NoLastReference`, `DimensionsChanged`) match
+    /// [`Self::encode_p_frame_with_refresh`] exactly. `last_keyframe_index`
+    /// is **not** touched.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas` /
+        // `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`:
+        // adj-enabled frames update the carried state with this frame's
+        // effective deltas; adj-disabled frames leave it unchanged. The
+        // §11 intra-pick toggle does NOT affect the §9.4 delta carry —
+        // it governs per-MB candidate scoring only.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // Mirror the §20 page-147 ordering exactly (the same walk the
+        // decoder runs in `Vp8DecoderState` and the same walk every other
+        // refresh-aware entry-point on this struct runs):
+        //   copy_buffer_to_alternate → copy_buffer_to_golden →
+        //   refresh_golden_frame → refresh_alternate_frame →
+        //   refresh_last. The "copy" cases consult the slot state from
+        //   BEFORE the refresh writes, so we capture pre-state in
+        //   temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
     /// Borrow the across-frame §9.4 `ref_frame_delta[]` carried state
     /// (in `{CURRENT, LAST, GOLDEN, ALTREF}` order). Cleared to
     /// `[0; 4]` on every key frame per RFC 6386 §9.4.

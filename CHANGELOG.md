@@ -6,6 +6,38 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+* **§13.4 fitter composed with §9.4 deltas on the stream-driver refresh
+  path (RFC 6386 §13.4 / §13.5 / §9.4 / §9.7)** — round 164 closes
+  the r163 next-step ladder item (5) ("analogous
+  `_with_fitted_token_prob_updates` composition on the refresh +
+  lf-deltas axis"). The new
+  `Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+  mirrors the existing
+  `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`
+  argument shape (caller-supplied `refresh` + `lf_deltas`, carried
+  `[i16; 4]` / `[i16; 4]` state threaded by the stream driver) and
+  dispatches to the round-158 bare-encoder
+  `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`.
+  The bare-encoder's `bytes_fitted <= bytes_default` safety guard
+  carries through unchanged: whenever the fitter's saving threshold is
+  not crossed (or pass-2's re-encode is larger than pass-1's defaults),
+  the stream emits the default-encode bytes — byte-equal to
+  `encode_p_frame_with_refresh_and_lf_deltas` on the same inputs.
+  Whenever the fitter wins, the bytes are byte-equal to the bare-encoder
+  composition. The §9.4 across-frame carry rule is unchanged
+  (adj-enabled frames write back the effective deltas; adj-disabled
+  frames leave the carry untouched); the §13.4 fitter does NOT
+  perturb the §9.4 carry — it governs residual-token coding only,
+  identical to the caller-driven token-updates sibling. Pre-conditions,
+  slot-rotation (§20 page-147 walk), and error surface
+  (`NoLastReference`, `DimensionsChanged`) match
+  `encode_p_frame_with_refresh` exactly.
+  Pins (`tests/encoder_inter_stream_fitted_lf_deltas.rs`, 5 cases):
+  bare-encoder composition byte-equality; fitted-stream wire never
+  grows vs. caller-driven default; §9.4 carry advance/persist/reset
+  semantics under the fitter; `NoLastReference` + `DimensionsChanged`
+  guards.
+  Tests: 544 → 549 (+5).
 * **§9.4 `mb_lf_adjustments()` deltas + §11 intra-pick — composed on
   the stream-driver refresh path (RFC 6386 §9.4 / §11 / §9.7 / §16.1)**
   — round 163 closes the r162 next-step ladder item #3 ("compose the

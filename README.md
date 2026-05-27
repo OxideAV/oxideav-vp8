@@ -2,6 +2,92 @@
 
 Pure-Rust VP8 video codec (RFC 6386).
 
+## Status — 2026-05-27 (round 164)
+
+**§13.4 fitter composed with §9.4 deltas on the stream-driver refresh
+path.** Round 158 landed the bare-encoder
+`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+(two-pass: defaults-then-fitted with a `bytes_fitted <= bytes_default`
+safety guard) and its own doc-comment named the missing thread:
+*"Out of round-158 scope: threading the fitter into
+`Vp8InterStreamEncoder`'s `encode_frame` ladder — the stream-driver
+method `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`
+stays on the caller-driven entry-point for now; a subsequent round adds
+the analogous `_with_fitted_token_prob_updates` stream method."* Round
+159 wired the *scheduler-driven* fitter through
+`Vp8InterStreamEncoder::encode_frame_with_fitted_token_prob_updates`
+but the refresh-axis sibling stayed unthreaded — that's the gap round
+164 closes (item (5) on r163's next-step ladder).
+
+The new
+`Vp8InterStreamEncoder::encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+mirrors the existing
+`encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`
+shape exactly — caller-supplied `refresh` + `lf_deltas`, carried
+`[i16; 4]` / `[i16; 4]` state threaded by the stream driver — and
+dispatches to the round-158 bare-encoder fitter. The across-frame
+§9.4 carry-update rule is unchanged (adj-enabled frames write back the
+effective deltas; adj-disabled frames leave the carry untouched), the
+§20 page-147 slot-rotation walk
+(`copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`)
+runs after the bitstream is emitted, pre-conditions + error surface
+(`NoLastReference`, `DimensionsChanged`) match
+`encode_p_frame_with_refresh` exactly, and `last_keyframe_index` is
+**not** touched. The §13.4 fitter does NOT affect the §9.4 delta
+carry — it governs residual-token coding only, identical to the
+caller-driven token-updates sibling.
+
+Wire compatibility: whenever the fitter's safety guard falls back
+(no slot crosses the saving threshold, **or** the fitted re-encode is
+larger than the default-encode wire), the stream bytes are the
+default-encode bytes, byte-equal to
+`encode_p_frame_with_refresh_and_lf_deltas` on the same inputs.
+Whenever the fitter wins, the bytes are byte-equal to the bare-encoder
+composition. The bare-encoder's `bytes_fitted <= bytes_default` guard
+carries through unchanged.
+
+New test pins (`tests/encoder_inter_stream_fitted_lf_deltas.rs`,
+5 cases):
+
+  1. **`bare_encoder_byte_match_on_composition`** — a K + P sequence
+     with both knobs engaged byte-matches the bare-encoder composition
+     (`encode_keyframe_with_reconstruction` +
+     `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`).
+     Stream-side carry advances to the effective transmitted values;
+     self-decode PSNR clears the round target.
+  2. **`never_grows_wire_vs_caller_driven_default`** — over a 4-P
+     synthetic sequence with `lf_deltas` engaged, the fitted-composed
+     stream bytes are never larger than the
+     `encode_p_frame_with_refresh_and_lf_deltas` default — round-158
+     safety guard lifted into the stream driver.
+  3. **`carries_deltas_and_resets_on_keyframe`** — the §9.4
+     across-frame carry rule applies identically to the non-fitter
+     sibling: fresh deltas advance the carry, `update = false` carries
+     through, partial updates merge per-slot, adj-disabled frames leave
+     the carry untouched, keyframes reset to zero. Six-frame run pins
+     all transitions.
+  4. **`refresh_errors_when_no_last`** — refusing a refresh-driven
+     P-frame before any `LAST` exists surfaces
+     `StreamEncodeError::NoLastReference`; frame counter is not
+     advanced.
+  5. **`dimensions_change_rejected`** — dimensions-lock preserved on
+     the composed path; counter is not advanced on rejection.
+
+Tests: 544 → 549 (+5 in `tests/encoder_inter_stream_fitted_lf_deltas.rs`).
+The 544 pre-r164 cases are unchanged — round 164 is a pure composition
+layer, no existing wire moves.
+
+The next-step ladder for the encoder is now: (1) §9.3 segmentation
+header support (long-standing — round 159 follow-up's #2), (2) intra
+`B_PRED` (per-sub-block) within the inter picker — a separate fitter
+family extending the §11.3 sub-block walker that already lives on the
+keyframe path, (3) end-to-end libvpx / vpxdec black-box cross-decode
+validation, (4) deeper §18.3 sub-pel ME / RD refinement, (5) the
+parallel fitter composition on the **intra-pick + refresh + lf-deltas**
+axis — combining round 163 and round 164 so the picker is engaged on
+the fitted refresh path (the natural next composition once a caller
+actually requests both).
+
 ## Status — 2026-05-27 (round 163)
 
 **§9.4 `mb_lf_adjustments()` deltas + §11 intra-pick — composed on

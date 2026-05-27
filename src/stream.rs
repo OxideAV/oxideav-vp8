@@ -67,7 +67,8 @@ use crate::encoder::{
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh_and_intra_pick,
-    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates, EncodeError,
+    I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
 use crate::state::RefFrameSlot;
@@ -1474,6 +1475,192 @@ impl Vp8InterStreamEncoder {
         //   refresh_last. The "copy" cases consult the slot state from
         //   BEFORE the refresh writes, so we capture pre-state in
         //   temporaries first.
+        let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
+        let pre_last = self.last.clone();
+        let pre_golden = self.golden.clone();
+        let pre_altref = self.altref.clone();
+
+        let mut new_altref = pre_altref.clone();
+        match refresh.copy_buffer_to_alternate {
+            1 => new_altref = pre_last.clone(),
+            2 => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match refresh.copy_buffer_to_golden {
+            1 => new_golden = pre_last.clone(),
+            2 => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh.refresh_golden_frame {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh.refresh_alternate_frame {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh.refresh_last {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+
+        self.last = new_last;
+        self.golden = new_golden;
+        self.altref = new_altref;
+        self.dimensions = Some(dims);
+        self.frame_count += 1;
+        Ok(EncodedStreamFrame {
+            bytes,
+            kind: FrameKind::InterZeroMv,
+            frame_index,
+        })
+    }
+
+    /// Encode one P-frame with a caller-supplied §9.7 / §9.8
+    /// reference-slot refresh pattern, a caller-supplied §9.4
+    /// `mb_lf_adjustments()` per-reference / per-mode loop-filter delta
+    /// layer, **and** the round-157 / round-158 §13.4 token-prob
+    /// observed-counts fitter engaged.
+    ///
+    /// Round 158 landed the bare-encoder
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    /// (two-pass: encode with §13.5 defaults to collect observed branch
+    /// counts, run [`crate::encoder::fit_token_prob_updates`] to derive
+    /// a [`TokenProbUpdates`] payload that nets a positive bit saving,
+    /// then re-encode with that payload through
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates`]
+    /// — with the `bytes_fitted <= bytes_default` safety guard). Round
+    /// 159 threaded the *scheduler-driven* fitter through
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`] /
+    /// [`Self::encode_frame_with_force_and_fitted_token_prob_updates`].
+    /// The round-158 entry-point itself flagged the gap that this
+    /// method closes:
+    ///
+    /// > *Out of round-158 scope: threading the fitter into
+    /// > `Vp8InterStreamEncoder`'s `encode_frame` ladder — the
+    /// > stream-driver method
+    /// > `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`
+    /// > stays on the caller-driven entry-point for now; a subsequent
+    /// > round adds the analogous `_with_fitted_token_prob_updates`
+    /// > stream method.*
+    ///
+    /// Round 164 lands that subsequent-round method on the **refresh +
+    /// lf-deltas** axis — i.e. composed with the caller-supplied §9.4
+    /// delta layer. The companion scheduler-driven fitter path
+    /// ([`Self::encode_frame_with_fitted_token_prob_updates`]) already
+    /// exists; this is the missing refresh-axis sibling.
+    ///
+    /// Internally calls
+    /// [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`].
+    /// The stream encoder threads the across-frame carried delta state
+    /// per RFC 6386 §9.4 — the caller does not need to track it; the
+    /// carry-update rule is identical to
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas`] (adj-enabled
+    /// frames write back the effective deltas; adj-disabled frames
+    /// leave the carry untouched). The §13.4 fitter does NOT affect
+    /// the §9.4 delta carry — it governs residual-token coding only,
+    /// exactly as on the caller-driven token-updates sibling
+    /// [`Self::encode_p_frame_with_refresh_and_lf_deltas_and_token_updates`].
+    ///
+    /// Wire compatibility:
+    ///
+    /// * Whenever the fitter's safety guard falls back (no slot crossed
+    ///   the saving threshold, **or** the fitted re-encode is larger
+    ///   than the default-encode wire), the returned bytes are the
+    ///   default-encode bytes, byte-equal to
+    ///   [`Self::encode_p_frame_with_refresh_and_lf_deltas`] on the
+    ///   same inputs.
+    /// * Whenever the fitter wins, the bytes are byte-equal to the
+    ///   bare-encoder composition
+    ///   [`crate::encoder::encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`]
+    ///   on the same inputs. The bare-encoder's safety guard also
+    ///   ensures the wire is `<=` the default-encode wire on every
+    ///   frame — this property carries through unchanged to the
+    ///   stream driver.
+    ///
+    /// Pre-conditions, slot-rotation (§20 page-147 walk
+    /// `copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last`),
+    /// and error surface (`NoLastReference`, `DimensionsChanged`) match
+    /// [`Self::encode_p_frame_with_refresh`] exactly. `last_keyframe_index`
+    /// is **not** touched.
+    ///
+    /// **Carried-base assumption.** Same as the round-158 bare-encoder
+    /// fitter: this method assumes the prior key frame was emitted
+    /// with the §13.5 defaults — i.e. either
+    /// [`crate::encoder::encode_keyframe`] /
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`], or
+    /// [`crate::encoder::encode_keyframe_with_token_prob_updates`]
+    /// called with an all-`None` array. The standard stream entry-points
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] both
+    /// satisfy this since they go through
+    /// [`crate::encoder::encode_keyframe_with_reconstruction`]. Mixing
+    /// a fitted keyframe (e.g.
+    /// [`Self::encode_frame_with_fitted_token_prob_updates`]) with this
+    /// entry-point is out of round-164 scope — same rule as the
+    /// round-156 caller-driven token-updates sibling.
+    pub fn encode_p_frame_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(
+        &mut self,
+        frame: &I420Frame<'_>,
+        refresh: &RefreshControls,
+        lf_deltas: &LoopFilterDeltas,
+    ) -> Result<EncodedStreamFrame, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            _ => {}
+        }
+        let last_slot = self
+            .last
+            .as_ref()
+            .ok_or(StreamEncodeError::NoLastReference)?;
+
+        let last_planes = ref_slot_to_keyframe_planes(last_slot);
+        let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
+        let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
+        let (bytes, planes) =
+            encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates(
+                frame,
+                &last_planes,
+                golden_planes.as_ref(),
+                altref_planes.as_ref(),
+                &self.params,
+                refresh,
+                lf_deltas,
+                self.carried_ref_deltas,
+                self.carried_mode_deltas,
+            )?;
+
+        let frame_index = self.frame_count;
+
+        // ---- §9.4 across-frame delta carry ----------------------------
+        // Identical to `encode_p_frame_with_refresh_and_lf_deltas` /
+        // `encode_p_frame_with_refresh_and_lf_deltas_and_token_updates` /
+        // `encode_p_frame_with_refresh_and_lf_deltas_and_intra_pick`:
+        // adj-enabled frames update the carried state with this frame's
+        // effective deltas; adj-disabled frames leave it unchanged. The
+        // §13.4 token-prob fitter does NOT affect the §9.4 delta carry —
+        // the fitter's bytes-vs-default safety guard does not interact
+        // with the loop-filter delta layer either way.
+        let (eff_ref, eff_mode) =
+            lf_deltas.effective(self.carried_ref_deltas, self.carried_mode_deltas);
+        if lf_deltas.enabled {
+            self.carried_ref_deltas = eff_ref;
+            self.carried_mode_deltas = eff_mode;
+        }
+
+        // ---- §9.7 / §9.8 reference-slot rotation -----------------------
+        // §20 page-147 ordering — identical to every other refresh-aware
+        // entry-point. The fitter's pass-2 vs. pass-1 reconstruction
+        // choice is already resolved inside
+        // `encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates`
+        // (it returns matched `(bytes, planes)`), so the slot we hand
+        // forward matches what the decoder will reconstruct from
+        // `bytes`.
         let current_slot = RefFrameSlot::from_keyframe_planes(&planes);
         let pre_last = self.last.clone();
         let pre_golden = self.golden.clone();

@@ -1,7 +1,7 @@
 //! Standalone-reachable lock-test for [`oxideav_vp8::quality_to_qindex`].
 //!
-//! `quality_to_qindex` is the libwebp-style quality (`0.0..=100.0`) to
-//! VP8 §9.6 `y_ac_qi` (`0..=127`) mapping that
+//! `quality_to_qindex` is the WebP-canonical `0.0..=100.0` quality
+//! scale to VP8 §9.6 `y_ac_qi` (`0..=127`) mapping that
 //! `oxideav-webp`'s lossy path relies on. The function is intentionally
 //! pure (no `oxideav-core` dep) so it MUST stay reachable under
 //! `--no-default-features` for embedded image / video pipelines that
@@ -28,7 +28,7 @@ fn quality_0_maps_to_qindex_127_worst() {
 }
 
 #[test]
-fn quality_75_maps_to_qindex_32_libwebp_default() {
+fn quality_75_maps_to_qindex_32_webp_canonical_default() {
     // round((100 - 75) * 1.27) = round(31.75) = 32 (half-away-from-zero).
     assert_eq!(quality_to_qindex(75.0), 32);
 }

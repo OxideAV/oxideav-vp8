@@ -7487,9 +7487,9 @@ pub fn make_silent_keyframe_encoder() -> SilentKeyframeEncoder {
     SilentKeyframeEncoder
 }
 
-// ───────────────────────── libwebp-style quality mapping ─────────────────────────
+// ───────────────────────── WebP-canonical quality mapping ─────────────────────────
 
-/// Map a libwebp-style `quality` scalar (`0.0..=100.0`) onto the VP8
+/// Map a WebP-canonical `0.0..=100.0` quality scalar onto the VP8
 /// §9.6 `y_ac_qi` quantiser index (`0..=127`, lower = higher quality).
 ///
 /// The mapping matches the on-wire convention `oxideav-webp`'s VP8 lossy
@@ -7558,8 +7558,8 @@ mod factory {
         make_encoder_with_qindex(params, KeyframeParams::default().y_ac_qi)
     }
 
-    /// Build a framework-side VP8 encoder with the libwebp-style
-    /// `quality` (`0.0..=100.0`, higher = better) translated into a
+    /// Build a framework-side VP8 encoder with the WebP-canonical
+    /// `0.0..=100.0` `quality` (higher = better) translated into a
     /// `y_ac_qi` via [`super::quality_to_qindex`].
     pub fn make_encoder_with_quality(
         params: &CodecParameters,

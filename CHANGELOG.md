@@ -4,6 +4,58 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.0...v0.2.1) - 2026-05-27
+
+### Other
+
+- 0.1.13 public-surface widen per API-COMPAT-0.1.13.md
+- API-COMPAT-0.1.13.md — minimum public surface from crates.io 0.1.13
+- encoder API finalize r166: public-surface lock for oxideav-webp lossy-VP8 binding
+- encoder Phase 18 r165: §11 intra-pick parallel-composed with §13.4 fitter on the stream-driver refresh + §9.4 deltas axis (RFC 6386 §11 / §13.4 / §13.5 / §9.4 / §9.7)
+- encoder Phase 17 r164: §13.4 fitter composed with §9.4 deltas on the stream-driver refresh path (RFC 6386 §13.4 / §13.5 / §9.4 / §9.7)
+- encoder Phase 16 r163: §9.4 mb_lf_adjustments() deltas + §11 intra-pick composed on the stream-driver refresh path (RFC 6386 §9.4 / §11 / §9.7 / §16.1)
+- encoder Phase 16 r162: §11 intra-within-inter MB picker threaded into Vp8InterStreamEncoder (RFC 6386 §11 / §9.7 / §9.8 / §16.1)
+- encoder Phase 16 r161: §11 intra-within-inter MB picker widened to 4 Y × 4 UV whole-block grid (RFC 6386 §11.2 / §11.4 / §16.1)
+- encoder Phase 16: §11 / §12.2 intra-within-inter MB picking — first cut (RFC 6386 §11 / §12.2 / §16.1)
+- encoder Phase 15: §13.4 fitter threaded into the multi-frame stream drivers (RFC 6386 §13.4 / §13.5 / §9.7)
+- encoder Phase 14: §13.4 token-prob observed-counts fitter for the inter (P-frame) path (RFC 6386 §13.4 / §13.5)
+- encoder Phase 13: §13.4 token-prob observed-counts fitter for the keyframe path (RFC 6386 §13.4 / §13.5)
+- encoder Phase 12: §13.4 token-prob caller-driven update layer for the inter (P-frame) path (RFC 6386 §13.4 / §13.5)
+- encoder Phase 12: §13.4 token-prob caller-driven update layer for the keyframe path (RFC 6386 §13.4 / §13.5)
+- expose §9.4 filter_type knob through KeyframeParams (RFC 6386 §9.4 / §15.2 / §15.3)
+- dequantise inter MB picker forward-transform coeffs before reconstruction (RFC 6386 §14.1)
+- encoder Phase 11: §9.4 caller-driven mb_lf_adjustments delta layer (RFC 6386 §9.4 / §19.2 / §20.6)
+- encoder Phase 11: §9.7 / §9.8 caller-driven reference-slot refresh patterns (RFC 6386 §9.7 / §9.8 / §19.2 / §20)
+- encoder Phase 11: §9.5 / §20.4 multi-partition inter token output (RFC 6386 §9.5 / §20.4 / §13.3)
+- encoder Phase 11: §16.2 ref_frame_tree GOLDEN/ALTREF selector in the RD picker (RFC 6386 §9.10/§16.2/§16.3)
+- encoder Phase 11: §16.4 SPLITMV per-sub-block MV walk in the RD picker (RFC 6386 §16.4 / §17.2 / §18.1)
+- encoder Phase 11: §16.2 NEARESTMV/NEARMV in the RD picker (RFC 6386 §16.2/§16.3)
+- encoder Phase 11: §18.3 quarter-pixel motion-search refinement (RFC 6386 §17.1 / §18.3)
+- encoder Phase 11: §18.3 half-pixel motion-search refinement (RFC 6386 §17.1 / §18.3)
+- encoder Phase 11: per-MB ZEROMV/NEWMV rate-distortion pick (RFC 6386 §16.2 / §16.3 / §17 / §18)
+- encoder Phase 11 begin: whole-pixel motion-search primitive (RFC 6386 §17.1 / §18.1 / §20.14)
+- encoder Phase 10: multi-frame I + P stream driver (RFC 6386 §9 / §16 / §17 / §18)
+- encoder Phase 9 begin: minimum-viable P-frame encoder (RFC 6386 §16 / §17 / §18)
+- encoder Phase 8: multi-frame keyframe stream driver (RFC 6386 §4 / §9.7 / §9.8)
+- wire §15 loop filter into the keyframe driver (Phase 7)
+- encoder Phase 6: multi-partition DCT output (RFC 6386 §9.5 / §20.4)
+- encoder Phase 5: rate-distortion intra mode selection (RFC 6386 §13 / §14)
+- encoder Phase 4: per-frame keyframe raster driver (RFC 6386 §9 / §11 / §19.2)
+- encoder Phase 3b: B_PRED 4×4 sub-block intra mode pick (RFC 6386 §11.3 / §12.3)
+- encoder Phase 3: whole-block intra mode pick (RFC 6386 §12.2)
+- encoder Phase 2: per-MB block-set wiring (RFC 6386 §13.3 / §14.2)
+- encoder Phase 2 begin: §14 forward 4×4 DCT + WHT primitives (RFC 6386 §14.3/§14.4)
+- encoder Phase 2: §13 DCT-token block encoder (RFC 6386 §13.2/§13.3)
+- rephrase BoolEncoder docstring (no behaviour change)
+- Phase 1 — §9 frame-header writers + silent-keyframe path
+- expose public Vp8Error umbrella at crate root
+- refresh decode_vp8 scope docstring (no behaviour change)
+- multi-frame Vp8DecoderState driver + bit-exact P-frame decode
+- §16.4 SPLITMV per-sub-block MV decoding + §18 SPLITMV reconstruction
+- §16.2/§16.3/§18.1 near/nearest MV census + inter-mode tree
+- §18.3 sub-pixel motion compensation (sixtap + bilinear)
+- Add §16.2/§18 whole-pixel interframe motion compensation
+
 ### Added — 0.1.13 public-surface widen (round 167, 2026-05-27)
 
 Per `crates/oxideav-vp8/API-COMPAT-0.1.13.md` (the parent's contract

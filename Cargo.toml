@@ -20,12 +20,15 @@ oxideav-core = { version = "0.1", optional = true }
 default = ["registry"]
 registry = ["dep:oxideav-core"]
 # `simd` opts into the §14.3 / §14.4 inverse-transform vectorised
-# kernels under `core::simd::Simd<i32, 4>` (the WHT and IDCT pull
-# four lanes per pass — see `src/inverse_transform.rs`). Requires a
+# kernels under `core::simd::Simd<i32, 4>` (the WHT and IDCT each
+# pull four lanes per pass — see `src/inverse_transform.rs`,
+# `inverse_wht_4x4_simd` and `inverse_dct_4x4_simd`). Requires a
 # nightly toolchain because `core::simd` is currently nightly-only.
 # The default (stable) build keeps the scalar fallback bit-for-bit
 # identical to the spec listing; the SIMD path is byte-exact against
-# the scalar path on every test fixture.
+# the scalar path on every test fixture (`dct_simd_matches_scalar_on_stress_inputs`
+# and `wht_simd_matches_scalar_on_stress_inputs` enforce that, both
+# on stable and on nightly+simd).
 simd = []
 
 [dev-dependencies]

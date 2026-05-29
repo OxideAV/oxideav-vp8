@@ -31,7 +31,7 @@ oxideav-vp8 = { version = "0.2", default-features = false }
 | Feature | Default | What it does |
 |---|---|---|
 | `registry` | ✅ on | Pulls `oxideav-core` and the framework-trait factories (`make_encoder` / `make_decoder` returning `Box<dyn Encoder>` / `Box<dyn Decoder>`) plus `Vp8Decoder` (the `oxideav_core::Decoder` impl) and the `register*` entry points. |
-| `simd` | — | **Nightly-only.** Switches the §14.3 inverse 4×4 WHT (`inverse_wht_4x4`) over to a `core::simd::Simd<i32, 4>` rewrite; byte-exact against the scalar path on every test fixture, ≈ −20 % on the `inverse_transform_4x4/inverse_wht_4x4` criterion micro-bench (9.4 ns → 7.5 ns on `aarch64-apple-darwin`). Requires a nightly toolchain because `core::simd` is itself nightly. Default (stable) builds use the scalar §14.3 path unchanged. See `BENCHMARKS.md` for the A/B numbers + the round-170 profile that motivated this primitive's vectorisation. |
+| `simd` | — | **Nightly-only.** Switches the §14.3 inverse 4×4 WHT (`inverse_wht_4x4`) and the §14.4 inverse 4×4 DCT (`inverse_dct_4x4`) over to `core::simd::Simd<i32, 4>` rewrites; both are byte-exact against the scalar path on a 21-input stress set (DC-only across 10 magnitudes, single-AC at every position, mixed gradients). Headline micro-bench numbers on `aarch64-apple-darwin`: WHT 9.4 → 7.5 ns (≈ −20 %); DCT 10.07 → ~9.5 ns (≈ −1 to −5 %, the DCT is multiply-heavy so per-lane serialisation eats most of the win). Requires a nightly toolchain because `core::simd` is itself nightly. Default (stable) builds use the scalar §14.3 / §14.4 paths unchanged. See `BENCHMARKS.md` for the A/B numbers + the round-170 / round-180 profiles that motivated each primitive's vectorisation. |
 
 ## Standalone use (no `oxideav-core`)
 

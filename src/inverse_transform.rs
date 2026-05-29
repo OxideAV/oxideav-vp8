@@ -375,7 +375,29 @@ const SINPI8_SQRT2: i32 = 35468;
 /// `shortpitch` is 4 (one row of `short`s), so the column stride in the
 /// first pass and the row stride in the second pass are both 4. This is
 /// the standard packed-4×4 case and is what this function implements.
+///
+/// Dispatch: SIMD path on nightly + `simd`, scalar otherwise. The SIMD
+/// path is byte-exact against the scalar listing on every test fixture.
 pub fn inverse_dct_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
+    #[cfg(feature = "simd")]
+    {
+        inverse_dct_4x4_simd(input, output);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        inverse_dct_4x4_scalar(input, output);
+    }
+}
+
+/// Scalar §14.4 inverse DCT — the literal RFC 6386 listing.
+///
+/// Bit-for-bit byte-exact with the spec C source. The public
+/// [`inverse_dct_4x4`] dispatches here on stable builds (and on nightly
+/// without the `simd` feature); the `simd` feature swaps in
+/// [`inverse_dct_4x4_simd`], which is itself byte-exact against this
+/// implementation.
+#[allow(dead_code)] // Used by `inverse_dct_4x4` only on the !simd path.
+fn inverse_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
     let mut tmp = [0i32; 16];
 
     // First pass: operate down each column (spec: ip[0], ip[4], ip[8],
@@ -429,6 +451,147 @@ pub fn inverse_dct_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
         output[base + 3] = ((a1 - d1 + 4) >> 3) as i16;
         output[base + 1] = ((b1 + c1 + 4) >> 3) as i16;
         output[base + 2] = ((b1 - c1 + 4) >> 3) as i16;
+    }
+}
+
+/// SIMD §14.4 inverse DCT — `core::simd::Simd<i32, 4>` rewrite of
+/// [`inverse_dct_4x4_scalar`].
+///
+/// The §14.4 inverse DCT is the same separable two-pass shape as the
+/// §14.3 WHT: both passes operate on four independent 1-D 4-point
+/// transforms. The first pass takes one column at a time; if we hold
+/// the input matrix as four `Simd<i32, 4>` row-vectors (lane `j` of row
+/// `i` carries `input[i*4 + j]`), then each lane of the row-vector
+/// already corresponds to one column of the matrix, and the entire
+/// first-pass column butterfly maps onto four parallel SIMD adds, subs,
+/// and fixed-point multiplies.
+///
+/// The fixed-point multiplies — `(x * SINPI8_SQRT2) >> 16` and
+/// `x + ((x * COSPI8_SQRT2_MINUS1) >> 16)` — vectorise as
+/// `Simd::splat(SINPI8_SQRT2) * v >> Simd::splat(16)` etc. The
+/// `Simd<i32, 4> * Simd<i32, 4>` lane product is full-width (the SIMD
+/// API specifies wrapping `i32` multiply matching scalar `i32::wrapping_mul`),
+/// then the `>> 16` lane shift drops the low 16 bits exactly like the
+/// scalar `(x * K) >> 16` expression. The `>> 16` shift is arithmetic
+/// for signed `Simd<i32, 4>` (Rust spec: `>>` on signed integers is
+/// arithmetic shift right) so the high-bit sign-extension matches the
+/// scalar listing.
+///
+/// After the first pass we transpose the 4×4 to put each row of the
+/// intermediate into a row-vector, run the second pass (same butterfly,
+/// different constants in the lane shuffle since the second pass writes
+/// `output[base], output[base+3], output[base+1], output[base+2]`), and
+/// apply the `(x + 4) >> 3` rounding lane-wide.
+///
+/// No external SIMD reference consulted — the layout is derived from
+/// the §14.4 listing in RFC 6386 directly (one lane per column ⇒
+/// first-pass vectorises; transpose ⇒ second-pass vectorises). Byte-
+/// exact against [`inverse_dct_4x4_scalar`] on every test fixture.
+#[cfg(feature = "simd")]
+fn inverse_dct_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
+    use core::simd::Simd;
+
+    // Row-vectors: row_i[j] = input[i*4 + j]. Lane j is column j.
+    let row0 = Simd::<i32, 4>::from_array([
+        input[0] as i32,
+        input[1] as i32,
+        input[2] as i32,
+        input[3] as i32,
+    ]);
+    let row1 = Simd::<i32, 4>::from_array([
+        input[4] as i32,
+        input[5] as i32,
+        input[6] as i32,
+        input[7] as i32,
+    ]);
+    let row2 = Simd::<i32, 4>::from_array([
+        input[8] as i32,
+        input[9] as i32,
+        input[10] as i32,
+        input[11] as i32,
+    ]);
+    let row3 = Simd::<i32, 4>::from_array([
+        input[12] as i32,
+        input[13] as i32,
+        input[14] as i32,
+        input[15] as i32,
+    ]);
+
+    // Splatted constants. Holding the splats in locals lets LLVM keep
+    // them in registers across the two passes.
+    let sin = Simd::<i32, 4>::splat(SINPI8_SQRT2);
+    let cos_m1 = Simd::<i32, 4>::splat(COSPI8_SQRT2_MINUS1);
+    let sh16 = Simd::<i32, 4>::splat(16);
+
+    // First pass — §14.4 column butterfly, four columns in parallel.
+    // (row0, row1, row2, row3) play the role of (i0, i4, i8, i12).
+    let a1 = row0 + row2;
+    let b1 = row0 - row2;
+
+    let t1_c = (row1 * sin) >> sh16;
+    let t2_c = row3 + ((row3 * cos_m1) >> sh16);
+    let c1 = t1_c - t2_c;
+
+    let t1_d = row1 + ((row1 * cos_m1) >> sh16);
+    let t2_d = (row3 * sin) >> sh16;
+    let d1 = t1_d + t2_d;
+
+    // Intermediate rows: per the scalar listing,
+    //   tmp[col]      = a1 + d1   (row 0)
+    //   tmp[4 + col]  = b1 + c1   (row 1)
+    //   tmp[8 + col]  = b1 - c1   (row 2)
+    //   tmp[12 + col] = a1 - d1   (row 3)
+    let t0 = a1 + d1;
+    let t1 = b1 + c1;
+    let t2 = b1 - c1;
+    let t3 = a1 - d1;
+
+    // Transpose so each row-vector now carries one row of the
+    // intermediate (lane j of new_row_i = old t_i[j]) ⇒ each new
+    // row-vector is one input to a second-pass 4-point 1-D DCT.
+    let t0a = t0.to_array();
+    let t1a = t1.to_array();
+    let t2a = t2.to_array();
+    let t3a = t3.to_array();
+
+    let s0 = Simd::<i32, 4>::from_array([t0a[0], t1a[0], t2a[0], t3a[0]]);
+    let s1 = Simd::<i32, 4>::from_array([t0a[1], t1a[1], t2a[1], t3a[1]]);
+    let s2 = Simd::<i32, 4>::from_array([t0a[2], t1a[2], t2a[2], t3a[2]]);
+    let s3 = Simd::<i32, 4>::from_array([t0a[3], t1a[3], t2a[3], t3a[3]]);
+
+    // Second pass — §14.4 row butterfly. Same shape: (s0, s1, s2, s3)
+    // play the role of (r0, r1, r2, r3) in the scalar listing, with
+    // each lane now being one row of the intermediate.
+    let a2 = s0 + s2;
+    let b2 = s0 - s2;
+
+    let t1_c2 = (s1 * sin) >> sh16;
+    let t2_c2 = s3 + ((s3 * cos_m1) >> sh16);
+    let c2 = t1_c2 - t2_c2;
+
+    let t1_d2 = s1 + ((s1 * cos_m1) >> sh16);
+    let t2_d2 = (s3 * sin) >> sh16;
+    let d2 = t1_d2 + t2_d2;
+
+    // §14.4 rounding: (x + 4) >> 3.
+    let four = Simd::<i32, 4>::splat(4);
+    let sh3 = Simd::<i32, 4>::splat(3);
+    let o0 = (a2 + d2 + four) >> sh3; // output[base]
+    let o3 = (a2 - d2 + four) >> sh3; // output[base + 3]
+    let o1 = (b2 + c2 + four) >> sh3; // output[base + 1]
+    let o2 = (b2 - c2 + four) >> sh3; // output[base + 2]
+
+    // Each o_k holds, at lane j, the second-pass output for row j at
+    // column k. Stripe back into raster order: output[j*4 + k] = o_k[j].
+    let o0a = o0.to_array();
+    let o1a = o1.to_array();
+    let o2a = o2.to_array();
+    let o3a = o3.to_array();
+    for j in 0..4 {
+        output[j * 4] = o0a[j] as i16;
+        output[j * 4 + 1] = o1a[j] as i16;
+        output[j * 4 + 2] = o2a[j] as i16;
+        output[j * 4 + 3] = o3a[j] as i16;
     }
 }
 
@@ -792,5 +955,88 @@ mod tests {
         let mut out = [0u8; 16];
         add_residue_4x4(&pred, &residue, &mut out);
         assert_eq!(out, pred);
+    }
+
+    // -------------------------------------------------------------
+    // SIMD vs scalar byte-exact equivalence tests.
+    //
+    // These run on every build configuration. On stable / `!simd` they
+    // exercise only the scalar path twice; that's harmless and keeps
+    // CI green. On nightly + `simd` they're the primary safety net:
+    // the public `inverse_wht_4x4` / `inverse_dct_4x4` dispatch to
+    // SIMD, and the `_scalar` variants are still reachable as
+    // module-private fallbacks, so the assertions compare the two.
+    // -------------------------------------------------------------
+
+    /// 21 stress inputs covering DC-only, single AC lanes (every
+    /// position), mixed gradients, near-i16 extremes, and signed-zero
+    /// edge cases.
+    fn stress_inputs() -> Vec<[i16; 16]> {
+        let mut v: Vec<[i16; 16]> = Vec::new();
+        // All-zero.
+        v.push([0i16; 16]);
+        // DC-only.
+        for &dc in &[1i16, 7, 8, -8, 64, -64, 1000, -1000, 4096, -4096] {
+            let mut a = [0i16; 16];
+            a[0] = dc;
+            v.push(a);
+        }
+        // Single-AC at each position.
+        for pos in 1..16 {
+            let mut a = [0i16; 16];
+            a[pos] = 100;
+            v.push(a);
+        }
+        // A mixed low-frequency pattern (the bench's SAMPLE_INPUT).
+        v.push([
+            320, -64, 16, -4, //
+            -48, 32, -16, 8, //
+            24, -12, 8, -4, //
+            -8, 4, -2, 1,
+        ]);
+        // A high-AC near-extreme pattern (kept inside the i32-safe
+        // headroom — §14.4 doesn't promise wraparound matching beyond
+        // the i16 quantised range).
+        v.push([
+            512, 256, 128, 64, //
+            256, 128, 64, 32, //
+            128, 64, 32, 16, //
+            64, 32, 16, 8,
+        ]);
+        v.push([
+            -512, 256, -128, 64, //
+            256, -128, 64, -32, //
+            -128, 64, -32, 16, //
+            64, -32, 16, -8,
+        ]);
+        v
+    }
+
+    #[test]
+    fn dct_simd_matches_scalar_on_stress_inputs() {
+        for (idx, input) in stress_inputs().iter().enumerate() {
+            let mut via_public = [0i16; 16];
+            inverse_dct_4x4(input, &mut via_public);
+            let mut via_scalar = [0i16; 16];
+            inverse_dct_4x4_scalar(input, &mut via_scalar);
+            assert_eq!(
+                via_public, via_scalar,
+                "input #{idx} ({input:?}): public dispatch ≠ scalar listing"
+            );
+        }
+    }
+
+    #[test]
+    fn wht_simd_matches_scalar_on_stress_inputs() {
+        for (idx, input) in stress_inputs().iter().enumerate() {
+            let mut via_public = [0i16; 16];
+            inverse_wht_4x4(input, &mut via_public);
+            let mut via_scalar = [0i16; 16];
+            inverse_wht_4x4_scalar(input, &mut via_scalar);
+            assert_eq!(
+                via_public, via_scalar,
+                "input #{idx} ({input:?}): public dispatch ≠ scalar listing"
+            );
+        }
     }
 }

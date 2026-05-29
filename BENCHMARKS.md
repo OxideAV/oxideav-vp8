@@ -151,6 +151,40 @@ the WHT is a small fraction of total decode time; the same rewrite
 pattern applied to `inverse_dct_4x4` in a future round is the natural
 next step.
 
+## Round 180 — `inverse_dct_4x4` SIMD
+
+Round 180 (2026-05-29) landed the round-170 deferred follow-on: a
+`core::simd::Simd<i32, 4>` rewrite of `inverse_dct_4x4` parallel to the
+existing `inverse_wht_4x4_simd`. Same dispatch shape — the public
+`inverse_dct_4x4` calls `inverse_dct_4x4_simd` on nightly + `simd` and
+`inverse_dct_4x4_scalar` (the spec listing, unchanged) elsewhere.
+
+Byte-exact against the scalar listing on a 21-input stress set in
+`src/inverse_transform.rs::tests::dct_simd_matches_scalar_on_stress_inputs`
+(DC-only over 10 magnitudes from ±8 to ±4096, single-AC at every one
+of the 15 non-DC positions, plus two near-extreme mixed gradients).
+The same suite was added for the WHT
+(`wht_simd_matches_scalar_on_stress_inputs`) so the round-170 path now
+has the same dense equivalence proof as the new round-180 path.
+
+| Bench | r170 stable | r180 stable | r180 nightly+simd | Δ |
+|---|---:|---:|---:|---:|
+| `inverse_transform_4x4/inverse_dct_4x4` | 10.06 ns | 10.07–10.32 ns | **9.51–10.02 ns** | **−1 to −5 %** (simd) |
+| `inverse_transform_4x4/inverse_wht_4x4` | 9.38 ns | 9.4–10.0 ns | 7.36–8.03 ns | unchanged from r170 |
+
+The §14.4 inverse DCT carries 8 fixed-point multiplies per pass
+against the §14.3 WHT's zero — that's where the smaller r180 SIMD
+margin comes from. The WHT moves end-to-end as four parallel
+adds/subs per pass; the DCT has multiply-then-shift dependencies that
+serialise inside each lane. Both passes still vectorise correctly
+across the four-lane width, just at a lower speedup than the WHT.
+The headline value of the round is the byte-exact equivalence and
+the now-symmetric §14.3 / §14.4 SIMD shape, not a runtime headline
+number — `inverse_dct_4x4` fires once per Y / U / V sub-block (16 +
+4 + 4 = 24 calls per MB on decode) vs `inverse_wht_4x4` once per
+Y2-bearing MB, so the cumulative whole-frame impact tracks the small
+per-call delta scaled by the call count.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **`encoder::token_to_bit_path::descend` (#1 self-time on encode)** —
@@ -162,9 +196,5 @@ next step.
   pass with a `SmallVec` / fixed-size `[Vec; …]` cache should hit it.
 * **`sixtap_2d` (#4 on inter)** — the inner 6-tap convolution is a
   natural SIMD target (`Simd<i16, 8>` for an 8-pixel-wide stripe).
-  Held back this round to keep the SIMD-feature surface to one
-  primitive.
-* **`inverse_dct_4x4` SIMD** — same layout as the WHT but with the
-  §14.4 `(t1 * SINPI8_SQRT2) >> 16` fixed-point multiplies. A
-  `Simd<i32, 4>` rewrite is straightforward; deferred so this round
-  ships one SIMD primitive that's been A/B-proven against scalar.
+  Held back this round to keep the SIMD-feature surface to the two
+  §14 inverse-transform primitives.

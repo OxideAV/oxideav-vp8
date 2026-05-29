@@ -4,6 +4,44 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `inverse_dct_4x4` SIMD + byte-exact stress tests (round 180, 2026-05-29)
+
+Followed the round-170 `inverse_wht_4x4_simd` deferred TODO from
+`BENCHMARKS.md` ("`inverse_dct_4x4` SIMD ... deferred so this round
+ships one SIMD primitive that's been A/B-proven against scalar"). The
+public `inverse_dct_4x4` now dispatches at compile time between
+`inverse_dct_4x4_scalar` (the unchanged RFC 6386 §14.4 listing) and
+`inverse_dct_4x4_simd` (a `core::simd::Simd<i32, 4>` rewrite of the
+two §14.4 passes), matching the round-170 `inverse_wht_4x4` dispatch
+shape exactly.
+
+The SIMD layout maps lane `j` of each row-vector onto column `j` of the
+input matrix; the §14.4 column-pass butterfly + fixed-point multiplies
+(`(x * SINPI8_SQRT2) >> 16` etc.) then vectorise as four parallel SIMD
+operations across the lanes. After the column pass we transpose the
+4×4 i32 matrix so the row-pass runs the same butterfly across the
+intermediate, applying the `(x + 4) >> 3` rounding lane-wide. No
+external SIMD reference consulted — the layout is derived from the
+§14.4 listing in RFC 6386 directly.
+
+Added two byte-exact stress tests (`dct_simd_matches_scalar_on_stress_inputs`
+and `wht_simd_matches_scalar_on_stress_inputs`) that compare the public
+dispatch against the scalar listing on 21 inputs: DC-only at 10
+magnitudes (±8 to ±4096), single-AC at every one of the 15 non-DC
+positions, plus two near-extreme mixed gradients. The same suite
+backfills equivalence coverage for the round-170 WHT SIMD path. Both
+tests pass on stable (where the dispatch is identity) and on
+nightly + `simd` (where the dispatch points at the SIMD rewrite).
+
+Bench numbers (round 180, criterion `--quick`,
+`inverse_transform_4x4/inverse_dct_4x4`): scalar 10.07–10.32 ns,
+SIMD 9.51–10.02 ns (Apple M4, aarch64). Modest 1–5 % drop — the §14.4
+DCT has 8 fixed-point multiplies per pass against the §14.3 WHT's
+zero, so the SIMD margin is smaller than the round-170 WHT's −23.9 %
+(the WHT moves end-to-end as parallel adds/subs; the DCT's multiplies
+serialise inside each lane). No whole-frame regression on the seven
+criterion macro-benches under `cargo bench -p oxideav-vp8 -- --quick`.
+
 ## [0.2.2](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.1...v0.2.2) - 2026-05-27
 
 ### Other

@@ -4,6 +4,12 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.3](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.2...v0.2.3) - 2026-05-29
+
+### Other
+
+- inverse_dct_4x4 SIMD r180: §14.4 vectorisation parallel to round-170 WHT (RFC 6386 §14.4)
+
 ### Added — `inverse_dct_4x4` SIMD + byte-exact stress tests (round 180, 2026-05-29)
 
 Followed the round-170 `inverse_wht_4x4_simd` deferred TODO from

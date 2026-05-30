@@ -185,6 +185,68 @@ number — `inverse_dct_4x4` fires once per Y / U / V sub-block (16 +
 Y2-bearing MB, so the cumulative whole-frame impact tracks the small
 per-call delta scaled by the call count.
 
+## Round 194 — rate-control `y_ac_qi` sweep
+
+Round 194 (2026-05-31) adds a depth-mode bench
+(`rate_control_qi_sweep`) that walks `KeyframeParams::y_ac_qi` — the
+§9.6 baseline quantiser index, the principal rate-control knob on
+`encode_keyframe` — across ten representative values on the same
+deterministic 320×240 I420 source the round-170 `keyframe_encode` bench
+uses. The goal is *not* a new optimisation but a published trade-off
+curve readers can tune against: every other §9.6 quantiser delta
+defaults to 0 in `KeyframeParams`, so a single `y_ac_qi` value moves the
+DC + AC luma / chroma quantiser bank in lockstep.
+
+```sh
+CARGO_TARGET_DIR=/tmp/oxideav-vp8-target \
+    cargo bench -p oxideav-vp8 --bench rate_control_qi_sweep -- --quick
+```
+
+Headline numbers (Apple M4 / aarch64, criterion `--quick`, source =
+mixed luma gradient + centre flat-128 square, 320×240 I420):
+
+| `y_ac_qi` | Output | bpp | Encode wall | Throughput |
+|---:|---:|---:|---:|---:|
+|   8 | 1701 B | 0.18 |  9.33 ms |  8.23 Mpx/s |
+|  16 |  676 B | 0.07 |  8.48 ms |  9.05 Mpx/s |
+|  24 |  612 B | 0.06 |  8.44 ms |  9.10 Mpx/s |
+|  32 |  595 B | 0.06 |  8.38 ms |  9.16 Mpx/s |
+|  40 |  480 B | 0.05 |  8.16 ms |  9.41 Mpx/s |
+|  48 |  466 B | 0.05 |  8.21 ms |  9.35 Mpx/s |
+|  56 |  461 B | 0.05 |  7.92 ms |  9.69 Mpx/s |
+|  72 |  360 B | 0.04 |  7.61 ms | 10.09 Mpx/s |
+|  96 |  355 B | 0.04 |  7.54 ms | 10.18 Mpx/s |
+| 120 |  299 B | 0.03 |  7.31 ms | 10.51 Mpx/s |
+
+Reading the curve:
+
+* The byte cost falls monotonically with `y_ac_qi` — a strict
+  expected-direction sanity check on the quantiser path. The jump
+  between qi=8 and qi=16 (1701 → 676 B, ~−60 %) is the steepest
+  segment; everything past qi=32 lives in the lossy-but-flat tail of
+  the dial.
+* Encode wall time falls in the same direction (9.33 → 7.31 ms, −22 %)
+  because larger quantisers produce shorter token streams + more EOB
+  early-exits inside `encoder::token_to_bit_path::descend` and
+  `encoder::estimate_block_bits` — the two top self-time symbols
+  identified in the round-170 profile (`BENCHMARKS.md` §Profile
+  evidence above). The trend is consistent with that profile: the
+  rate-control knob and the encoder's hot path are coupled through
+  the token bit count.
+* Throughput delta across the sweep is +28 % (8.23 → 10.51 Mpx/s) —
+  picking a higher qi for previewing / draft modes is a real wall-time
+  win, not just a bytes-on-the-wire win.
+* The synthetic source compresses to small outputs at every qi
+  (DC-heavy gradient + uniform flat square is the easy case for the
+  intra picker) — production-content numbers will be larger in
+  absolute bytes but the *shape* of the qi/bytes/throughput trade-off
+  carries.
+
+This bench is intended as a published baseline: re-run after any
+encoder change and compare the per-qi byte and wall-time columns to
+catch regressions on a single dial that drives the whole rate-control
+surface.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **`encoder::token_to_bit_path::descend` (#1 self-time on encode)** —

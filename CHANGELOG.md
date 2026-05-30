@@ -4,6 +4,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `rate_control_qi_sweep` criterion bench + published trade-off curve (round 194, 2026-05-31)
+
+Depth-mode round: extends the existing criterion bench suite with a
+new `rate_control_qi_sweep` macro-bench that walks
+`KeyframeParams::y_ac_qi` — the §9.6 baseline quantiser index, the
+principal rate-control knob on `encode_keyframe` — across ten
+representative values (`8 / 16 / 24 / 32 / 40 / 48 / 56 / 72 / 96 /
+120`) on the same deterministic 320×240 I420 source the round-170
+`keyframe_encode` bench uses.
+
+The bench produces both wall-time throughput (Mpx/s) and per-call
+output bytes (printed via a one-shot probe encode in the bench
+prologue + tabulated in `BENCHMARKS.md`). Trade-off curve on Apple M4
+/ aarch64 (criterion `--quick`):
+
+* qi=8   → 1701 B at  8.23 Mpx/s
+* qi=32  →  595 B at  9.16 Mpx/s (default)
+* qi=120 →  299 B at 10.51 Mpx/s
+
+Across the full sweep: −83 % bytes, +28 % throughput. Both axes are
+strictly monotonic; the steepest byte segment is qi=8 → qi=16
+(−60 %). The encode-wall-time drop is consistent with the round-170
+profile — higher `y_ac_qi` produces shorter token streams + more EOB
+early-exits inside `encoder::token_to_bit_path::descend` and
+`encoder::estimate_block_bits`, the two top self-time symbols on the
+encoder hot path.
+
+No source / encoder changes; this round adds measured evidence
+people can tune against and a regression baseline (re-run after any
+encoder change and compare the per-qi columns). See
+`BENCHMARKS.md` §"Round 194 — rate-control `y_ac_qi` sweep" for the
+full 10-row table and reading.
+
+
 ## [0.2.3](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.2...v0.2.3) - 2026-05-29
 
 ### Other

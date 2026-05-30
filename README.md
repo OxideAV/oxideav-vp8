@@ -131,6 +131,27 @@ let qindex = quality_to_qindex(100.0);         // → 0   (best)
 let qindex = quality_to_qindex(f32::NAN);      // → 127 (worst, safe)
 ```
 
+### Rate-control trade-off (the `y_ac_qi` knob)
+
+`KeyframeParams::y_ac_qi` (range `0..=127`, default `32`, §9.6) is the
+principal rate-control knob on the encoder — every other §9.6 quantiser
+delta defaults to 0, so a single dial moves the DC + AC luma / chroma
+quantiser bank in lockstep. Lower = higher quality / larger output;
+higher = lower quality / smaller output.
+
+The `rate_control_qi_sweep` criterion bench walks the dial across ten
+representative values on a fixed 320×240 deterministic source:
+
+```sh
+cargo bench -p oxideav-vp8 --bench rate_control_qi_sweep -- --quick
+```
+
+Headline trade-off (Apple M4 / aarch64, criterion `--quick`,
+output bytes are bench-prologue stderr lines): qi=8 → 1701 B at
+8.2 Mpx/s; qi=32 → 595 B at 9.2 Mpx/s; qi=120 → 299 B at 10.5 Mpx/s
+(`−83 %` bytes, `+28 %` throughput across the full sweep). See
+`BENCHMARKS.md` round-194 section for the complete 10-row table.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

@@ -65,3 +65,12 @@ harness = false
 [[bench]]
 name = "loop_filter_normal"
 harness = false
+
+# Round 194 bench. Sweeps `KeyframeParams::y_ac_qi` (the §9.6 baseline
+# quantiser index, the principal rate-control knob) across 10 values
+# on the same 320×240 deterministic source used by `keyframe_encode`,
+# so readers can pair wall-time throughput with output-byte cost when
+# tuning the dial.
+[[bench]]
+name = "rate_control_qi_sweep"
+harness = false

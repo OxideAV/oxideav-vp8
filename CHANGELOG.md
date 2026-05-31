@@ -4,6 +4,33 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `cargo-fuzz` harness suite (round 200, 2026-06-01)
+
+Depth-mode round: stands up a new `fuzz/` nested workspace with three
+libFuzzer targets, none of which existed in any prior round. The
+contract across all three is panic-freedom — public APIs MUST surface
+malformed input as a `Result::Err`, never via panic, abort,
+debug-arithmetic overflow, or out-of-bounds index.
+
+| Target | Surface |
+|--------|---------|
+| `panic_free_decode_keyframe` | `decode_vp8` — one-shot keyframe decode end-to-end. Pre-flighted by a §9.1 dimension cap (256 × 256 luma pixels) so wire-legal 14-bit width / height extremes don't OOM the runner. |
+| `panic_free_decoder_state`   | `Vp8DecoderState::decode_frame` driven over a length-prefixed packet sequence — the §9.7 LAST / GOLDEN / ALTREF refresh ladder, i.e. the *extreme reference-frame dependency* path a one-shot decode call can't reach. |
+| `parse_headers`              | Six pure-parse entry points: `frame_tag::parse_header`, `frame_tag::parse_keyframe_header`, `frame_header::Vp8FrameHeader::parse`, `coded_header::Vp8CodedHeader::parse` (key + inter), `ivf::parse_header`, `ivf::parse_frame_header`. The §19.2 walk in particular exercises `update_segmentation`, `mb_lf_adjustments`, `quant_indices`, `token_prob_update`, and `mv_prob_update` — the malformed-segmentation-map / LF-delta / token-prob-update paths the depth-mode brief explicitly called out. |
+
+Initial smoke pass on `aarch64-apple-darwin` (Apple M-series,
+nightly libFuzzer): 200 000 iterations on `parse_headers` in ~4 s,
+300 000 iterations on each of `panic_free_decode_keyframe` and
+`panic_free_decoder_state` in ~1 s each — zero panics across
+800 000 combined iterations starting from an empty seed corpus.
+The targets are intended to run continuously on demand
+(`cargo +nightly fuzz run <target>`), not as part of umbrella CI;
+the fuzz crate is a nested workspace (`[workspace] members = ["."]`)
+so it is NOT pulled into the umbrella's `crates/*` glob.
+
+No `src/` changes; this round adds a regression baseline for
+fuzz-discoverable defects.
+
 ### Added — `rate_control_qi_sweep` criterion bench + published trade-off curve (round 194, 2026-05-31)
 
 Depth-mode round: extends the existing criterion bench suite with a

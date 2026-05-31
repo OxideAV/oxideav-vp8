@@ -205,6 +205,24 @@ unit tests:
   cleanly via `eprintln! + return` when `ffmpeg` isn't on `$PATH` —
   never `#[ignore]`.
 
+## Fuzz harnesses
+
+The crate ships three `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+that exercise the public decode-side surface for panic-freedom:
+
+* `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
+  at 256 × 256.
+* `panic_free_decoder_state` — multi-packet `Vp8DecoderState::decode_frame`
+  drives the §9.7 LAST / GOLDEN / ALTREF refresh ladder.
+* `parse_headers` — `frame_tag::parse_header` / `parse_keyframe_header`,
+  `Vp8FrameHeader::parse`, `Vp8CodedHeader::parse` (key + inter — the
+  §19.2 segmentation-map / MB-LF-adjustments / token-prob-update /
+  MV-prob-update walk), and the IVF framing layer.
+
+Initial smoke pass: 800 000 combined iterations, zero panics. See
+[`fuzz/README.md`](./fuzz/README.md) for caps, run instructions, and
+the rationale behind each target's pre-flight gating.
+
 ## License
 
 MIT. See [`LICENSE`](./LICENSE).

@@ -1,0 +1,71 @@
+[package]
+name = "oxideav-vp8-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# oxideav-vp8 is the pure-Rust VP8 video codec (RFC 6386). This fuzz
+# crate exercises the public decode-side entry points with arbitrary
+# attacker bytes — none of them may ever panic, abort, or index out of
+# bounds. Three targets cover the layered surface:
+#
+#   * `panic_free_decode_keyframe`  — one-shot `decode_vp8`
+#   * `panic_free_decoder_state`    — stateful multi-frame
+#                                     `Vp8DecoderState::decode_frame`
+#                                     (LAST / GOLDEN / ALTREF carry-over,
+#                                      extreme reference-frame dependency)
+#   * `parse_headers`               — `frame_tag::parse_header`,
+#                                     `parse_keyframe_header`,
+#                                     `Vp8FrameHeader::parse`,
+#                                     `Vp8CodedHeader::parse` (malformed
+#                                     segmentation maps, MB-LF
+#                                     adjustments, token-prob updates,
+#                                     MV-prob updates) and the IVF
+#                                     framing layer (`ivf::parse_header`
+#                                     / `ivf::parse_frame_header`).
+#
+# The harness uses no oracle and depends on no external library — it's a
+# pure differential-against-spec sanity sweep.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-vp8]
+path = ".."
+
+[lib]
+name = "oxideav_vp8_fuzz"
+path = "src/lib.rs"
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace at `crates/*` glob-resolve time.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+[[bin]]
+name = "panic_free_decode_keyframe"
+path = "fuzz_targets/panic_free_decode_keyframe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_decoder_state"
+path = "fuzz_targets/panic_free_decoder_state.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_headers"
+path = "fuzz_targets/parse_headers.rs"
+test = false
+doc = false

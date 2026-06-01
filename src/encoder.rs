@@ -1475,44 +1475,135 @@ impl core::fmt::Display for TokenEncodeError {
 
 impl std::error::Error for TokenEncodeError {}
 
-/// Walk [`ENC_COEFF_TREE`] starting at internal node `start_index` and
-/// record the `(prob_index, bit)` sequence that lands at the leaf for
-/// `target`. Mirrors the decoder's `treed_read_coef` traversal but
-/// runs backwards from a known leaf.
+/// One step of a §13.2 token bit-path: the `coeff_probs[…][prob_index]`
+/// slot to consult and the bit to emit / decode at that node.
 ///
-/// Returns the list of `(i_half, bit)` pairs in the exact order the
-/// decoder will read them. The `start_index` distinguishes the §13.2
-/// "may emit EOB" case (`0`) from the "previous coefficient was DCT_0"
-/// case (`2`, EOB branch bypassed).
-fn token_to_bit_path(token: DctToken, start_index: i8) -> Vec<(usize, bool)> {
-    let target = token as i8;
+/// Width matches the `(usize, bool)` tuple the three call sites in this
+/// module iterate over so the table reads as a drop-in replacement for
+/// the prior `Vec<(usize, bool)>`.
+#[derive(Clone, Copy, Debug)]
+struct TokenBitStep {
+    /// The `coeff_probs[plane][band][ctx3][prob_index]` slot index — the
+    /// `i_half` value the call sites pass into `probs[i_half]`.
+    prob_index: u8,
+    /// The boolean to emit (encoder) / accumulate against the prob
+    /// (RD scorer / fitter).
+    bit: bool,
+}
 
-    fn descend(i: i8, target: i8, path: &mut Vec<(usize, bool)>) -> bool {
+/// Maximum bit-path width across the 24 reachable `(start_index, token)`
+/// combinations. Computed in `precompute_token_bit_paths` below — the
+/// deepest leaves (`Cat3..Cat6` from root) emit exactly 7 bits; every
+/// other path is shorter. The fixed-width buffer lets the table live in
+/// static storage with zero per-call allocation.
+const TOKEN_BIT_PATH_MAX_LEN: usize = 7;
+
+/// One precomputed table entry: a fixed-width buffer of up to
+/// [`TOKEN_BIT_PATH_MAX_LEN`] [`TokenBitStep`]s plus the number of valid
+/// leading slots. Type-aliased to keep [`TOKEN_BIT_PATHS`] readable.
+type TokenBitPathEntry = ([TokenBitStep; TOKEN_BIT_PATH_MAX_LEN], u8);
+
+/// The full table: `[start_slot ∈ {0, 1}][token ∈ 0..12]` →
+/// [`TokenBitPathEntry`]. See [`TOKEN_BIT_PATHS`] for indexing.
+type TokenBitPathTable = [[TokenBitPathEntry; 12]; 2];
+
+/// Precomputed token bit paths for every `(start_index, token)` pair
+/// reachable from [`ENC_COEFF_TREE`]. Indexed as
+/// `TOKEN_BIT_PATHS[start_slot][token as usize]`, where `start_slot` is
+/// `0` for `start_index = 0` (the §13.2 root including the Eob branch)
+/// and `1` for `start_index = 2` (the "previous coefficient was DCT_0"
+/// shortcut that bypasses the Eob split).
+///
+/// Each entry is `(buffer, length)`; only the leading `length` slots of
+/// `buffer` are valid. `(start_slot = 1, token = Eob)` is unreachable
+/// (§13.2 explicitly forbids EOB after a DCT_0) and stores `length = 0`
+/// as a tombstone; the call sites never request it.
+///
+/// Computed at module load via `std::sync::LazyLock`. The first call
+/// inside the encoder hot path drives the one-time cost; every
+/// subsequent token emission resolves to a single index-and-slice.
+static TOKEN_BIT_PATHS: std::sync::LazyLock<TokenBitPathTable> =
+    std::sync::LazyLock::new(precompute_token_bit_paths);
+
+fn precompute_token_bit_paths() -> TokenBitPathTable {
+    let zero = TokenBitStep {
+        prob_index: 0,
+        bit: false,
+    };
+    let mut out = [[([zero; TOKEN_BIT_PATH_MAX_LEN], 0u8); 12]; 2];
+
+    fn descend(
+        i: i8,
+        target: i8,
+        buf: &mut [TokenBitStep; TOKEN_BIT_PATH_MAX_LEN],
+        len: &mut usize,
+    ) -> bool {
         for &bit in &[false, true] {
             let child = ENC_COEFF_TREE[i as usize + bit as usize];
             if child <= 0 {
                 if -child == target {
-                    path.push(((i as usize) >> 1, bit));
+                    buf[*len] = TokenBitStep {
+                        prob_index: (i as usize >> 1) as u8,
+                        bit,
+                    };
+                    *len += 1;
                     return true;
                 }
             } else {
-                path.push(((i as usize) >> 1, bit));
-                if descend(child, target, path) {
+                buf[*len] = TokenBitStep {
+                    prob_index: (i as usize >> 1) as u8,
+                    bit,
+                };
+                *len += 1;
+                if descend(child, target, buf, len) {
                     return true;
                 }
-                path.pop();
+                *len -= 1;
             }
         }
         false
     }
 
-    let mut out = Vec::with_capacity(8);
-    let ok = descend(start_index, target, &mut out);
+    for (slot, &start) in [0i8, 2i8].iter().enumerate() {
+        for token in 0i8..12 {
+            let mut buf = [zero; TOKEN_BIT_PATH_MAX_LEN];
+            let mut len = 0usize;
+            if descend(start, token, &mut buf, &mut len) {
+                out[slot][token as usize] = (buf, len as u8);
+            }
+            // (slot = 1, token = Eob) is unreachable; the (zeros, 0)
+            // tombstone is correct and never indexed by the encoder.
+        }
+    }
+    out
+}
+
+/// Walk [`ENC_COEFF_TREE`] starting at internal node `start_index` and
+/// return the `(prob_index, bit)` sequence that lands at the leaf for
+/// `target`. Mirrors the decoder's `treed_read_coef` traversal but
+/// runs backwards from a known leaf.
+///
+/// Resolves through the precomputed [`TOKEN_BIT_PATHS`] table — every
+/// reachable `(start_index, token)` pair is materialised at module load,
+/// so each call is a single index + slice borrow with no allocation.
+/// The `start_index` distinguishes the §13.2 "may emit EOB" case (`0`)
+/// from the "previous coefficient was DCT_0" case (`2`, EOB branch
+/// bypassed).
+fn token_to_bit_path(token: DctToken, start_index: i8) -> &'static [TokenBitStep] {
+    let slot = match start_index {
+        0 => 0usize,
+        2 => 1usize,
+        _ => {
+            debug_assert!(false, "unsupported coeff_tree start_index {start_index}");
+            0
+        }
+    };
+    let (buf, len) = &TOKEN_BIT_PATHS[slot][token as usize];
     debug_assert!(
-        ok,
+        *len > 0,
         "token {token:?} not reachable from coeff_tree index {start_index}"
     );
-    out
+    &buf[..*len as usize]
 }
 
 /// Look up the cat-token's `(base, prob_list)` pair. Returns `None`
@@ -1611,8 +1702,8 @@ pub fn encode_coeff_block(
         // EOB-vs-rest split bit, so neither must we write it.
         let start = if prev_was_zero { 2i8 } else { 0i8 };
 
-        for (i_half, bit) in token_to_bit_path(token, start) {
-            enc.write_bool(probs[i_half], bit);
+        for step in token_to_bit_path(token, start) {
+            enc.write_bool(probs[step.prob_index as usize], step.bit);
         }
 
         if token == DctToken::Eob {
@@ -1962,8 +2053,8 @@ fn estimate_block_bits(
         };
 
         let start = if prev_was_zero { 2i8 } else { 0i8 };
-        for (i_half, bit) in token_to_bit_path(token, start) {
-            bits += bool_bits(probs[i_half], bit);
+        for step in token_to_bit_path(token, start) {
+            bits += bool_bits(probs[step.prob_index as usize], step.bit);
         }
 
         if token == DctToken::Eob {
@@ -3107,9 +3198,9 @@ pub fn count_block_branches(
         };
 
         let start = if prev_was_zero { 2i8 } else { 0i8 };
-        for (i_half, bit) in token_to_bit_path(token, start) {
-            let slot = &mut counts[plane][band][ctx3][i_half];
-            if bit {
+        for step in token_to_bit_path(token, start) {
+            let slot = &mut counts[plane][band][ctx3][step.prob_index as usize];
+            if step.bit {
                 slot.1 += 1;
             } else {
                 slot.0 += 1;
@@ -8503,6 +8594,104 @@ mod tests {
     use crate::coded_header::Vp8CodedHeader;
     use crate::decode_vp8;
     use crate::frame_header::Vp8FrameHeader;
+
+    /// Equivalence proof for the precomputed `TOKEN_BIT_PATHS` table:
+    /// for every reachable `(start_index, token)` combination, the
+    /// table's stored `(prob_index, bit)` sequence must equal the result
+    /// of running the §13.2 tree descent on `ENC_COEFF_TREE` directly.
+    /// Also asserts the one unreachable cell (`start_index = 2`,
+    /// `token = Eob`) stays a length-0 tombstone — the §13.2 "previous
+    /// coefficient was DCT_0 → skip Eob branch" invariant — so any
+    /// future call to it will trip the in-function `debug_assert`.
+    #[test]
+    fn token_bit_path_table_matches_tree_descent() {
+        // Reference descent — duplicates the original recursive walk
+        // before round 204 precomputed it into TOKEN_BIT_PATHS.
+        fn reference_descent(i: i8, target: i8, path: &mut Vec<(usize, bool)>) -> bool {
+            for &bit in &[false, true] {
+                let child = ENC_COEFF_TREE[i as usize + bit as usize];
+                if child <= 0 {
+                    if -child == target {
+                        path.push(((i as usize) >> 1, bit));
+                        return true;
+                    }
+                } else {
+                    path.push(((i as usize) >> 1, bit));
+                    if reference_descent(child, target, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+            }
+            false
+        }
+
+        let tokens = [
+            DctToken::Dct0,
+            DctToken::Dct1,
+            DctToken::Dct2,
+            DctToken::Dct3,
+            DctToken::Dct4,
+            DctToken::Cat1,
+            DctToken::Cat2,
+            DctToken::Cat3,
+            DctToken::Cat4,
+            DctToken::Cat5,
+            DctToken::Cat6,
+            DctToken::Eob,
+        ];
+
+        for &start in &[0i8, 2i8] {
+            for &token in &tokens {
+                let mut reference = Vec::new();
+                let reachable = reference_descent(start, token as i8, &mut reference);
+
+                // The single unreachable cell.
+                if !reachable {
+                    assert_eq!(
+                        (start, token),
+                        (2i8, DctToken::Eob),
+                        "unexpected unreachable (start, token) = ({start}, {token:?})"
+                    );
+                    let slot = 1usize;
+                    let (_, len) = &TOKEN_BIT_PATHS[slot][token as usize];
+                    assert_eq!(*len, 0, "(start=2, Eob) must remain a length-0 tombstone");
+                    continue;
+                }
+
+                let table = token_to_bit_path(token, start);
+                assert_eq!(
+                    table.len(),
+                    reference.len(),
+                    "path-length mismatch for (start={start}, token={token:?})"
+                );
+                for (k, &(ref_i, ref_bit)) in reference.iter().enumerate() {
+                    assert_eq!(
+                        table[k].prob_index as usize, ref_i,
+                        "prob_index mismatch at step {k} of (start={start}, token={token:?})"
+                    );
+                    assert_eq!(
+                        table[k].bit, ref_bit,
+                        "bit mismatch at step {k} of (start={start}, token={token:?})"
+                    );
+                }
+            }
+        }
+
+        // Width contract: no path should ever exceed the static buffer.
+        const { assert!(TOKEN_BIT_PATH_MAX_LEN >= 7) };
+        for slot in 0..2 {
+            for token in 0..12 {
+                let (_, len) = &TOKEN_BIT_PATHS[slot][token];
+                assert!(
+                    (*len as usize) <= TOKEN_BIT_PATH_MAX_LEN,
+                    "path length {} > buffer capacity {} at slot={slot} token={token}",
+                    *len,
+                    TOKEN_BIT_PATH_MAX_LEN
+                );
+            }
+        }
+    }
 
     /// Sanity check on the local `COEFF_UPDATE_PROBS` table — the
     /// 1056-entry flat walk should be non-zero and the last entry should

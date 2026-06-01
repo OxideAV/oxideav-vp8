@@ -247,15 +247,57 @@ encoder change and compare the per-qi byte and wall-time columns to
 catch regressions on a single dial that drives the whole rate-control
 surface.
 
+## Round 204 — `token_to_bit_path` precomputation
+
+Round 204 (2026-06-01) lands the round-170 follow-up
+*"`encoder::token_to_bit_path::descend` — the function walks a small
+tree and ends up RD-scoring the same token paths repeatedly. A
+precomputed token-to-path table would remove the descent entirely."*
+
+`token_to_bit_path` is hit at least three times per coefficient in the
+encoder hot path — once by the block writer, once by the RD bit-cost
+estimator, and once by the §13.4 token-prob counts fitter. Before
+round 204 each call allocated a fresh `Vec<(usize, bool)>` and ran a
+recursive `ENC_COEFF_TREE` descent. The descent is a pure function of
+`(start_index ∈ {0, 2}, token ∈ 12 entries)`, so all 24 cells are now
+materialised once at module load through `std::sync::LazyLock` into a
+fixed-shape `[[([TokenBitStep; 7], u8); 12]; 2]` table. Path widths cap
+at 7 (`Cat3..Cat6` from the root); the unreachable `(start = 2, Eob)`
+cell is a `length = 0` tombstone. The function returns
+`&'static [TokenBitStep]` — index-and-slice, zero per-token allocation.
+
+| Bench | r194 stable | r204 stable | Δ |
+|---|---:|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 8.51 ms | **5.97 ms** | **−29.8 %** |
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 10.82 ms | **10.20 ms** | **−5.7 %** |
+
+Throughput on the whole-frame benches (Apple M4 / aarch64,
+criterion `--quick`):
+
+* `keyframe_encode_320x240_qi32`: 9.03 → **12.87 Mpx/s** (+43 %)
+* `inter_encode_4f_128x128_qi32`: 6.06 → **6.42 Mpx/s** (+5.9 %)
+
+The keyframe-encode delta is the headline. The round-170 sample profile
+counted `_xzm_xzone_malloc` + `_xzm_free` at ≈ 93 combined self-samples
+across the encoder bench; removing the per-coefficient `Vec` allocation
+collapses that into the static table's single one-shot init. The inter
+delta is smaller because motion search + reconstruction dilute the
+token-emission share of total time.
+
+Equivalence proof:
+`encoder::tests::token_bit_path_table_matches_tree_descent` re-runs the
+original recursive descent inline and asserts every reachable cell
+agrees on length, every prob_index, and every bit. Plus the full
+450-test lib suite + every existing integration test reach unchanged
+byte-exact output through the new dispatch.
+
 ## What didn't get touched yet (next-round candidates)
 
-* **`encoder::token_to_bit_path::descend` (#1 self-time on encode)** —
-  the function walks a small tree and ends up RD-scoring the same
-  token paths repeatedly. A precomputed token-to-path table would
-  remove the descent entirely.
-* **Allocator churn (`malloc` / `free` ≈ 90 self-samples on the
-  encoder)** — likely `Vec`-on-Vec inside the per-MB inner loop. A
-  pass with a `SmallVec` / fixed-size `[Vec; …]` cache should hit it.
+* **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
+  the token-path `Vec`, the round-170 profile's #2/#4/#5/#7 hits
+  (`_xzm_*`) should have shifted; re-profile to find the next biggest
+  short-lived `Vec` (the §11 mode picker + `near_mv` MV-candidate
+  scratch are the most likely remaining offenders).
 * **`sixtap_2d` (#4 on inter)** — the inner 6-tap convolution is a
   natural SIMD target (`Simd<i16, 8>` for an 8-pixel-wide stripe).
   Held back this round to keep the SIMD-feature surface to the two

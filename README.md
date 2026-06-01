@@ -9,7 +9,10 @@ production status as of 2026-05-27.
 * Phase-2 encoder with SPLITMV, GOLDEN / ALTREF, multi-partition,
   RefreshControls, LoopFilterDeltas, §11 intra picker, §13.4
   token-probability fitter, and a complexity-aware two-pass
-  rate-control family.
+  rate-control family. Encoder hot path is allocation-free for
+  per-coefficient token emission as of round 204 (§13.2 token bit
+  paths precomputed into a 24-cell static table; **−30 % keyframe
+  encode wall time, +43 % throughput** on the criterion bench).
 * The full crates.io `0.1.13` public surface is reachable, both with
   the default `registry` build and under `--no-default-features`.
   Compile-only assertion suite:

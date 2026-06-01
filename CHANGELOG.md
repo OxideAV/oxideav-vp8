@@ -4,6 +4,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — `token_to_bit_path` precomputed (round 204, 2026-06-01)
+
+Closes the round-170 `BENCHMARKS.md` follow-up *"`encoder::token_to_bit_path::descend`
+— the function walks a small tree and ends up RD-scoring the same token paths
+repeatedly. A precomputed token-to-path table would remove the descent
+entirely."*
+
+`token_to_bit_path` previously allocated a fresh `Vec<(usize, bool)>` and
+ran a recursive `ENC_COEFF_TREE` descent on every call — and was hit at
+least three times per coefficient (encoder block writer, RD bit-cost
+estimator, and the §13.4 token-prob counts fitter). The descent is a
+pure function of `(start_index ∈ {0, 2}, token ∈ 12 alphabet entries)`,
+so all 24 cells (one is the §13.2-forbidden `start = 2, Eob` tombstone)
+are materialised once at module load through `std::sync::LazyLock` into
+`TOKEN_BIT_PATHS: [[([TokenBitStep; 7], u8); 12]; 2]`. The function now
+returns `&'static [TokenBitStep]` — a single index-and-slice with zero
+per-token allocation. Path widths cap at 7 (`Cat3..Cat6` from root); the
+fixed-width buffer fits in static storage with no heap involvement.
+
+The new `encoder::tests::token_bit_path_table_matches_tree_descent`
+re-runs the original recursive descent inline and asserts every
+reachable cell agrees on length, every prob_index, and every bit. The
+unreachable `(start = 2, Eob)` cell stays a `length = 0` tombstone, so a
+caller accidentally requesting it will trip the in-function
+`debug_assert`. Bit-identical encoder output across the full 450-test
+lib suite + every existing integration test.
+
+Bench delta (Apple M4 / aarch64, criterion `--quick`,
+`CARGO_TARGET_DIR=/tmp/oxideav-vp8-r204-target cargo bench
+--bench keyframe_encode --bench inter_encode_short_clip`):
+
+* `keyframe_encode_320x240_qi32`: 8.51 ms → **5.97 ms (−29.8 %)**,
+  9.03 → **12.87 Mpx/s (+43 %)**.
+* `inter_encode_4f_128x128_qi32`: 10.82 ms → **10.20 ms (−5.7 %)**,
+  6.06 → **6.42 Mpx/s (+5.9 %)**.
+
+The keyframe-encode delta is the headline number: removing the
+per-coefficient `Vec` allocation moves `malloc` / `free` (which sat at
+≈ 50 self-samples per pair on the round-170 profile) out of the encode
+hot path entirely. The inter-encode delta is smaller because motion
+search and reconstruction dilute the token-emission share of total time.
+
 ### Added — `cargo-fuzz` harness suite (round 200, 2026-06-01)
 
 Depth-mode round: stands up a new `fuzz/` nested workspace with three

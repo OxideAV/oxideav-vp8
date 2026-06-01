@@ -210,8 +210,8 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships three `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
-that exercise the public decode-side surface for panic-freedom:
+The crate ships four `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
   at 256 × 256.
@@ -221,10 +221,23 @@ that exercise the public decode-side surface for panic-freedom:
   `Vp8FrameHeader::parse`, `Vp8CodedHeader::parse` (key + inter — the
   §19.2 segmentation-map / MB-LF-adjustments / token-prob-update /
   MV-prob-update walk), and the IVF framing layer.
+* `panic_free_encode_keyframe` — `encode_keyframe(&I420Frame,
+  &KeyframeParams)`. Drives both the happy path through the §11 intra
+  mode pick → §14 forward transform → §13 token emission → §15
+  loop-filter reconstruct chain AND the parameter-rejection surface
+  (raw `y_ac_qi` / `loop_filter_level` / `sharpness_level` /
+  `nbr_of_dct_partitions` bytes fed unnormalised so the encoder's
+  `QuantIndexOutOfRange` / `LoopFilterLevelOutOfRange` /
+  `SharpnessLevelOutOfRange` / `InvalidDctPartitionCount` returns are
+  also exercised). Dimension-gated to 256 × 256 by normalising the
+  width / height bytes into 1..=16 MB-units (16..=256 luma px).
 
-Initial smoke pass: 800 000 combined iterations, zero panics. See
-[`fuzz/README.md`](./fuzz/README.md) for caps, run instructions, and
-the rationale behind each target's pre-flight gating.
+Initial smoke pass: 800 000 combined iterations on the three decode
+targets + 17 500+ iterations on the encode target (2790 coverage edges,
+541-input corpus from empty seed in 31 s on aarch64-apple-darwin),
+zero panics across the board. See [`fuzz/README.md`](./fuzz/README.md)
+for caps, run instructions, and the rationale behind each target's
+pre-flight gating.
 
 ## License
 

@@ -8,9 +8,9 @@ edition = "2021"
 cargo-fuzz = true
 
 # oxideav-vp8 is the pure-Rust VP8 video codec (RFC 6386). This fuzz
-# crate exercises the public decode-side entry points with arbitrary
-# attacker bytes — none of them may ever panic, abort, or index out of
-# bounds. Three targets cover the layered surface:
+# crate exercises the public encode and decode entry points with
+# arbitrary attacker bytes — none of them may ever panic, abort, or
+# index out of bounds. Four targets cover the layered surface:
 #
 #   * `panic_free_decode_keyframe`  — one-shot `decode_vp8`
 #   * `panic_free_decoder_state`    — stateful multi-frame
@@ -26,6 +26,17 @@ cargo-fuzz = true
 #                                     MV-prob updates) and the IVF
 #                                     framing layer (`ivf::parse_header`
 #                                     / `ivf::parse_frame_header`).
+#   * `panic_free_encode_keyframe`  — public `encode_keyframe(&I420Frame,
+#                                     &KeyframeParams)` driver: exercises
+#                                     both the happy-path §11 mode pick
+#                                     → §14 forward transform → §13
+#                                     token emission → §15 loop filter
+#                                     reconstruct chain, AND the
+#                                     parameter-rejection surface
+#                                     (`QuantIndexOutOfRange` /
+#                                      `LoopFilterLevelOutOfRange` /
+#                                      `SharpnessLevelOutOfRange` /
+#                                      `InvalidDctPartitionCount`).
 #
 # The harness uses no oracle and depends on no external library — it's a
 # pure differential-against-spec sanity sweep.
@@ -67,5 +78,11 @@ doc = false
 [[bin]]
 name = "parse_headers"
 path = "fuzz_targets/parse_headers.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_encode_keyframe"
+path = "fuzz_targets/panic_free_encode_keyframe.rs"
 test = false
 doc = false

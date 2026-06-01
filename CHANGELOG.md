@@ -4,6 +4,45 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — encoder-side `panic_free_encode_keyframe` fuzz target (round 207, 2026-06-02)
+
+Depth-mode round: extends the round-200 fuzz harness suite with a
+fourth target that exercises the public encoder driver
+`encode_keyframe(&I420Frame, &KeyframeParams)`. The previous three
+targets cover the decode-side surface only; this one closes the encode
+side so the panic-freedom contract now holds on every public entry
+point the crate documents.
+
+The target consumes a 7-byte header from the front of the libFuzzer
+input — `(mb_w, mb_h)` (each normalised into 1..=16 MB-units i.e.
+16..=256 luma px so the per-iteration raster stays inside the same
+~96 KiB OOM envelope as `panic_free_decode_keyframe`), then `y_ac_qi`,
+`loop_filter_level`, `sharpness_level`, `nbr_of_dct_partitions`, and
+`filter_type` raw bytes. The four numeric knobs are NOT pre-clamped
+into their wire-legal sub-ranges: the goal is to exercise the
+parameter-rejection paths
+(`QuantIndexOutOfRange` / `LoopFilterLevelOutOfRange` /
+`SharpnessLevelOutOfRange` / `InvalidDctPartitionCount`) in the same
+iteration loop as the happy-path §11 / §14 / §13 / §15 chain. The
+tail of the input tiles modular-indexed across the three I420 planes
+so a short fuzz seed still produces fully-populated pixel data and the
+intra mode picker has real content to score.
+
+Smoke pass on `aarch64-apple-darwin` (Apple M-series, nightly
+libFuzzer): 17 585 iterations in 31 s from an empty corpus, 2 790
+coverage edges, 541-input corpus, zero panics. Subsequent 60 s sweep
+hit 28 000+ cumulative runs across both invocations, still zero
+panics, no `artifacts/panic_free_encode_keyframe/` crash inputs.
+
+The fuzz crate stays a nested workspace (`[workspace] members = ["."]`
+in its `Cargo.toml`) so it remains NOT pulled into the umbrella's
+`crates/*` glob — the four targets run on demand
+(`cargo +nightly fuzz run <target>`), not as part of umbrella CI.
+
+No `src/` changes; this round adds a regression baseline for
+encoder-side fuzz-discoverable defects parallel to the decoder side
+landed in round 200.
+
 ### Changed — `token_to_bit_path` precomputed (round 204, 2026-06-01)
 
 Closes the round-170 `BENCHMARKS.md` follow-up *"`encoder::token_to_bit_path::descend`

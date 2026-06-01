@@ -1,10 +1,10 @@
 # oxideav-vp8 fuzz harnesses
 
-Panic-free harnesses for the public decode-side API of `oxideav-vp8`.
-Each target feeds arbitrary libFuzzer bytes through one layer of the
-RFC 6386 decode stack and asserts that no input — well-formed,
-malformed, or hostile — causes a panic, abort, debug-arithmetic
-overflow, or out-of-bounds index.
+Panic-free harnesses for the public encode and decode API of
+`oxideav-vp8`. Each target feeds arbitrary libFuzzer bytes through
+one layer of the RFC 6386 stack and asserts that no input —
+well-formed, malformed, or hostile — causes a panic, abort,
+debug-arithmetic overflow, or out-of-bounds index.
 
 ## Targets
 
@@ -13,10 +13,11 @@ overflow, or out-of-bounds index.
 | `panic_free_decode_keyframe` | `decode_vp8` | One-shot keyframe decode end-to-end (§9.1 header → §19.2 coded header → §11 / §12 / §13 / §14 / §15 pipeline). Pre-flighted by the §9.1 dimension cap below. |
 | `panic_free_decoder_state`   | `Vp8DecoderState::decode_frame` | Stateful multi-packet driver. Exercises the §9.7 reference-frame refresh ladder (LAST / GOLDEN / ALTREF) — the extreme-reference-dependency path a one-shot decode call can never reach. |
 | `parse_headers`              | `frame_tag::parse_header`, `frame_tag::parse_keyframe_header`, `frame_header::Vp8FrameHeader::parse`, `coded_header::Vp8CodedHeader::parse` (key + inter), `ivf::parse_header`, `ivf::parse_frame_header` | Pure-parse layer. The §19.2 coded-header walk routes through `update_segmentation`, `mb_lf_adjustments`, `quant_indices`, `token_prob_update`, and `mv_prob_update`. |
+| `panic_free_encode_keyframe` | `encode_keyframe(&I420Frame, &KeyframeParams)` | Public encoder driver. Drives both the happy-path §11 intra mode pick → §14 forward transform → §13 token emission → §15 loop-filter reconstruct chain AND the parameter-rejection surface (raw `y_ac_qi` / `loop_filter_level` / `sharpness_level` / `nbr_of_dct_partitions` bytes are fed without normalisation so the encoder's `QuantIndexOutOfRange` / `LoopFilterLevelOutOfRange` / `SharpnessLevelOutOfRange` / `InvalidDctPartitionCount` paths are exercised in addition to the legal-range cases). |
 
-The harnesses are **decode-only**: no oracle, no comparison against
-any external implementation. The contract is panic-freedom, not
-output equivalence.
+The harnesses use **no oracle** and depend on no external
+implementation. The contract is panic-freedom, not output
+equivalence.
 
 ## OOM caps
 
@@ -31,6 +32,8 @@ gating data short-circuits before the decoder runs:
 | Max luma pixels per decoded frame (`panic_free_decode_keyframe`) | 256 × 256 (65 536) | I420 raster stays under ~100 KiB |
 | Max input length (`panic_free_decoder_state`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth |
 | Max packets per iteration (`panic_free_decoder_state`) | 32 | Bounds per-iteration wall time so exec/s stays comparable to the single-frame target |
+| Max luma pixels per encoded frame (`panic_free_encode_keyframe`) | 256 × 256 (65 536) | Width / height are normalised to `1 + (b % 16)` MB units so the dimensions land in the same 16..=256 px range as the decode target's cap |
+| Max input length (`panic_free_encode_keyframe`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth |
 
 The `parse_headers` target has **no** dimension cap — it allocates
 nothing beyond the parsers' own internal state, so even wire-extreme
@@ -49,6 +52,7 @@ cd crates/oxideav-vp8/fuzz
 cargo +nightly fuzz run panic_free_decode_keyframe
 cargo +nightly fuzz run panic_free_decoder_state
 cargo +nightly fuzz run parse_headers
+cargo +nightly fuzz run panic_free_encode_keyframe
 ```
 
 `cargo-fuzz` requires the nightly toolchain for libFuzzer's

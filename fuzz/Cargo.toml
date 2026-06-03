@@ -10,7 +10,7 @@ cargo-fuzz = true
 # oxideav-vp8 is the pure-Rust VP8 video codec (RFC 6386). This fuzz
 # crate exercises the public encode and decode entry points with
 # arbitrary attacker bytes — none of them may ever panic, abort, or
-# index out of bounds. Four targets cover the layered surface:
+# index out of bounds. Five targets cover the layered surface:
 #
 #   * `panic_free_decode_keyframe`  — one-shot `decode_vp8`
 #   * `panic_free_decoder_state`    — stateful multi-frame
@@ -37,6 +37,18 @@ cargo-fuzz = true
 #                                      `LoopFilterLevelOutOfRange` /
 #                                      `SharpnessLevelOutOfRange` /
 #                                      `InvalidDctPartitionCount`).
+#   * `panic_free_two_pass_stream`  — multi-frame `Vp8TwoPassEncoder`:
+#                                     `first_pass_analyze` → `encode_frame`
+#                                     loop with random configs and
+#                                     scene-cut bitmaps, exercising the
+#                                     §9.7 reference-frame refresh
+#                                     ladder, the keyframe-vs-Pframe
+#                                     switching state machine, and the
+#                                     complexity-aware qindex picker
+#                                     across the full delta envelope.
+#                                     The only public encoder entry
+#                                     point that reaches
+#                                     `encode_p_frame_multi_ref`.
 #
 # The harness uses no oracle and depends on no external library — it's a
 # pure differential-against-spec sanity sweep.
@@ -84,5 +96,11 @@ doc = false
 [[bin]]
 name = "panic_free_encode_keyframe"
 path = "fuzz_targets/panic_free_encode_keyframe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_two_pass_stream"
+path = "fuzz_targets/panic_free_two_pass_stream.rs"
 test = false
 doc = false

@@ -210,7 +210,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships four `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships five `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -231,6 +231,18 @@ that exercise the public encode and decode surface for panic-freedom:
   `SharpnessLevelOutOfRange` / `InvalidDctPartitionCount` returns are
   also exercised). Dimension-gated to 256 × 256 by normalising the
   width / height bytes into 1..=16 MB-units (16..=256 luma px).
+* `panic_free_two_pass_stream` — `Vp8TwoPassEncoder::first_pass_analyze`
+  + `Vp8TwoPassEncoder::encode_frame` over a multi-frame sequence
+  (round 213). The only public encoder fuzz target that reaches
+  `encode_p_frame_multi_ref` (the §9.7 reference-frame refresh ladder,
+  the keyframe-vs-Pframe switching state machine, and the
+  complexity-aware qindex picker). A scene-cut bitmap and per-frame
+  `bits_per_mb` bytes from the input tail drive the force-keyframe
+  + qindex-delta envelope even on the first-pass-skipped fallback.
+  Frame count capped at 4 and per-axis dimensions at 128 px to bound
+  per-iteration memory and wall time. 20-second smoke pass landed
+  `cov: 3672, ft: 19072` across 6244 iterations from an empty seed on
+  aarch64-apple-darwin, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

@@ -4,6 +4,50 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — multi-frame `panic_free_two_pass_stream` fuzz target (round 213, 2026-06-03)
+
+Fuzz-target-depth round: extends the round-207 four-target suite
+with a fifth target that exercises the public
+`Vp8TwoPassEncoder::first_pass_analyze` → `encode_frame` loop over a
+multi-frame sequence. This is the only encoder fuzz target that
+reaches `encode_p_frame_multi_ref` — the §9.7 reference-frame
+refresh ladder, the keyframe-vs-Pframe switching state machine, and
+the complexity-aware qindex picker that the round-207 keyframe-only
+target by definition cannot touch.
+
+Input layout: 8-byte header (visible width / height in MB-units,
+base `qindex`, `lf_level`, `golden_interval`, `alt_ref_interval`,
+frame count `1..=4`, scene-cut bitmap) followed by one
+`bits_per_mb` byte per frame, then a tiled pixel payload. The
+fuzzer-supplied scene-cut bitmap can override the analysed flag
+per-frame so the §9.7 force-keyframe-on-scene-cut path is exercised
+even mid-stream; the per-frame `bits_per_mb` bytes are rescaled into
+the qindex picker's full 0..=1024 envelope so the complexity-aware
+delta path is also covered. `golden_interval`, `alt_ref_interval`,
+`qindex`, and `lf_level` are fed raw so the encoder's structured
+`Vp8Error` surface is exercised in the same iteration loop as the
+happy-path encode chain. Frame count capped at 4 and per-axis
+dimensions at 128 px (i.e. 4 × 128×128 ≈ 96 KiB of luma per
+iteration) so the per-iteration memory + wall-time budget stays
+inside libFuzzer's defaults even with the full inter-prediction
+pipeline + reference-reconstruction carry-over running on every
+frame after the first.
+
+A 20-second smoke pass on aarch64-apple-darwin (nightly +
+`cargo fuzz run`) landed `cov: 3672` (216 new coverage edges over
+the encoder-only target's 2790) and `ft: 19072` features across 6244
+iterations from an empty seed, no panics. The new harness is
+documented in [`fuzz/README.md`](./fuzz/README.md) alongside the
+existing four targets and called out in the top-level README's
+"Fuzz harnesses" section.
+
+Files: [`fuzz/fuzz_targets/panic_free_two_pass_stream.rs`](./fuzz/fuzz_targets/panic_free_two_pass_stream.rs)
+(new); [`fuzz/Cargo.toml`](./fuzz/Cargo.toml) (binary entry +
+intro comment updated from "Four targets" to "Five");
+[`fuzz/README.md`](./fuzz/README.md) (target table row + OOM-cap
+rows + run command); [`README.md`](./README.md) (Fuzz-harnesses
+section bumped from four to five targets).
+
 ### Added — encoder-side `panic_free_encode_keyframe` fuzz target (round 207, 2026-06-02)
 
 Depth-mode round: extends the round-200 fuzz harness suite with a

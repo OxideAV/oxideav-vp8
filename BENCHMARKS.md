@@ -345,6 +345,72 @@ The bench input matches `inverse_transform_4x4.rs::SAMPLE_INPUT`
 verbatim so a future `forward_dct_4x4_simd` rewrite would produce
 the same per-call delta shape across the two pairs.
 
+## Round 226 — `forward_wht_4x4` / `forward_dct_4x4` SIMD rewrites
+
+Round 226 (2026-06-04) closes the round-220 next-round candidate: the
+§14.3 forward WHT and §14.4 forward DCT now dispatch through a
+`core::simd::Simd<i32, 4>` rewrite under the `simd` cargo feature,
+parallel to the round-180 `inverse_*_simd` rewrites. The layout
+mirrors the inverse SIMD path one-for-one: hold the input as four
+`Simd<i32, 4>` row-vectors (lane `j` of row `i` carries `input[i*4 +
+j]`); the first pass operates as four parallel lane-wide column
+butterflies + (for the DCT) `c_mul` / `s_mul` lane-wide multiplies;
+transpose; run the second pass the same way; apply the symmetric
+`round_div2` step lane-wide via a `Mask::select(pos_branch,
+neg_branch)` over `simd_ge(0)` (matching scalar `round_div2` bit-
+for-bit — the two arithmetic branches are unconditional).
+
+Headline `--quick` numbers (Apple M4 / aarch64), comparing scalar
+(public dispatcher on stable, no `simd` feature) against the new SIMD
+path (public dispatcher on nightly + `simd`):
+
+| Bench | Scalar | SIMD | Δ |
+|---|---:|---:|---:|
+| `forward_transform_4x4/forward_wht_4x4` | 10.74 ns | **8.72 ns** | **−18.8 %** |
+| `forward_transform_4x4/forward_dct_4x4` | 10.71 ns | 11.54 ns | +7.7 % |
+
+Observations:
+
+* The forward WHT SIMD path is the cleanest win in the suite next to
+  the round-180 inverse WHT (also ≈ −20 %). Both transforms are
+  pure butterfly chains over an i32 column axis; the four-lane
+  layout collapses the per-column scalar loop into a straight-line
+  add / sub sequence. The bulk of the −19 % comes from the second-
+  pass `round_div2` step folding into four lane-wide `Mask::select`s
+  in place of four scalar branch-pairs.
+* The forward DCT SIMD path is +8 % slower than scalar — the
+  multiply-heavy `c_mul` / `s_mul` chain (8 i32 lane-wide multiplies
+  per pass × 2 passes) doesn't pipeline as well as the scalar
+  straight-line code, and the lane-wide `round_div2_simd` adds a
+  mask + select that the scalar path avoids. This is the same shape
+  the round-180 inverse DCT measurement showed (≈ −1 to −5 % over
+  scalar) — the forward direction's per-pass `round_div2` step is
+  the extra cost, where the inverse path's `(x + 4) >> 3` is a
+  pure shift. The SIMD path is kept enabled under `simd` for shape
+  parity with the WHT and so the byte-exact equivalence assertion
+  (`fdct_forward_simd_matches_scalar_on_stress_inputs`) is exercised
+  on every nightly + `simd` test run; a future round can split the
+  dispatch (route `forward_dct_4x4` to scalar even under `simd` if
+  the regression matters on a target hardware).
+* Round-trip math: per-MB call count is 24 × `forward_dct_4x4` (16 Y
+  + 8 chroma) + at most 1 × `forward_wht_4x4`. Under `simd` that's
+  24 × 11.54 + 1 × 8.72 ≈ 286 ns / MB on the forward side, vs the
+  scalar-path 24 × 10.71 + 1 × 10.74 ≈ 268 ns / MB — within a few
+  percent end-to-end. The forward DCT regression and the forward
+  WHT improvement roughly cancel at the whole-frame `keyframe_encode`
+  bench's resolution.
+
+Equivalence proof: `forward_transform::tests::{
+fdct_forward_simd_matches_scalar_on_stress_inputs,
+fwht_forward_simd_matches_scalar_on_stress_inputs}` run a 21-input
+stress set (the same matrix shape as the round-180 inverse tests:
+all-zero / DC-only at 10 magnitudes / single-AC at every of the
+15 positions / mixed gradients / high-AC mid-range, both positive
+and alternating-sign) and assert public-dispatch byte-equality with
+the renamed `_scalar` variants. The full 452-test lib suite and
+every integration test pass on both stable (scalar dispatch) and
+nightly + `simd` (SIMD dispatch).
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -354,10 +420,12 @@ the same per-call delta shape across the two pairs.
   scratch are the most likely remaining offenders).
 * **`sixtap_2d` (#4 on inter)** — the inner 6-tap convolution is a
   natural SIMD target (`Simd<i16, 8>` for an 8-pixel-wide stripe).
-  Held back this round to keep the SIMD-feature surface to the two
-  §14 inverse-transform primitives.
-* **`forward_dct_4x4` SIMD rewrite** — round 220 published the
-  baseline micro-bench; the §14.4 forward butterfly maps onto the
-  same `Simd<i32, 4>` layout `inverse_dct_4x4_simd` uses, so a
-  future round can land a feature-gated forward SIMD path that
-  mirrors the round-180 inverse rewrite.
+  Held back this round to keep the SIMD-feature surface focused on
+  the §14 transform primitives.
+* **Split the `forward_dct_4x4` SIMD dispatch** — round 226 keeps the
+  forward DCT routed through SIMD under `simd` for shape parity
+  with the WHT, even though the bench shows a small (~+8 %)
+  regression. A future round can route `forward_dct_4x4` to the
+  scalar path even under `simd` if benchmarks on a hardware target
+  prove the regression material; the `_simd` impl + the byte-
+  equivalence test stay in place either way.

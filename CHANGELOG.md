@@ -4,6 +4,68 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `forward_wht_4x4` / `forward_dct_4x4` SIMD rewrites (round 226, 2026-06-04)
+
+SIMD-depth round: closes the round-220 next-round candidate. The
+public `forward_wht_4x4` and `forward_dct_4x4` are now dispatchers
+(SIMD on nightly + `simd`, scalar otherwise) matching the round-180
+inverse-side rewrite shape. The forward primitives sit behind the
+same `simd` cargo feature the inverse primitives use; no new feature
+flags, no new dependencies.
+
+* `forward_wht_4x4_simd` — `core::simd::Simd<i32, 4>` rewrite of the
+  §14.3 forward WHT. Holds the input as four row-vectors (lane `j`
+  of row `i` is `input[i*4 + j]`), runs the four-column butterfly as
+  four parallel lane-wide adds / subs, transposes to put each row of
+  the intermediate into a row-vector, runs the row butterfly the
+  same way, and applies the symmetric `round_div2` `/2` step
+  lane-wide via a shared `round_div2_simd` helper.
+* `forward_dct_4x4_simd` — `core::simd::Simd<i32, 4>` rewrite of the
+  §14.4 forward DCT. Same layout. The `c_mul` / `s_mul` fixed-point
+  multiplies become `Simd::splat(K) * v` / `>> Simd::splat(16)` lane-
+  wide chains that produce identical bytes to scalar `(x * K) >> 16`
+  because the SIMD spec defines i32 lane multiplies as wrapping and
+  signed-i32 lane right-shift as arithmetic.
+* `round_div2_simd` — lane-wide port of scalar `round_div2`. The two
+  arithmetic branches (`(v + 1) >> 1` and `-((-v + 1) >> 1)`) are
+  computed unconditionally and merged with `simd_ge(0).select(...)`,
+  followed by `simd_clamp(i16::MIN, i16::MAX)` so the final clamp the
+  scalar path applies before the `as i16` truncation is mirrored.
+  Uses `core::simd::Select` and `core::simd::cmp::SimdOrd`.
+
+Equivalence proof:
+`forward_transform::tests::fdct_forward_simd_matches_scalar_on_stress_inputs`
+and `…::fwht_forward_simd_matches_scalar_on_stress_inputs` run a
+21-input stress set (all-zero, DC-only across 10 magnitudes,
+single-AC at every of the 15 positions, the bench's mixed pattern,
+and two high-AC mid-range patterns including alternating-sign) and
+assert public-dispatch byte-equality against the renamed `_scalar`
+variants. Full 452-test lib suite passes on both stable (scalar
+dispatch) and nightly + `simd` (SIMD dispatch).
+
+Headline numbers on `aarch64-apple-darwin` (criterion `--quick`):
+
+* `forward_transform_4x4/forward_wht_4x4`: 10.74 ns → **8.72 ns**
+  (**−18.8 %**) — the clearest win in the suite next to the round-180
+  inverse WHT.
+* `forward_transform_4x4/forward_dct_4x4`: 10.71 ns → 11.54 ns
+  (+7.7 %) — the multiply-heavy DCT plus the lane-wide `round_div2`
+  cost more per call than the scalar path's straight-line arithmetic.
+  Kept routed through SIMD for shape parity with the WHT and so the
+  byte-exact equivalence test fires; a future round can split the
+  dispatch.
+
+Files: [`src/forward_transform.rs`](./src/forward_transform.rs)
+(public dispatchers `forward_wht_4x4` / `forward_dct_4x4`; new
+`_scalar` + `_simd` siblings; shared `round_div2_simd` helper; two
+new `*_simd_matches_scalar` stress tests);
+[`README.md`](./README.md) (feature-table SIMD row extended to cover
+the forward partners + Δ numbers);
+[`BENCHMARKS.md`](./BENCHMARKS.md) (round-226 section with the A/B
+table and the inverse-side comparison). No `Cargo.toml` change — the
+`simd` feature and the `[bench]` entry already exist from earlier
+rounds.
+
 ### Added — `forward_transform_4x4` micro-bench (round 220, 2026-06-03)
 
 Bench-depth round: publishes the long-missing A/B target for the

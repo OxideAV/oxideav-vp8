@@ -392,13 +392,15 @@ Observations:
   on every nightly + `simd` test run; a future round can split the
   dispatch (route `forward_dct_4x4` to scalar even under `simd` if
   the regression matters on a target hardware).
-* Round-trip math: per-MB call count is 24 × `forward_dct_4x4` (16 Y
-  + 8 chroma) + at most 1 × `forward_wht_4x4`. Under `simd` that's
-  24 × 11.54 + 1 × 8.72 ≈ 286 ns / MB on the forward side, vs the
-  scalar-path 24 × 10.71 + 1 × 10.74 ≈ 268 ns / MB — within a few
-  percent end-to-end. The forward DCT regression and the forward
-  WHT improvement roughly cancel at the whole-frame `keyframe_encode`
-  bench's resolution.
+* Per-MB call count: 24 × `forward_dct_4x4` (16 Y + 8 chroma) + at
+  most 1 × `forward_wht_4x4`. Under `simd` the forward-side wall is
+  24 × 11.54 + 1 × 8.72 ≈ 286 ns / MB, vs scalar 24 × 10.71 + 1 ×
+  10.74 ≈ 268 ns / MB — a ~+7 % bias on the forward primitives only,
+  whose round-170 share of `keyframe_encode` was ~1.3 %. That puts
+  the expected `keyframe_encode` impact at sub-0.1 %, deep below the
+  bench's `--quick` noise envelope; verifying empirically by
+  re-running `keyframe_encode` under both feature settings is left
+  to a future profile-depth round.
 
 Equivalence proof: `forward_transform::tests::{
 fdct_forward_simd_matches_scalar_on_stress_inputs,

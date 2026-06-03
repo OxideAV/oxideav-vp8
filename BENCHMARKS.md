@@ -291,6 +291,60 @@ agrees on length, every prob_index, and every bit. Plus the full
 450-test lib suite + every existing integration test reach unchanged
 byte-exact output through the new dispatch.
 
+## Round 220 — `forward_transform_4x4` micro-bench
+
+Round 220 (2026-06-03) closes a long-standing gap in the published
+A/B surface: the §14.3 forward WHT (`forward_wht_4x4`) and the §14.4
+forward DCT (`forward_dct_4x4`) — the encoder partners of the
+round-170 / round-180 inverse-side primitives — had no published
+micro-bench. The whole-frame `keyframe_encode` and
+`inter_encode_short_clip` benches drive them inside the §11 intra
+picker + §13 token emit + §15 loop-filter cascade, which makes
+attributing a wall-time delta to a forward-transform rewrite
+ambiguous. The new `forward_transform_4x4` bench mirrors
+`inverse_transform_4x4`'s input layout (the same representative
+DC-heavy 4×4 residual block) so a side-by-side read of the two files
+lines up the forward and inverse passes one-for-one.
+
+Headline baseline (Apple M4 / aarch64, criterion `--quick`):
+
+| Bench | Wall time |
+|---|---:|
+| `forward_transform_4x4/forward_dct_4x4` | 10.13 ns |
+| `forward_transform_4x4/forward_wht_4x4` | 10.48 ns |
+| `inverse_transform_4x4/inverse_dct_4x4` | 10.25 ns |
+| `inverse_transform_4x4/inverse_wht_4x4` | 9.76 ns |
+
+Observations:
+
+* The forward DCT and the §14.4 inverse DCT are within a percent of
+  each other (10.13 vs 10.25 ns) — the §14.3 / §14.4 forward and
+  inverse passes share the same fixed-point constants
+  (`COSPI8_SQRT2_MINUS1`, `SINPI8_SQRT2`), the same butterfly
+  shape, and the same number of `c_mul` / `s_mul` invocations per
+  pass. The forward path's per-row `round_div2` (the symmetric
+  round-away-from-zero step that doesn't appear in the inverse)
+  costs the small remaining delta.
+* The forward WHT is ~8 % more expensive than the inverse WHT
+  (10.48 vs 9.76 ns) — the forward path's symmetric `round_div2`
+  fires on every output sample (16 calls per `forward_wht_4x4`)
+  where the §14.3 inverse path's matching `(x + 3) >> 3` rounds
+  without the negative-symmetric branch.
+* Per-MB call count: 24 × `forward_dct_4x4` (16 Y + 8 chroma) +
+  potentially 1 × `forward_wht_4x4` (for MBs with a Y2 DC plane).
+  At 10.13 + 10.48 ns this is ≈ 253 ns / MB on the forward side
+  alone, which at 320 × 240 (300 MBs / frame) is ~76 µs per frame
+  — ~1.3 % of the 5.81 ms `keyframe_encode` wall time. Reads as:
+  the forward primitives are not the encoder hot path (token emit
+  + RD scoring dwarf them), but they're now visible at criterion's
+  micro-bench resolution, ready as an A/B target for any future
+  SIMD / unroll work on the encoder side parallel to the round-180
+  `inverse_dct_4x4_simd` rewrite.
+
+The bench input matches `inverse_transform_4x4.rs::SAMPLE_INPUT`
+verbatim so a future `forward_dct_4x4_simd` rewrite would produce
+the same per-call delta shape across the two pairs.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -302,3 +356,8 @@ byte-exact output through the new dispatch.
   natural SIMD target (`Simd<i16, 8>` for an 8-pixel-wide stripe).
   Held back this round to keep the SIMD-feature surface to the two
   §14 inverse-transform primitives.
+* **`forward_dct_4x4` SIMD rewrite** — round 220 published the
+  baseline micro-bench; the §14.4 forward butterfly maps onto the
+  same `Simd<i32, 4>` layout `inverse_dct_4x4_simd` uses, so a
+  future round can land a feature-gated forward SIMD path that
+  mirrors the round-180 inverse rewrite.

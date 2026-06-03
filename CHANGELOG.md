@@ -4,6 +4,52 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `forward_transform_4x4` micro-bench (round 220, 2026-06-03)
+
+Bench-depth round: publishes the long-missing A/B target for the
+§14.3 forward WHT (`forward_wht_4x4`) and the §14.4 forward DCT
+(`forward_dct_4x4`) — the encoder partners of the round-170 /
+round-180 inverse-transform primitives. Up to now the only encoder
+benches that touched the forward path were the whole-frame
+`keyframe_encode` and `inter_encode_short_clip` jobs, which drive
+the forward primitives inside the §11 intra picker + §13 token
+emit + §15 loop-filter cascade and so cannot attribute a wall-time
+delta to a forward-transform rewrite in isolation.
+
+The new bench mirrors `inverse_transform_4x4.rs`'s input layout
+(same DC-heavy 4×4 residual block, same `SAMPLE_INPUT` constant)
+so a side-by-side read of the forward and inverse files lines
+the two passes up sample-for-sample. Headline baseline numbers
+on Apple M4 / aarch64, criterion `--quick`:
+
+* `forward_transform_4x4/forward_dct_4x4` — 10.13 ns
+* `forward_transform_4x4/forward_wht_4x4` — 10.48 ns
+* `inverse_transform_4x4/inverse_dct_4x4` — 10.25 ns (reference)
+* `inverse_transform_4x4/inverse_wht_4x4` — 9.76 ns (reference)
+
+The forward DCT and §14.4 inverse DCT cost within a percent of
+each other (shared butterfly shape, shared fixed-point constants).
+The forward WHT is ~8 % more expensive than the inverse WHT because
+the forward path's symmetric `round_div2` rounds every output
+sample (16 calls per invocation) where the §14.3 inverse path's
+matching `(x + 3) >> 3` doesn't carry the negative-symmetric branch.
+
+Per-MB call count is 24 × `forward_dct_4x4` (16 Y + 8 chroma)
+plus optionally 1 × `forward_wht_4x4` (MBs with a Y2 DC plane),
+which lands the forward path at ~76 µs / frame on 320 × 240
+(~1.3 % of the 5.81 ms `keyframe_encode` wall time) — not the
+hot path but now visible at criterion's micro-bench resolution,
+ready as an A/B target for a future SIMD / unroll rewrite parallel
+to the round-180 `inverse_dct_4x4_simd` work.
+
+Files: [`benches/forward_transform_4x4.rs`](./benches/forward_transform_4x4.rs)
+(new); [`Cargo.toml`](./Cargo.toml) (new `[[bench]]` entry);
+[`BENCHMARKS.md`](./BENCHMARKS.md) (round-220 section with the
+forward + inverse side-by-side table and the next-round
+`forward_dct_4x4` SIMD candidate). No source changes — the bench
+target uses the existing `oxideav_vp8::forward_dct_4x4` /
+`oxideav_vp8::forward_wht_4x4` crate-root re-exports unchanged.
+
 ### Added — multi-frame `panic_free_two_pass_stream` fuzz target (round 213, 2026-06-03)
 
 Fuzz-target-depth round: extends the round-207 four-target suite

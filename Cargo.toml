@@ -74,3 +74,13 @@ harness = false
 [[bench]]
 name = "rate_control_qi_sweep"
 harness = false
+
+# Round 220 bench. The §14.3 / §14.4 forward primitives — the encoder
+# partners of the round-170 `inverse_transform_4x4` micro-bench. They
+# fire on every coded residual block, so a stable A/B target for
+# future SIMD / unroll work on the forward path was overdue. Inputs
+# match the inverse micro-bench so the two pass numbers compare
+# directly.
+[[bench]]
+name = "forward_transform_4x4"
+harness = false

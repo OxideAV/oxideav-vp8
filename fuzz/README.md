@@ -15,6 +15,7 @@ debug-arithmetic overflow, or out-of-bounds index.
 | `parse_headers`              | `frame_tag::parse_header`, `frame_tag::parse_keyframe_header`, `frame_header::Vp8FrameHeader::parse`, `coded_header::Vp8CodedHeader::parse` (key + inter), `ivf::parse_header`, `ivf::parse_frame_header` | Pure-parse layer. The §19.2 coded-header walk routes through `update_segmentation`, `mb_lf_adjustments`, `quant_indices`, `token_prob_update`, and `mv_prob_update`. |
 | `panic_free_encode_keyframe` | `encode_keyframe(&I420Frame, &KeyframeParams)` | Public encoder driver. Drives both the happy-path §11 intra mode pick → §14 forward transform → §13 token emission → §15 loop-filter reconstruct chain AND the parameter-rejection surface (raw `y_ac_qi` / `loop_filter_level` / `sharpness_level` / `nbr_of_dct_partitions` bytes are fed without normalisation so the encoder's `QuantIndexOutOfRange` / `LoopFilterLevelOutOfRange` / `SharpnessLevelOutOfRange` / `InvalidDctPartitionCount` paths are exercised in addition to the legal-range cases). |
 | `panic_free_two_pass_stream` | `Vp8TwoPassEncoder::first_pass_analyze` + `Vp8TwoPassEncoder::encode_frame` (multi-frame loop) | Public multi-frame encoder driver. The only target that reaches `encode_p_frame_multi_ref` (the §9.7 reference-frame refresh ladder, keyframe-vs-Pframe switching state machine, complexity-aware qindex picker). Per-frame `bits_per_mb` and a scene-cut bitmap are fed from the input tail so the qindex-delta envelope and the force-keyframe-on-scene-cut path are exercised even on the first-pass-skipped fallback. Frame count capped at 4 and per-axis dimensions at 128 px to bound per-iteration memory / wall time. |
+| `panic_free_loopfilter_segment` | `common_adjust`, `simple_segment`, `subblock_filter`, `mb_filter`, `LoopFilterParams::derive` | §15 per-segment loop-filter primitives. Drives the `(seg.len(), base)` slice-arithmetic envelope plus the four §15.4 `(loop_filter_level, sharpness_level, key_frame)` axis combinations directly, exercising the saturating-clamp / `interior_limit==0→1` floor / hev-ladder branches the higher-level decode and encode harnesses can only reach via a fully-formed reconstruction raster. Both the derived parameter set and an independent raw-byte triple are fed to each kernel, with a snapshot-and-restore step between calls so each primitive sees a fresh segment. A chained-pass leg (`simple_segment` → `mb_filter`, or `subblock_filter` → `mb_filter`) exercises state hand-off across primitives. |
 
 The harnesses use **no oracle** and depend on no external
 implementation. The contract is panic-freedom, not output
@@ -38,6 +39,7 @@ gating data short-circuits before the decoder runs:
 | Max frames per iteration (`panic_free_two_pass_stream`) | 4 | Bounds per-iteration wall time; the §9.7 keyframe / golden / alt-ref schedule turns over within 4 frames at the smaller frame size used here |
 | Max luma pixels per encoded frame (`panic_free_two_pass_stream`) | 128 × 128 (16 384) | Tighter than the keyframe-only target so 4 frames × the full pipeline (forward transform → token emit → §15 loop filter → reconstruction storage for the next frame's reference) stays inside the per-iteration memory cap |
 | Max input length (`panic_free_two_pass_stream`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth |
+| Max input length (`panic_free_loopfilter_segment`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth. The working buffer is `max(8, payload.len())` bytes; no further allocation |
 
 The `parse_headers` target has **no** dimension cap — it allocates
 nothing beyond the parsers' own internal state, so even wire-extreme
@@ -58,6 +60,7 @@ cargo +nightly fuzz run panic_free_decoder_state
 cargo +nightly fuzz run parse_headers
 cargo +nightly fuzz run panic_free_encode_keyframe
 cargo +nightly fuzz run panic_free_two_pass_stream
+cargo +nightly fuzz run panic_free_loopfilter_segment
 ```
 
 `cargo-fuzz` requires the nightly toolchain for libFuzzer's
@@ -67,10 +70,14 @@ the fuzz binaries need nightly.
 ## Corpus
 
 The repository ships **no** seed corpus. libFuzzer starts from empty
-and discovers structure on its own; the five targets each converge
+and discovers structure on its own; the six targets each converge
 on coverage of their respective surface within a few minutes on a
 single core. A 20-second smoke run on `panic_free_two_pass_stream`
 landed `cov: 3672, ft: 19072` across 6244 iterations at round 213.
+A 21-second smoke run on `panic_free_loopfilter_segment` landed
+`cov: 202, ft: 475, corp: 157/2944b` across 5 819 579 iterations at
+round 232 (the primitive-layer kernel runs ~830 × faster per
+iteration than the multi-frame two-pass encoder).
 
 ## CI
 

@@ -4,6 +4,62 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_loopfilter_segment` fuzz target (round 232, 2026-06-04)
+
+Fuzz-depth round: closes the gap where the four pre-existing fuzz
+targets (`panic_free_decode_keyframe`, `panic_free_decoder_state`,
+`parse_headers`, `panic_free_encode_keyframe`, `panic_free_two_pass_stream`)
+all reach §15 only through `decode_vp8` / `Vp8DecoderState::decode_frame`
+/ `encode_keyframe` / `Vp8TwoPassEncoder::encode_frame`, which gate the
+per-segment loop-filter primitives behind a fully-formed reconstruction
+raster. The new sixth target drives the §15 primitive surface directly
+with an attacker-shaped `(seg.len(), base)` envelope.
+
+Surface covered:
+
+* `loop_filter::common_adjust(use_outer_taps, seg, base) -> i32` —
+  the §15.2 core 4-pixel adjustment shared by both filter types.
+* `loop_filter::simple_segment(edge_limit, seg, base)` — the §15.2
+  4-pixel simple filter (luma edges only on the decode side; the
+  primitive itself doesn't enforce that).
+* `loop_filter::subblock_filter(hev_threshold, interior_limit,
+  edge_limit, seg, base)` — the §15.3 8-pixel normal inter-subblock
+  filter.
+* `loop_filter::mb_filter(hev_threshold, interior_limit, edge_limit,
+  seg, base)` — the §15.3 8-pixel normal inter-macroblock filter.
+* `loop_filter::LoopFilterParams::derive(loop_filter_level,
+  sharpness_level, key_frame)` — the §15.4 parameter derivation
+  (saturating-sub cap, `interior_limit==0→1` floor, key-frame vs.
+  interframe hev-ladder).
+
+Input layout: 7 header bytes (`loop_filter_level`, `sharpness_level`,
+raw `hev_threshold`, raw `interior_limit`, raw `edge_limit`, flag byte
+for `(key_frame, use_outer_taps, prefer_simple)`, `base` selector)
+followed by the segment payload tiled into a working buffer of length
+`max(8, payload.len())`. `base` is masked so `base + 8 <= buf.len()`
+unconditionally; both kernel families read up to 8 bytes past `base`.
+
+Coverage budget: 4 KiB input cap (libFuzzer default; re-checked at
+harness entry as defence-in-depth); single `Vec<u8>` allocation per
+iteration.
+
+Smoke pass — 21 seconds, empty seed, aarch64-apple-darwin:
+`cov: 202, ft: 475, corp: 157/2944b` across 5 819 579 iterations,
+zero panics. Throughput ~290 000 exec/s — the primitive-layer kernel
+runs ~830 × faster per iteration than `panic_free_two_pass_stream`
+(at 6244 it/20 s) because no encoder reconstruction raster is
+allocated and the §15 kernels each operate on at most an 8-byte
+segment.
+
+Files: [`fuzz/fuzz_targets/panic_free_loopfilter_segment.rs`](./fuzz/fuzz_targets/panic_free_loopfilter_segment.rs)
+(new target), [`fuzz/Cargo.toml`](./fuzz/Cargo.toml) (one `[[bin]]`
+section + header doc rewrite to "six targets"),
+[`fuzz/README.md`](./fuzz/README.md) (target table + run-command
+list + smoke-pass numbers), [`README.md`](./README.md) (Fuzz
+harnesses section bumped from five to six targets with the round-232
+prose). No `src/` change; no behaviour change; the new target is a
+read-only stressor of an already-stable public surface.
+
 ### Added — `forward_wht_4x4` / `forward_dct_4x4` SIMD rewrites (round 226, 2026-06-04)
 
 SIMD-depth round: closes the round-220 next-round candidate. The

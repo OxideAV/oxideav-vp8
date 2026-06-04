@@ -210,7 +210,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships five `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships six `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -243,6 +243,24 @@ that exercise the public encode and decode surface for panic-freedom:
   per-iteration memory and wall time. 20-second smoke pass landed
   `cov: 3672, ft: 19072` across 6244 iterations from an empty seed on
   aarch64-apple-darwin, zero panics.
+* `panic_free_loopfilter_segment` — the public §15 per-segment loop-filter
+  primitives `common_adjust`, `simple_segment`, `subblock_filter`,
+  `mb_filter`, plus the §15.4 `LoopFilterParams::derive` parameter
+  derivation (round 232). The four decode / encode harnesses above
+  reach §15 only through `decode_vp8` / `Vp8DecoderState::decode_frame`
+  / `encode_keyframe`, which gate the per-segment kernels behind a
+  fully-formed reconstruction raster; this target drives them
+  directly with an attacker-shaped `(seg.len(), base)` envelope.
+  Both the derived `(hev_threshold, interior_limit, edge_limit)`
+  triple from §15.4 AND an independent raw-byte triple feed each
+  kernel, with snapshot-and-restore between calls so each primitive
+  sees a fresh segment. A chained-pass leg (`simple_segment` →
+  `mb_filter`, or `subblock_filter` → `mb_filter`) exercises
+  state hand-off across primitives. 21-second smoke pass landed
+  `cov: 202, ft: 475, corp: 157/2944b` across 5 819 579 iterations
+  from an empty seed on aarch64-apple-darwin, zero panics — the
+  primitive-layer kernel runs ~830 × faster per iteration than
+  `panic_free_two_pass_stream`.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

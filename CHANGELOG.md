@@ -4,6 +4,21 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.3...v0.2.4) - 2026-06-05
+
+### Other
+
+- motion-comp fuzz r237: panic_free_motion_comp_subpel target (RFC 6386 §18.3 / §20.14)
+- loopfilter fuzz r232: panic_free_loopfilter_segment target (RFC 6386 §15)
+- BENCHMARKS r226: soften whole-frame extrapolation, leave verification to a future profile-depth round
+- forward_transform SIMD r226: §14.3 + §14.4 forward `core::simd<i32,4>` rewrites (RFC 6386 §14)
+- encoder bench r220: forward_transform_4x4 micro-bench (RFC 6386 §14.3 / §14.4)
+- encoder fuzz r213: panic_free_two_pass_stream multi-frame target (RFC 6386 §9.7)
+- encoder fuzz r207: panic_free_encode_keyframe target (RFC 6386 §11/§13/§14/§15)
+- encoder r204: precompute §13.2 token bit paths (RFC 6386 §13.2)
+- round 200: cargo-fuzz harness suite + nested fuzz crate
+- round 194: rate_control_qi_sweep bench + published 10-row trade-off curve
+
 ### Added — `panic_free_motion_comp_subpel` fuzz target (round 237, 2026-06-05)
 
 Fuzz-depth round: closes the gap where the five pre-existing fuzz

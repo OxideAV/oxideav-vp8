@@ -10,7 +10,7 @@ cargo-fuzz = true
 # oxideav-vp8 is the pure-Rust VP8 video codec (RFC 6386). This fuzz
 # crate exercises the public encode and decode entry points with
 # arbitrary attacker bytes — none of them may ever panic, abort, or
-# index out of bounds. Six targets cover the layered surface:
+# index out of bounds. Seven targets cover the layered surface:
 #
 #   * `panic_free_decode_keyframe`  — one-shot `decode_vp8`
 #   * `panic_free_decoder_state`    — stateful multi-frame
@@ -62,6 +62,30 @@ cargo-fuzz = true
 #                                     reach (they gate §15 behind a
 #                                     fully-formed reconstruction
 #                                     raster) are exercised directly.
+#   * `panic_free_motion_comp_subpel` — §18.3 / §20.14 sub-pixel
+#                                     motion-compensation primitives
+#                                     (`fetch_block_whole_pixel`,
+#                                      `fetch_block_halo`, `sixtap_2d`,
+#                                      `filter_block_4x4`, `interp`,
+#                                      `filter_set_for_version`,
+#                                      `stored_luma_mv`, `chroma_mv`,
+#                                      `apply_full_pixel`,
+#                                      `whole_pixel_fraction_is_zero`)
+#                                     plus the §18.2 / §18.4 MB-level
+#                                     wrappers (`predict_inter_mb`,
+#                                      `predict_inter_mb_whole_pixel`).
+#                                     Drives the `(plane, stride, w, h,
+#                                      blk_x, blk_y, mv, version)`
+#                                     envelope so the §20.14
+#                                     `build_mc_border` edge-replication
+#                                     clamp, the eighth-pel phase
+#                                     selector, and the version-routed
+#                                     sixtap-vs-bilinear filter-set
+#                                     pick the higher-level decode /
+#                                     encode harnesses can only reach
+#                                     via a fully-formed inter-frame
+#                                     state machine are exercised
+#                                     directly.
 #
 # The harness uses no oracle and depends on no external library — it's a
 # pure differential-against-spec sanity sweep.
@@ -121,5 +145,11 @@ doc = false
 [[bin]]
 name = "panic_free_loopfilter_segment"
 path = "fuzz_targets/panic_free_loopfilter_segment.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_motion_comp_subpel"
+path = "fuzz_targets/panic_free_motion_comp_subpel.rs"
 test = false
 doc = false

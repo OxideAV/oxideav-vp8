@@ -16,6 +16,7 @@ debug-arithmetic overflow, or out-of-bounds index.
 | `panic_free_encode_keyframe` | `encode_keyframe(&I420Frame, &KeyframeParams)` | Public encoder driver. Drives both the happy-path §11 intra mode pick → §14 forward transform → §13 token emission → §15 loop-filter reconstruct chain AND the parameter-rejection surface (raw `y_ac_qi` / `loop_filter_level` / `sharpness_level` / `nbr_of_dct_partitions` bytes are fed without normalisation so the encoder's `QuantIndexOutOfRange` / `LoopFilterLevelOutOfRange` / `SharpnessLevelOutOfRange` / `InvalidDctPartitionCount` paths are exercised in addition to the legal-range cases). |
 | `panic_free_two_pass_stream` | `Vp8TwoPassEncoder::first_pass_analyze` + `Vp8TwoPassEncoder::encode_frame` (multi-frame loop) | Public multi-frame encoder driver. The only target that reaches `encode_p_frame_multi_ref` (the §9.7 reference-frame refresh ladder, keyframe-vs-Pframe switching state machine, complexity-aware qindex picker). Per-frame `bits_per_mb` and a scene-cut bitmap are fed from the input tail so the qindex-delta envelope and the force-keyframe-on-scene-cut path are exercised even on the first-pass-skipped fallback. Frame count capped at 4 and per-axis dimensions at 128 px to bound per-iteration memory / wall time. |
 | `panic_free_loopfilter_segment` | `common_adjust`, `simple_segment`, `subblock_filter`, `mb_filter`, `LoopFilterParams::derive` | §15 per-segment loop-filter primitives. Drives the `(seg.len(), base)` slice-arithmetic envelope plus the four §15.4 `(loop_filter_level, sharpness_level, key_frame)` axis combinations directly, exercising the saturating-clamp / `interior_limit==0→1` floor / hev-ladder branches the higher-level decode and encode harnesses can only reach via a fully-formed reconstruction raster. Both the derived parameter set and an independent raw-byte triple are fed to each kernel, with a snapshot-and-restore step between calls so each primitive sees a fresh segment. A chained-pass leg (`simple_segment` → `mb_filter`, or `subblock_filter` → `mb_filter`) exercises state hand-off across primitives. |
+| `panic_free_motion_comp_subpel` | `fetch_block_whole_pixel`, `fetch_block_halo`, `sixtap_2d`, `filter_block_4x4`, `interp`, `filter_set_for_version`, `stored_luma_mv`, `chroma_mv`, `apply_full_pixel`, `whole_pixel_fraction_is_zero`, `predict_inter_mb_whole_pixel`, `predict_inter_mb` | §18.3 / §20.14 sub-pixel motion-compensation primitives. Drives the `(plane, stride, w, h, blk_x, blk_y, mv, version)` envelope so the §20.14 `build_mc_border` edge-replication clamp (whole-pixel and 9×9 halo branches), the eighth-pel phase selector across all 8 positions of both filter sets, the `(a + 64) >> 7 → clamp255` rounding ladder in `interp`, and the version-routed sixtap-vs-bilinear filter-set pick are all exercised at the primitive layer. Both phase pairs (`mv & 7` and `(mv ^ flags) & 7`) and both tap tables are driven per iteration so a single fuzz seed reaches more than one branch of the dispatcher; the optional §18.2 / §18.4 MB-level wrappers (`predict_inter_mb_whole_pixel`, `predict_inter_mb`) aggregate the 16×16 luma + 8×8 chroma per-sub-block fetches under a flag-gated leg. |
 
 The harnesses use **no oracle** and depend on no external
 implementation. The contract is panic-freedom, not output
@@ -40,6 +41,9 @@ gating data short-circuits before the decoder runs:
 | Max luma pixels per encoded frame (`panic_free_two_pass_stream`) | 128 × 128 (16 384) | Tighter than the keyframe-only target so 4 frames × the full pipeline (forward transform → token emit → §15 loop filter → reconstruction storage for the next frame's reference) stays inside the per-iteration memory cap |
 | Max input length (`panic_free_two_pass_stream`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth |
 | Max input length (`panic_free_loopfilter_segment`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth. The working buffer is `max(8, payload.len())` bytes; no further allocation |
+| Max input length (`panic_free_motion_comp_subpel`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth |
+| Max plane dimensions (`panic_free_motion_comp_subpel`) | 64 × 64 px, stride ≤ 80 | Plane allocation is `stride × h` ≤ ~5 KiB; the §20.14 `build_mc_border` clamp is fully exercised at this size and per-iteration memory stays inside the runner's cap |
+| Max MB-grid (`panic_free_motion_comp_subpel` MB-aggregate leg) | 2 × 2 MB (32 × 32 px luma + 16 × 16 px chroma per plane) | The §18.2 / §18.4 wrappers demand a strict MB-aligned plane; the flag-gated leg synthesises a 1..=2 MB-wide × 1..=2 MB-tall plane so the 16×16 / 8×8 aggregate is reached without inflating per-iteration alloc |
 
 The `parse_headers` target has **no** dimension cap — it allocates
 nothing beyond the parsers' own internal state, so even wire-extreme
@@ -61,6 +65,7 @@ cargo +nightly fuzz run parse_headers
 cargo +nightly fuzz run panic_free_encode_keyframe
 cargo +nightly fuzz run panic_free_two_pass_stream
 cargo +nightly fuzz run panic_free_loopfilter_segment
+cargo +nightly fuzz run panic_free_motion_comp_subpel
 ```
 
 `cargo-fuzz` requires the nightly toolchain for libFuzzer's
@@ -70,14 +75,23 @@ the fuzz binaries need nightly.
 ## Corpus
 
 The repository ships **no** seed corpus. libFuzzer starts from empty
-and discovers structure on its own; the six targets each converge
+and discovers structure on its own; the seven targets each converge
 on coverage of their respective surface within a few minutes on a
 single core. A 20-second smoke run on `panic_free_two_pass_stream`
 landed `cov: 3672, ft: 19072` across 6244 iterations at round 213.
 A 21-second smoke run on `panic_free_loopfilter_segment` landed
 `cov: 202, ft: 475, corp: 157/2944b` across 5 819 579 iterations at
 round 232 (the primitive-layer kernel runs ~830 × faster per
-iteration than the multi-frame two-pass encoder).
+iteration than the multi-frame two-pass encoder). A 16-second smoke
+run on `panic_free_motion_comp_subpel` landed
+`cov: 344, ft: 958, corp: 147/2471b` across 1 197 792 iterations at
+round 237 — sustained throughput ~74 800 exec/s on a single core,
+peak RSS 456 MiB — establishing the §18.3 primitive harness as
+mid-tier between the multi-frame encoder and the §15 segment
+harness (the §18.3 halo allocates a 9×9 byte buffer plus a 9×4
+intermediate per `sixtap_2d` call, so the per-iteration cost sits
+between the multi-frame state machine and the in-place §15
+kernels).
 
 ## CI
 

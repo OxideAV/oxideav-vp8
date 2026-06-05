@@ -4,6 +4,87 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_motion_comp_subpel` fuzz target (round 237, 2026-06-05)
+
+Fuzz-depth round: closes the gap where the five pre-existing fuzz
+targets (`panic_free_decode_keyframe`, `panic_free_decoder_state`,
+`parse_headers`, `panic_free_encode_keyframe`,
+`panic_free_two_pass_stream`, `panic_free_loopfilter_segment`) all reach
+§18 only through `decode_vp8` / `Vp8DecoderState::decode_frame` /
+`encode_keyframe` / `Vp8TwoPassEncoder::encode_frame`, which gate the
+sub-pixel motion-compensation primitives behind a fully-formed
+inter-frame state machine (a decoded reference plane plus a
+fully-built MV tree). The new seventh target drives the §18.3 /
+§20.14 primitive surface directly with an attacker-shaped
+`(plane, stride, w, h, blk_x, blk_y, mv, version)` envelope.
+
+Surface covered:
+
+* `motion_comp::fetch_block_whole_pixel(plane, stride, w, h, blk_x,
+  blk_y, mv) -> [u8; 16]` — the §20.14 `build_mc_border` whole-pixel
+  4×4 fetch (edge-replication clamp on out-of-plane positions).
+* `motion_comp::fetch_block_halo(plane, stride, w, h, blk_x, blk_y,
+  mv) -> [u8; 81]` — the §20.14 `build_mc_border` 9×9 halo (the
+  edge-replication clamp that backs `sixtap_2d`).
+* `motion_comp::sixtap_2d(&halo, mx, my, &filters) -> [u8; 16]` —
+  the §20.14 horizontal-then-vertical six-tap convolution on a
+  pre-fetched halo.
+* `motion_comp::filter_block_4x4(plane, stride, w, h, blk_x, blk_y,
+  mv, &filters) -> [u8; 16]` — the §20.14 dispatcher (whole-pixel
+  fast path on a zero fractional, `sixtap_2d` slow path otherwise).
+* `motion_comp::interp(&filter, &support) -> u8` — the §18.3 single
+  six-tap dot product with `(a + 64) >> 7` rounding and `clamp255`.
+* `motion_comp::filter_set_for_version(version_byte) -> FilterSet`
+  — the §20.14 `setup_subpixel_filters` sixtap-vs-bilinear selector.
+* `motion_comp::stored_luma_mv(mv) -> Mv`, `chroma_mv(mv) -> Mv`,
+  `apply_full_pixel(mv) -> Mv`, `whole_pixel_fraction_is_zero(mv) -> bool`
+  — the §18.1 MV-arithmetic helpers (raw `i16` envelope, not clamped
+  to §17 `-1023..=1023`).
+* `motion_comp::predict_inter_mb_whole_pixel(refs, mb_col, mb_row,
+  luma_mv, full_pixel) -> Result<ReconstructedMb, MotionCompError>`
+  — the §18.2 whole-pixel 16×16 luma + 8×8 chroma aggregate (flag-gated).
+* `motion_comp::predict_inter_mb(refs, mb_col, mb_row, luma_mv,
+  full_pixel, &filters) -> ReconstructedMb` — the §18.4 sub-pixel
+  16×16 luma + 8×8 chroma aggregate under the version-routed filter
+  set (flag-gated).
+
+Input layout: 11 header bytes
+(`version_byte`, `w_sel`, `h_sel`, `stride_pad`, `blk_x`, `blk_y`,
+`mv_row` low + high, `mv_col` low + high, flags) followed by the
+plane payload tiled into a `stride × h`-byte plane. Width and height
+are 1..=64 px, stride is `w + 0..=16`, and `(mv_row, mv_col)` are the
+full raw `i16` envelope. The driving MV is selected from the §18.1
+helper outputs (`mv` / `apply_full_pixel(mv)` / `chroma_mv(mv)` /
+`stored_luma_mv(mv)`) by two flag bits so a single fuzz seed reaches
+multiple §18.1 branches. The harness then drives both the picked
+filter set AND the other set through `filter_block_4x4` / `sixtap_2d`
+/ `predict_inter_mb` so the dispatcher's parameter routing is
+independently sampled per iteration.
+
+Caps:
+
+* Input length ≤ 4 KiB (libFuzzer default; re-checked at harness
+  entry as defence-in-depth).
+* Plane dimensions ≤ 64 × 64 px, stride ≤ 80; per-iteration plane
+  allocation ≤ ~5 KiB.
+* MB-aggregate leg gated to 1..=2 MB × 1..=2 MB (32 × 32 px luma +
+  16 × 16 px chroma per plane); the §18.2 / §18.4 wrappers demand a
+  strict MB-aligned plane.
+
+Initial coverage (16-second smoke run on this machine, single core):
+
+* 1 197 792 iterations
+* `cov: 344, ft: 958, corp: 147/2471b`
+* exec/s ≈ 74 862 sustained
+* peak RSS 456 MiB
+* no panics, no aborts, no out-of-bounds indices
+
+The harness uses **no oracle** and depends on no external library —
+the contract is panic-freedom, not output equivalence. The
+allocations are bounded by the input length cap and the `(stride × h)
++ 9 × 9 + 9 × 4`-byte working set per `sixtap_2d` call so per-iteration
+wall time stays under a millisecond on the wider envelope.
+
 ### Added — `panic_free_loopfilter_segment` fuzz target (round 232, 2026-06-04)
 
 Fuzz-depth round: closes the gap where the four pre-existing fuzz

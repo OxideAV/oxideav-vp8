@@ -45,8 +45,8 @@
 //!    `data[2..5]`, snapshotting + restoring the buffer between calls
 //!    so each primitive sees a fresh segment.
 //!
-//! No oracle, no decoder, no allocations beyond the working buffer:
-//! pure differential-against-spec sanity at the primitive layer.
+//! Sweeps the §15 primitive layer for panic-freedom, with the working
+//! buffer as the only allocation.
 //!
 //! Hard caps: input ≤ 4 KiB (libFuzzer default; re-checked at harness
 //! entry as defence-in-depth).

@@ -17,9 +17,8 @@ debug-arithmetic overflow, or out-of-bounds index.
 | `panic_free_two_pass_stream` | `Vp8TwoPassEncoder::first_pass_analyze` + `Vp8TwoPassEncoder::encode_frame` (multi-frame loop) | Public multi-frame encoder driver. The only target that reaches `encode_p_frame_multi_ref` (the §9.7 reference-frame refresh ladder, keyframe-vs-Pframe switching state machine, complexity-aware qindex picker). Per-frame `bits_per_mb` and a scene-cut bitmap are fed from the input tail so the qindex-delta envelope and the force-keyframe-on-scene-cut path are exercised even on the first-pass-skipped fallback. Frame count capped at 4 and per-axis dimensions at 128 px to bound per-iteration memory / wall time. |
 | `panic_free_loopfilter_segment` | `common_adjust`, `simple_segment`, `subblock_filter`, `mb_filter`, `LoopFilterParams::derive` | §15 per-segment loop-filter primitives. Drives the `(seg.len(), base)` slice-arithmetic envelope plus the four §15.4 `(loop_filter_level, sharpness_level, key_frame)` axis combinations directly, exercising the saturating-clamp / `interior_limit==0→1` floor / hev-ladder branches the higher-level decode and encode harnesses can only reach via a fully-formed reconstruction raster. Both the derived parameter set and an independent raw-byte triple are fed to each kernel, with a snapshot-and-restore step between calls so each primitive sees a fresh segment. A chained-pass leg (`simple_segment` → `mb_filter`, or `subblock_filter` → `mb_filter`) exercises state hand-off across primitives. |
 
-The harnesses use **no oracle** and depend on no external
-implementation. The contract is panic-freedom, not output
-equivalence.
+The contract these harnesses enforce is **panic-freedom on the
+public API surface**, not output equivalence.
 
 ## OOM caps
 
@@ -70,7 +69,7 @@ the fuzz binaries need nightly.
 ## Corpus
 
 The repository ships **no** seed corpus. libFuzzer starts from empty
-and discovers structure on its own; the six targets each converge
+and discovers structure on its own; the targets each converge
 on coverage of their respective surface within a few minutes on a
 single core. A 20-second smoke run on `panic_free_two_pass_stream`
 landed `cov: 3672, ft: 19072` across 6244 iterations at round 213.

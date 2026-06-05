@@ -3,7 +3,7 @@
 //! Fuzz: panic-freedom of the public §13.2 / §13.3 token-coding
 //! primitives.
 //!
-//! The six pre-existing fuzz targets all reach §13 only indirectly
+//! The pre-existing fuzz targets reach §13 only indirectly
 //! through `decode_vp8` / `Vp8DecoderState::decode_frame` /
 //! `encode_keyframe` / `Vp8TwoPassEncoder::encode_frame`, which gate
 //! the per-block token walk behind a fully-formed frame-header +

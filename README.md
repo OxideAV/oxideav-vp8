@@ -210,7 +210,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships six `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships seven `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -261,6 +261,30 @@ that exercise the public encode and decode surface for panic-freedom:
   from an empty seed on aarch64-apple-darwin, zero panics — the
   primitive-layer kernel runs ~830 × faster per iteration than
   `panic_free_two_pass_stream`.
+* `panic_free_token_block` — the public §13.2 / §13.3 token-coding
+  primitives `decode_block`, `decode_mb_coeffs`, and
+  `merge_default_token_probs`, plus the §13.3 `MbEntropyCtx` above /
+  left predictor lattice (round 237). The six harnesses above all
+  reach §13 only indirectly through `decode_vp8` /
+  `Vp8DecoderState::decode_frame` / `encode_keyframe` /
+  `Vp8TwoPassEncoder::encode_frame`, which gate the per-block token
+  walk behind a fully-formed frame-header + coded-header + dequant
+  state; this target drives the §13 primitive surface directly. An
+  attacker-shaped `(probability override list, predictor lattice,
+  bool partition)` envelope hits every node of the §13.2 coefficient
+  tree, every `Cat1..Cat6` extra-bits leg, every per-position slot of
+  `coeff_probs[4][8][3][11]` (default seed AND all-128 seed —
+  the §19.2 "every slot replaced by `token_prob_update`" envelope),
+  the §13.3 `decode_mb_coeffs` 25-block `(Y2, 16 Y, 4 U, 4 V)` walk
+  with both `has_y2` polarities, and the `mb_skip_coeff`
+  short-circuit through `MbEntropyCtx::reset_for_skip`. A 9-bit
+  bitmap per predictor vector seeds the `MB_ENTROPY_CTX_LEN`
+  above / left flags so the §13.3 lattice covers every starting
+  state. 21-second smoke pass landed `cov: 1418, ft: 2172, corp:
+  296/8566b` across 1 765 349 iterations from an empty seed on
+  aarch64-apple-darwin, peak RSS 316 MiB, zero panics — the §13
+  primitive surface gets ~7 × the coverage envelope of the §15
+  loop-filter target while running at 84 064 exec/s.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

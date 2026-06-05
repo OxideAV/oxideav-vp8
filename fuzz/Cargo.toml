@@ -123,3 +123,9 @@ name = "panic_free_loopfilter_segment"
 path = "fuzz_targets/panic_free_loopfilter_segment.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "panic_free_token_block"
+path = "fuzz_targets/panic_free_token_block.rs"
+test = false
+doc = false

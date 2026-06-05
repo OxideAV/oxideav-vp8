@@ -4,6 +4,73 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_token_block` fuzz target (round 237, 2026-06-05)
+
+Fuzz-depth round: closes the gap where the six pre-existing fuzz
+targets (`panic_free_decode_keyframe`, `panic_free_decoder_state`,
+`parse_headers`, `panic_free_encode_keyframe`, `panic_free_two_pass_stream`,
+`panic_free_loopfilter_segment`) all reach §13 only indirectly through
+`decode_vp8` / `Vp8DecoderState::decode_frame` / `encode_keyframe` /
+`Vp8TwoPassEncoder::encode_frame`, which gate the per-block token walk
+behind a fully-formed frame-header + coded-header + dequant state. The
+new seventh target drives the §13 primitive surface directly with an
+attacker-shaped `(probability override list, predictor lattice,
+bool partition)` envelope.
+
+Surface covered:
+
+* `dct_tokens::decode_block(dec, block_type, coeff_probs,
+  above_has_nonzero, left_has_nonzero, &mut coeffs) -> Result<usize,
+  DctTokenError>` — the §13.2 per-sub-block token loop, walking the
+  eleven-internal-node coefficient tree, the `Cat1..Cat6` extra-bits
+  ladder, the `prev_was_zero` skip-eob branch, and the `ctx3`
+  rollover. All four `BlockType` variants (`YAfterY2` / `Y2` / `UV` /
+  `YNoY2`) are reached via two flag bits of the input header.
+* `dct_tokens::decode_mb_coeffs(dec, has_y2, mb_skip_coeff,
+  coeff_probs, above, left) -> Result<MbCoeffs, MbCoeffError>` — the
+  §13.3 25-block macroblock walk in `(Y2, 16 Y, 4 U, 4 V)` order,
+  with both `has_y2` polarities and the `mb_skip_coeff` short-circuit
+  through `MbEntropyCtx::reset_for_skip`.
+* `dct_tokens::merge_default_token_probs(updates) -> CoeffProbs` —
+  folded over a `TokenProbUpdates` seeded from up to 32
+  `(plane, band, ctx, pos, prob)` tuples per iteration, with a
+  toggleable "every slot replaced" seed for the §19.2 maximum-update
+  envelope.
+* `bool_decoder::BoolDecoder::init_partition` — the §20-reference
+  short-tolerant init, so 0- and 1-byte partitions still drive the
+  renormalisation tail-case rather than returning early at harness
+  entry.
+
+Input layout (consumed from the front of the libFuzzer `data`):
+
+| Bytes | Meaning |
+|------:|---------|
+| `[0]`  | flags byte (path selector, `has_y2`, `mb_skip_coeff`, above/left nonzero predictors, `BlockType` selector, default vs all-128 prob seed) |
+| `[1]`  | override count `n`, saturated to `0..=32` |
+| `[2 .. 2+5n]` | `n` five-byte override tuples `(plane, band, ctx, pos, prob)`, each modulo its dimension upper bound |
+| next 2 bytes  | above-context 9-bit nonzero bitmap (`MB_ENTROPY_CTX_LEN`) |
+| next 2 bytes  | left-context  9-bit nonzero bitmap |
+| remainder     | bool-decoder partition bytes |
+
+Caps: input ≤ 4 KiB (libFuzzer default; re-checked at harness entry
+as defence-in-depth). `MAX_OVERRIDES = 32` ensures every position
+slot of one `(plane, band, ctx)` triple can be replaced via the
+override channel alone (16 slots per triple × 2 triples).
+
+Smoke pass:
+
+      21 s wall on aarch64-apple-darwin
+      1 765 349 iterations
+      cov: 1418, ft: 2172, corp: 296/8566b
+      exec/s 84 064 sustained
+      peak RSS 316 MiB
+      no panics, no aborts, no OOB indices
+
+The §13 primitive surface gets ~7 × the coverage envelope of the
+§15 loop-filter target while running at ~84 k exec/s. The full
+§19.2 token-prob-update lattice is reachable through the harness'
+override channel without any encoder pre-amble.
+
 ### Added — `panic_free_loopfilter_segment` fuzz target (round 232, 2026-06-04)
 
 Fuzz-depth round: closes the gap where the four pre-existing fuzz

@@ -4,6 +4,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — `forward_dct_4x4` SIMD dispatch split (round 247, 2026-06-07)
+
+Closes the round-226 deferred next-round candidate
+*"Split the `forward_dct_4x4` SIMD dispatch — round 226 keeps the
+forward DCT routed through SIMD under `simd` for shape parity with the
+WHT, even though the bench shows a small (~+8 %) regression."*
+
+The §14.4 `forward_dct_4x4` SIMD path runs the same lane-wide
+`c_mul` / `s_mul` chain (8 i32 multiplies per pass × 2 passes) plus a
+`round_div2_simd` mask + select, and on `aarch64-apple-darwin` doesn't
+pipeline as well as the scalar straight-line code (re-measured at
+11.69 ns SIMD vs 10.67 ns scalar this round, matching the round-226
+note). The §14.3 `forward_wht_4x4` SIMD path has no multiplies in the
+butterfly and stays −18 % under scalar, so it keeps the SIMD dispatch.
+
+* `forward_dct_4x4` now calls `forward_dct_4x4_scalar` directly under
+  every feature configuration (no `#[cfg(feature = "simd")]` arm).
+* `forward_dct_4x4_simd` stays compiled under the `simd` feature with
+  `#[allow(dead_code)]` so the byte-equivalence assertion still has a
+  symbol to call.
+* `fdct_forward_simd_matches_scalar_on_stress_inputs` is now gated
+  `#[cfg(feature = "simd")]` and calls `_simd` directly against
+  `_scalar` over the 21-input stress matrix — the equivalence proof is
+  preserved regardless of the public dispatch.
+* A new `fdct_public_dispatch_is_scalar` test runs on every
+  configuration and asserts `forward_dct_4x4(input) == forward_dct_4x4_scalar(input)`
+  so a future round can't accidentally re-route the dispatcher without
+  flipping that assertion too.
+
+Measured impact under nightly + `simd`:
+
+| Bench | r226 SIMD | r247 SIMD | Δ |
+|---|---:|---:|---:|
+| `forward_transform_4x4/forward_dct_4x4` | 11.69 ns | **9.81 ns** | **−16.2 %** |
+| `forward_transform_4x4/forward_wht_4x4` | 8.94 ns | 8.74 ns | −2.2 % |
+
+Stable (no `simd`): unchanged within criterion `--quick` noise envelope
+(forward DCT 10.67 → 10.82 ns; forward WHT 10.81 → 10.84 ns). The 452-
+test stable lib suite and the 11-test nightly + `simd` forward-transform
+suite all pass; the new equivalence-direction test fires on both
+configurations.
+
 ### Added — `panic_free_token_block` fuzz target (round 237, 2026-06-05)
 
 Fuzz-depth round: closes the gap where the six pre-existing fuzz

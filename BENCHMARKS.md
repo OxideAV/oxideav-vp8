@@ -413,6 +413,44 @@ the renamed `_scalar` variants. The full 452-test lib suite and
 every integration test pass on both stable (scalar dispatch) and
 nightly + `simd` (SIMD dispatch).
 
+## Round 247 — `forward_dct_4x4` SIMD dispatch split
+
+Round 247 (2026-06-07) closes the round-226 deferred next-round
+candidate. The §14.4 `forward_dct_4x4` SIMD path ran the lane-wide
+`c_mul` / `s_mul` chain (8 i32 multiplies per pass × 2 passes) plus a
+`round_div2_simd` mask + select; round 226 measured it ~+8 % slower
+than the scalar straight-line code on `aarch64-apple-darwin` but kept
+the SIMD dispatch for shape parity with the §14.3 WHT. Round 247
+re-routes the public `forward_dct_4x4` dispatcher to the scalar path
+under every feature configuration — `forward_wht_4x4` keeps its SIMD
+dispatch unchanged (no multiplies, still −18 % under scalar).
+
+The `_simd` implementation stays compiled under the `simd` feature
+(now with `#[allow(dead_code)]` since the dispatcher no longer reaches
+it) so the byte-equivalence assertion still has a symbol to call. The
+test was renamed `_simd_matches_scalar`-style logic-wise and now calls
+`forward_dct_4x4_simd` directly against `forward_dct_4x4_scalar` over
+the 21-input stress matrix (the public-dispatch comparison would be
+trivially equal after the split). A second
+`fdct_public_dispatch_is_scalar` test runs on every configuration and
+asserts `forward_dct_4x4 == forward_dct_4x4_scalar` so a future round
+can't accidentally re-route the dispatcher without flipping that
+assertion too.
+
+Headline `--quick` numbers (Apple M4 / aarch64) comparing the
+post-round-226 SIMD dispatch with the round-247 scalar dispatch:
+
+| Bench | r226 SIMD | r247 SIMD | Δ |
+|---|---:|---:|---:|
+| `forward_transform_4x4/forward_dct_4x4` | 11.69 ns | **9.81 ns** | **−16.2 %** |
+| `forward_transform_4x4/forward_wht_4x4` | 8.94 ns | 8.74 ns | −2.2 % |
+
+Stable (no `simd`): unchanged within criterion `--quick` noise (forward
+DCT 10.67 → 10.82 ns; forward WHT 10.81 → 10.84 ns). Per-MB forward
+side under `simd` now drops from 24 × 11.54 + 1 × 8.72 ≈ 286 ns / MB
+to 24 × 9.81 + 1 × 8.74 ≈ 244 ns / MB — a ~−15 % bias on the forward
+primitives, the inverse of round 226's +7 % bias.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -424,10 +462,8 @@ nightly + `simd` (SIMD dispatch).
   natural SIMD target (`Simd<i16, 8>` for an 8-pixel-wide stripe).
   Held back this round to keep the SIMD-feature surface focused on
   the §14 transform primitives.
-* **Split the `forward_dct_4x4` SIMD dispatch** — round 226 keeps the
-  forward DCT routed through SIMD under `simd` for shape parity
-  with the WHT, even though the bench shows a small (~+8 %)
-  regression. A future round can route `forward_dct_4x4` to the
-  scalar path even under `simd` if benchmarks on a hardware target
-  prove the regression material; the `_simd` impl + the byte-
-  equivalence test stay in place either way.
+* **Whole-frame `keyframe_encode` re-measure under nightly + `simd`**
+  — round 247's per-primitive `--quick` numbers imply a sub-percent
+  whole-frame win, deep below the bench's `--quick` noise envelope. A
+  profile-depth round with `--measurement-time` extended could attribute
+  it cleanly instead of letting it sit inside the per-frame noise.

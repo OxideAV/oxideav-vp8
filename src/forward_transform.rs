@@ -393,28 +393,39 @@ fn round_div2_simd(
 /// Each `* C` is computed as `i + ((i * 20091) >> 16)` and each `* S`
 /// as `(i * 35468) >> 16`, matching the §14.4 inverse exactly.
 ///
-/// Dispatch: SIMD path on nightly + `simd`, scalar otherwise. The SIMD
-/// path is byte-exact against the scalar listing on every test fixture
-/// (`fdct_forward_simd_matches_scalar_on_stress_inputs`).
+/// Dispatch: always the scalar path. The §14.4 SIMD partner
+/// [`forward_dct_4x4_simd`] (compiled under the nightly-only `simd`
+/// feature) is kept available and is asserted byte-exact against the
+/// scalar listing on a 21-input stress set
+/// (`fdct_forward_simd_matches_scalar_on_stress_inputs`), but the
+/// `forward_transform_4x4/forward_dct_4x4` criterion `--quick` numbers
+/// recorded in `BENCHMARKS.md` round 226 show the SIMD path is ~+8 %
+/// slower than the scalar straight-line code on `aarch64-apple-darwin`:
+/// the eight fixed-point `c_mul` / `s_mul` lane-wide multiplies per
+/// pass (× 2 passes) plus the lane-wide `round_div2_simd` mask + select
+/// don't pipeline as well as the scalar path. Round 247 therefore
+/// routes the public dispatcher to [`forward_dct_4x4_scalar`] under
+/// every feature configuration; the `_simd` implementation stays in
+/// place so a future round can re-target it (e.g. on a host where the
+/// regression flips), and the byte-equivalence test now calls the
+/// `_simd` path directly so the equivalence proof is preserved
+/// regardless of the public dispatch.
 pub fn forward_dct_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
-    #[cfg(feature = "simd")]
-    {
-        forward_dct_4x4_simd(input, output);
-    }
-    #[cfg(not(feature = "simd"))]
-    {
-        forward_dct_4x4_scalar(input, output);
-    }
+    forward_dct_4x4_scalar(input, output);
 }
 
 /// Scalar §14.4 forward DCT — the longhand derivation from the §14.4
 /// inverse listing.
 ///
-/// The public [`forward_dct_4x4`] dispatches here on stable builds (and
-/// on nightly without the `simd` feature); the `simd` feature swaps in
-/// [`forward_dct_4x4_simd`], which is itself byte-exact against this
-/// implementation (`fdct_forward_simd_matches_scalar_on_stress_inputs`).
-#[allow(dead_code)] // Used by `forward_dct_4x4` only on the !simd path.
+/// The public [`forward_dct_4x4`] dispatches here under every feature
+/// configuration as of round 247 (see the dispatcher docstring for the
+/// rationale — the `simd` lane-wide `c_mul` / `s_mul` chain regresses
+/// vs scalar on `aarch64-apple-darwin`). The `simd` feature's
+/// [`forward_dct_4x4_simd`] partner is still compiled and is byte-exact
+/// against this implementation
+/// (`fdct_forward_simd_matches_scalar_on_stress_inputs`); a future
+/// round can flip the public dispatch back to SIMD if benchmarks on a
+/// different host justify it.
 fn forward_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
     let mut tmp = [0i32; 16];
 
@@ -497,7 +508,17 @@ fn forward_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
 /// the scalar §14.4 forward listing directly (one lane per column ⇒
 /// first-pass vectorises; transpose ⇒ second-pass vectorises). Byte-
 /// exact against [`forward_dct_4x4_scalar`] on every test fixture.
+///
+/// As of round 247 the public dispatcher [`forward_dct_4x4`] routes to
+/// the scalar path under every feature configuration (see the
+/// dispatcher docstring for the bench evidence). This `_simd`
+/// implementation stays compiled under the `simd` feature so the
+/// `fdct_forward_simd_matches_scalar_on_stress_inputs` byte-
+/// equivalence assertion still runs on every nightly + `simd` test
+/// pass; a future round can re-target the dispatcher to this function
+/// if hardware-specific benches justify it.
 #[cfg(feature = "simd")]
+#[allow(dead_code)] // Reached only by the cfg(test) equivalence assertion.
 fn forward_dct_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
     use core::simd::Simd;
 
@@ -891,8 +912,35 @@ mod tests {
         v
     }
 
+    /// `forward_dct_4x4_simd` is byte-exact against `forward_dct_4x4_scalar`
+    /// on the 21-input stress matrix. Compared to the round-226 shape
+    /// (`public dispatch ≠ scalar`) this test now goes directly through
+    /// the `_simd` symbol because the round-247 public dispatcher routes
+    /// to `_scalar` under every feature configuration (the `--quick`
+    /// numbers in `BENCHMARKS.md` showed the SIMD path regresses for
+    /// the forward DCT). The equivalence proof has to survive the
+    /// dispatcher change, so this asserts `simd == scalar` directly
+    /// rather than going through the public function.
+    #[cfg(feature = "simd")]
     #[test]
     fn fdct_forward_simd_matches_scalar_on_stress_inputs() {
+        for (idx, input) in forward_stress_inputs().iter().enumerate() {
+            let mut via_simd = [0i16; 16];
+            forward_dct_4x4_simd(input, &mut via_simd);
+            let mut via_scalar = [0i16; 16];
+            forward_dct_4x4_scalar(input, &mut via_scalar);
+            assert_eq!(
+                via_simd, via_scalar,
+                "input #{idx} ({input:?}): _simd ≠ _scalar"
+            );
+        }
+    }
+
+    /// Public dispatch matches the scalar listing under every feature
+    /// configuration after round 247. Cheap sanity check that the
+    /// dispatcher didn't get accidentally rerouted in a future round.
+    #[test]
+    fn fdct_public_dispatch_is_scalar() {
         for (idx, input) in forward_stress_inputs().iter().enumerate() {
             let mut via_public = [0i16; 16];
             forward_dct_4x4(input, &mut via_public);

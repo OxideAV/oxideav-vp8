@@ -4,6 +4,76 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — `forward_wht_4x4` scalar + SIMD rewritten in canonical butterfly shape, mirroring the §14.3 inverse listing (round 251, 2026-06-07)
+
+Round 249 reorganised `forward_dct_4x4_scalar` into the canonical
+`(a1, b1, c1, d1)` partial-sum butterfly form, and round 250 propagated
+the same shape into `forward_dct_4x4_simd`. Round 251 closes the
+remaining gap on the §14 forward transforms by giving
+`forward_wht_4x4_scalar` and `forward_wht_4x4_simd` the same
+treatment: both listings now mirror the §14.3 inverse listing
+`inverse_wht_4x4` line-for-line.
+
+The §14.3 inverse listing pairs `(ip[0], ip[12])` and `(ip[4], ip[8])`
+in each pass with the assignments
+
+```
+a1 = ip[0] + ip[12];   b1 = ip[4] + ip[8]
+c1 = ip[4] - ip[8];    d1 = ip[0] - ip[12]
+op[0] = a1 + b1;   op[4] = c1 + d1;   op[8] = a1 - b1;   op[12] = d1 - c1
+```
+
+Because the WHT matrix `M` is symmetric and `M * M = 4 * I`, the
+forward and inverse 1-D Walsh-Hadamard transforms use the same
+butterfly — only the final rounding differs (`round_div2(x)` on the
+forward side, `(x + 3) >> 3` on the inverse side, the two together
+producing the round-trip `(8v + 3) >> 3 = v` for a uniform-DC input
+of value `v`). Before the rewrite the forward listings paired
+`(i0, i4)` / `(i8, i12)` for the column pass and `(r0, r1)` /
+`(r2, r3)` for the row pass, with the four outputs assigned in a
+different `(a1+b1, a1-b1, c1-d1, c1+d1)` shape. After the rewrite
+each pass uses the identical pair-selection and butterfly assignment
+as the §14.3 inverse, so the forward / inverse pairs sit side-by-side
+in the source.
+
+The rearrangement is bit-exact: each butterfly output unfolds to the
+same four-term sum it did before the refactor (`tmp[0] = (i0 + i12) +
+(i4 + i8) = i0 + i4 + i8 + i12`, `tmp[4] = (i4 - i8) + (i0 - i12) =
+i0 + i4 - i8 - i12`, etc.), and integer addition on `i32` /
+`Simd<i32, 4>` is associative on each lane. A new regression guard
+`fwht_scalar_matches_direct_derivation_listing` anchors the refactored
+scalar listing against the unfactored direct-derivation form
+`forward_wht_4x4_listing` (which writes each output as the literal
+four-term row-of-`M` sum, `o0 = i0 + i4 + i8 + i12`, etc.) on the
+21-input stress matrix — parallel to round 249's
+`fdct_scalar_matches_direct_derivation_listing` for the §14.4 forward
+DCT.
+
+Bit-exactness between the scalar and SIMD WHT paths continues to be
+covered by the existing `fwht_forward_simd_matches_scalar_on_stress_inputs`
+test, which routes through the public `forward_wht_4x4` dispatcher
+(SIMD under `simd`, scalar otherwise). The chain on nightly + `simd`
+is therefore
+
+```
+forward_wht_4x4_simd  ==  forward_wht_4x4_scalar  ==  forward_wht_4x4_listing
+```
+
+over the 21-input stress matrix.
+
+Test counts: stable lib 454, nightly + `simd` lib 455 (each +1 over
+round 250 for the new `_listing` regression guard). `cargo fmt
+--check` clean. `cargo clippy --all-targets --no-deps -- -D warnings`
+clean on stable and on nightly + `simd`.
+
+The public dispatcher `forward_wht_4x4` is unchanged: it routes to
+`forward_wht_4x4_simd` under the `simd` feature and to
+`forward_wht_4x4_scalar` otherwise. (The `forward_dct_4x4` dispatcher
+remains pinned to scalar per the round-247 `BENCHMARKS.md`
+observation; that decision is independent of the WHT path because the
+WHT butterfly is multiply-free and the SIMD lane-wide adds /
+shifts pipeline well.)
+
 ### Changed — `forward_dct_4x4_simd` rewritten in canonical butterfly shape, matching the round-249 scalar listing (round 250, 2026-06-07)
 
 Round 249 reorganised `forward_dct_4x4_scalar` into the canonical

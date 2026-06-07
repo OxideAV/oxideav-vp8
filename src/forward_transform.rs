@@ -145,18 +145,40 @@ pub fn forward_wht_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
 /// Scalar §14.3 forward WHT — the derivation written out longhand from
 /// the §14.3 inverse listing.
 ///
+/// Round 251 reorganised the listing into the canonical `(a1, b1, c1,
+/// d1)` partial-sum butterfly shape that mirrors the §14.3 inverse
+/// listing `inverse_wht_4x4_scalar` exactly: identical pair-selection
+/// (`a1 = i0 + i12`, `b1 = i4 + i8`, `c1 = i4 - i8`, `d1 = i0 - i12`)
+/// and identical butterfly output assignments (`tmp[0] = a1 + b1`,
+/// `tmp[4] = c1 + d1`, `tmp[8] = a1 - b1`, `tmp[12] = d1 - c1`). The
+/// only line that differs between forward and inverse is the final
+/// rounding step in the second pass — `round_div2` here vs `(x + 3) >> 3`
+/// in the inverse — because the WHT matrix `M` is symmetric and
+/// `M * M = 4 * I`, so the forward and inverse butterflies are
+/// identical up to the divide-by-2 / divide-by-8 scaling.
+///
+/// The rearrangement is bit-exact against the previous flat-sum
+/// listing — each butterfly output unfolds to the same four-term sum
+/// (`tmp[0] = (i0 + i12) + (i4 + i8) = i0 + i4 + i8 + i12`, etc.), and
+/// integer addition on `i32` is associative. The regression guard
+/// `fwht_scalar_matches_direct_derivation_listing` asserts
+/// `forward_wht_4x4_scalar` matches the unfactored direct-derivation
+/// form `forward_wht_4x4_listing` on the 21-input stress matrix.
+///
 /// The public [`forward_wht_4x4`] dispatches here on stable builds (and
 /// on nightly without the `simd` feature); the `simd` feature swaps in
 /// [`forward_wht_4x4_simd`], which is itself byte-exact against this
 /// implementation (`fwht_forward_simd_matches_scalar_on_stress_inputs`).
 #[allow(dead_code)] // Used by `forward_wht_4x4` only on the !simd path.
 fn forward_wht_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
-    // First pass: operate down each column. With the WHT matrix M
-    // applied to a column [i0, i4, i8, i12], the four outputs are
-    //   o0  = i0 + i4 + i8 + i12   (row 0 of M)
-    //   o4  = i0 + i4 - i8 - i12   (row 1 of M)
-    //   o8  = i0 - i4 - i8 + i12   (row 2 of M)
-    //   o12 = i0 - i4 + i8 - i12   (row 3 of M)
+    // First pass: operate down each column. Canonical butterfly shape
+    // mirroring the §14.3 inverse listing — pair (i0, i12) and (i4, i8)
+    // so the evens reuse one set of partial sums and the odd outputs
+    // reuse the other. The four outputs unfold to:
+    //   tmp[0]  = (i0 + i12) + (i4 + i8) = i0 + i4 + i8 + i12   (row 0 of M)
+    //   tmp[4]  = (i4 - i8)  + (i0 - i12) = i0 + i4 - i8 - i12  (row 1 of M)
+    //   tmp[8]  = (i0 + i12) - (i4 + i8) = i0 - i4 - i8 + i12   (row 2 of M)
+    //   tmp[12] = (i0 - i12) - (i4 - i8) = i0 - i4 + i8 - i12   (row 3 of M)
     let mut tmp = [0i32; 16];
     for col in 0..4 {
         let i0 = input[col] as i32;
@@ -164,21 +186,23 @@ fn forward_wht_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
         let i8 = input[8 + col] as i32;
         let i12 = input[12 + col] as i32;
 
-        let a1 = i0 + i4;
-        let b1 = i8 + i12;
-        let c1 = i0 - i4;
-        let d1 = i8 - i12;
+        let a1 = i0 + i12;
+        let b1 = i4 + i8;
+        let c1 = i4 - i8;
+        let d1 = i0 - i12;
 
         tmp[col] = a1 + b1;
-        tmp[4 + col] = a1 - b1;
-        tmp[8 + col] = c1 - d1;
-        tmp[12 + col] = c1 + d1;
+        tmp[4 + col] = c1 + d1;
+        tmp[8 + col] = a1 - b1;
+        tmp[12 + col] = d1 - c1;
     }
 
-    // Second pass: operate across each row (M applied along the row),
-    // followed by `/2` with symmetric rounding so a uniform input
-    // produces a single DC at coefficient 0 (see the
-    // `fwht_uniform_block_concentrates_to_dc` test).
+    // Second pass: operate across each row with the same canonical
+    // butterfly shape — pair (r0, r3) and (r1, r2). Followed by `/2`
+    // with symmetric round-half-away-from-zero (the forward partner of
+    // the §14.3 inverse's `(x + 3) >> 3`); the test
+    // `fwht_uniform_block_concentrates_to_dc` anchors the rounding sign
+    // for the uniform-block DC case.
     for row in 0..4 {
         let base = row * 4;
         let r0 = tmp[base];
@@ -186,25 +210,24 @@ fn forward_wht_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
         let r2 = tmp[base + 2];
         let r3 = tmp[base + 3];
 
-        let a1 = r0 + r1;
-        let b1 = r2 + r3;
-        let c1 = r0 - r1;
-        let d1 = r2 - r3;
+        let a1 = r0 + r3;
+        let b1 = r1 + r2;
+        let c1 = r1 - r2;
+        let d1 = r0 - r3;
 
-        let o0 = a1 + b1;
-        let o1 = a1 - b1;
-        let o2 = c1 - d1;
-        let o3 = c1 + d1;
+        let a2 = a1 + b1;
+        let b2 = c1 + d1;
+        let c2 = a1 - b1;
+        let d2 = d1 - c1;
 
         // Symmetric "/2 with round-half-away-from-zero". Plain `(x+1)>>1`
-        // would bias negatives down (e.g. (-1+1)>>1 = 0 but (-3+1)>>1 = -1
-        // is correct anyway); pairing the rounding so that negative
-        // values round toward zero matches the IWHT's `(x+3)>>3` shape
-        // for the round-trip.
-        output[base] = round_div2(o0);
-        output[base + 1] = round_div2(o1);
-        output[base + 2] = round_div2(o2);
-        output[base + 3] = round_div2(o3);
+        // would bias negatives down; pairing the rounding so that
+        // negative values round toward zero matches the IWHT's
+        // `(x + 3) >> 3` shape for the round-trip.
+        output[base] = round_div2(a2);
+        output[base + 1] = round_div2(b2);
+        output[base + 2] = round_div2(c2);
+        output[base + 3] = round_div2(d2);
     }
 }
 
@@ -227,6 +250,18 @@ fn forward_wht_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
 /// is expressed lane-wide as `select(x >= 0, (x + 1) >> 1, -((-x + 1) >> 1))`;
 /// the resulting per-lane value matches the scalar `round_div2` bit-
 /// for-bit because both branches are lane-wide arithmetic on `i32`s.
+///
+/// Round 251 reshapes this SIMD listing into the canonical
+/// `(a1, b1, c1, d1)` partial-sum butterfly shape that round 251 gave
+/// to `forward_wht_4x4_scalar`, so the SIMD and scalar listings now
+/// agree visually and both mirror the §14.3 inverse `inverse_wht_4x4`
+/// butterfly line-for-line. Each pass pairs (row0, row3) / (row1, row2)
+/// (first pass) and (r0, r3v) / (r1, r2) (second pass) so the four
+/// butterfly outputs collapse to a shared set of partial sums. The
+/// rearrangement is bit-exact against the previous listing because
+/// integer addition on `Simd<i32, 4>` is associative on each lane
+/// (lane-wise wrapping `i32::wrapping_add`) and the final butterfly
+/// outputs unfold to the same four-term sums.
 ///
 /// No external SIMD reference consulted — the layout is derived from
 /// the scalar §14.3 listing directly (one lane per column ⇒
@@ -264,21 +299,21 @@ fn forward_wht_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
 
     // First pass — §14.3 forward column butterfly across the four
     // lanes. (row0, row1, row2, row3) play the role of (i0, i4, i8, i12)
-    // in the scalar listing:
-    //   a1 = i0 + i4;  b1 = i8 + i12;  c1 = i0 - i4;  d1 = i8 - i12
+    // in the scalar listing's canonical butterfly shape:
+    //   a1 = i0 + i12;   b1 = i4 + i8;   c1 = i4 - i8;   d1 = i0 - i12
     //   tmp[0]  = a1 + b1
-    //   tmp[4]  = a1 - b1
-    //   tmp[8]  = c1 - d1
-    //   tmp[12] = c1 + d1
-    let a1 = row0 + row1;
-    let b1 = row2 + row3;
-    let c1 = row0 - row1;
-    let d1 = row2 - row3;
+    //   tmp[4]  = c1 + d1
+    //   tmp[8]  = a1 - b1
+    //   tmp[12] = d1 - c1
+    let a1 = row0 + row3;
+    let b1 = row1 + row2;
+    let c1 = row1 - row2;
+    let d1 = row0 - row3;
 
     let t0 = a1 + b1;
-    let t1 = a1 - b1;
-    let t2 = c1 - d1;
-    let t3 = c1 + d1;
+    let t1 = c1 + d1;
+    let t2 = a1 - b1;
+    let t3 = d1 - c1;
 
     // Transpose so each row-vector now carries one row of the
     // intermediate; r_i[j] = t_j[i].
@@ -292,19 +327,22 @@ fn forward_wht_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
     let r2 = Simd::<i32, 4>::from_array([t0a[2], t1a[2], t2a[2], t3a[2]]);
     let r3v = Simd::<i32, 4>::from_array([t0a[3], t1a[3], t2a[3], t3a[3]]);
 
-    // Second pass — §14.3 forward row butterfly. (r0, r1, r2, r3v)
-    // play the role of (r0, r1, r2, r3) in the scalar listing:
-    //   a1 = r0 + r1; b1 = r2 + r3; c1 = r0 - r1; d1 = r2 - r3
-    //   o0 = a1 + b1; o1 = a1 - b1; o2 = c1 - d1; o3 = c1 + d1
-    let a2 = r0 + r1;
-    let b2 = r2 + r3v;
-    let c2 = r0 - r1;
-    let d2 = r2 - r3v;
+    // Second pass — §14.3 forward row butterfly. Same canonical
+    // butterfly shape as the column pass; (r0, r1, r2, r3v) play the
+    // role of (r0, r1, r2, r3) in the scalar listing — pairing
+    // (r0, r3v) and (r1, r2) so the evens reuse a single set of
+    // partial sums.
+    //   a1 = r0 + r3;   b1 = r1 + r2;   c1 = r1 - r2;   d1 = r0 - r3
+    //   o0 = a1 + b1;   o1 = c1 + d1;   o2 = a1 - b1;   o3 = d1 - c1
+    let a2 = r0 + r3v;
+    let b2 = r1 + r2;
+    let c2 = r1 - r2;
+    let d2 = r0 - r3v;
 
     let u0 = a2 + b2;
-    let u1 = a2 - b2;
-    let u2 = c2 - d2;
-    let u3 = c2 + d2;
+    let u1 = c2 + d2;
+    let u2 = a2 - b2;
+    let u3 = d2 - c2;
 
     // Lane-wide symmetric `/2 with round-half-away-from-zero`:
     //   v >= 0 ⇒ (v + 1) >> 1
@@ -1122,6 +1160,71 @@ mod tests {
             assert_eq!(
                 via_public, via_scalar,
                 "input #{idx} ({input:?}): public dispatch ≠ scalar listing"
+            );
+        }
+    }
+
+    /// Reference §14.3 forward WHT — the spec derivation written out
+    /// in the unfactored direct form `o0 = i0 + i4 + i8 + i12; o4 =
+    /// i0 + i4 - i8 - i12; ...` (no `a1` / `b1` partial sums shared
+    /// between the even and odd outputs). The round-251 refactor of
+    /// `forward_wht_4x4_scalar` reorganises the same arithmetic into
+    /// the canonical butterfly shape mirroring the §14.3 inverse
+    /// listing; this function is the regression guard proving that
+    /// reorganisation is bit-exact (integer addition is associative on
+    /// `i32`, so the butterfly partial sums `(i0 + i12) + (i4 + i8)`
+    /// produce the same bytes as the flat sum `i0 + i4 + i8 + i12`).
+    /// Used only by `fwht_scalar_matches_direct_derivation_listing`.
+    fn forward_wht_4x4_listing(input: &[i16; 16], output: &mut [i16; 16]) {
+        let mut tmp = [0i32; 16];
+        for col in 0..4 {
+            let i0 = input[col] as i32;
+            let i4 = input[4 + col] as i32;
+            let i8 = input[8 + col] as i32;
+            let i12 = input[12 + col] as i32;
+
+            // Direct row-of-M unfactored sums.
+            tmp[col] = i0 + i4 + i8 + i12;
+            tmp[4 + col] = i0 + i4 - i8 - i12;
+            tmp[8 + col] = i0 - i4 - i8 + i12;
+            tmp[12 + col] = i0 - i4 + i8 - i12;
+        }
+        for row in 0..4 {
+            let base = row * 4;
+            let r0 = tmp[base];
+            let r1 = tmp[base + 1];
+            let r2 = tmp[base + 2];
+            let r3 = tmp[base + 3];
+
+            let o0 = r0 + r1 + r2 + r3;
+            let o1 = r0 + r1 - r2 - r3;
+            let o2 = r0 - r1 - r2 + r3;
+            let o3 = r0 - r1 + r2 - r3;
+
+            output[base] = round_div2(o0);
+            output[base + 1] = round_div2(o1);
+            output[base + 2] = round_div2(o2);
+            output[base + 3] = round_div2(o3);
+        }
+    }
+
+    /// Round-251 regression guard: the refactored `forward_wht_4x4_scalar`
+    /// (canonical butterfly shape mirroring the §14.3 inverse listing)
+    /// is byte-exact against `forward_wht_4x4_listing` (the unfactored
+    /// direct spec-derivation listing) on the 21-input stress matrix.
+    /// Any future change to the scalar listing that breaks this
+    /// assertion is changing the output bytes, not just the
+    /// readability shape.
+    #[test]
+    fn fwht_scalar_matches_direct_derivation_listing() {
+        for (idx, input) in forward_stress_inputs().iter().enumerate() {
+            let mut via_scalar = [0i16; 16];
+            forward_wht_4x4_scalar(input, &mut via_scalar);
+            let mut via_listing = [0i16; 16];
+            forward_wht_4x4_listing(input, &mut via_listing);
+            assert_eq!(
+                via_scalar, via_listing,
+                "input #{idx} ({input:?}): refactored _scalar ≠ direct-derivation listing"
             );
         }
     }

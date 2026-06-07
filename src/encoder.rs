@@ -8707,6 +8707,69 @@ mod tests {
         );
     }
 
+    /// Anchor the §13.4 `token_prob_update()` walk-order byte-
+    /// equivalence between [`write_no_token_prob_updates`] and
+    /// [`write_token_prob_updates`]-handed-all-`None` against the
+    /// **actual** §13.4 `coeff_update_probs[4][8][3][11]` spec table
+    /// (RFC 6386 §13.4 page 69), not a flat `[128u8; 1056]` placeholder.
+    ///
+    /// Why both writers should agree on every byte when the §13.4 flag
+    /// is `false` everywhere:
+    ///
+    /// * Both writers walk the same `(i=0..4, j=0..8, k=0..3, t=0..11)`
+    ///   four-nested-`do/while` order from RFC 6386 §13.4.
+    /// * Both writers consult `flag_probs[i*8*3*11 + j*3*11 + k*11 + t]`
+    ///   when emitting the per-position "is this slot replaced?" bit.
+    /// * On the all-`None` path, `write_token_prob_updates` emits
+    ///   `write_bool(p, false)` at every position and never follows up
+    ///   with an `L(8)`; `write_no_token_prob_updates` emits the same
+    ///   `write_bool(p, false)` at the same `p`. With the bool encoder
+    ///   being deterministic on `(state, prob, bit)` triples, the byte
+    ///   streams MUST be identical.
+    ///
+    /// The existing external test
+    /// (`tests/encoder_token_prob_updates.rs::write_token_prob_updates_all_none_matches_no_update_writer`)
+    /// validates this with a flat `[128u8; 1056]`, which means the bool
+    /// encoder's range / split machinery never exercises the rare
+    /// extreme-probability splits the §13.4 table actually contains
+    /// (the table has entries as low as `5` and as high as `255`). This
+    /// in-crate test closes that gap by exercising the byte equivalence
+    /// against the real §13.4 flag table — if a future refactor of
+    /// either writer subtly diverges (e.g. one switches to `write_bit`
+    /// at a hard-coded probability, or skips a slot when the flag
+    /// probability is `0` / `255`), the [128;1056] placeholder test
+    /// might still pass while this one would catch the regression.
+    #[test]
+    fn write_no_token_prob_updates_matches_all_none_against_spec_flag_probs() {
+        let no_updates: crate::coded_header::TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+
+        let mut a = BoolEncoder::new();
+        write_no_token_prob_updates(&mut a, &COEFF_UPDATE_PROBS_FLAT);
+        let bytes_a = a.finish();
+
+        let mut b = BoolEncoder::new();
+        write_token_prob_updates(&mut b, &no_updates, &COEFF_UPDATE_PROBS_FLAT);
+        let bytes_b = b.finish();
+
+        assert_eq!(
+            bytes_a, bytes_b,
+            "writers must agree on the all-None §13.4 payload under \
+             the real coeff_update_probs[4][8][3][11] table — any \
+             divergence here means the §13.4 four-nested walk order \
+             or the per-position probability lookup has drifted \
+             between the two writers."
+        );
+
+        // Bit-count sanity: both writers emit exactly 1056 bool bits
+        // and no L(8) payload on the all-None path, so the output must
+        // be non-empty (the bool encoder always flushes at least one
+        // partial byte at `finish()`).
+        assert!(
+            !bytes_a.is_empty(),
+            "all-None §13.4 payload must still emit at least one byte"
+        );
+    }
+
     /// The §11 mode-layer writer must produce a first partition the
     /// decoder's `parse_key_frame_macroblock_modes` reads back to the
     /// exact `MacroblockModes` the encoder chose — including the §11.3

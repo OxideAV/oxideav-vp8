@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §13.4 walk-order byte-equivalence anchored against the actual spec flag table (round 252, 2026-06-08)
+
+The external test
+`tests/encoder_token_prob_updates.rs::write_token_prob_updates_all_none_matches_no_update_writer`
+validates the byte equivalence of `write_no_token_prob_updates` and
+`write_token_prob_updates(all-None)` against a flat
+`[128u8; 1056]` placeholder for the §13.4
+`coeff_update_probs[4][8][3][11]` flag-probability table. That
+placeholder never exercises the rare extreme-probability splits the
+real §13.4 table actually contains (entries as low as `5`, as high
+as `255`).
+
+The new in-crate test
+`encoder::tests::write_no_token_prob_updates_matches_all_none_against_spec_flag_probs`
+closes the gap by anchoring the same byte equivalence against the
+actual `COEFF_UPDATE_PROBS_FLAT` table (the crate-local flat view of
+`coeff_update_probs[4][8][3][11]`). The §13.4 four-nested-`do/while`
+walk `(i=0..4, j=0..8, k=0..3, t=0..11)` is identical between the
+two writers, and on the all-`None` path each writer emits
+`write_bool(p, false)` at the same `p` for every position with no
+follow-up `L(8)` — so the byte streams must match. The test catches
+a future regression where one writer subtly diverges from the other
+on the extreme-probability splits (e.g. a refactor that switches one
+writer to `write_bit` at a hard-coded probability, or skips a slot
+when the flag probability is `0` / `255`) while the
+flat-`[128u8; 1056]` placeholder test would still pass.
+
+Test counts: stable lib 455 (+1 over round 251), nightly + `simd` lib
+456 (+1 over round 251). No behavioural change — strengthens the
+existing §13.4 walk-order regression net.
+
 ### Changed — `forward_wht_4x4` scalar + SIMD rewritten in canonical butterfly shape, mirroring the §14.3 inverse listing (round 251, 2026-06-07)
 
 Round 249 reorganised `forward_dct_4x4_scalar` into the canonical

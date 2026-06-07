@@ -4,6 +4,67 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — `forward_dct_4x4_simd` rewritten in canonical butterfly shape, matching the round-249 scalar listing (round 250, 2026-06-07)
+
+Round 249 reorganised `forward_dct_4x4_scalar` into the canonical
+`(a1, b1, c1, d1)` partial-sum butterfly form that the §14.4 inverse
+listing `inverse_dct_4x4_scalar` uses. Round 250 propagates the same
+shape into `forward_dct_4x4_simd`, the `core::simd::Simd<i32, 4>`
+partner kept compiled under the `simd` feature for the byte-
+equivalence assertion. Before the rewrite the SIMD listing held the
+two even outputs (`t0`, `t2`) as flat four-term sums (`row0 + row1 +
+row2 + row3` and `row0 - row1 - row2 + row3`) and the two odd outputs
+(`t1`, `t3`) as flat four-term `c_mul` / `s_mul` chains
+(`c0 + s1 - s2 - c3` and `s0 - c1v + c2v - s3`). After the rewrite
+each pass groups the partial sums into `(a1, b1)` pair-sums shared
+between the two even outputs and `(c1, d1)` pair-differences for the
+odd outputs, matching the scalar listing line-for-line:
+
+```
+a1 = row0 + row3;   b1 = row1 + row2
+c1 = (c_mul(row0) - c_mul(row3)) + (s_mul(row1) - s_mul(row2))   // o4
+d1 = (s_mul(row0) - s_mul(row3)) - (c_mul(row1) - c_mul(row2))   // o12
+t0 = a1 + b1;   t1 = c1;   t2 = a1 - b1;   t3 = d1
+```
+
+Each `c_mul` / `s_mul` lane operation is evaluated separately on its
+own row-vector — `c_mul(row0)` and `c_mul(row3)` are computed
+independently before their lane-wise difference — never collapsed
+into `c_mul(row0 - row3)`, which would change the lane-wise
+`>> splat(16)` truncation result. The partial-sum reorder is on
+associative lane-wise i32 add / sub, so each lane's final byte is
+identical to the previously-flat sum.
+
+Bit-exactness is preserved by the existing
+`fdct_forward_simd_matches_scalar_on_stress_inputs` test (nightly +
+`simd` only), which asserts `forward_dct_4x4_simd` produces identical
+bytes against `forward_dct_4x4_scalar` over the same 21-input stress
+matrix round 249's scalar refactor was anchored against (DC-only
+across 10 magnitudes, single-AC at every position, mixed gradients,
+near-i16 extremes). The scalar listing in turn is anchored against
+the unfactored direct-derivation form by round 249's
+`fdct_scalar_matches_direct_derivation_listing`, so the chain is
+
+```
+forward_dct_4x4_simd  ==  forward_dct_4x4_scalar  ==  forward_dct_4x4_listing
+```
+
+over the 21-input stress matrix.
+
+Test counts unchanged: stable lib 453, nightly + `simd` lib 454,
+`--no-default-features` lib 448. `cargo fmt --check` clean.
+`cargo clippy --all-targets --no-deps -- -D warnings` clean on stable,
+on `--no-default-features`, and on nightly + `simd`.
+
+The round-247 public dispatcher decision is unchanged: the public
+`forward_dct_4x4` still routes to `forward_dct_4x4_scalar` under every
+feature configuration on `aarch64-apple-darwin` (the lane-wide
+multiply-heavy chain regresses against the scalar straight-line
+listing on this host — see `BENCHMARKS.md` round-247 entry). The
+SIMD listing stays compiled under the `simd` feature so a future
+round on a host where the multiply-heavy SIMD path pipelines better
+can re-target the dispatcher without an intervening listing rewrite.
+
 ### Changed — `forward_dct_4x4_scalar` rewritten in canonical butterfly shape mirroring §14.4 inverse listing (round 249, 2026-06-07)
 
 Next-round refinement on top of round 247's SIMD dispatch split.

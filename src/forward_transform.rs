@@ -534,6 +534,22 @@ fn forward_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
 /// shape over the rows, and apply `round_div2_simd` lane-wide for the
 /// symmetric `/2` rounding step.
 ///
+/// Round 250 reshapes the SIMD listing into the canonical `(a1, b1,
+/// c1, d1)` partial-sum butterfly form that round 249 gave to
+/// `forward_dct_4x4_scalar`, so the SIMD and scalar listings now agree
+/// visually as well as producing identical bytes. Each pass shares a
+/// single `(a1, b1)` pair-sum between the two even outputs and
+/// collects the odd outputs' fixed-point multiplies into a `(c1, d1)`
+/// pair-difference form (`(c_mul(i0) - c_mul(i12)) + (s_mul(i4) -
+/// s_mul(i8))` for `o4`, etc.). No `c_mul` / `s_mul` call is collapsed
+/// into `c_mul(row0 - row3)` — that would change the `>> 16`
+/// truncation result; the partial-sum reorder is on associative i32
+/// lane adds. Bit-exact against the previous flat-sum SIMD listing —
+/// see the `fdct_forward_simd_matches_scalar_on_stress_inputs` byte-
+/// equivalence assertion (which itself anchors to the scalar listing,
+/// which round 249's `fdct_scalar_matches_direct_derivation_listing`
+/// anchors to the unfactored direct-derivation form).
+///
 /// No external SIMD reference consulted — the layout is derived from
 /// the scalar §14.4 forward listing directly (one lane per column ⇒
 /// first-pass vectorises; transpose ⇒ second-pass vectorises). Byte-
@@ -586,25 +602,40 @@ fn forward_dct_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
 
     // First pass — §14.4 forward column butterfly across the four
     // lanes. (row0, row1, row2, row3) play the role of (i0, i4, i8, i12)
-    // in the scalar listing:
-    //   o0  = i0 + i4 + i8 + i12
-    //   o4  = i0*C + i4*S - i8*S - i12*C
-    //   o8  = i0 - i4 - i8 + i12
-    //   o12 = i0*S - i4*C + i8*C - i12*S
-    let t0 = row0 + row1 + row2 + row3;
-    let t2 = row0 - row1 - row2 + row3;
+    // in `forward_dct_4x4_scalar`'s canonical `(a1, b1, c1, d1)` partial-
+    // sum butterfly. Round 250 reshapes this listing into the same form
+    // the scalar listing took on in round 249: the evens share a single
+    // `(a1, b1)` pair-sum, and the odd outputs collect their fixed-point
+    // multiplies into `(c1, d1)` pair-differences. The pair-difference
+    // structure is bit-exact against the previously-flat
+    // `c0 + s1 - s2 - c3` sum because integer addition is associative
+    // on `Simd<i32, 4>` (lane-wise wrapping i32 add) and no `c_mul` /
+    // `s_mul` call is collapsed into `c_mul(row0 - row3)` — which would
+    // change the `>> 16` truncation result.
+    //
+    //   a1 = i0 + i12;   b1 = i4 + i8
+    //   c1 = (c_mul(i0) - c_mul(i12)) + (s_mul(i4) - s_mul(i8))     // o4
+    //   d1 = (s_mul(i0) - s_mul(i12)) - (c_mul(i4) - c_mul(i8))     // o12
+    //   o0 = a1 + b1;    o4 = c1;     o8 = a1 - b1;    o12 = d1
+    let a1 = row0 + row3;
+    let b1 = row1 + row2;
 
-    let c0 = row0 + ((row0 * cos_m1) >> sh16);
-    let s1 = (row1 * sin) >> sh16;
-    let s2 = (row2 * sin) >> sh16;
-    let c3 = row3 + ((row3 * cos_m1) >> sh16);
-    let t1 = c0 + s1 - s2 - c3;
+    let c_row0 = row0 + ((row0 * cos_m1) >> sh16);
+    let c_row3 = row3 + ((row3 * cos_m1) >> sh16);
+    let s_row1 = (row1 * sin) >> sh16;
+    let s_row2 = (row2 * sin) >> sh16;
+    let c1 = (c_row0 - c_row3) + (s_row1 - s_row2);
 
-    let s0 = (row0 * sin) >> sh16;
-    let c1v = row1 + ((row1 * cos_m1) >> sh16);
-    let c2v = row2 + ((row2 * cos_m1) >> sh16);
-    let s3 = (row3 * sin) >> sh16;
-    let t3 = s0 - c1v + c2v - s3;
+    let s_row0 = (row0 * sin) >> sh16;
+    let s_row3 = (row3 * sin) >> sh16;
+    let c_row1 = row1 + ((row1 * cos_m1) >> sh16);
+    let c_row2 = row2 + ((row2 * cos_m1) >> sh16);
+    let d1 = (s_row0 - s_row3) - (c_row1 - c_row2);
+
+    let t0 = a1 + b1;
+    let t1 = c1;
+    let t2 = a1 - b1;
+    let t3 = d1;
 
     // Intermediate ordering after the first pass:
     //   tmp_row_0 = t0  (the `o0` outputs across the four columns)
@@ -624,26 +655,35 @@ fn forward_dct_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
     let r2 = Simd::<i32, 4>::from_array([t0a[2], t1a[2], t2a[2], t3a[2]]);
     let r3v = Simd::<i32, 4>::from_array([t0a[3], t1a[3], t2a[3], t3a[3]]);
 
-    // Second pass — §14.4 forward row butterfly. Same shape as the
-    // column pass; (r0, r1, r2, r3v) play the role of (r0, r1, r2, r3):
-    //   o0 = r0 + r1 + r2 + r3
-    //   o1 = r0*C + r1*S - r2*S - r3*C
-    //   o2 = r0 - r1 - r2 + r3
-    //   o3 = r0*S - r1*C + r2*C - r3*S
-    let u0 = r0 + r1 + r2 + r3v;
-    let u2 = r0 - r1 - r2 + r3v;
+    // Second pass — §14.4 forward row butterfly. Same canonical
+    // `(a1, b1, c1, d1)` partial-sum butterfly as the column pass;
+    // (r0, r1, r2, r3v) play the role of (r0, r1, r2, r3) in the scalar
+    // second-pass listing (which itself plays the role of (i0, i4, i8,
+    // i12) of the column pass). Pairing is (r0, r3v) and (r1, r2).
+    //
+    //   a1 = r0 + r3;    b1 = r1 + r2
+    //   c1 = (c_mul(r0) - c_mul(r3)) + (s_mul(r1) - s_mul(r2))      // o1
+    //   d1 = (s_mul(r0) - s_mul(r3)) - (c_mul(r1) - c_mul(r2))      // o3
+    //   o0 = a1 + b1;    o1 = c1;     o2 = a1 - b1;    o3 = d1
+    let a1r = r0 + r3v;
+    let b1r = r1 + r2;
 
-    let c0r = r0 + ((r0 * cos_m1) >> sh16);
-    let s1r = (r1 * sin) >> sh16;
-    let s2r = (r2 * sin) >> sh16;
-    let c3r = r3v + ((r3v * cos_m1) >> sh16);
-    let u1 = c0r + s1r - s2r - c3r;
+    let c_r0 = r0 + ((r0 * cos_m1) >> sh16);
+    let c_r3 = r3v + ((r3v * cos_m1) >> sh16);
+    let s_r1 = (r1 * sin) >> sh16;
+    let s_r2 = (r2 * sin) >> sh16;
+    let c1r = (c_r0 - c_r3) + (s_r1 - s_r2);
 
-    let s0r = (r0 * sin) >> sh16;
-    let c1r = r1 + ((r1 * cos_m1) >> sh16);
-    let c2r = r2 + ((r2 * cos_m1) >> sh16);
-    let s3r = (r3v * sin) >> sh16;
-    let u3 = s0r - c1r + c2r - s3r;
+    let s_r0 = (r0 * sin) >> sh16;
+    let s_r3 = (r3v * sin) >> sh16;
+    let c_r1 = r1 + ((r1 * cos_m1) >> sh16);
+    let c_r2 = r2 + ((r2 * cos_m1) >> sh16);
+    let d1r = (s_r0 - s_r3) - (c_r1 - c_r2);
+
+    let u0 = a1r + b1r;
+    let u1 = c1r;
+    let u2 = a1r - b1r;
+    let u3 = d1r;
 
     // Lane-wide symmetric `/2` rounding (matches scalar `round_div2`).
     let one = Simd::<i32, 4>::splat(1);

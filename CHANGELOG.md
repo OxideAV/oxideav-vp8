@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `motion_search_descent` criterion bench covering the §17.1 / §18.3 luma MV picker (round 255, 2026-06-08)
+
+`benches/motion_search_descent.rs` is a new criterion micro-bench
+that attributes wall-time to the three stages of the encoder-side
+luma motion-search ladder — `small_diamond_search_luma`
+(whole-pixel descent), `half_pixel_refine_luma` (the 8 half-pixel
+offsets around the diamond pick) and `quarter_pixel_refine_luma`
+(the 8 quarter-pixel offsets around the half-pixel pick) — plus a
+composite `full_descent_whole_half_quarter` number for the whole
+per-MB pick. Every encoded inter MB walks the ladder, so the
+search-shape layer is one of the hottest §18 paths in the
+encoder; no existing bench attributed wall-time to it (the
+round-170 `inter_encode_short_clip` wraps the descent inside the
+§11 mode picker + §13 token emit + §15 loop-filter cascade and so
+cannot isolate a delta from a future descent-shape rewrite, and
+the round-170 `motion_comp_subpel_luma` bench sits one layer
+*below* it on the §18.3 sixtap kernel only).
+
+Inputs: deterministic 64×64 luma planes with a mixed-frequency
+gradient (mirroring the round-170 `motion_comp_subpel_luma` input
+shape so the two micro-benches compare directly) and the MB
+placed at `(mb_col, mb_row) = (1, 1)` so the search window stays
+clear of the §20.14 edge-replication clamp. Headline numbers on
+the dev machine (M4, `--quick`): whole-pixel ≈ 277 ns,
+half-pixel ≈ 2.70 µs, quarter-pixel ≈ 2.70 µs, full ladder
+≈ 5.68 µs per MB — confirming the half/quarter §18.3 sixtap
+synthesis cost dominates and any future SIMD fan-out on
+`mb_luma_sad_at_mv` is the highest-return target. Bench-only;
+no public surface or library-code change. Test counts unchanged
+(stable lib 457, nightly + `simd` lib 458).
+
 ### Added — §13.2 `ENC_PCAT*` + `ENC_CAT_BASE` anchored against the RFC 6386 spec listing (round 254, 2026-06-08)
 
 The encoder's per-cat-token `DCTextra` writer in `cat_extras()`

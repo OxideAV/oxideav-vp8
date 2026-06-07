@@ -84,3 +84,15 @@ harness = false
 [[bench]]
 name = "forward_transform_4x4"
 harness = false
+
+# Round 255 bench. The §17.1 / §18.3 luma motion-search descent ladder
+# — `small_diamond_search_luma` (whole-pixel), `half_pixel_refine_luma`
+# (8 half-pixel offsets) and `quarter_pixel_refine_luma` (8 quarter-pixel
+# offsets) — plus a composite `full_descent_whole_half_quarter` number.
+# Every encoded inter MB walks the ladder, so a stable A/B target for
+# future search-shape rewrites (hex, full-search, SAD SIMD fan-out) was
+# overdue. Sits one layer above `motion_comp_subpel_luma` and one layer
+# below `inter_encode_short_clip`.
+[[bench]]
+name = "motion_search_descent"
+harness = false

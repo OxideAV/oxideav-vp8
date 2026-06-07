@@ -155,6 +155,25 @@ output bytes are bench-prologue stderr lines): qi=8 → 1701 B at
 (`−83 %` bytes, `+28 %` throughput across the full sweep). See
 `BENCHMARKS.md` round-194 section for the complete 10-row table.
 
+### Motion-search descent ladder (the §17.1 / §18.3 inter picker)
+
+`motion_search_descent` attributes wall-time to the three stages
+of the per-MB luma MV picker — whole-pixel diamond, half-pixel
+ring, quarter-pixel ring — plus a composite full-ladder number:
+
+```sh
+cargo bench -p oxideav-vp8 --bench motion_search_descent -- --quick
+```
+
+Headline numbers (Apple M4 / aarch64, criterion `--quick`):
+whole-pixel `small_diamond_search_luma` ≈ 277 ns,
+`half_pixel_refine_luma` ≈ 2.70 µs,
+`quarter_pixel_refine_luma` ≈ 2.70 µs,
+`full_descent_whole_half_quarter` ≈ 5.68 µs per MB. The
+half/quarter §18.3 sixtap synthesis cost dominates the whole-pixel
+SAD by ~10×, so any future SIMD fan-out on `mb_luma_sad_at_mv` is
+the highest-return target on the §17 search-shape layer.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

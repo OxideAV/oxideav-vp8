@@ -734,7 +734,11 @@ const COEFF_UPDATE_PROBS: [[[[u8; 11]; 3]; 8]; 4] = [
 /// * `[1]` — sign
 /// * `[2..=8]` — 7-position short tree
 /// * `[9..=18]` — 10 long-value independent bit probabilities
-const MV_UPDATE_PROBS: [[u8; MV_PROB_COUNT]; 2] = [
+// Crate-visible so an in-crate anchor in `encoder.rs` can byte-equal
+// the encoder-side `MV_UPDATE_PROBS_FLAT` 38-entry flat copy against
+// this canonical 2×19 spec table — see
+// `encoder::tests::mv_update_probs_flat_matches_spec_table` (round 253).
+pub(crate) const MV_UPDATE_PROBS: [[u8; MV_PROB_COUNT]; 2] = [
     [
         237, 246, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 250, 250, 252, 254,
         254,

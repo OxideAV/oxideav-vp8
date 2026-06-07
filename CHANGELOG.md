@@ -4,6 +4,35 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §17.2 `MV_UPDATE_PROBS_FLAT` anchored against the spec 2×19 table (round 253, 2026-06-08)
+
+The encoder's inter-frame entry-points emit the §17.2
+`mv_prob_update()` no-update block by walking a flat 38-entry copy
+of the RFC 6386 §17.2 `vp8_mv_update_probs[2]` table
+(`MV_UPDATE_PROBS_FLAT` at `encoder.rs`). The canonical 2×19
+transcription lives in `coded_header.rs` as `MV_UPDATE_PROBS` and
+drives the decoder's `parse_mv_prob_update` per-position
+`read_bool(MV_UPDATE_PROBS[i][j])`. If the two transcriptions drifted
+— a typo, a row/column swap, an off-by-one in the flat walk — the
+encoder would emit each F flag at a different probability than the
+decoder consumes it at, silently producing a bool-coder range that
+looks valid but means a wholly different bitstream to a third-party
+reference reader. Self-roundtrip CI would catch it after a real
+encode runs, but not at the constants level.
+
+The new in-crate test
+`encoder::tests::mv_update_probs_flat_matches_spec_table` closes
+that gap by promoting `coded_header::MV_UPDATE_PROBS` to `pub(crate)`
+and comparing `MV_UPDATE_PROBS_FLAT[i*MV_PROB_COUNT + j]` byte-for-byte
+against `MV_UPDATE_PROBS[i][j]` for `i in 0..2`, `j in 0..19`. A
+length sanity-check on the flat array catches a future
+`MV_PROB_COUNT` redefinition that would shrink the spec table
+without the encoder's `[u8; 38]` literal noticing.
+
+Test counts: stable lib 456 (+1 over round 252), nightly + `simd`
+lib 457 (+1 over round 252). No behavioural change — strengthens the
+existing §17.2 constant-table regression net.
+
 ### Added — §13.4 walk-order byte-equivalence anchored against the actual spec flag table (round 252, 2026-06-08)
 
 The external test

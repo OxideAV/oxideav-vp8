@@ -8770,6 +8770,57 @@ mod tests {
         );
     }
 
+    /// Anchor the encoder-side §17.2 `MV_UPDATE_PROBS_FLAT` 38-entry
+    /// flat table against the canonical 2×19 spec table held in
+    /// [`crate::coded_header`] (`MV_UPDATE_PROBS`, transcribed from
+    /// RFC 6386 §17.2 `vp8_mv_update_probs[2]`).
+    ///
+    /// The encoder's `mv_prob_update()` writer (called inline by
+    /// every inter-frame entry-point — see the
+    /// `for ctx in MV_UPDATE_PROBS_FLAT.iter()` loop around the §17.2
+    /// no-update flag emission) walks a flat 38-entry copy of the
+    /// table. The decoder (`parse_mv_prob_update`) reads each `F`
+    /// flag at `MV_UPDATE_PROBS[i][j]`. If the two transcriptions
+    /// ever drift — a typo, a row/column swap, or an off-by-one in
+    /// the flat walk — the encoder would emit `write_bool(p1, false)`
+    /// at one probability while the decoder consumed `read_bool(p2)`
+    /// at a different one, silently producing a bool-coder range that
+    /// looks valid but means a wholly different bitstream to a
+    /// third-party reference reader. CI would catch it on the
+    /// self-roundtrip, but only after a real encode runs; this anchor
+    /// catches the divergence at lib-test time on the *constants*.
+    ///
+    /// The walk order is row-major `(component=0..2, position=0..19)`,
+    /// matching the encoder's flat layout (rows concatenated) and the
+    /// decoder's `for i in 0..2 { for j in 0..MV_PROB_COUNT { ... } }`
+    /// double-loop. Sanity-checks the flat length too — `MV_PROB_COUNT`
+    /// could be re-defined and silently shrink the spec table without
+    /// the encoder's `[u8; 38]` literal noticing.
+    #[test]
+    fn mv_update_probs_flat_matches_spec_table() {
+        use crate::coded_header::{MV_PROB_COUNT, MV_UPDATE_PROBS};
+
+        assert_eq!(
+            MV_UPDATE_PROBS_FLAT.len(),
+            2 * MV_PROB_COUNT,
+            "MV_UPDATE_PROBS_FLAT length must match 2 × MV_PROB_COUNT \
+             (RFC 6386 §17.2 two MV_CONTEXTs × 19 positions)"
+        );
+
+        for i in 0..2 {
+            for j in 0..MV_PROB_COUNT {
+                let flat = MV_UPDATE_PROBS_FLAT[i * MV_PROB_COUNT + j];
+                let spec = MV_UPDATE_PROBS[i][j];
+                assert_eq!(
+                    flat, spec,
+                    "encoder-side MV_UPDATE_PROBS_FLAT[{i}*{MV_PROB_COUNT}+{j}] \
+                     ({flat}) diverges from the §17.2 spec table \
+                     MV_UPDATE_PROBS[{i}][{j}] ({spec}) the decoder reads at"
+                );
+            }
+        }
+    }
+
     /// The §11 mode-layer writer must produce a first partition the
     /// decoder's `parse_key_frame_macroblock_modes` reads back to the
     /// exact `MacroblockModes` the encoder chose — including the §11.3

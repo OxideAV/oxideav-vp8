@@ -8821,6 +8821,172 @@ mod tests {
         }
     }
 
+    /// Anchor the encoder-side §13.2 `ENC_PCAT1..ENC_PCAT6` extra-bits
+    /// probability lists and `ENC_CAT_BASE` category-base offsets against
+    /// the literal §13.2 spec listing transcribed inline from
+    /// RFC 6386 §13.2 (the `Pcat1..Pcat6` arrays at the `DCTextra`
+    /// definition, and `categoryBase[6]` immediately preceding the
+    /// `vp8_dct_value_cost` cost table).
+    ///
+    /// The encoder consults these six lists in `cat_extras()` to drive
+    /// `DCTextra`'s per-bit `read_bool(d, *p)` (decoder side); the
+    /// encoder mirror is the per-bit `write_bool(p, bit)` walk that
+    /// emits the `(v - categoryBase[c])` residual MSB-first against the
+    /// same `Pcat` probability sequence. If a `Pcat` byte or a
+    /// `CAT_BASE` offset drifts here — a typo, a transposed pair, a
+    /// dropped trailing zero swept into the slice — the encoder would
+    /// emit a bit at `p1` while a third-party reference reader consumed
+    /// the same bit at `p2`, silently producing a bool-coder range that
+    /// looks valid but means a *different* residual integer to the
+    /// reader. CI's self-roundtrip would still pass (encoder + decoder
+    /// drift together), but `ffmpeg -c:v vp8` would diverge on the
+    /// first cat-token. This anchor catches the divergence at
+    /// lib-test time on the *constants*, before any real frame
+    /// encode runs.
+    ///
+    /// Spec source (verbatim from RFC 6386 §13.2):
+    ///
+    /// ```text
+    ///     const Prob Pcat1[] = { 159, 0};
+    ///     const Prob Pcat2[] = { 165, 145, 0};
+    ///     const Prob Pcat3[] = { 173, 148, 140, 0};
+    ///     const Prob Pcat4[] = { 176, 155, 140, 135, 0};
+    ///     const Prob Pcat5[] = { 180, 157, 141, 134, 130, 0};
+    ///     const Prob Pcat6[] =
+    ///         { 254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0};
+    ///     ...
+    ///     int categoryBase[6] = { 5, 7, 11, 19, 35, 67 };
+    /// ```
+    ///
+    /// The encoder's local copies drop the `0` terminator (the encoder
+    /// walks a known-length slice instead of testing `*p` at the loop
+    /// edge), so the byte-equal comparison runs against the
+    /// terminator-stripped prefix of each spec list.
+    #[test]
+    fn enc_pcat_and_cat_base_match_spec_listing() {
+        // RFC 6386 §13.2 — Pcat1..Pcat6 with trailing `0` terminator
+        // stripped (encoder walks a fixed-length slice).
+        const SPEC_PCAT1: &[u8] = &[159];
+        const SPEC_PCAT2: &[u8] = &[165, 145];
+        const SPEC_PCAT3: &[u8] = &[173, 148, 140];
+        const SPEC_PCAT4: &[u8] = &[176, 155, 140, 135];
+        const SPEC_PCAT5: &[u8] = &[180, 157, 141, 134, 130];
+        const SPEC_PCAT6: &[u8] = &[254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129];
+        // RFC 6386 §13.2 — categoryBase[6].
+        const SPEC_CAT_BASE: [u16; 6] = [5, 7, 11, 19, 35, 67];
+
+        // Length sanity — the encoder's six Pcat slices must match
+        // the spec list lengths (1, 2, 3, 4, 5, 11 extra bits for
+        // cat1..cat6 respectively; the cat6 range spans 67..=2114
+        // = 2048 values requiring 11 bits, the rest follow the
+        // geometric `(2^n - 1) + base` pattern).
+        let enc_lists: [(&[u8], &[u8], &str, usize); 6] = [
+            (ENC_PCAT1, SPEC_PCAT1, "Pcat1", 1),
+            (ENC_PCAT2, SPEC_PCAT2, "Pcat2", 2),
+            (ENC_PCAT3, SPEC_PCAT3, "Pcat3", 3),
+            (ENC_PCAT4, SPEC_PCAT4, "Pcat4", 4),
+            (ENC_PCAT5, SPEC_PCAT5, "Pcat5", 5),
+            (ENC_PCAT6, SPEC_PCAT6, "Pcat6", 11),
+        ];
+        for (enc_list, spec_list, name, expected_len) in enc_lists.iter() {
+            assert_eq!(
+                enc_list.len(),
+                *expected_len,
+                "encoder-side {name} carries {} probs but §13.2 \
+                 emits exactly {expected_len} extra bits",
+                enc_list.len()
+            );
+            assert_eq!(
+                enc_list.len(),
+                spec_list.len(),
+                "encoder-side {name} length ({}) diverges from §13.2 \
+                 spec list length ({})",
+                enc_list.len(),
+                spec_list.len()
+            );
+            for (k, (&enc_p, &spec_p)) in enc_list.iter().zip(spec_list.iter()).enumerate() {
+                assert_eq!(
+                    enc_p, spec_p,
+                    "encoder-side {name}[{k}] ({enc_p}) diverges from \
+                     §13.2 spec listing {name}[{k}] ({spec_p}) — the \
+                     decoder's DCTextra() reads each cat-residual bit \
+                     at this probability"
+                );
+            }
+        }
+
+        // CAT_BASE — the §13.2 `categoryBase[6]` offsets used by
+        // `cat_extras()` to add to the decoded residual `v`.
+        assert_eq!(
+            ENC_CAT_BASE.len(),
+            SPEC_CAT_BASE.len(),
+            "encoder-side ENC_CAT_BASE length ({}) diverges from \
+             §13.2 categoryBase[6] ({})",
+            ENC_CAT_BASE.len(),
+            SPEC_CAT_BASE.len()
+        );
+        for k in 0..ENC_CAT_BASE.len() {
+            assert_eq!(
+                ENC_CAT_BASE[k],
+                SPEC_CAT_BASE[k],
+                "encoder-side ENC_CAT_BASE[{k}] ({}) diverges from \
+                 §13.2 spec categoryBase[{k}] ({}) — the decoder adds \
+                 this offset to the cat{}-residual",
+                ENC_CAT_BASE[k],
+                SPEC_CAT_BASE[k],
+                k + 1
+            );
+        }
+
+        // Cross-check `cat_extras()` returns the same `(base, list)`
+        // pair the encoder's per-cat-token writer consumes — catches
+        // a future drift where the match-arm order desyncs from the
+        // table index. The `expected_bits` field carries the §13.2
+        // extra-bits count for each cat (1, 2, 3, 4, 5, 11).
+        let cat_token_pairs: [(DctToken, usize, usize); 6] = [
+            (DctToken::Cat1, 0, 1),
+            (DctToken::Cat2, 1, 2),
+            (DctToken::Cat3, 2, 3),
+            (DctToken::Cat4, 3, 4),
+            (DctToken::Cat5, 4, 5),
+            (DctToken::Cat6, 5, 11),
+        ];
+        for (tok, expected_idx, expected_bits) in cat_token_pairs.iter() {
+            let (base, list) = cat_extras(*tok).expect("cat-token must carry extras");
+            assert_eq!(
+                base, ENC_CAT_BASE[*expected_idx],
+                "cat_extras({tok:?}) returned base {base} but \
+                 §13.2 categoryBase[{expected_idx}] is {}",
+                ENC_CAT_BASE[*expected_idx]
+            );
+            assert_eq!(
+                list.len(),
+                *expected_bits,
+                "cat_extras({tok:?}) returned a Pcat list of len {} \
+                 but §13.2 emits exactly {expected_bits} extra bits",
+                list.len()
+            );
+        }
+
+        // Non-cat tokens (Dct0..Dct4, Eob) must not advertise extras —
+        // any future regression that started returning `Some(...)` for
+        // them would lead to bogus tail bits in the bitstream.
+        for tok in [
+            DctToken::Eob,
+            DctToken::Dct0,
+            DctToken::Dct1,
+            DctToken::Dct2,
+            DctToken::Dct3,
+            DctToken::Dct4,
+        ] {
+            assert!(
+                cat_extras(tok).is_none(),
+                "cat_extras({tok:?}) must be None — §13.2 reserves \
+                 the trailing `DCTextra` walk for cat1..cat6 only"
+            );
+        }
+    }
+
     /// The §11 mode-layer writer must produce a first partition the
     /// decoder's `parse_key_frame_macroblock_modes` reads back to the
     /// exact `MacroblockModes` the encoder chose — including the §11.3

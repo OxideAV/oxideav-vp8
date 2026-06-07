@@ -4,6 +4,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §13.2 `ENC_PCAT*` + `ENC_CAT_BASE` anchored against the RFC 6386 spec listing (round 254, 2026-06-08)
+
+The encoder's per-cat-token `DCTextra` writer in `cat_extras()`
+emits each cat-residual MSB-first against six terminator-stripped
+probability lists (`ENC_PCAT1..ENC_PCAT6` at `encoder.rs`) and offsets
+the recovered residual by `ENC_CAT_BASE[c]` to land in the §13.2
+range for cat`c`. The decoder reads the same MSB-first bit sequence
+via `DCTextra(d, p)` at `read_bool(d, *p)` against the matching
+`Pcat<n>` list, then adds `categoryBase[c]`. If a Pcat byte or a
+`CAT_BASE` offset ever drifts here — a typo, a transposed pair, a
+dropped trailing zero swept into the slice — the encoder would
+emit a bit at `p1` while a third-party reference reader consumed
+the same bit at `p2`, silently producing a bool-coder range that
+looks valid but means a wholly different integer to the reader.
+Self-roundtrip CI would still pass (encoder + decoder drift
+together), but a third-party decoder would diverge on the first
+cat-token in the bitstream.
+
+The new in-crate test
+`encoder::tests::enc_pcat_and_cat_base_match_spec_listing` closes
+that gap by anchoring each of the six `ENC_PCAT<n>` lists and the
+6-entry `ENC_CAT_BASE` array byte-for-byte against the literal
+RFC 6386 §13.2 listing (the `Pcat1..Pcat6` arrays at the `DCTextra`
+definition and `categoryBase[6]` immediately preceding the
+`vp8_dct_value_cost` cost table). Per-list length checks catch a
+future regression that swept the trailing `0` terminator into the
+slice or dropped a probability; the cross-check against
+`cat_extras()` catches a match-arm reorder that desynced the
+returned `(base, list)` pair from the cat index; the non-cat-token
+sweep catches a future regression that started returning
+`Some(...)` for `Dct0..Dct4` or `Eob`. Lib-test only — no public
+surface change. Test counts: stable lib 457, nightly + `simd` lib
+458 (each +1 over round 253).
+
 ### Added — §17.2 `MV_UPDATE_PROBS_FLAT` anchored against the spec 2×19 table (round 253, 2026-06-08)
 
 The encoder's inter-frame entry-points emit the §17.2

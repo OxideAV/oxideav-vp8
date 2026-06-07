@@ -4,6 +4,54 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — `forward_dct_4x4_scalar` rewritten in canonical butterfly shape mirroring §14.4 inverse listing (round 249, 2026-06-07)
+
+Next-round refinement on top of round 247's SIMD dispatch split.
+Round 247 kept the §14.4 forward DCT routed through `forward_dct_4x4_scalar`
+under every feature configuration; the scalar listing itself was still
+in the unfactored direct-derivation form (`o0 = i0 + i4 + i8 + i12;
+o4 = c_mul(i0) + s_mul(i4) - s_mul(i8) - c_mul(i12); ...`), shaped
+unlike the §14.4 `inverse_dct_4x4_scalar`'s canonical `(a1, b1, c1, d1)`
+partial-sum butterfly form. Round 249 reorganises the listing into that
+canonical shape so forward and inverse paths share the same visual
+structure:
+
+* Even outputs collect into a single pair of partial sums:
+  `a1 = i0 + i12`, `b1 = i4 + i8`, then `o0 = a1 + b1` / `o8 = a1 - b1`.
+  This mirrors the inverse's `op[0] = a1 + d1` / `op[12] = a1 - d1`
+  shape (transposed: the inverse pairs `(i0, i8)`, the forward pairs
+  `(i0, i12)`).
+* Odd outputs collect their fixed-point multiplies into a `c1` / `d1`
+  pair-difference form:
+  `c1 = (c_mul(i0) - c_mul(i12)) + (s_mul(i4) - s_mul(i8))` for `o4`,
+  `d1 = (s_mul(i0) - s_mul(i12)) - (c_mul(i4) - c_mul(i8))` for `o12`.
+  Each `c_mul` / `s_mul` call is evaluated separately (not collapsed
+  into `c_mul(i0 - i12)`, which would be non-equivalent under the
+  fixed-point `>> 16` truncation) so the rounding stays bit-exact
+  against the unfactored listing.
+
+Bit-exactness is verified by a new `forward_dct_4x4_listing` private
+reference function (the unfactored direct-derivation form, kept as a
+regression oracle) and the test
+`fdct_scalar_matches_direct_derivation_listing` that asserts
+`forward_dct_4x4_scalar` produces identical bytes against
+`forward_dct_4x4_listing` over the 21-input stress matrix (DC-only
+across 10 magnitudes, single-AC at every position, mixed gradients,
+near-i16 extremes). The pre-existing `fdct_forward_simd_matches_scalar_on_stress_inputs`
+(nightly + `simd`) re-runs after the refactor and continues to pass,
+confirming the SIMD path is still byte-exact against the refactored
+scalar (the SIMD listing was independently shaped on the same
+butterfly form in round 226, so the two now visually agree as well as
+producing identical bytes).
+
+Test counts: stable lib 452 → 453 (one new regression test); nightly
++ `simd` lib 453 → 454. The 23-bench `forward_transform_4x4/forward_dct_4x4`
+`--quick` numbers are within criterion noise envelope of the round-247
+baseline on both stable (10.82 → 10.83 ns) and nightly + `simd`
+(9.81 → 10.05 ns); the refactor is a readability / shape-parity change,
+not a perf optimisation. `cargo fmt --check` + `cargo clippy
+--all-targets --no-deps -- -D warnings` both clean.
+
 ### Changed — `forward_dct_4x4` SIMD dispatch split (round 247, 2026-06-07)
 
 Closes the round-226 deferred next-round candidate

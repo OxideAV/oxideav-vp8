@@ -417,6 +417,25 @@ pub fn forward_dct_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
 /// Scalar §14.4 forward DCT — the longhand derivation from the §14.4
 /// inverse listing.
 ///
+/// Round 249 reorganised the listing into the canonical butterfly
+/// shape mirroring the §14.4 inverse's `inverse_dct_4x4_scalar`
+/// listing. The inverse listing splits each 1-D pass into four
+/// partial-sums (`a1 = i0 + i8`, `b1 = i0 - i8`, plus a `c1` / `d1`
+/// pair carrying the fixed-point cosine / sine multiplies); the
+/// forward DCT is the transpose of that, so the corresponding pairs
+/// shift one slot — `a1 = i0 + i12`, `b1 = i4 + i8`, with `c1` / `d1`
+/// holding the multiply pair-differences for the odd outputs. The
+/// even outputs become `o0 = a1 + b1` and `o8 = a1 - b1`, mirroring
+/// the inverse's `op[0] = a1 + d1` / `op[12] = a1 - d1` shape. The
+/// odd outputs `o4 = c1` and `o12 = d1` are decomposed into pair-
+/// differences like `(c_mul(i0) - c_mul(i12)) + (s_mul(i4) - s_mul(i8))`,
+/// each `c_mul` / `s_mul` call evaluated separately so the fixed-point
+/// rounding stays bit-exact against the unfactored direct-derivation
+/// form (verified by the test
+/// `fdct_scalar_matches_direct_derivation_listing` against
+/// `forward_dct_4x4_listing`, which is the spec derivation written
+/// out longhand).
+///
 /// The public [`forward_dct_4x4`] dispatches here under every feature
 /// configuration as of round 247 (see the dispatcher docstring for the
 /// rationale — the `simd` lane-wide `c_mul` / `s_mul` chain regresses
@@ -429,39 +448,52 @@ pub fn forward_dct_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
 fn forward_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
     let mut tmp = [0i32; 16];
 
-    // First pass: operate down each column. `c_mul` and `s_mul` use
-    // the same fixed-point evaluation as §14.4 so the rounding shape is
-    // consistent between forward and inverse.
+    // First pass: operate down each column. Written in the same
+    // `(a1, b1, c1, d1)` partial-sum butterfly shape the §14.4 inverse
+    // listing uses, transposed: where the inverse pairs (i0, i8) and
+    // (i4, i12), the forward pairs (i0, i12) and (i4, i8) so the
+    // `o0 = a1 + b1` / `o8 = a1 - b1` evens reuse a single set of
+    // partial sums and the odd outputs collect their multiplies into
+    // `c1`, `d1`. `c_mul` / `s_mul` use the same fixed-point evaluation
+    // as §14.4 so the rounding shape is consistent between forward and
+    // inverse; each pair-difference like `c_mul(i0) - c_mul(i12)` is
+    // bit-exact against the unfactored sum `c_mul(i0) + (-c_mul(i12))`
+    // (addition is associative on i32) but is NOT collapsed into
+    // `c_mul(i0 - i12)` because the fixed-point truncation in `>> 16`
+    // is non-linear under sum.
     for col in 0..4 {
         let i0 = input[col] as i32;
         let i4 = input[4 + col] as i32;
         let i8 = input[8 + col] as i32;
         let i12 = input[12 + col] as i32;
 
-        let o0 = i0 + i4 + i8 + i12;
-        let o8 = i0 - i4 - i8 + i12;
+        // Even-output partial sums:
+        //   o0  = i0 + i4 + i8 + i12 = (i0 + i12) + (i4 + i8) = a1 + b1
+        //   o8  = i0 - i4 - i8 + i12 = (i0 + i12) - (i4 + i8) = a1 - b1
+        let a1 = i0 + i12;
+        let b1 = i4 + i8;
 
-        // o4 = i0*C + i4*S - i8*S - i12*C
-        let c0 = c_mul(i0);
-        let s4 = s_mul(i4);
-        let s8 = s_mul(i8);
-        let c12 = c_mul(i12);
-        let o4 = c0 + s4 - s8 - c12;
+        // Odd-output multiply pair-differences. Splitting each `o4`,
+        // `o12` listing into its (i0, i12) and (i4, i8) halves makes
+        // the symmetry with the inverse's `c1` / `d1` form explicit:
+        //   o4  = c_mul(i0)*1 + s_mul(i4)*1 - s_mul(i8)*1 - c_mul(i12)*1
+        //       = (c_mul(i0) - c_mul(i12)) + (s_mul(i4) - s_mul(i8))
+        //   o12 = s_mul(i0) - c_mul(i4)   + c_mul(i8)   - s_mul(i12)
+        //       = (s_mul(i0) - s_mul(i12)) - (c_mul(i4) - c_mul(i8))
+        let c1 = (c_mul(i0) - c_mul(i12)) + (s_mul(i4) - s_mul(i8));
+        let d1 = (s_mul(i0) - s_mul(i12)) - (c_mul(i4) - c_mul(i8));
 
-        // o12 = i0*S - i4*C + i8*C - i12*S
-        let s0 = s_mul(i0);
-        let c4 = c_mul(i4);
-        let c8 = c_mul(i8);
-        let s12 = s_mul(i12);
-        let o12 = s0 - c4 + c8 - s12;
-
-        tmp[col] = o0;
-        tmp[4 + col] = o4;
-        tmp[8 + col] = o8;
-        tmp[12 + col] = o12;
+        tmp[col] = a1 + b1;
+        tmp[4 + col] = c1;
+        tmp[8 + col] = a1 - b1;
+        tmp[12 + col] = d1;
     }
 
     // Second pass: operate across each row, then symmetric `/2` round.
+    // Same butterfly shape as the column pass, with (r0, r1, r2, r3)
+    // playing the role of (i0, i4, i8, i12) in the listing: pair
+    // (r0, r3) and (r1, r2) so the evens reuse a single set of partial
+    // sums.
     for row in 0..4 {
         let base = row * 4;
         let r0 = tmp[base];
@@ -469,25 +501,23 @@ fn forward_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
         let r2 = tmp[base + 2];
         let r3 = tmp[base + 3];
 
-        let o0 = r0 + r1 + r2 + r3;
-        let o2 = r0 - r1 - r2 + r3;
+        // Even-output partial sums:
+        //   o0 = r0 + r1 + r2 + r3 = (r0 + r3) + (r1 + r2) = a1 + b1
+        //   o2 = r0 - r1 - r2 + r3 = (r0 + r3) - (r1 + r2) = a1 - b1
+        let a1 = r0 + r3;
+        let b1 = r1 + r2;
 
-        let c0 = c_mul(r0);
-        let s1 = s_mul(r1);
-        let s2 = s_mul(r2);
-        let c3 = c_mul(r3);
-        let o1 = c0 + s1 - s2 - c3;
+        // Odd-output multiply pair-differences (same shape as the
+        // column pass):
+        //   o1 = (c_mul(r0) - c_mul(r3)) + (s_mul(r1) - s_mul(r2))
+        //   o3 = (s_mul(r0) - s_mul(r3)) - (c_mul(r1) - c_mul(r2))
+        let c1 = (c_mul(r0) - c_mul(r3)) + (s_mul(r1) - s_mul(r2));
+        let d1 = (s_mul(r0) - s_mul(r3)) - (c_mul(r1) - c_mul(r2));
 
-        let s0 = s_mul(r0);
-        let c1 = c_mul(r1);
-        let c2 = c_mul(r2);
-        let s3 = s_mul(r3);
-        let o3 = s0 - c1 + c2 - s3;
-
-        output[base] = round_div2(o0);
-        output[base + 1] = round_div2(o1);
-        output[base + 2] = round_div2(o2);
-        output[base + 3] = round_div2(o3);
+        output[base] = round_div2(a1 + b1);
+        output[base + 1] = round_div2(c1);
+        output[base + 2] = round_div2(a1 - b1);
+        output[base + 3] = round_div2(d1);
     }
 }
 
@@ -910,6 +940,95 @@ mod tests {
             64, -32, 16, -8,
         ]);
         v
+    }
+
+    /// Reference §14.4 forward DCT — the spec derivation written out
+    /// in the unfactored direct form `o0 = i0 + i4 + i8 + i12; o4 =
+    /// c_mul(i0) + s_mul(i4) - s_mul(i8) - c_mul(i12); ...` (no `a1` /
+    /// `b1` partial sums shared between the even outputs, no
+    /// `c_mul(i0) - c_mul(i12)` pair-differences). The round-249
+    /// refactor of `forward_dct_4x4_scalar` reorganises the same
+    /// arithmetic into the canonical butterfly shape mirroring the
+    /// §14.4 inverse listing; this function is the regression guard
+    /// proving that reorganisation is bit-exact (integer addition is
+    /// associative on i32 and we never collapse a pair-difference into
+    /// `c_mul(i0 - i12)`, which would change the fixed-point rounding).
+    /// Used only by `fdct_scalar_matches_direct_derivation_listing`.
+    fn forward_dct_4x4_listing(input: &[i16; 16], output: &mut [i16; 16]) {
+        let mut tmp = [0i32; 16];
+        for col in 0..4 {
+            let i0 = input[col] as i32;
+            let i4 = input[4 + col] as i32;
+            let i8 = input[8 + col] as i32;
+            let i12 = input[12 + col] as i32;
+
+            let o0 = i0 + i4 + i8 + i12;
+            let o8 = i0 - i4 - i8 + i12;
+
+            let c0 = c_mul(i0);
+            let s4 = s_mul(i4);
+            let s8 = s_mul(i8);
+            let c12 = c_mul(i12);
+            let o4 = c0 + s4 - s8 - c12;
+
+            let s0 = s_mul(i0);
+            let c4 = c_mul(i4);
+            let c8 = c_mul(i8);
+            let s12 = s_mul(i12);
+            let o12 = s0 - c4 + c8 - s12;
+
+            tmp[col] = o0;
+            tmp[4 + col] = o4;
+            tmp[8 + col] = o8;
+            tmp[12 + col] = o12;
+        }
+        for row in 0..4 {
+            let base = row * 4;
+            let r0 = tmp[base];
+            let r1 = tmp[base + 1];
+            let r2 = tmp[base + 2];
+            let r3 = tmp[base + 3];
+
+            let o0 = r0 + r1 + r2 + r3;
+            let o2 = r0 - r1 - r2 + r3;
+
+            let c0 = c_mul(r0);
+            let s1 = s_mul(r1);
+            let s2 = s_mul(r2);
+            let c3 = c_mul(r3);
+            let o1 = c0 + s1 - s2 - c3;
+
+            let s0 = s_mul(r0);
+            let c1 = c_mul(r1);
+            let c2 = c_mul(r2);
+            let s3 = s_mul(r3);
+            let o3 = s0 - c1 + c2 - s3;
+
+            output[base] = round_div2(o0);
+            output[base + 1] = round_div2(o1);
+            output[base + 2] = round_div2(o2);
+            output[base + 3] = round_div2(o3);
+        }
+    }
+
+    /// Round-249 regression guard: the refactored `forward_dct_4x4_scalar`
+    /// (butterfly shape mirroring the §14.4 inverse listing) is byte-
+    /// exact against `forward_dct_4x4_listing` (the unfactored direct
+    /// spec-derivation listing) on the 21-input stress matrix. Any
+    /// future change to the scalar listing that breaks this assertion
+    /// is changing the output bytes, not just the readability shape.
+    #[test]
+    fn fdct_scalar_matches_direct_derivation_listing() {
+        for (idx, input) in forward_stress_inputs().iter().enumerate() {
+            let mut via_scalar = [0i16; 16];
+            forward_dct_4x4_scalar(input, &mut via_scalar);
+            let mut via_listing = [0i16; 16];
+            forward_dct_4x4_listing(input, &mut via_listing);
+            assert_eq!(
+                via_scalar, via_listing,
+                "input #{idx} ({input:?}): refactored _scalar ≠ direct-derivation listing"
+            );
+        }
     }
 
     /// `forward_dct_4x4_simd` is byte-exact against `forward_dct_4x4_scalar`

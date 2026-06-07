@@ -451,6 +451,42 @@ side under `simd` now drops from 24 × 11.54 + 1 × 8.72 ≈ 286 ns / MB
 to 24 × 9.81 + 1 × 8.74 ≈ 244 ns / MB — a ~−15 % bias on the forward
 primitives, the inverse of round 226's +7 % bias.
 
+## Round 249 — `forward_dct_4x4_scalar` canonical-butterfly refactor
+
+Round 249 (2026-06-07) reorganises the scalar §14.4 `forward_dct_4x4_scalar`
+listing into the canonical `(a1, b1, c1, d1)` partial-sum butterfly form
+mirroring the §14.4 `inverse_dct_4x4_scalar` listing. The original form
+matched the direct derivation from `T_fwd * input * T_fwd^T` (`o0 = i0
++ i4 + i8 + i12`; eight `c_mul` / `s_mul` calls split across `o4` and
+`o12`); the refactored form groups partial sums (`a1 = i0 + i12`, `b1
+= i4 + i8` for the evens, `c1` / `d1` carrying the fixed-point
+multiply pair-differences for the odds) so forward and inverse paths
+share visual shape. Bit-exactness is preserved by never collapsing a
+multiply pair-difference into `c_mul(i0 - i12)` (the `>> 16` truncation
+is non-linear under sum); each `c_mul` / `s_mul` call still evaluates
+separately and the addition reorder is on associative i32 sums. A new
+`forward_dct_4x4_listing` private function holds the unfactored
+direct-derivation form as a regression oracle, and
+`fdct_scalar_matches_direct_derivation_listing` asserts the refactored
+`_scalar` produces identical bytes on the 21-input stress matrix.
+
+`--quick` numbers comparing round-247 (post-SIMD-split) and round-249
+(post-refactor) on Apple M4 / aarch64:
+
+| Bench | r247 | r249 | Δ |
+|---|---:|---:|---:|
+| `forward_transform_4x4/forward_dct_4x4` (stable) | 10.82 ns | 10.83 ns | within noise |
+| `forward_transform_4x4/forward_dct_4x4` (nightly + `simd`) | 9.81 ns | 10.05 ns | +2.4 % (within `--quick` noise envelope) |
+| `forward_transform_4x4/forward_wht_4x4` (stable) | 10.84 ns | 10.54 ns | within noise |
+| `forward_transform_4x4/forward_wht_4x4` (nightly + `simd`) | 8.74 ns | 8.93 ns | within noise |
+
+The refactor is a readability / spec-shape parity change (LLVM was
+already CSE'ing the i0/i12 partial sums under `-O3`); the bench numbers
+on both configurations agree on the round-247 baseline within the
+criterion `--quick` envelope. The `forward_dct_4x4_simd` listing (which
+already used a butterfly-friendly lane-wide form in round 226) now
+agrees visually as well as bit-exactly with the scalar.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed

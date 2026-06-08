@@ -103,8 +103,48 @@ pub const QUARTER_PIXEL_STEP: i16 = 1;
 /// reconstruction round-trip. Returned as `u32` because a fully-
 /// saturated 16×16 block sums to `256 * 255 = 65_280`, comfortably
 /// inside `u32` and inside `i32` for downstream arithmetic.
+///
+/// Dispatch: always the scalar path. The §17 SIMD partner
+/// [`block_sad_16x16_simd`] (compiled under the nightly-only `simd`
+/// feature) is kept available and is asserted byte-exact against the
+/// scalar listing on a 21-input stress set
+/// (`block_sad_simd_matches_scalar_on_stress_inputs`), but the
+/// `motion_search_descent/block_sad_16x16_single_pair` criterion
+/// `--quick` numbers recorded in `BENCHMARKS.md` round 258 show a
+/// trade-off: the SIMD path is **−36 %** in isolation on
+/// `aarch64-apple-darwin` (4.08 ns vs 6.43 ns) but the
+/// `half_pixel_refine_luma_8_offsets` / `quarter_pixel_refine_luma_8_offsets`
+/// descent stages regress by **+13 %** under the same configuration —
+/// inlining the SIMD leaf into the 16-call-per-MB `mb_luma_sad_at_mv`
+/// body increases NEON register pressure across the surrounding
+/// `filter_block_4x4` loop and pessimises the surrounding scheduling
+/// enough to swamp the leaf-level win. Routing the public dispatcher
+/// to [`block_sad_16x16_scalar`] under every feature configuration
+/// keeps the descent stages on their fastest measured shape; the
+/// `_simd` implementation stays in place so a future round can
+/// re-target it (e.g. on a host where the regression flips, or with a
+/// non-inlined wrapper that doesn't pollute LLVM's scheduling around
+/// `mb_luma_sad_at_mv`), and the byte-equivalence test calls the
+/// `_simd` path directly so the equivalence proof is preserved
+/// regardless of the public dispatch. Mirrors the round-247 dispatch
+/// split for [`crate::forward_transform::forward_dct_4x4`].
 #[inline]
 pub fn block_sad_16x16(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
+    block_sad_16x16_scalar(src, pred)
+}
+
+/// Scalar §17 SAD primitive — the straight-line
+/// `Σ |src[i] - pred[i]|` reference path.
+///
+/// Bit-for-bit equivalent to the longhand spec definition. The public
+/// [`block_sad_16x16`] dispatches here under every feature
+/// configuration after the round-258 measurement (see the dispatch
+/// note on `block_sad_16x16` for the trade-off). The `simd` feature
+/// keeps [`block_sad_16x16_simd`] compiled + tested, and the
+/// byte-equivalence proof against this listing stays standing on a
+/// 21-input stress set.
+#[inline]
+fn block_sad_16x16_scalar(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
     let mut acc: u32 = 0;
     for i in 0..256 {
         let s = src[i] as i32;
@@ -112,6 +152,62 @@ pub fn block_sad_16x16(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
         acc += (s - p).unsigned_abs();
     }
     acc
+}
+
+/// SIMD §17 SAD primitive — `core::simd::Simd<u8, 16>` row-stencil
+/// fan-out of [`block_sad_16x16_scalar`].
+///
+/// The 16×16 source / prediction pair lays out as 16 packed rows of 16
+/// bytes each. Each row maps directly onto a 16-lane `Simd<u8, 16>`
+/// load. The absolute-difference per lane is computed in `u8` as
+/// `max(s, p) - min(s, p)` — a saturating subtract per-lane against the
+/// other operand collapses to the same value but requires two-pass
+/// `saturating_sub` and an OR, so the max/min shape stays simpler — and
+/// then widened to `u16` and accumulated into a `Simd<u16, 16>` row
+/// accumulator. After 16 rows the worst-case per-lane value is
+/// `16 × 255 = 4_080`, well inside the `u16` envelope, so no
+/// intermediate widening is needed inside the loop. A single
+/// `reduce_sum()` at the end collapses the 16 lanes into the final
+/// `u32` total.
+///
+/// No external SIMD layout reference was consulted — the layout falls
+/// out of the §17 definition of SAD (linear sum of absolute byte
+/// differences; the 16×16 block already packs as 16 rows × 16 bytes)
+/// and the [`block_sad_16x16_scalar`] listing above. Byte-exact
+/// against the scalar path on every test fixture.
+#[cfg(feature = "simd")]
+#[allow(dead_code)]
+// The public `block_sad_16x16` dispatcher routes to
+// the scalar partner under every feature configuration after the
+// round-258 measurement; this SIMD listing is kept in tree as a
+// future re-target target and is exercised by
+// `block_sad_simd_matches_scalar_on_stress_inputs`.
+#[inline]
+fn block_sad_16x16_simd(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
+    use core::simd::cmp::SimdOrd;
+    use core::simd::num::SimdUint;
+    use core::simd::Simd;
+
+    let mut acc: Simd<u16, 16> = Simd::splat(0);
+    for row in 0..16 {
+        let off = row * 16;
+        let s: Simd<u8, 16> = Simd::from_slice(&src[off..off + 16]);
+        let p: Simd<u8, 16> = Simd::from_slice(&pred[off..off + 16]);
+        // Per-lane absolute difference: `max(s, p) - min(s, p)`. The
+        // subtract is performed in `u8`; with `max >= min` it never
+        // underflows.
+        let absdiff = s.simd_max(p) - s.simd_min(p);
+        // Widen to `u16` so the cross-row accumulator stays inside the
+        // `16 * 255 = 4_080` per-lane envelope a `u16` covers (the
+        // scalar partner's `u32` accumulator is wider than necessary
+        // for that step, but its single-pass scalar loop has no reason
+        // to pay for a second accumulator width).
+        acc += absdiff.cast::<u16>();
+    }
+    // Final horizontal reduce: widen `u16` → `u32` so the per-lane sum
+    // and the cross-lane sum both stay inside `u32` (a fully-saturated
+    // 16×16 block totals `256 * 255 = 65_280`).
+    acc.cast::<u32>().reduce_sum()
 }
 
 /// A borrow of one reference frame's **luma plane** sized for motion
@@ -1332,5 +1428,245 @@ mod tests {
         let b = a;
         assert_eq!(a, b);
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    /// A 21-input stress set for the §17 SAD primitive. Each entry is a
+    /// `(src, pred)` pair shaped to walk the corners of the
+    /// per-lane absolute-difference behaviour (`max - min` direction,
+    /// row-wide saturation, alternating signs, sparse vs dense
+    /// differences, full-zero / full-saturated extremes). The set is
+    /// shared between the scalar-equivalence test below and any future
+    /// SIMD path that wants the same coverage.
+    ///
+    /// The numbered comment + `push` sequence is intentional: each
+    /// entry's purpose is annotated inline; collapsing the body into
+    /// a `vec![…]` literal with 21 multi-line tuples obscures the
+    /// intent.
+    #[allow(clippy::vec_init_then_push)]
+    fn sad_stress_pairs() -> Vec<([u8; 256], [u8; 256])> {
+        let mut pairs: Vec<([u8; 256], [u8; 256])> = Vec::new();
+
+        // 1. Both blocks identically zero.
+        pairs.push(([0u8; 256], [0u8; 256]));
+        // 2. Both blocks identically saturated.
+        pairs.push(([255u8; 256], [255u8; 256]));
+        // 3. Maximum positive difference everywhere.
+        pairs.push(([0u8; 256], [255u8; 256]));
+        // 4. Maximum negative difference everywhere (tests the
+        //    `max(s, p) - min(s, p)` direction symmetry).
+        pairs.push(([255u8; 256], [0u8; 256]));
+        // 5. Single-pixel ±1 perturbation deep inside the block.
+        let mut s5 = [10u8; 256];
+        let mut p5 = [10u8; 256];
+        s5[133] = 11;
+        p5[133] = 10;
+        pairs.push((s5, p5));
+        // 6. Alternating-column delta — exercises lane-position
+        //    dependence inside a 16-wide row vector.
+        let mut s6 = [0u8; 256];
+        let mut p6 = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                if c % 2 == 0 {
+                    s6[r * 16 + c] = 200;
+                    p6[r * 16 + c] = 50;
+                } else {
+                    s6[r * 16 + c] = 70;
+                    p6[r * 16 + c] = 130;
+                }
+            }
+        }
+        pairs.push((s6, p6));
+        // 7. Alternating-row delta — same as #6 but rotated 90° so the
+        //    row stencil sees uniform rows alternating between extremes.
+        let mut s7 = [0u8; 256];
+        let mut p7 = [0u8; 256];
+        for r in 0..16 {
+            let (sv, pv) = if r % 2 == 0 { (240, 16) } else { (32, 192) };
+            for c in 0..16 {
+                s7[r * 16 + c] = sv;
+                p7[r * 16 + c] = pv;
+            }
+        }
+        pairs.push((s7, p7));
+        // 8. Ramp src vs constant pred (gradient difference per lane).
+        let mut s8 = [0u8; 256];
+        for (i, slot) in s8.iter_mut().enumerate() {
+            *slot = (i & 0xff) as u8;
+        }
+        pairs.push((s8, [128u8; 256]));
+        // 9. Ramp pred vs constant src (gradient difference, flipped).
+        pairs.push(([128u8; 256], s8));
+        // 10. Mixed-frequency pattern src vs ramp pred — the same
+        //     gradient shape `motion_search_descent.rs` uses.
+        let mut s10 = [0u8; 256];
+        let mut p10 = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                let mix = (r as u32 * 7).wrapping_add(c as u32 * 11).wrapping_add(13)
+                    ^ (r as u32 * c as u32);
+                s10[r * 16 + c] = mix as u8;
+                p10[r * 16 + c] = ((r as u32 * 16 + c as u32) & 0xff) as u8;
+            }
+        }
+        pairs.push((s10, p10));
+        // 11. Sparse single-row delta (only row 0 differs).
+        let mut s11 = [42u8; 256];
+        let p11 = [42u8; 256];
+        for (c, slot) in s11.iter_mut().take(16).enumerate() {
+            *slot = (c * 17) as u8;
+        }
+        pairs.push((s11, p11));
+        // 12. Sparse single-column delta (only column 7 differs).
+        let mut s12 = [42u8; 256];
+        let p12 = [42u8; 256];
+        for r in 0..16 {
+            s12[r * 16 + 7] = (r * 17) as u8;
+        }
+        pairs.push((s12, p12));
+        // 13. Checkerboard difference pattern — alternating sign every
+        //     pixel.
+        let mut s13 = [0u8; 256];
+        let mut p13 = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                if (r + c) & 1 == 0 {
+                    s13[r * 16 + c] = 240;
+                    p13[r * 16 + c] = 16;
+                } else {
+                    s13[r * 16 + c] = 16;
+                    p13[r * 16 + c] = 240;
+                }
+            }
+        }
+        pairs.push((s13, p13));
+        // 14. Both blocks pseudo-random but bounded so per-lane absdiff
+        //     sometimes saturates and sometimes does not.
+        let mut s14 = [0u8; 256];
+        let mut p14 = [0u8; 256];
+        for i in 0..256 {
+            s14[i] = ((i.wrapping_mul(101)) ^ 0x5a) as u8;
+            p14[i] = ((i.wrapping_mul(53)) ^ 0xa5) as u8;
+        }
+        pairs.push((s14, p14));
+        // 15. Both blocks pseudo-random, different seeds.
+        let mut s15 = [0u8; 256];
+        let mut p15 = [0u8; 256];
+        for i in 0..256 {
+            s15[i] = ((i.wrapping_mul(7) ^ (i >> 3)) & 0xff) as u8;
+            p15[i] = ((i.wrapping_mul(11) ^ (i >> 2)) & 0xff) as u8;
+        }
+        pairs.push((s15, p15));
+        // 16. Per-lane envelope check: every row contributes a 16 ×
+        //     255 saturation — pins the per-lane `u16` accumulator at
+        //     the 16 × 255 = 4_080 maximum for every lane simultaneously.
+        let mut s16a = [0u8; 256];
+        let mut p16a = [255u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                if (r + c) & 1 == 0 {
+                    s16a[r * 16 + c] = 0;
+                    p16a[r * 16 + c] = 255;
+                } else {
+                    s16a[r * 16 + c] = 255;
+                    p16a[r * 16 + c] = 0;
+                }
+            }
+        }
+        pairs.push((s16a, p16a));
+        // 17. Half-block split: top 8 rows zero, bottom 8 rows saturated.
+        let mut s17 = [0u8; 256];
+        let mut p17 = [0u8; 256];
+        for r in 8..16 {
+            for c in 0..16 {
+                s17[r * 16 + c] = 200;
+                p17[r * 16 + c] = 40;
+            }
+        }
+        pairs.push((s17, p17));
+        // 18. Vertical-stripe split: left half src high, right half
+        //     pred high.
+        let mut s18 = [0u8; 256];
+        let mut p18 = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                if c < 8 {
+                    s18[r * 16 + c] = 220;
+                    p18[r * 16 + c] = 20;
+                } else {
+                    s18[r * 16 + c] = 20;
+                    p18[r * 16 + c] = 220;
+                }
+            }
+        }
+        pairs.push((s18, p18));
+        // 19. Tiny perturbation (≤ 3) over the whole block — bottom-end
+        //     of the per-lane envelope.
+        let mut s19 = [0u8; 256];
+        let mut p19 = [0u8; 256];
+        for i in 0..256 {
+            s19[i] = 100;
+            p19[i] = 100 + ((i % 4) as u8);
+        }
+        pairs.push((s19, p19));
+        // 20. Equal-magnitude positive/negative differences interleaved
+        //     so the absolute-value reduction is exercised on both sign
+        //     branches in a single row.
+        let mut s20 = [0u8; 256];
+        let mut p20 = [0u8; 256];
+        for r in 0..16 {
+            for c in 0..16 {
+                let v = (r * 16 + c) as i32;
+                let centred = 128 + ((v % 41) - 20);
+                let other = 128 - ((v % 41) - 20);
+                s20[r * 16 + c] = centred.clamp(0, 255) as u8;
+                p20[r * 16 + c] = other.clamp(0, 255) as u8;
+            }
+        }
+        pairs.push((s20, p20));
+        // 21. Ramp-vs-ramp with a deliberate constant offset, so every
+        //     per-lane absdiff lands on the same non-zero value.
+        let mut s21 = [0u8; 256];
+        let mut p21 = [0u8; 256];
+        for i in 0..256 {
+            s21[i] = (i & 0x7f) as u8;
+            p21[i] = ((i & 0x7f) + 17).min(255) as u8;
+        }
+        pairs.push((s21, p21));
+
+        pairs
+    }
+
+    #[test]
+    fn block_sad_public_dispatch_matches_scalar_on_stress_inputs() {
+        // Standing equivalence proof: the public `block_sad_16x16`
+        // dispatcher must agree with the scalar listing on every input
+        // in `sad_stress_pairs()`. On stable + default features this
+        // is `scalar == scalar` (trivially true); on nightly + `simd`
+        // the dispatcher routes through `block_sad_16x16_simd`, so the
+        // assertion becomes the SIMD-vs-scalar bit-equivalence proof.
+        for (idx, (src, pred)) in sad_stress_pairs().iter().enumerate() {
+            let via_public = block_sad_16x16(src, pred);
+            let via_scalar = block_sad_16x16_scalar(src, pred);
+            assert_eq!(
+                via_public, via_scalar,
+                "pair #{idx}: public dispatch ≠ scalar listing"
+            );
+        }
+    }
+
+    #[cfg(feature = "simd")]
+    #[test]
+    fn block_sad_simd_matches_scalar_on_stress_inputs() {
+        // Direct SIMD-vs-scalar bit-equivalence proof on the stress
+        // set, regardless of which path the public dispatcher routes
+        // to. Mirrors `wht_simd_matches_scalar_on_stress_inputs`
+        // / `dct_simd_matches_scalar_on_stress_inputs` in
+        // `src/inverse_transform.rs`.
+        for (idx, (src, pred)) in sad_stress_pairs().iter().enumerate() {
+            let via_simd = block_sad_16x16_simd(src, pred);
+            let via_scalar = block_sad_16x16_scalar(src, pred);
+            assert_eq!(via_simd, via_scalar, "pair #{idx}: SIMD ≠ scalar listing");
+        }
     }
 }

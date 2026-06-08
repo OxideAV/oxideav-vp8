@@ -30,7 +30,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use oxideav_vp8::motion_search::{
-    half_pixel_refine_luma, quarter_pixel_refine_luma, small_diamond_search_luma, LumaRef,
+    block_sad_16x16, half_pixel_refine_luma, quarter_pixel_refine_luma, small_diamond_search_luma,
+    LumaRef,
 };
 use oxideav_vp8::motion_vector::Mv;
 
@@ -226,11 +227,44 @@ fn bench_full_descent(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_block_sad(c: &mut Criterion) {
+    // Round 258 leaf bench. `block_sad_16x16` is the per-candidate
+    // distortion primitive every stage of the descent ladder collapses
+    // to once the per-candidate prediction has been synthesised; the
+    // round-258 SIMD fan-out (gated behind the existing `simd` feature)
+    // pulls 16 rows × 16 bytes through a `Simd<u8, 16>` `max - min`
+    // absdiff into a `Simd<u16, 16>` row accumulator and finishes with
+    // a single horizontal `reduce_sum`. This bench attributes wall-time
+    // directly to that primitive so a future deeper SIMD rewrite has a
+    // stable A/B target inside the same harness the descent stages
+    // live in. Inputs are two deterministic 16×16 blocks lifted from
+    // the same gradient pattern the stages above use, so the bench
+    // numbers stack cleanly against the per-stage descent measurements.
+    let w = 64;
+    let h = 64;
+    let src_plane = make_plane(w, h, 1);
+    let ref_plane = make_plane(w, h, 2);
+    let stride = w;
+
+    let src_blk = source_block(&src_plane, stride, 16, 16);
+    let ref_blk = source_block(&ref_plane, stride, 16, 16);
+
+    let mut g = c.benchmark_group("motion_search_descent");
+    g.bench_function("block_sad_16x16_single_pair", |b| {
+        b.iter(|| {
+            let r = block_sad_16x16(black_box(&src_blk), black_box(&ref_blk));
+            black_box(r)
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_small_diamond,
     bench_half_pixel_refine,
     bench_quarter_pixel_refine,
     bench_full_descent,
+    bench_block_sad,
 );
 criterion_main!(benches);

@@ -4,6 +4,82 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `block_sad_16x16` SIMD partner + `block_sad_16x16_single_pair` bench (round 258, 2026-06-08)
+
+Round 258 is the SIMD-depth round on the §17 SAD primitive — the
+per-candidate distortion metric every stage of the round-255 luma
+motion-search descent ladder collapses to once the per-candidate
+prediction has been synthesised. `motion_search_descent.rs` in the
+r255 bench profiled `block_sad_16x16` as a ~6.4 ns leaf on
+`aarch64-apple-darwin`, called 16× per MB by `mb_luma_sad_at_mv` and
+once per MB by `mb_luma_sad_at_whole_mv`. The leaf has the simplest
+possible SIMD-friendly shape: 256 packed bytes = 16 rows × 16 bytes,
+linear `Σ |s - p|` per-lane reduction with a single horizontal sum
+at the end.
+
+`block_sad_16x16_simd` (gated behind the existing `simd` feature,
+the same nightly-only `core::simd::Simd` surface the
+round-226 / round-247 inverse-transform rewrites already use) pulls
+each row through `Simd<u8, 16>::simd_max - simd_min` for the per-lane
+absolute difference, widens to `Simd<u16, 16>` and accumulates
+across all 16 rows (worst-case `16 × 255 = 4_080` per lane stays
+inside `u16`), then closes with a single `reduce_sum()` widened to
+`u32`. The byte-equivalence test
+`block_sad_simd_matches_scalar_on_stress_inputs` walks a 21-entry
+stress set (full-zero / full-saturated extremes, alternating-column
+and alternating-row deltas, checkerboard sign-flip, sparse single-
+row / single-column deltas, pseudo-random with two seeds, half-block
+splits, vertical-stripe split, tiny perturbations, equal-magnitude
+sign-flip interleave, ramp-vs-ramp constant offset, both gradient
+shapes the descent ladder uses) and is asserted bit-equal against
+`block_sad_16x16_scalar` on every input.
+
+`benches/motion_search_descent.rs` grows a new
+`block_sad_16x16_single_pair` micro-bench so the SAD leaf has a
+stable A/B target inside the same harness the descent stages live
+in (the round-255 `small_diamond_search_luma_iters_8`,
+`half_pixel_refine_luma_8_offsets`,
+`quarter_pixel_refine_luma_8_offsets`, and
+`full_descent_whole_half_quarter` numbers).
+
+#### Dispatch decision
+
+The `--quick` numbers on `aarch64-apple-darwin` showed a trade-off:
+the SIMD leaf is **−36 %** in isolation (4.08 ns vs 6.43 ns) but
+inlining it into the 16-call-per-MB `mb_luma_sad_at_mv` body
+regresses `half_pixel_refine_luma_8_offsets` and
+`quarter_pixel_refine_luma_8_offsets` by **+13 %** each (2.74 µs →
+3.12 µs). The likely cause is increased NEON register pressure
+across the surrounding `filter_block_4x4` loop pessimising LLVM's
+scheduling around the leaf. The public `block_sad_16x16` therefore
+routes to `block_sad_16x16_scalar` under every feature
+configuration — same shape as the round-247 dispatch decision for
+`forward_dct_4x4` — keeping the descent stages on their fastest
+measured shape. The `_simd` listing stays compiled + tested under
+the `simd` feature so a future round can re-target it (e.g. on a
+host where the regression flips, or with an `#[inline(never)]`
+wrapper that prevents the LLVM scheduling spill into
+`mb_luma_sad_at_mv`).
+
+| Bench | r255 stable | r258 stable | r258 nightly + simd direct-call | Δ direct-call vs scalar |
+|---|---:|---:|---:|---:|
+| `motion_search_descent/block_sad_16x16_single_pair` | (new) | 6.27 ns | 4.08 ns | **−35 %** |
+| `motion_search_descent/small_diamond_search_luma_iters_8` | 279.2 ns | 278.4 ns | 275.8 ns | ±0 % |
+| `motion_search_descent/half_pixel_refine_luma_8_offsets` | 2.74 µs | 2.71 µs | 3.12 µs *(if dispatched to SIMD)* | +13 % (rejected) |
+| `motion_search_descent/quarter_pixel_refine_luma_8_offsets` | 2.75 µs | 2.70 µs | 3.13 µs *(if dispatched to SIMD)* | +13 % (rejected) |
+| `motion_search_descent/full_descent_whole_half_quarter` | 5.75 µs | 5.64 µs | 5.71 µs | ±1 % |
+
+Test counts: stable lib **458** (+1 vs r257), nightly + `simd` lib
+**460** (+2 vs r257 — the public-dispatch equivalence test plus the
+direct SIMD-vs-scalar equivalence test, mirroring the
+`wht_simd_matches_scalar_on_stress_inputs` shape from
+`src/inverse_transform.rs`). No `#[ignore]`; no version bump; no
+`Cargo.lock` committed; `oxideav-core = "0.1"`. Wall: read
+`docs/video/vp8/` (RFC 6386 §17 / §18.3), `oxideav-core` public
+API, and the agent's own crate only; no external library source, no
+web search, no third-party crate, no source-reading of any reference
+codec implementation; black-box validator usage unchanged.
+
 ### Added — `panic_free_sixtap_subpel` fuzz target covering the §18.3 / §20.14 sub-pixel synthesis primitives (round 257, 2026-06-08)
 
 `fuzz/fuzz_targets/panic_free_sixtap_subpel.rs` is a new libFuzzer

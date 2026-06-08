@@ -190,6 +190,36 @@ route to `block_sad_16x16_scalar` — same shape as the round-247
 dispatch decision for `forward_dct_4x4`. The `_simd` listing stays
 compiled + tested as a future re-target target.
 
+### Wide deblock filter (the §15.3 `MBfilter` partner)
+
+Round 260 added `loop_filter_mb_edge`, the partner of the round-170
+`loop_filter_normal` bench. The round-170 entry measures the
+`subblock_filter` + `simple_segment` per-call cost; the round-260
+partner covers the heavier wider `mb_filter` (the §15.3 `MBfilter`
+kernel that fires on every MB-to-MB edge — up to twice per
+non-skipped luma MB plus the chroma analogues) plus a leaf number
+for the §15.2 `common_adjust` inner core that both filters funnel
+into:
+
+```sh
+cargo bench -p oxideav-vp8 --bench loop_filter_mb_edge -- --quick
+```
+
+Headline numbers (Apple M4 / aarch64, criterion `--quick`):
+`mb_filter_wide` ≈ 5.8 ns (three decaying `27/18/9` weight
+adjustments over six pixels — the heaviest deblock path),
+`mb_filter_hev` ≈ 5.4 ns (inner `common_adjust` outer-tap fallback
+when `hev` trips), `subblock_filter_low_variance` ≈ 5.0 ns
+(head-to-head on the same 8-pixel segment — the round-170 entry
+measures the high-variance branch, this one the low-variance
+branch so both branches have a baseline), `common_adjust_outer_taps`
+≈ 2.9 ns, `common_adjust_no_outer` ≈ 2.6 ns (the §15.2 4-pixel
+leaf). The wide MB-edge kernel is ~16 % heavier than the sub-block
+kernel per call on the same input, confirming the deblock-path
+wall-time picture is two-pronged: future SIMD / unroll work needs
+to target both poles. Same input as `loop_filter_normal` so the two
+deblock micro-benches compare directly.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

@@ -85,6 +85,20 @@ harness = false
 name = "forward_transform_4x4"
 harness = false
 
+# Round 260 bench. The §15.3 `MBfilter` wide inter-macroblock loop
+# filter — the heavier sibling of the round-170 `loop_filter_normal`
+# (which covers only `subblock_filter` + `simple_segment`). `mb_filter`
+# fires on every MB-to-MB edge (up to twice per non-skipped luma MB
+# plus the chroma analogues) and executes three decaying clamp/s2u
+# adjustments per call, so it dominates per-call cost on the deblock
+# path even though `subblock_filter` dominates by call count. Both
+# branches are benched (low-variance wide + high-variance hev fallback)
+# plus the §15.2 `common_adjust` leaf so future SIMD / unroll work has
+# a baseline for the inner core in isolation.
+[[bench]]
+name = "loop_filter_mb_edge"
+harness = false
+
 # Round 255 bench. The §17.1 / §18.3 luma motion-search descent ladder
 # — `small_diamond_search_luma` (whole-pixel), `half_pixel_refine_luma`
 # (8 half-pixel offsets) and `quarter_pixel_refine_luma` (8 quarter-pixel

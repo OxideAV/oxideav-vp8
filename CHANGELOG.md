@@ -4,6 +4,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `loop_filter_mb_edge` criterion bench (round 260, 2026-06-08)
+
+Round 260 is the depth-mode bench round on the §15.3 deblock-filter
+hot path — the heaviest sibling of the round-170 `loop_filter_normal`
+bench, which covers only `subblock_filter` + `simple_segment`. The
+new `benches/loop_filter_mb_edge.rs` adds five criterion points
+arranged so a future SIMD / unroll rewrite can compare across
+branches and across siblings on the same input:
+
+* `mb_filter_wide` — the §15.3 `MBfilter` low-edge-variance branch:
+  the three decaying `27/18/9` weight adjustments that update six of
+  the eight straddling pixels. This is the per-call hot path on
+  every MB-to-MB edge (up to two times per non-skipped luma MB plus
+  the chroma analogues), and the kernel a SIMD rewrite would
+  primarily target. Round-260 baseline: ~5.8 ns / call.
+* `mb_filter_hev` — the §15.3 `MBfilter` high-edge-variance branch:
+  the inner-window `common_adjust` outer-tap fallback when `hev`
+  trips. Round-260 baseline: ~5.4 ns / call.
+* `subblock_filter_low_variance` — head-to-head against the
+  partner: the §15.3 sub-block low-variance branch on the *same*
+  8-pixel segment so a reader can read off the wide / narrow
+  per-call ratio directly. The round-170 `loop_filter_normal` bench
+  measures `subblock_filter` at `hev=true` (high-variance branch);
+  this entry covers the *low*-variance branch so both branches have
+  a baseline number on file. Round-260 baseline: ~5.0 ns / call.
+* `common_adjust_outer_taps` and `common_adjust_no_outer` — the
+  §15.2 4-pixel inner core that `simple_segment` calls directly and
+  that both normal-filter kernels funnel into for their inner-window
+  step. Two entries for the two outer-tap polarities. Round-260
+  baselines: ~2.9 ns and ~2.6 ns / call.
+
+The bench reuses the same `[120, 122, 124, 126, 130, 132, 134, 136]`
+low-variance ramp as `loop_filter_normal.rs` (chosen so `filter_yes`
+accepts at `interior_limit = 4`, `edge_limit = 16`) so the two
+deblock micro-benches share an input and successive measurements
+can compare directly.
+
+Registered as a `harness = false` `[[bench]]` in `Cargo.toml`. No
+src/ changes; additive bench-only commit. CI for benches runs
+`cargo check --benches` (the round-170 contract), so the new entry
+inherits the existing CI guard.
+
 ### Added — `panic_free_intra_predict_kernels` fuzz target (round 259, 2026-06-08)
 
 Round 259 is the depth-mode fuzz round on the §12 intra-prediction

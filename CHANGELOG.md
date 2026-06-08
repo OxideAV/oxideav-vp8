@@ -4,6 +4,38 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_motion_search_descent` fuzz target covering the §17.1 / §18.3 luma MV picker (round 256, 2026-06-08)
+
+`fuzz/fuzz_targets/panic_free_motion_search_descent.rs` is a new
+libFuzzer harness for the §17 / §18.3 primitive surface —
+`small_diamond_search_luma`, `half_pixel_refine_luma`,
+`quarter_pixel_refine_luma`, `mb_luma_sad_at_whole_mv`, and
+`mb_luma_sad_at_mv`. The pre-existing fuzz targets reached this
+surface only indirectly through `encode_keyframe` /
+`Vp8TwoPassEncoder::encode_frame`, which gate the per-MB motion-vector
+picker behind a fully-formed I420 frame + §11 mode picker + §13 token
+emitter cascade, leaving the §17 / §18.3 primitive layer
+under-fuzzed — in particular the §20.14 edge-replication clamp inside
+`fetch_block_halo` that the round-255 `motion_search_descent`
+criterion bench never visits (the bench pins the MB at `(1, 1)` inside
+a 64×64 plane, well clear of the clamp).
+
+The harness drives the (mb-position, mv-center, plane-dimension,
+source-block) envelope across plane axes ∈ {16, 24, 32, 40} per
+dimension, MB origin saturated against `width / 16` and `height / 16`,
+center MV pre-clamped into `[MV_MIN, MV_MAX]`, and `max_iters` capped
+at `8`. The flags byte picks the descent stage (whole-pixel only / +
+half-pixel / + quarter-pixel / full ladder), the source-block seed
+(gradient vs constant), and the per-candidate evaluator sweep
+(`mb_luma_sad_at_whole_mv` 5-probe whole-pixel ring vs
+`mb_luma_sad_at_mv` 3×3 quarter-pixel ring) — so every §18.3
+fractional offset `(mx, my) ∈ {0, 2, 4, 6}²` is exercised, not just
+the ones the descent happened to land on. The reference plane is a
+single tile-extended `Vec<u8>` (≤ ~1.6 KiB at the 40×40 max); the
+16×16 source block is stack-allocated. Fuzz-only — no library code or
+public surface change. Test counts unchanged (stable lib 457, nightly
++ `simd` lib 458).
+
 ### Added — `motion_search_descent` criterion bench covering the §17.1 / §18.3 luma MV picker (round 255, 2026-06-08)
 
 `benches/motion_search_descent.rs` is a new criterion micro-bench

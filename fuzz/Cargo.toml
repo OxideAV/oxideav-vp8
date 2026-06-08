@@ -112,6 +112,57 @@ cargo-fuzz = true
 #                                     patterns the §20.14 fetch's
 #                                     edge-replication clamp would
 #                                     never produce.
+#   * `panic_free_intra_predict_kernels` — §12 intra-prediction pixel
+#                                     kernels `predict_y16x16_dc`,
+#                                     `predict_y16x16_v`,
+#                                     `predict_y16x16_h`,
+#                                     `predict_y16x16_tm`,
+#                                     `predict_y16x16` (dispatcher),
+#                                     `predict_uv8x8_dc`,
+#                                     `predict_uv8x8_v`,
+#                                     `predict_uv8x8_h`,
+#                                     `predict_uv8x8_tm`,
+#                                     `predict_uv8x8` (dispatcher),
+#                                     and `predict_b4x4` across all
+#                                     ten `IntraBmode` arms (round
+#                                     259). The seven decode / encode
+#                                     harnesses above reach §12 only
+#                                     through `decode_vp8` /
+#                                     `Vp8DecoderState::decode_frame`
+#                                     / `encode_keyframe` /
+#                                     `Vp8TwoPassEncoder::encode_frame`,
+#                                     which gate the per-block
+#                                     prediction kernels behind a
+#                                     fully-formed reconstruction
+#                                     raster (every neighbour pixel
+#                                     pre-sourced, every right-edge
+#                                     sub-block `above`-extension
+#                                     pre-clamped). The round-258
+#                                     `intra_predict_dc16` criterion
+#                                     bench only exercises
+#                                     `predict_y16x16_dc` / `_v` /
+#                                     `_h` against a fixed
+#                                     `[128u8; 16] / [129u8; 16]`
+#                                     neighbour pair. This target
+#                                     drives the §12 primitive surface
+#                                     directly: every `Option`
+#                                     polarity for `Dc` (`top-left`
+#                                     fallback path included), every
+#                                     `IntraYMode` arm of the 16×16
+#                                     dispatcher (incl. the `B → None`
+#                                     short-circuit), every
+#                                     `IntraUvMode` arm of the 8×8
+#                                     dispatcher, and every
+#                                     `IntraBmode` arm of the §12.3
+#                                     `predict_b4x4` sub-block
+#                                     dispatcher — including the six
+#                                     diagonal arms `Ld` / `Rd` /
+#                                     `Vr` / `Vl` / `Hd` / `Hu` whose
+#                                     assignment lists reference
+#                                     different positions of the
+#                                     §12.3 `E[0..=8]` synthetic array
+#                                     and the `above[4..=7]`
+#                                     right-extension pixels.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -188,5 +239,11 @@ doc = false
 [[bin]]
 name = "panic_free_sixtap_subpel"
 path = "fuzz_targets/panic_free_sixtap_subpel.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_intra_predict_kernels"
+path = "fuzz_targets/panic_free_intra_predict_kernels.rs"
 test = false
 doc = false

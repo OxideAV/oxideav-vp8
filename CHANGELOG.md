@@ -4,6 +4,78 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_intra_predict_kernels` fuzz target (round 259, 2026-06-08)
+
+Round 259 is the depth-mode fuzz round on the §12 intra-prediction
+pixel-kernel surface — the primitive layer the eight existing fuzz
+targets (`panic_free_decode_keyframe`,
+`panic_free_decoder_state`, `parse_headers`,
+`panic_free_encode_keyframe`, `panic_free_two_pass_stream`,
+`panic_free_loopfilter_segment`, `panic_free_token_block`,
+`panic_free_motion_search_descent`, `panic_free_sixtap_subpel`)
+reach only indirectly through the top-level decode / encode
+entry points and that the round-258 `intra_predict_dc16` criterion
+bench likewise only exercises three of the eleven public §12
+kernels against a fixed `[128u8; 16] / [129u8; 16]` neighbour pair.
+
+The new target drives every public §12 kernel directly:
+
+* The four 16×16 luma primitives `predict_y16x16_dc` / `_v` / `_h` /
+  `_tm`. The DC primitive is exercised in all four `(above, left)`
+  `Option` polarities so the top-left-fallback (`DEFAULT_TOPLEFT_DC`)
+  and the two single-edge fallbacks are reached on every input.
+* The `predict_y16x16` dispatcher across every variant of
+  `IntraYMode`, including the `B → None` short-circuit.
+* The four 8×8 chroma partners `predict_uv8x8_dc` / `_v` / `_h` /
+  `_tm` with the same `Option` polarity envelope.
+* The `predict_uv8x8` dispatcher across every variant of
+  `IntraUvMode`.
+* The ten-arm `predict_b4x4` dispatcher across every variant of
+  `IntraBmode` — `Dc`, `Tm`, `Ve`, `He`, `Ld`, `Rd`, `Vr`, `Vl`,
+  `Hd`, `Hu`. Each diagonal arm references different positions of
+  the synthetic §12.3 `E[0..=8]` array and the `above[4..=7]`
+  right-extension pixels; sweeping every arm against the same
+  attacker-shaped `(above, left, p)` triple exercises the
+  assignment-list arithmetic of every diagonal mode.
+* A chained leg re-feeds the 16×16 luma TM output's first row /
+  column into the chroma neighbour pair so a kernel-output-as-
+  kernel-input data-flow shape (cross-plane neighbour reuse, as the
+  §11 / §12 macroblock walker performs) is also exercised.
+
+Input layout: 63-byte header (1 flags + 1 `IntraBmode` selector +
+1 `p` + 16-byte luma `above` + 16-byte luma `left` + 8-byte chroma
+`above` + 8-byte chroma `left` + 8-byte b4x4 `above` + 4-byte b4x4
+`left`). Inputs shorter than 63 bytes early-return so libFuzzer
+learns the boundary; inputs longer than 4 KiB also early-return as
+defence-in-depth against the libFuzzer default. Every kernel writes
+into a fixed-size stack-allocated `[u8; 256]` / `[u8; 64]` /
+`[u8; 16]`; no heap touches.
+
+A 21-second smoke pass on `aarch64-apple-darwin` landed:
+
+```
+cov: 525, ft: 1300, corp: 31/1892b
+2 288 663 iterations, exec/s 108 983, rss 409 MiB, zero panics.
+```
+
+The §12 primitive kernel runs ~2.6 × the per-iteration coverage of
+the round-232 `panic_free_loopfilter_segment` smoke pass with no
+heap allocation, and ~1.2 × the exec/s of the round-257
+`panic_free_sixtap_subpel` target (both sub-pixel synthesis and
+intra prediction are pure stack-allocated pixel primitives, but
+intra prediction's kernel envelope is meaningfully smaller — no
+`fetch_block_halo` boundary clamp).
+
+Files touched: `fuzz/fuzz_targets/panic_free_intra_predict_kernels.rs`
+(new, ~210 LOC); `fuzz/Cargo.toml` (new `[[bin]]` stanza +
+comment-block description); `fuzz/README.md` (Targets table row +
+input-bytes envelope row in the OOM-cap table + new
+`cargo +nightly fuzz run` line); crate `README.md` (round-259
+fuzz-target description block + round-259 sentence in the headline
+`simd` cell mirroring the round-258 / -257 pattern). Test counts
+unchanged (no new lib tests): stable lib 458, nightly + `simd` lib
+460.
+
 ### Added — `block_sad_16x16` SIMD partner + `block_sad_16x16_single_pair` bench (round 258, 2026-06-08)
 
 Round 258 is the SIMD-depth round on the §17 SAD primitive — the

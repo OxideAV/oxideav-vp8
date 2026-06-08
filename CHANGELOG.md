@@ -4,6 +4,84 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_bool_codec` fuzz target (round 261, 2026-06-08)
+
+Round 261 is the depth-mode fuzz round on the §7 boolean range coder
+— the lowest-level entropy primitive both decode and encode paths
+funnel through. The ten existing fuzz targets reach §7 only
+indirectly: the four decode harnesses (`panic_free_decode_keyframe` /
+`_decoder_state` / `parse_headers` / `panic_free_token_block`) feed
+bytes through `decode_vp8` / `Vp8DecoderState::decode_frame` /
+`Vp8FrameHeader::parse` / `decode_block`, every one of which calls
+`BoolDecoder::init` once at the top of a partition and then issues
+`read_bool` / `read_literal` against probabilities determined by the
+higher-level decode state — the attacker controls the bytes but the
+probability schedule is locked to whatever the upper layers compute.
+The four encode harnesses (`panic_free_encode_keyframe` /
+`_two_pass_stream`) reach `BoolEncoder` only through
+`encode_keyframe` / `Vp8TwoPassEncoder::encode_frame`, which run a
+valid §9 / §11 / §13 / §15 encode chain on top of it — the bool
+coder is the final stage, never driven with attacker-shaped (prob,
+value) schedules in isolation.
+
+The new `fuzz/fuzz_targets/panic_free_bool_codec.rs` drives the §7
+primitive surface directly across three legs:
+
+1. **Stand-alone decode.** `BoolDecoder::init` (the §7.3
+   `init_bool_decoder` 2-byte minimum) and
+   `BoolDecoder::init_partition` (the §20 reference's short-input
+   fallback that tolerates `sz < 2` with `value = 0` and an empty
+   input — the 0- and 1-byte legs small inter MBs land on) are both
+   attempted against the attacker bytes. The successful initial
+   state is then walked with an attacker-shaped (op-type, prob,
+   num_bits) schedule of `read_bool` / `read_literal` /
+   `read_signed_literal` calls; `InputTooShort` / `EndOfStream`
+   errors are accepted as normal returns (the target only fails on
+   panic).
+2. **Round-trip encode → decode.** A `BoolEncoder` is fed an
+   attacker-shaped (op-type, prob, value, num_bits) schedule via
+   `write_bool` / `write_literal` / `write_signed_literal`; the
+   encoder is `finish`-ed and the resulting partition is fed back
+   into a fresh `BoolDecoder::init` that replays the same schedule
+   and asserts every read recovers what was written. Any asymmetry
+   in the `split = 1 + (((range - 1) * prob) >> 8)` arithmetic or
+   in the §7.3 `add_one_to_output` carry propagation surfaces as a
+   mismatch on the read side. The `write_signed_literal` round-trip
+   pairs against `read_literal(num_bits) + read_bool(128)` (its
+   actual §9.3 / §9.4 / §9.6 inverse) rather than
+   `read_signed_literal`, which uses a different §7.3 convention
+   (sign-first, magnitude-second) and is documented in the harness
+   to NOT be the symmetric inverse.
+3. **`write_treed` round-trip.** A 7-entry tree mirroring the §11
+   `kf_ymode_tree` shape is encoded with an attacker-chosen leaf and
+   per-node probabilities; the same partition is decode-walked with
+   the same probability schedule and the recovered leaf is asserted
+   to match the written leaf. The §8.1 `treed_read` ↔ `write_treed`
+   pair is exercised end-to-end.
+
+Input layout: 7-byte header (`flags`, `op_count`, `read_back_count`,
+`leaf_sel`, three tree-node probability bytes) followed by 3-byte op
+records (`op_type`, `prob`, `payload`). `op_count` is capped at 64
+to bound per-iteration memory; the encoder's output is bounded by
+`op_count * 5` bytes (a worst-case per-bool 32-bit shift+flush),
+≤ 320 bytes per iteration. Total input cap is libFuzzer's default
+4 KiB.
+
+26-second smoke pass landed `cov: 286, ft: 1162, corp: 232/8981b`
+across 1 693 989 iterations from an empty seed on
+aarch64-apple-darwin at 65 153 exec/s, zero panics. The primitive
+runs at ~3× the throughput of the §15 loopfilter target
+(`panic_free_loopfilter_segment`, ~830× the per-iteration speed of
+the keyframe-level harnesses) so libFuzzer mutates aggressively on
+top of the §7.3 carry-propagation envelope.
+
+Documentation: the harness's prologue is the §7 read-/write-half
+audit reference (which kernels are reachable from which existing
+harness, why this direct primitive-layer target is needed, and how
+the signed-literal asymmetry is intentional). `fuzz/Cargo.toml`'s
+header block is updated to enumerate the new target alongside the
+existing ten.
+
 ### Added — `loop_filter_mb_edge` criterion bench (round 260, 2026-06-08)
 
 Round 260 is the depth-mode bench round on the §15.3 deblock-filter

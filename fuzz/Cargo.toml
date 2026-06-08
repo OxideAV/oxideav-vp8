@@ -163,6 +163,39 @@ cargo-fuzz = true
 #                                     §12.3 `E[0..=8]` synthetic array
 #                                     and the `above[4..=7]`
 #                                     right-extension pixels.
+#   * `panic_free_bool_codec`        — §7 boolean range coder primitives
+#                                     driven directly: `BoolDecoder::init`
+#                                     + `init_partition` (the §20
+#                                     reference's short-input
+#                                     fallback), `read_bool` /
+#                                     `read_literal` /
+#                                     `read_signed_literal` against an
+#                                     attacker-shaped (op-type, prob,
+#                                     num_bits) schedule, plus the
+#                                     write side `BoolEncoder` (`new`
+#                                     / `write_bool` / `write_literal`
+#                                     / `write_signed_literal` /
+#                                     `write_treed` / `finish`). An
+#                                     encode-then-decode round-trip
+#                                     leg locks the two halves in
+#                                     §7.3 lockstep: any asymmetry in
+#                                     the `split = 1 + (((range - 1)
+#                                     * prob) >> 8)` arithmetic or in
+#                                     the `add_one_to_output` carry
+#                                     propagation surfaces as a
+#                                     mismatch on the read side. The
+#                                     ten existing fuzz targets reach
+#                                     §7 only through `decode_vp8` /
+#                                     `Vp8DecoderState::decode_frame`
+#                                     / `Vp8FrameHeader::parse` /
+#                                     `decode_block` (decode) or
+#                                     `encode_keyframe` /
+#                                     `Vp8TwoPassEncoder::encode_frame`
+#                                     (encode); the bool coder is
+#                                     always the final stage and never
+#                                     driven with attacker-shaped
+#                                     probability schedules in
+#                                     isolation. This target does.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -245,5 +278,11 @@ doc = false
 [[bin]]
 name = "panic_free_intra_predict_kernels"
 path = "fuzz_targets/panic_free_intra_predict_kernels.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_bool_codec"
+path = "fuzz_targets/panic_free_bool_codec.rs"
 test = false
 doc = false

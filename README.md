@@ -275,7 +275,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships nine `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships eleven `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -405,6 +405,35 @@ that exercise the public encode and decode surface for panic-freedom:
   `cov: 525, ft: 1300, corp: 31/1892b` across 2 288 663 iterations
   from an empty seed on aarch64-apple-darwin at 108 983 exec/s, zero
   panics.
+* `panic_free_bool_codec` — the public §7 boolean range coder
+  primitives driven directly (round 261). Decode side:
+  `BoolDecoder::init` (§7.3 `init_bool_decoder` with the 2-byte
+  `InputTooShort` rejection) and `BoolDecoder::init_partition`
+  (the §20 reference's short-input fallback that tolerates `sz < 2`
+  with `value = 0`); plus `read_bool(prob)`, `read_literal(num_bits)`
+  ∈ 0..=32, and `read_signed_literal(num_bits)` ∈ 0..=31 (incl. the
+  `num_bits == 0 → 0` short-circuit). Encode side: `BoolEncoder::new`,
+  `write_bool` / `write_literal` / `write_signed_literal` /
+  `write_treed` / `finish` (§7.3 `init_bool_encoder` /
+  `add_one_to_output` / `flush_bool_encoder`). An encode-then-decode
+  round-trip leg locks the `write_bool` ↔ `read_bool` and
+  `write_literal` ↔ `read_literal` halves in §7.3 lockstep against an
+  attacker-shaped (op-type, prob, value, num_bits) schedule, so any
+  asymmetry in the `split = 1 + (((range - 1) * prob) >> 8)`
+  arithmetic or in the `add_one_to_output` carry propagation surfaces
+  as a mismatch on the read side. A separate `write_treed` round-trip
+  leg encodes a leaf of a 7-entry `kf_ymode_tree`-shaped tree and
+  decode-walks it with the same per-node probabilities so the §8.1
+  `treed_read` ↔ `write_treed` pair is exercised end-to-end. The ten
+  fuzz targets above reach §7 only through `decode_vp8` /
+  `Vp8DecoderState::decode_frame` / `Vp8FrameHeader::parse` /
+  `decode_block` (decode) or `encode_keyframe` /
+  `Vp8TwoPassEncoder::encode_frame` (encode); the bool coder is
+  always the final stage and never driven with attacker-shaped
+  probability schedules in isolation. This target does. 26-second
+  smoke pass landed `cov: 286, ft: 1162, corp: 232/8981b` across
+  1 693 989 iterations from an empty seed on aarch64-apple-darwin at
+  65 153 exec/s, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

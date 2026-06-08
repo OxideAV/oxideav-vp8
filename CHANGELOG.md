@@ -4,6 +4,55 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_sixtap_subpel` fuzz target covering the §18.3 / §20.14 sub-pixel synthesis primitives (round 257, 2026-06-08)
+
+`fuzz/fuzz_targets/panic_free_sixtap_subpel.rs` is a new libFuzzer
+harness for the §18 primitive surface — `filter_block_4x4`,
+`sixtap_2d`, `fetch_block_halo`, `fetch_block_whole_pixel`, and
+`filter_set_for_version`. The round-256
+`panic_free_motion_search_descent` target reaches these only through
+the §17 motion-search descent ladder, which by construction snaps
+every per-candidate MV to the half- or quarter-pixel grid — so
+`mv & 7` only ever indexes a subset of the 64 (mx, my) ∈ {0..7}²
+fractional combinations the §18.3 tap table indexes. The round-225
+`motion_comp_subpel_luma` criterion bench similarly only exercises a
+fixed `(mx, my) = (6, 6)` choice against a mid-plane MB so the §20.14
+`build_mc_border` edge-replication clamp inside `fetch_block_halo`
+stays cold. That left every fractional offset, every filter-set arm
+(sixtap `version == 0` vs bilinear other versions selected via
+`filter_set_for_version`), and every border-position class
+(top-left corner, bottom-right corner, adversarial, mid-plane fast
+path) directly under-fuzzed.
+
+The harness drives the (plane-dimension, sub-block-origin, MV,
+filter-set) envelope across plane axes ∈ {16, 24, 32, 40} per
+dimension; 4×4 sub-block origin saturated against `(width - 4,
+height - 4)`; eighth-pixel MV constructed inline so the chosen
+fractional `(mx, my)` is honoured regardless of the integer offset;
+filter-set version byte drawn from the input so both `Sixtap` and
+`Bilinear` arms are exercised. A border-class selector in the flags
+byte forces the integer MV to (a) keep the halo strictly inside the
+plane (mid-plane fast path), (b) push the origin past the top-left
+edge (every halo row / column clamped), (c) push it past the
+bottom-right edge (symmetric), or (d) pass the raw signed
+`i16`-range bytes through unchanged so the §20.14 clamp absorbs the
+full envelope. An 81-byte halo seeded directly from the input
+payload also feeds `sixtap_2d` so the convolution sees byte patterns
+the §20.14 fetch could never produce (non-monotonic adjacent rows
+swinging the partial sum between extremes within a single tap
+window) — the `(a + 64) >> 7` rounding and `clamp255` saturation
+surface are the primary panic candidates that pattern targets.
+
+Hard caps: input ≤ 4 KiB (libFuzzer default; re-checked at harness
+entry); plane ≤ 40 × 40 pixels (matches the r256 motion_search_descent
+target for memory-footprint consistency); no internal iteration so
+every per-iteration work bound is determined by the input header.
+The reference-plane allocation stays under 2 KiB; everything else
+(9×9 halo, 4×4 output, the `temp` buffer inside `sixtap_2d`) is
+stack-allocated. The harness is panic-freedom-only; output
+equivalence against the reference decoder remains the responsibility
+of the `tests/ffmpeg_oracle.rs` round-trip suite.
+
 ### Added — `panic_free_motion_search_descent` fuzz target covering the §17.1 / §18.3 luma MV picker (round 256, 2026-06-08)
 
 `fuzz/fuzz_targets/panic_free_motion_search_descent.rs` is a new

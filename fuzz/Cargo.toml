@@ -84,6 +84,34 @@ cargo-fuzz = true
 #                                     a 64×64 plane so the SAD
 #                                     landscape stays clear of the
 #                                     clamp).
+#   * `panic_free_sixtap_subpel`   — §18.3 / §20.14 sub-pixel synthesis
+#                                     primitives `filter_block_4x4`,
+#                                     `sixtap_2d`, `fetch_block_halo`,
+#                                     `fetch_block_whole_pixel`,
+#                                     `filter_set_for_version`. The
+#                                     round-256 motion_search target
+#                                     reaches these only through the
+#                                     §17 descent ladder (which by
+#                                     construction snaps every MV to
+#                                     the half- or quarter-pixel grid)
+#                                     and the round-225 motion_comp
+#                                     bench only exercises a fixed
+#                                     `(mx, my) = (6, 6)` choice
+#                                     mid-plane; this target drives
+#                                     every (mx, my) ∈ {0..7}²
+#                                     fractional combination, both
+#                                     filter-set arms (sixtap version
+#                                     0 / bilinear other versions),
+#                                     and every border-position class
+#                                     (top-left corner, bottom-right
+#                                     corner, adversarial, mid-plane
+#                                     fast path) directly. An
+#                                     attacker-shaped 81-byte halo
+#                                     fed straight into `sixtap_2d`
+#                                     also exercises convolution
+#                                     patterns the §20.14 fetch's
+#                                     edge-replication clamp would
+#                                     never produce.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -154,5 +182,11 @@ doc = false
 [[bin]]
 name = "panic_free_motion_search_descent"
 path = "fuzz_targets/panic_free_motion_search_descent.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_sixtap_subpel"
+path = "fuzz_targets/panic_free_sixtap_subpel.rs"
 test = false
 doc = false

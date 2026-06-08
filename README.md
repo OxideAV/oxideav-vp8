@@ -229,7 +229,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships seven `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships nine `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -304,6 +304,31 @@ that exercise the public encode and decode surface for panic-freedom:
   aarch64-apple-darwin, peak RSS 316 MiB, zero panics — the §13
   primitive surface gets ~7 × the coverage envelope of the §15
   loop-filter target while running at 84 064 exec/s.
+* `panic_free_motion_search_descent` — the public §17.1 / §18.3 luma
+  motion-search descent ladder (`small_diamond_search_luma`,
+  `half_pixel_refine_luma`, `quarter_pixel_refine_luma`) plus the
+  per-candidate evaluators `mb_luma_sad_at_whole_mv` /
+  `mb_luma_sad_at_mv` (round 256). Drives the (mb-position, mv-center,
+  plane-dimension, source-block) envelope into the §20.14 edge-
+  replication clamp inside `fetch_block_halo` and across every §18.3
+  sixtap fractional offset.
+* `panic_free_sixtap_subpel` — the public §18.3 / §20.14 sub-pixel
+  synthesis primitives `filter_block_4x4`, `sixtap_2d`,
+  `fetch_block_halo`, `fetch_block_whole_pixel`, and
+  `filter_set_for_version` (round 257). The motion_search_descent
+  target reaches these only through the §17 descent ladder, which by
+  construction snaps every per-candidate MV to the half- or
+  quarter-pixel grid; the round-225 `motion_comp_subpel_luma`
+  criterion bench only exercises a fixed `(mx, my) = (6, 6)` choice
+  against a mid-plane MB. This target drives every (mx, my) ∈ {0..7}²
+  fractional combination, both filter-set arms (sixtap `version == 0`
+  vs bilinear other versions), and every border-position class
+  (top-left corner, bottom-right corner, adversarial, mid-plane fast
+  path) directly. An 81-byte halo seeded from the input also feeds
+  `sixtap_2d` so the convolution sees byte patterns the §20.14 clamp
+  would never produce. 26-second smoke pass landed `cov: 181, ft:
+  337, corp: 37/846b` across 2 286 492 iterations from an empty seed
+  on aarch64-apple-darwin at 87 942 exec/s, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

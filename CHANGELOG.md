@@ -4,6 +4,83 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_transform_4x4_roundtrip` fuzz target (round 262, 2026-06-09)
+
+Round 262 is the depth-mode fuzz round on the §14 transform / dequant
+/ residue-summation primitive layer — the §14.3 forward + inverse
+WHT, §14.4 forward + inverse DCT, §14.1 `dequant_block`, §14.5
+`add_residue` / `add_residue_4x4`, §14.3 `inverse_wht_4x4_dc_only`
+fast path, §20.16 `raster_to_scan` permutation, and the §9.6
+`clamp_qindex` / §14.5 `clamp255` saturating caps. The eleven
+existing fuzz targets reach §14 only indirectly: the four decode-
+side targets (`panic_free_decode_keyframe` / `_decoder_state` /
+`parse_headers` / `panic_free_token_block`) feed bytes through
+`decode_vp8` / `Vp8DecoderState::decode_frame` / `Vp8FrameHeader::
+parse` / `decode_block`, each of which gates §14 behind a fully-
+formed §9 / §11 / §13 / §14.1 state machine — the inverse path is
+exercised only against well-formed dequantised residuals and the
+forward path is never exercised. The two encode-side targets
+(`panic_free_encode_keyframe` / `_two_pass_stream`) run a §11 mode
+pick → §14 forward transform → §13 token emission chain — the
+forward DCT / WHT are exercised but only against §9.6-clamped
+residual magnitudes determined by the upper-layer encoder logic.
+The remaining five harnesses (`panic_free_loopfilter_segment` /
+`panic_free_motion_search_descent` / `panic_free_sixtap_subpel` /
+`panic_free_intra_predict_kernels` / `panic_free_bool_codec`) don't
+touch §14 at all.
+
+The new `fuzz/fuzz_targets/panic_free_transform_4x4_roundtrip.rs`
+drives the §14 primitive surface directly across four legs:
+
+1. **§14.3 WHT round-trip.** Forward `forward_wht_4x4` on an
+   attacker-shaped `[i16; 16]` residual seed (mid-magnitude / ±255 /
+   ±1023 §14.2 cliff — the documented §14.4 inverse-DCT envelope,
+   chosen so the intermediate `i32` butterfly multiplies by
+   `SINPI8_SQRT2 = 35468` stay inside `i32`) followed by
+   `inverse_wht_4x4` on the result. Panic-free for every
+   `(residual_seed_mode, [i16; 16])` combination.
+2. **§14.4 DCT round-trip.** Same shape with `forward_dct_4x4`
+   followed by `inverse_dct_4x4`.
+3. **§14.1 dequant + §14.5 residue-sum leg.** `dequant_block` with
+   attacker-chosen `(dc_factor, ac_factor)` cliff values
+   (`i16::MIN` / `i16::MAX` / `0` plus the §14.1 4..=255 envelope)
+   on a fresh copy of the residual — the §14.1 contract's `i32`
+   product wrapping cast back to `i16` is panic-free on every cliff
+   triple. The §14.5 `add_residue_4x4` and `add_residue` (arbitrary-
+   length form, byte-equality assertion against the fixed-size form
+   on equal-length inputs) are exercised against the §14.2-bounded
+   residual + a constant predictor.
+4. **§14.3 DC-only fast-path + §20.16 zigzag + §9.6 / §14.5 cap
+   primitives.** `inverse_wht_4x4_dc_only(dc, out)` is asserted
+   byte-equal to `inverse_wht_4x4([dc, 0, …, 0], out)` for every
+   `dc ∈ [i16::MIN, i16::MAX]` (the §14.3 fast-path equivalence
+   contract). `raster_to_scan(residual)` is asserted to be a
+   permutation via multiset equality between input and output.
+   `clamp_qindex` is exercised at the `i32::MIN` / `i32::MAX` cliff
+   endpoints with a panic-free `idx < QINDEX_RANGE` assertion, and
+   `clamp255` at the same cliff endpoints.
+
+Each leg is independently flag-gated so libFuzzer can isolate
+coverage to the per-leg primitive surface. The harness is
+allocation-free — every buffer is a stack-resident `[i16; 16]` /
+`[u8; 16]`. Header is 7 bytes (flags + residual_seed_mode +
+dc/ac_factor classes + pred / dc_only seeds); the residual
+window is 32 bytes (16 × 2-byte LE halfwords); minimum input is
+39 B; max is the libFuzzer 4 KiB default.
+
+`fuzz/Cargo.toml` adds the new `[[bin]]` entry. `README.md`'s
+"Fuzz harnesses" bullet count goes from 11 to 12 and the new
+target picks up its own bullet with the §14 surface enumeration.
+`fuzz/README.md` adds a row to the targets table.
+
+26-second smoke pass landed `cov: 264, ft: 387, corp: 48/1836b`
+across 1 000 000 iterations from an empty seed on
+aarch64-apple-darwin at 250 000 exec/s, zero panics — the
+primitive-layer kernel runs at a high exec/s rate comparable to
+the round-259 `panic_free_intra_predict_kernels` target.
+
+No source change. No public-API change. Test counts unchanged.
+
 ### Added — `panic_free_bool_codec` fuzz target (round 261, 2026-06-08)
 
 Round 261 is the depth-mode fuzz round on the §7 boolean range coder

@@ -196,6 +196,56 @@ cargo-fuzz = true
 #                                     driven with attacker-shaped
 #                                     probability schedules in
 #                                     isolation. This target does.
+#   * `panic_free_transform_4x4_roundtrip`
+#                                  — §14 transform / dequant / residue-
+#                                     summation primitive layer driven
+#                                     directly: forward DCT / inverse DCT
+#                                     and forward WHT / inverse WHT
+#                                     round-trip on an attacker-shaped
+#                                     `[i16; 16]` residual seed (mid-
+#                                     magnitude / ±255 / ±1023 §14.2
+#                                     cliff / ±i16::MAX overflow probe),
+#                                     `dequant_block` with attacker-
+#                                     chosen `(dc_factor, ac_factor)`
+#                                     cliff values (`i16::MIN` / `MAX` /
+#                                     `0` plus the §14.1 4..=255
+#                                     envelope), `add_residue_4x4` +
+#                                     `add_residue` (§14.5 fixed-size
+#                                     vs arbitrary-length form, byte-
+#                                     equality assertion on equal-
+#                                     length inputs), `inverse_wht_4x4
+#                                     _dc_only` (§14.3 single-non-zero-DC
+#                                     fast path, byte-equivalence
+#                                     against the general inverse on a
+#                                     `[dc, 0, …, 0]` input), the §20.16
+#                                     `raster_to_scan` permutation
+#                                     (multiset equality between input
+#                                     and output asserts the bijection),
+#                                     plus the `clamp_qindex` (§9.6) and
+#                                     `clamp255` (§14.5) saturating-cap
+#                                     primitives at their `i32::MIN` /
+#                                     `i32::MAX` cliff endpoints. The
+#                                     eleven targets above reach §14
+#                                     only indirectly: the decode-side
+#                                     targets feed inverse-only via
+#                                     well-formed dequantised residuals
+#                                     gated by the §9 / §11 / §13 /
+#                                     §14.1 state machine; the encode-
+#                                     side targets feed forward-only
+#                                     via §9.6-clamped residual
+#                                     magnitudes determined by the
+#                                     upper-layer encoder. No existing
+#                                     harness round-trips the §14.3 /
+#                                     §14.4 forward + inverse pair on
+#                                     attacker-shaped residuals at the
+#                                     §14.2 cliff envelope, drives
+#                                     `dequant_block` with cliff factor
+#                                     pairs, exercises `inverse_wht_4x4
+#                                     _dc_only` standalone with cliff
+#                                     `dc`, or asserts the §20.16
+#                                     `raster_to_scan` permutation
+#                                     invariant directly. This target
+#                                     does all four.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -284,5 +334,11 @@ doc = false
 [[bin]]
 name = "panic_free_bool_codec"
 path = "fuzz_targets/panic_free_bool_codec.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_transform_4x4_roundtrip"
+path = "fuzz_targets/panic_free_transform_4x4_roundtrip.rs"
 test = false
 doc = false

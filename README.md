@@ -275,7 +275,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships eleven `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twelve `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -434,6 +434,41 @@ that exercise the public encode and decode surface for panic-freedom:
   smoke pass landed `cov: 286, ft: 1162, corp: 232/8981b` across
   1 693 989 iterations from an empty seed on aarch64-apple-darwin at
   65 153 exec/s, zero panics.
+* `panic_free_transform_4x4_roundtrip` — the public §14 transform /
+  dequant / residue-summation primitive layer driven directly (round
+  262). Forward DCT (`forward_dct_4x4`) / inverse DCT
+  (`inverse_dct_4x4`) and forward WHT (`forward_wht_4x4`) / inverse
+  WHT (`inverse_wht_4x4`) round-trip on an attacker-shaped `[i16; 16]`
+  residual seed (mid-magnitude / ±255 / ±1023 §14.2 cliff — the
+  documented §14.4 inverse-DCT envelope, chosen so the intermediate
+  `i32` butterfly multiplies by `SINPI8_SQRT2 = 35468` stay inside
+  `i32`); `dequant_block` with attacker-chosen `(dc_factor, ac_factor)`
+  cliff values (`i16::MIN` / `i16::MAX` / `0` plus the §14.1 4..=255
+  envelope) on a fresh coeff copy — the §14.1 contract's `i32` product
+  wrapping cast back to `i16` is panic-free on every cliff triple;
+  `add_residue_4x4` / `add_residue` (§14.5 fixed-size vs arbitrary-
+  length form, byte-equality assertion on equal-length inputs) against
+  the §14.2-bounded residual + a constant predictor;
+  `inverse_wht_4x4_dc_only` (§14.3 single-non-zero-DC fast path)
+  asserted byte-equal to `inverse_wht_4x4([dc, 0, …, 0])` for every
+  `dc ∈ [i16::MIN, i16::MAX]`; the §20.16 `raster_to_scan` permutation
+  asserted via multiset equality between input and output; plus the
+  `clamp_qindex` (§9.6) and `clamp255` (§14.5) saturating-cap
+  primitives at their `i32::MIN` / `i32::MAX` cliff endpoints. The
+  eleven fuzz targets above reach §14 only indirectly: the four
+  decode-side targets feed inverse-only via well-formed dequantised
+  residuals gated by the §9 / §11 / §13 / §14.1 state machine; the
+  two encode-side targets feed forward-only via §9.6-clamped residual
+  magnitudes determined by the upper-layer encoder; the five
+  primitive-layer targets above don't touch §14 at all. No existing
+  harness round-trips the §14.3 / §14.4 forward + inverse pair on
+  attacker-shaped residuals at the §14.2 cliff envelope, drives
+  `dequant_block` with cliff factor pairs, exercises
+  `inverse_wht_4x4_dc_only` standalone with cliff `dc`, or asserts the
+  §20.16 `raster_to_scan` permutation invariant directly. This target
+  does all four. 26-second smoke pass landed `cov: 264, ft: 387, corp:
+  48/1836b` across 1 000 000 iterations from an empty seed on
+  aarch64-apple-darwin at 250 000 exec/s, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

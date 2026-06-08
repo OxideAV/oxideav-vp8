@@ -275,7 +275,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twelve `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships thirteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -469,6 +469,40 @@ that exercise the public encode and decode surface for panic-freedom:
   does all four. 26-second smoke pass landed `cov: 264, ft: 387, corp:
   48/1836b` across 1 000 000 iterations from an empty seed on
   aarch64-apple-darwin at 250 000 exec/s, zero panics.
+* `panic_free_loop_filter_writeback` — the public §9.4 / §19.2
+  loop-filter parameter writeback layer of the encoder PLUS the small
+  §9.5 / §9.6 / §9.10 / §9.11 sibling writers reached by the same
+  §19.2 frame-header walk (round 263). Drives `write_loop_filter`
+  (§9.4 baseline) AND `write_loop_filter_with_deltas` (§9.4 +
+  §19.2 `mb_lf_adjustments()` full), plus `LoopFilterDeltas::validate`
+  (§9.4 per-slot `|v| <= 63` magnitude check) and
+  `LoopFilterDeltas::effective` (§15.4 / §20.6 carried-state
+  resolution, cross-checked against a hand-rolled oracle on every
+  `(enabled, update, per-slot Some|None)` ladder branch),
+  `write_quant_indices` (§9.6, with the `y_ac_qi > 127` rejection
+  branch reached on every iteration that picks an out-of-range byte),
+  `write_token_partition_count` (§9.5, with the `count ∉ {1, 2, 4, 8}`
+  [`EncodeError::InvalidDctPartitionCount`] rejection branch
+  exhaustively covered across `0..=255`), and `write_mb_no_skip_coeff`
+  (§9.10 / §9.11). The twelve fuzz targets above reach the encoder
+  writeback layer only indirectly through `encode_keyframe` /
+  `Vp8TwoPassEncoder::encode_frame`, which feed NORMALISED parameter
+  bytes that the upstream `KeyframeParams` builder clamped against the
+  §9.4 / §9.5 / §9.6 fields; the round-261 `panic_free_encode_keyframe`
+  reaches `write_loop_filter` via the keyframe encoder which always
+  writes `adj_enable = 0`, never `write_loop_filter_with_deltas` and
+  never `LoopFilterDeltas::validate` / `::effective`. A round-trip leg
+  feeds the `write_loop_filter_with_deltas` output back into
+  `BoolDecoder::init` and walks the §19.2 field schedule
+  (`filter_type` at prob 128, `L(6)` level, `L(3)` sharp, `L(1)`
+  adj_enable, gated `L(1)` update + 4 ref + 4 mode `(present, L(6)
+  magnitude, L(1) sign)` slot triples), asserting every read value
+  equals what the encoder wrote — any asymmetry between
+  `write_loop_filter_with_deltas` and the §19.2 wire layout surfaces
+  as a `panic!` from the harness' equality assertion. 26-second smoke
+  pass landed `cov: 406, ft: 632, corp: 80/2295b` across 5 235 001
+  iterations from an empty seed on aarch64-apple-darwin at 201 346
+  exec/s, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

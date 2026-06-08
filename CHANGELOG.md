@@ -4,6 +4,107 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_loop_filter_writeback` fuzz target (round 263, 2026-06-09)
+
+Round 263 is the depth-mode fuzz round on the §9.4 / §19.2 loop-
+filter parameter writeback layer of the public encoder PLUS the small
+§9.5 / §9.6 / §9.10 / §9.11 sibling writers reached by the same §19.2
+frame-header walk. The twelve existing fuzz targets reach the encoder
+writeback layer only indirectly through `encode_keyframe` /
+`Vp8TwoPassEncoder::encode_frame`, which feed NORMALISED parameter
+bytes that the upstream `KeyframeParams` builder clamped against the
+§9.4 / §9.5 / §9.6 fields; the round-261 `panic_free_encode_keyframe`
+reaches `write_loop_filter` via the keyframe encoder which always
+writes `adj_enable = 0`, never `write_loop_filter_with_deltas` and
+never `LoopFilterDeltas::validate` / `::effective`. The round-232
+`panic_free_loopfilter_segment` target reaches §15 only through the
+per-segment kernel layer — the kernels consume the §15.4 derived
+(`hev_threshold`, `interior_limit`, `edge_limit`) triple, not the
+§9.4 wire form.
+
+The new `fuzz/fuzz_targets/panic_free_loop_filter_writeback.rs` drives
+the §9.4 / §19.2 wire-format writer surface directly:
+
+1. **§9.4 baseline writer.** `write_loop_filter(enc, filter_type,
+   level, sharp, adj_enable=false)` — covers the `filter_type` /
+   `level` / `sharp` rejection cliffs (`level > 63` /
+   [`EncodeError::LoopFilterLevelOutOfRange`]; `sharp > 7` /
+   [`EncodeError::SharpnessLevelOutOfRange`]). Passes `adj_enable=false`
+   unconditionally to honour the Phase-1 `debug_assert`.
+
+2. **§9.4 + §19.2 full writer.** `write_loop_filter_with_deltas(enc,
+   filter_type, level, sharp, &deltas)` — covers every `(enabled,
+   update, per-slot Some|None)` ladder branch of the
+   `mb_lf_adjustments()` block. The four per-reference + four
+   per-mode slots are seeded from attacker bytes; the presence-nibble
+   selects which slots carry `Some(v)`.
+
+3. **§9.4 validate().** `LoopFilterDeltas::validate()` — covers the
+   `|v| > 63` cliff on each of the eight per-slot magnitudes
+   ([`EncodeError::LoopFilterDeltaOutOfRange`]).
+
+4. **§15.4 / §20.6 effective().** `LoopFilterDeltas::effective(
+   carried_ref, carried_mode)` — covers every `(enabled, update,
+   per-slot Some|None)` × (carried `[i16; 4]` × 2) cross-product;
+   cross-checked against a hand-rolled §20.6 oracle on every input.
+
+5. **§9.6 quant indices.** `write_quant_indices(enc, y_ac_qi, …)` —
+   covers the `y_ac_qi > 127` cliff
+   ([`EncodeError::QuantIndexOutOfRange`]). The five per-`Option<i8>`
+   delta slots are pre-clamped to `-15..=15` (the §9.6 `L(4) + L(1)`
+   field envelope; the writer's documented contract panics on `|v| >=
+   16`, analogous to `add_residue`'s length-mismatch panic in the
+   round-262 target).
+
+6. **§9.5 token partition count.** `write_token_partition_count(enc,
+   count)` — covers the `count ∉ {1, 2, 4, 8}` cliff
+   ([`EncodeError::InvalidDctPartitionCount`]); every other byte
+   triggers the rejection branch.
+
+7. **§9.10 / §9.11 mb-skip-coeff.** `write_mb_no_skip_coeff(enc,
+   enabled, prob_skip_false)` — covers the gated literal arm.
+
+A round-trip leg feeds the `write_loop_filter_with_deltas` output
+back into [`BoolDecoder::init`] and walks the §19.2 field schedule
+(`filter_type` at prob 128, `L(6)` level, `L(3)` sharp, `L(1)`
+adj_enable, gated `L(1)` update + 4 ref + 4 mode `(present, L(6)
+magnitude, L(1) sign)` slot triples), asserting every read value
+equals what the encoder wrote. Any asymmetry between
+`write_loop_filter_with_deltas` and the §19.2 wire layout (field-order
+swap, stray bit, sign-vs-magnitude order transposition) surfaces as a
+`panic!` from the harness' equality assertion — the same shape the
+round-261 `panic_free_bool_codec` target locked at the primitive
+layer, now tight against the structured §9.4 field schedule.
+
+**Smoke results.** 26-second smoke run on aarch64-apple-darwin
+landed `cov: 406, ft: 632, corp: 80/2295b` across 5 235 001 iterations
+from an empty seed at 201 346 exec/s, zero panics.
+
+**Backfill.** The same round backfills the row `panic_free_token_block`
+(round 237) and `panic_free_bool_codec` (round 261) into
+`fuzz/README.md`'s targets table — both rows were missing since their
+respective rounds added the targets to `fuzz/Cargo.toml` without
+updating the README table.
+
+Round 263 marks the **thirteenth** fuzz target (`fuzz_targets/`
+files: 13). Stable lib tests: 458 (unchanged); nightly `+ simd`: 460
+(unchanged).
+
+Touched files in round 263:
+
+* `fuzz/Cargo.toml` — added the `[[bin]]` block for
+  `panic_free_loop_filter_writeback` and extended the metadata
+  comment that lists each target's role.
+* `fuzz/fuzz_targets/panic_free_loop_filter_writeback.rs` — new file
+  (≈350 lines).
+* `fuzz/README.md` — backfilled `panic_free_token_block` (round 237)
+  and `panic_free_bool_codec` (round 261) rows; added the new
+  `panic_free_loop_filter_writeback` row + caps + run / corpus
+  entries.
+* `README.md` — bumped target count 12 → 13; added the new bullet
+  with round-263 smoke results.
+* `CHANGELOG.md` — this entry.
+
 ### Added — `panic_free_transform_4x4_roundtrip` fuzz target (round 262, 2026-06-09)
 
 Round 262 is the depth-mode fuzz round on the §14 transform / dequant

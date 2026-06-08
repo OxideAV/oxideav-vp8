@@ -246,6 +246,58 @@ cargo-fuzz = true
 #                                     `raster_to_scan` permutation
 #                                     invariant directly. This target
 #                                     does all four.
+#   * `panic_free_loop_filter_writeback`
+#                                  — §9.4 / §19.2 loop-filter
+#                                     parameter writeback layer of the
+#                                     public encoder PLUS the small
+#                                     §9.5 / §9.6 / §9.10 / §9.11
+#                                     sibling writers reached by the
+#                                     same §19.2 frame-header walk
+#                                     (`write_loop_filter`,
+#                                     `write_loop_filter_with_deltas`,
+#                                     `LoopFilterDeltas::validate`,
+#                                     `LoopFilterDeltas::effective`,
+#                                     `write_quant_indices`,
+#                                     `write_token_partition_count`,
+#                                     `write_mb_no_skip_coeff`). The
+#                                     twelve targets above reach the
+#                                     encoder writeback layer only
+#                                     indirectly through
+#                                     `encode_keyframe` /
+#                                     `Vp8TwoPassEncoder::encode_frame`,
+#                                     which feed NORMALISED parameter
+#                                     bytes the upstream
+#                                     `KeyframeParams` builder clamped
+#                                     to the §9.4 / §9.5 / §9.6
+#                                     fields. Neither harness drives
+#                                     `write_loop_filter_with_deltas`
+#                                     (the §9.4 full-deltas writer
+#                                     never ran in either target as
+#                                     of round 262 —
+#                                     `encode_keyframe`'s key frame
+#                                     writes `adj_enable = 0`), nor
+#                                     `LoopFilterDeltas::validate` /
+#                                     `::effective` (the §15.4 /
+#                                     §20.6 carried-state resolution
+#                                     is only reached from inter-
+#                                     frame encode bodies that gate
+#                                     the call behind an `enabled`
+#                                     flag the keyframe-only harness
+#                                     never sets). The round-232
+#                                     `panic_free_loopfilter_segment`
+#                                     target reaches §15 only through
+#                                     the per-segment kernel layer —
+#                                     the kernels consume the §15.4
+#                                     derived (`hev_threshold`,
+#                                     `interior_limit`, `edge_limit`)
+#                                     triple, not the §9.4 wire form.
+#                                     A round-trip leg feeds the
+#                                     `write_loop_filter_with_deltas`
+#                                     output back into
+#                                     `BoolDecoder::init` and walks
+#                                     the §19.2 field schedule,
+#                                     asserting every read value
+#                                     equals what the encoder wrote.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -340,5 +392,11 @@ doc = false
 [[bin]]
 name = "panic_free_transform_4x4_roundtrip"
 path = "fuzz_targets/panic_free_transform_4x4_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_loop_filter_writeback"
+path = "fuzz_targets/panic_free_loop_filter_writeback.rs"
 test = false
 doc = false

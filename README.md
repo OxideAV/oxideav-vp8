@@ -275,7 +275,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships thirteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships fourteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -503,6 +503,36 @@ that exercise the public encode and decode surface for panic-freedom:
   pass landed `cov: 406, ft: 632, corp: 80/2295b` across 5 235 001
   iterations from an empty seed on aarch64-apple-darwin at 201 346
   exec/s, zero panics.
+* `panic_free_inter_mb_reconstruct` — the §16 inter-MB reconstruction
+  surface driven directly: `reconstruct_inter_mb_whole_pixel` (§16.2
+  non-SPLITMV whole-pixel), `reconstruct_inter_mb` (§16.2 / §18.3 full
+  sub-pixel), and `reconstruct_split_mv_mb` (§16.4 SPLITMV) plus their
+  `predict_*` residue-free counterparts (round 265). The thirteen
+  fuzz targets above reach §16 only indirectly through `decode_vp8` /
+  `Vp8DecoderState::decode_frame` / `encode_p_frame_multi_ref` /
+  `Vp8TwoPassEncoder::encode_frame`, which gate the inter-MB path
+  behind a fully-formed previous keyframe + §9.7 reference refresh
+  state machine; the round-256 `panic_free_motion_search_descent` and
+  round-257 `panic_free_sixtap_subpel` targets reach the §18.3
+  sub-pixel synthesis primitive layer but never the §16 macroblock-
+  level reconstruction orchestrator; the round-262
+  `panic_free_transform_4x4_roundtrip` target reaches §14 but never
+  feeds the residue into a §16 reconstruct call. This target drives
+  the §16 orchestrator directly with attacker-shaped `(mb_col, mb_row,
+  luma_mv, full_pixel, mb_skip_coeff, y2_coeffs, y_coeffs, u_coeffs,
+  v_coeffs)` tuples and cross-checks (a) the §18.1 fractional gate
+  against the dispatcher's `MotionCompError::SubPixelNotSupported`
+  return on the whole-pixel path, and (b) the §11.1 `mb_skip_coeff`
+  short-circuit (`reconstruct == predict` byte-equal on every input
+  that sets the skip flag) on all three §16 paths. Also drives
+  `select_ref_frame` over a short attacker partition (every `RefFrame`
+  variant reachable) and the §18.1 vector-adjustment primitives
+  (`stored_luma_mv`, `chroma_mv`, `apply_full_pixel`,
+  `whole_pixel_fraction_is_zero`, `chroma_idx_for_luma_subblock`,
+  `split_chroma_mvs`, `filter_set_for_version`) on every iteration.
+  25-second smoke pass landed `cov: 437, ft: 1005, corp: 105` across
+  2 375 327 iterations from an empty seed on aarch64-apple-darwin at
+  ~43 700 exec/s, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

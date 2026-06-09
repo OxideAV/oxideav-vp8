@@ -4,6 +4,68 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_inter_mb_reconstruct` fuzz target (round 265, 2026-06-09)
+
+Round 265 is the depth-mode fuzz round on the §16 inter-MB
+reconstruction surface (RFC 6386 §16 / §16.2 / §16.4 / §18 / §18.1 /
+§18.3). The thirteen existing fuzz targets reach §16 only indirectly:
+the decode-side targets gate the inter-MB path behind a fully-formed
+previous keyframe + §9.7 reference refresh state machine; the
+encode-side targets reach `reconstruct_inter_mb` through
+`encode_p_frame_multi_ref` / `Vp8TwoPassEncoder::encode_frame` and
+feed the §14 residue blocks with §9.6-clamped quantiser tables; the
+round-256 `panic_free_motion_search_descent` and round-257
+`panic_free_sixtap_subpel` targets reach the §18.3 primitive layer
+but never the §16 macroblock-level reconstruction orchestrator; the
+round-262 `panic_free_transform_4x4_roundtrip` target reaches §14
+but never feeds the residue into a §16 reconstruct call.
+
+The new `fuzz/fuzz_targets/panic_free_inter_mb_reconstruct.rs` drives
+the §16 macroblock-level orchestrator directly with attacker-shaped
+`(mb_col, mb_row, luma_mv, full_pixel, mb_skip_coeff, y2_coeffs,
+y_coeffs, u_coeffs, v_coeffs)` tuples on every iteration. A 2-bit
+path discriminator selects between the three reconstruction entry
+points, and each path also drives its `predict_*` residue-free
+counterpart for two cross-checks:
+
+1. **§18.1 fractional gate ↔ `SubPixelNotSupported`.** On the §16.2
+   whole-pixel path, the harness recomputes the §18.1 stored-luma
+   doubling + chroma-average + (optional) full-pel truncation gate
+   itself; the dispatcher's `MotionCompError::SubPixelNotSupported`
+   return must agree with that gate on every input.
+
+2. **§11.1 skip short-circuit.** On every path, setting
+   `mb_skip_coeff = true` collapses the reconstruct call into the
+   prediction (no residue is added); the harness asserts
+   `reconstruct == predict` byte-equal on every skip-enabled input,
+   across all three §16 paths.
+
+Surface covered:
+
+* `reconstruct_inter_mb_whole_pixel` + `predict_inter_mb_whole_pixel`
+  — §16.2 non-SPLITMV whole-pixel path.
+* `reconstruct_inter_mb` + `predict_inter_mb` — §16.2 / §18.3 full
+  sub-pixel path (both filter sets reachable via
+  `filter_set_for_version`).
+* `reconstruct_split_mv_mb` + `predict_split_mv` — §16.4 SPLITMV
+  path with sixteen per-luma-sub-block vectors derived from the
+  payload.
+* `select_ref_frame` — §16.2 reference-frame discriminator (every
+  `RefFrame` variant reachable from a short attacker partition).
+* §18.1 vector-adjustment primitives `stored_luma_mv`, `chroma_mv`,
+  `apply_full_pixel`, `whole_pixel_fraction_is_zero`,
+  `chroma_idx_for_luma_subblock`, `split_chroma_mvs`,
+  `filter_set_for_version` — driven directly on every iteration so
+  the dispatch table is exercised on every input.
+
+Smoke pass: 25-second `cargo +nightly fuzz run
+panic_free_inter_mb_reconstruct -j 2 -- -max_total_time=25
+-rss_limit_mb=2048` from an empty seed on aarch64-apple-darwin
+landed `cov: 437, ft: 1005, corp: 105` across **2 375 327
+iterations** at ~43 700 exec/s, zero panics. Peak RSS bounded by
+the 9-MB plane cap (`mb_cols ≤ 3`, `mb_rows ≤ 3` ⇒ ≤ 9 × 384 B
+per-MB array = 3 456 B per `ReferencePlanes` allocation).
+
 ### Added — `panic_free_loop_filter_writeback` fuzz target (round 263, 2026-06-09)
 
 Round 263 is the depth-mode fuzz round on the §9.4 / §19.2 loop-

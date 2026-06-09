@@ -298,6 +298,41 @@ cargo-fuzz = true
 #                                     the §19.2 field schedule,
 #                                     asserting every read value
 #                                     equals what the encoder wrote.
+#   * `panic_free_inter_mb_reconstruct`
+#                                  — §16 inter-MB reconstruction
+#                                     surface driven directly:
+#                                     `reconstruct_inter_mb_whole_pixel`
+#                                     (§16.2 non-SPLITMV whole-pixel),
+#                                     `reconstruct_inter_mb` (§16.2 /
+#                                     §18.3 full sub-pixel), and
+#                                     `reconstruct_split_mv_mb` (§16.4
+#                                     SPLITMV) plus their `predict_*`
+#                                     residue-free counterparts. The
+#                                     thirteen targets above reach §16
+#                                     only indirectly through
+#                                     `decode_vp8` /
+#                                     `Vp8DecoderState::decode_frame`
+#                                     / `encode_p_frame_multi_ref` /
+#                                     `Vp8TwoPassEncoder::encode_frame`,
+#                                     which gate the inter-MB path
+#                                     behind a fully-formed previous
+#                                     keyframe + §9.7 reference refresh
+#                                     state machine; none drive the
+#                                     reconstruct entry points with
+#                                     attacker-shaped `(mb_col,
+#                                     mb_row, luma_mv, full_pixel,
+#                                     mb_skip_coeff, y2_coeffs,
+#                                     y_coeffs, u_coeffs, v_coeffs)`
+#                                     tuples directly. Cross-checks
+#                                     (a) the §18.1 fractional gate
+#                                     against the
+#                                     `MotionCompError::SubPixelNotSupported`
+#                                     return on the whole-pixel path,
+#                                     and (b) the §11.1
+#                                     `mb_skip_coeff` short-circuit
+#                                     (predict == recon on every
+#                                     input that sets the skip flag)
+#                                     on every path.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -398,5 +433,11 @@ doc = false
 [[bin]]
 name = "panic_free_loop_filter_writeback"
 path = "fuzz_targets/panic_free_loop_filter_writeback.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_inter_mb_reconstruct"
+path = "fuzz_targets/panic_free_inter_mb_reconstruct.rs"
 test = false
 doc = false

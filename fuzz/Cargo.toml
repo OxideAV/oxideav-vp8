@@ -333,6 +333,58 @@ cargo-fuzz = true
 #                                     (predict == recon on every
 #                                     input that sets the skip flag)
 #                                     on every path.
+#   * `panic_free_encode_decode_e2e`
+#                                  — per-frame symmetric encode→decode
+#                                     round-trip
+#                                     (`encode_keyframe` →
+#                                     `decode_vp8` on the same
+#                                     iteration's bytes). The fourteen
+#                                     targets above cover each pipeline
+#                                     leg in isolation:
+#                                     `panic_free_encode_keyframe`
+#                                     stops at the emitted byte buffer;
+#                                     `panic_free_decode_keyframe`
+#                                     drives `decode_vp8` with
+#                                     arbitrary attacker bytes but the
+#                                     §9.1 frame-tag pre-screen rejects
+#                                     anything that isn't already a
+#                                     structurally-valid keyframe
+#                                     start. Neither locks the two
+#                                     halves in lockstep on the same
+#                                     iteration. This target stitches
+#                                     them: encode → decode on every
+#                                     `(I420Frame, KeyframeParams)`
+#                                     pair the encoder accepts. The
+#                                     seam where a §7.3 bool-coder
+#                                     asymmetry, a §13 token miscount,
+#                                     a §9.6 quant-index sign
+#                                     confusion, or a §15.4
+#                                     loop-filter derivation skew
+#                                     would hide is exactly this
+#                                     boundary: the encoder's own
+#                                     structural invariants suppress
+#                                     emission-side panics, and the
+#                                     decoder's early validation
+#                                     rejects everything except
+#                                     self-encoded bitstreams. Asserts
+#                                     the §9.1 visible width / height
+#                                     round-trip on every successful
+#                                     decode (any cross-side drift on
+#                                     the wire-form width / height
+#                                     surfaces as a mismatch). Distinct
+#                                     from r261 `panic_free_bool_codec`
+#                                     which drives the §7.3 primitives
+#                                     in isolation against an attacker-
+#                                     shaped probability schedule;
+#                                     this target drives them inside
+#                                     the full §11 / §13 / §14
+#                                     production chain on encoder-
+#                                     shaped probabilities, exposing
+#                                     any path where the encoder's
+#                                     range-tracking diverges from the
+#                                     decoder's even though both
+#                                     halves pass their isolated
+#                                     sweeps.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -439,5 +491,11 @@ doc = false
 [[bin]]
 name = "panic_free_inter_mb_reconstruct"
 path = "fuzz_targets/panic_free_inter_mb_reconstruct.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_encode_decode_e2e"
+path = "fuzz_targets/panic_free_encode_decode_e2e.rs"
 test = false
 doc = false

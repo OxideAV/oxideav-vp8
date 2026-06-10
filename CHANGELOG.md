@@ -4,6 +4,60 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §18.3 six-tap sub-pixel SIMD kernel (round 269, 2026-06-10)
+
+Round 269 is a depth-mode SIMD round extending the nightly-only `simd`
+feature onto the §18.3 / §20.14 six-tap sub-pixel interpolation kernel
+`sixtap_2d` — the round-170 profile's #4 self-time symbol on the inter
+encode and the candidate-list "next SIMD target" since then.
+
+`src/motion_comp.rs` `sixtap_2d` is now a dispatcher:
+
+* **scalar** (`sixtap_2d_scalar`) — the §20.14 two-pass
+  `sixtap_horiz` / `sixtap_vert` composition, unchanged, the default
+  on stable and on nightly without `simd`.
+* **SIMD** (`sixtap_2d_simd`, `#[cfg(feature = "simd")]`) — each
+  convolution row's four §18.3 `interp` dot products become one
+  `Simd<i32, 4>` vector (tap k's four support lanes are the contiguous
+  run `halo[r*9 + k ..][..4]`), so the six taps are six widen-multiply-
+  accumulates per row in place of 24 scalar MACs. The horizontal
+  pass's clamped intermediate stays resident in `i32` vectors (every
+  lane already in `0..=255` after the lane-wise clamp, so the vertical
+  pass reads the exact sample values the scalar listing's 8-bit `temp`
+  buffer would hold, without a u8 round trip).
+
+Lane-type note: the round-170 candidate list suggested a
+`Simd<i16, 8>` stripe, but the §18.3 dot product over `u8` support
+spans `[-32·255, 160·255] = [-8160, 40800]` (the ½-displacement row
+`{3, -16, 77, 77, -16, 3}` has positive-tap sum 160) — past
+`i16::MAX`, so a single `i16` accumulator wraps. A parity-split
+two-accumulator `i16×8` two-row-stripe variant was implemented and
+measured during the round (every tap-parity class partial sum fits
+`i16`) but benched no better than scalar on the MB-scale workload and
+~+15 % worse on `filter_block_4x4`, so the four-lane `i32` form —
+which matches the 4×4 sub-block geometry exactly — is the one that
+shipped.
+
+Two new tests (stable lib 461 → 463, nightly + `simd` lib 463 → 465):
+
+* `sixtap_2d_simd_matches_scalar_on_stress_inputs` — dispatcher vs
+  scalar over 13 halos (all-floor, all-ceiling, opposing ramps,
+  alternating-extreme checker, 8 deterministic LCG halos) × all 64
+  `(mx, my)` eighth-pixel fraction pairs × both §18.3 filter sets.
+* `sixtap_2d_accumulator_extremes_match_scalar` — drives the §18.3
+  dot product to both extremes (+40800 → clamp ceiling, −8160 → clamp
+  floor) through output column 0 under the ½-displacement taps,
+  pinning the exact overflow region that forces the `i32` lanes.
+
+Measured on the round-170 `motion_comp_subpel_luma` bench
+(`aarch64-apple-darwin`, criterion `--quick`, triple-run vs the same
+nightly scalar baseline): `mb_sixtap_2d_16x4x4` 271.5 → 248.5 ns
+(**−8.5 %**), `filter_block_4x4_sub3x5` 24.87 → 23.55 ns (**−5.3 %**).
+The modest margin (vs TM_PRED's −87.7 %) is expected: the scalar
+`interp` loop over fixed-size arrays was already auto-vectorising
+well, so the explicit kernel's win comes mostly from keeping the
+intermediate in vector registers rather than from new parallelism.
+
 ### Added — §12.2 TM_PRED intra SIMD kernel (round 268, 2026-06-10)
 
 Round 268 is a depth-mode SIMD round extending the nightly-only `simd`

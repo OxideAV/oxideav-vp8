@@ -487,6 +487,55 @@ criterion `--quick` envelope. The `forward_dct_4x4_simd` listing (which
 already used a butterfly-friendly lane-wide form in round 226) now
 agrees visually as well as bit-exactly with the scalar.
 
+## Round 269 — `sixtap_2d` SIMD (§18.3 six-tap sub-pixel interpolation)
+
+Round 269 (2026-06-10) closes the long-standing round-170 candidate:
+the §18.3 / §20.14 `sixtap_2d` kernel (#4 self-time on the round-170
+inter-encode profile) now dispatches through a `core::simd::Simd<i32,
+4>` rewrite under the `simd` feature, same dispatcher shape as the §14
+transforms / §14.1 dequant / §12.2 TM_PRED rounds. Each convolution
+row's four §18.3 `interp` dot products are one four-lane vector — tap
+k's support lanes are the contiguous run `halo[r*9 + k ..][..4]` — and
+the horizontal pass's clamped intermediate stays resident in `i32`
+vectors so the vertical pass runs with zero loads.
+
+Lane-type finding (vs the round-170 candidate note's `Simd<i16, 8>`
+stripe): the §18.3 dot product over `u8` support spans `[-8160,
+40800]` (the ½-displacement row `{3, -16, 77, 77, -16, 3}` has
+positive-tap sum 160; 160 × 255 = 40800 > `i16::MAX`), so a single
+`i16` accumulator wraps. A parity-split two-accumulator `i16×8`
+two-row-stripe variant (every tap-parity class partial sum provably
+fits `i16`: positive class sums cap at 128) was implemented and
+measured during the round: `mb_sixtap_2d_16x4x4` ≈ 260–268 ns (no
+better than scalar) and `filter_block_4x4_sub3x5` ≈ 28.3–28.7 ns
+(~+15 % regression — the per-tap two-row gather eats the lane-width
+win). The four-lane `i32` form, which matches the 4×4 sub-block
+geometry exactly, is what shipped.
+
+Headline `--quick` numbers (Apple M4 / aarch64, triple-run, nightly
+toolchain for both columns so the compiler version cancels):
+
+| Bench | Scalar | SIMD | Δ |
+|---|---:|---:|---:|
+| `motion_comp_subpel_luma/mb_sixtap_2d_16x4x4` | 271.5 ns | **248.5 ns** | **−8.5 %** |
+| `motion_comp_subpel_luma/filter_block_4x4_sub3x5` | 24.87 ns | **23.55 ns** | **−5.3 %** |
+
+Stable (no `simd`) is unchanged: 268.1 ns / 24.81 ns, within noise of
+the nightly scalar column. The margin is modest next to TM_PRED's
+−87.7 % because the scalar `interp` loop over fixed-size arrays was
+already auto-vectorising well; the explicit kernel's win comes mostly
+from keeping the two-pass intermediate in vector registers (no
+narrow-to-u8 / widen-from-u8 round trip between the passes) rather
+than from new parallelism.
+
+Equivalence proof:
+`motion_comp::tests::sixtap_2d_simd_matches_scalar_on_stress_inputs`
+(13 halos × all 64 `(mx, my)` fraction pairs × both §18.3 filter
+sets) plus `sixtap_2d_accumulator_extremes_match_scalar` (both dot-
+product extremes through output column 0 under the ½-displacement
+taps). The full lib suite passes on stable (463) and nightly + `simd`
+(465).
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -494,10 +543,12 @@ agrees visually as well as bit-exactly with the scalar.
   (`_xzm_*`) should have shifted; re-profile to find the next biggest
   short-lived `Vec` (the §11 mode picker + `near_mv` MV-candidate
   scratch are the most likely remaining offenders).
-* **`sixtap_2d` (#4 on inter)** — the inner 6-tap convolution is a
-  natural SIMD target (`Simd<i16, 8>` for an 8-pixel-wide stripe).
-  Held back this round to keep the SIMD-feature surface focused on
-  the §14 transform primitives.
+* **MB-scale §18.3 batching** — the round-269 per-4×4 `sixtap_2d`
+  SIMD win is capped by the 4-wide block geometry; real headroom is
+  one layer up in `predict_inter_mb`, which runs sixteen independent
+  4×4 interpolations off one 21×21 halo. A whole-MB horizontal pass
+  (16-wide rows, `Simd<u8/i32, 16>` stripes) would amortise the per-
+  block setup and quadruple the lane utilisation.
 * **Whole-frame `keyframe_encode` re-measure under nightly + `simd`**
   — round 247's per-primitive `--quick` numbers imply a sub-percent
   whole-frame win, deep below the bench's `--quick` noise envelope. A

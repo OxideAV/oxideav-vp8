@@ -483,7 +483,30 @@ fn sixtap_vert(
 /// the vertical pass needs); the vertical pass then synthesises the final
 /// 4×4. `(mx, my)` are the eighth-pixel fractions (`mv & 7`); `filters`
 /// is the version-selected tap set.
+///
+/// Dispatch: SIMD path on nightly + `simd`, scalar otherwise. The SIMD
+/// path is byte-exact against the scalar listing on every test fixture
+/// (`sixtap_2d_simd_matches_scalar_on_stress_inputs`).
 pub fn sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]) -> [u8; 16] {
+    #[cfg(feature = "simd")]
+    {
+        sixtap_2d_simd(halo, mx, my, filters)
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        sixtap_2d_scalar(halo, mx, my, filters)
+    }
+}
+
+/// Scalar §20.14 `sixtap_2d` — the two-pass [`sixtap_horiz`] /
+/// [`sixtap_vert`] composition written as the spec listing.
+///
+/// The public [`sixtap_2d`] dispatches here on stable builds (and on
+/// nightly without the `simd` feature); the `simd` feature swaps in
+/// [`sixtap_2d_simd`], which is itself byte-exact against this
+/// implementation (`sixtap_2d_simd_matches_scalar_on_stress_inputs`).
+#[allow(dead_code)] // Used by `sixtap_2d` only on the !simd path.
+fn sixtap_2d_scalar(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]) -> [u8; 16] {
     // Horizontal pass: 9 rows (the 4 block rows + 2 above + 3 below) ×
     // 4 cols. Intermediate is 8-bit (clamped), stride 4.
     //
@@ -518,6 +541,85 @@ pub fn sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8])
         4,
         &filters[my],
     );
+    out
+}
+
+/// SIMD §18.3 / §20.14 `sixtap_2d` — `core::simd::Simd<i32, 4>` row
+/// rewrite of [`sixtap_2d_scalar`].
+///
+/// Both §20.14 passes produce rows of exactly four output samples (the
+/// 4×4 sub-block geometry), and within a row the four §18.3 `interp`
+/// dot products are independent — only the support window slides by one
+/// sample per output column. Each output row is therefore computed as
+/// one four-lane vector: for tap `k` the four lanes' support samples
+/// are a contiguous source run (`halo[r*9 + k ..][..4]`), so the six
+/// taps become six widen-multiply-accumulates of four lanes each in
+/// place of 24 scalar multiply-accumulates per row. The horizontal
+/// pass's clamped intermediate stays resident in `i32` vectors — every
+/// lane is already in `0..=255` after the lane-wise clamp, so the
+/// vertical pass reads the exact same sample values the scalar
+/// listing's 8-bit `temp` buffer would hold, without a narrow-to-u8 /
+/// widen-from-u8 round trip.
+///
+/// Lane type: the accumulator must be `i32`, not `i16`. The §18.3
+/// six-tap dot product `a = Σ fil[i] * p[i]` over `u8` support spans
+/// `[-32·255, 160·255] = [-8160, 40800]` (the ½-displacement row
+/// `{3, -16, 77, 77, -16, 3}` has positive-tap sum 160 and
+/// negative-tap sum −32), and `a + 64` reaches 40864 — past
+/// `i16::MAX`. `i32` lanes reproduce the scalar `i32` arithmetic
+/// exactly: the `(a + 64) >> 7` lane shift is the same sign-propagating
+/// arithmetic shift, `simd_clamp(0, 255)` is the lane-wise §14.5
+/// `clamp255`, and the post-clamp `cast::<u8>()` of a value already in
+/// `0..=255` equals the scalar `as u8`. Byte-exactness against
+/// [`sixtap_2d_scalar`] is enforced on every fixture by
+/// `sixtap_2d_simd_matches_scalar_on_stress_inputs`.
+#[cfg(feature = "simd")]
+#[inline]
+fn sixtap_2d_simd(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]) -> [u8; 16] {
+    use core::simd::cmp::SimdOrd;
+    use core::simd::num::{SimdInt, SimdUint};
+    use core::simd::Simd;
+
+    let zero = Simd::<i32, 4>::splat(0);
+    let max = Simd::<i32, 4>::splat(255);
+    let seven = Simd::<i32, 4>::splat(7);
+
+    // Horizontal pass: 9 rows (the 4 block rows + 2 above + 3 below) ×
+    // 4 cols — exactly the scalar `sixtap_horiz(temp, 4, halo, 9, ref0 =
+    // 2, 4, 9, filters[mx])` call. With the halo's block origin at
+    // column 2, output column c's tap-k support sample is
+    // halo[r*9 + c + k], so the four lanes of tap k are the contiguous
+    // run halo[r*9 + k .. r*9 + k + 4].
+    let fh = &filters[mx];
+    let fh_v: [Simd<i32, 4>; 6] = core::array::from_fn(|k| Simd::splat(fh[k]));
+    let mut temp = [Simd::<i32, 4>::splat(0); 9];
+    for (r, trow) in temp.iter_mut().enumerate() {
+        let row = &halo[r * 9..r * 9 + 9];
+        // §18.3 interp: a = Σ fil[k] * support[k]; seed with the +64
+        // rounding term so the shift below is the spec's (a + 64) >> 7.
+        let mut acc = Simd::<i32, 4>::splat(64);
+        for (k, tap) in fh_v.iter().enumerate() {
+            let support: Simd<i32, 4> = Simd::<u8, 4>::from_slice(&row[k..k + 4]).cast::<i32>();
+            acc += support * tap;
+        }
+        *trow = (acc >> seven).simd_clamp(zero, max);
+    }
+
+    // Vertical pass: 4 rows × 4 cols reading the intermediate at block-
+    // origin row 2 — the scalar `sixtap_vert(out, 4, temp, 4, ref0 = 8,
+    // 4, 4, filters[my])` call. Output row r's tap-k support row is
+    // temp row r + k (= ref0/4 + r + k - 2), already a four-lane vector.
+    let fv = &filters[my];
+    let fv_v: [Simd<i32, 4>; 6] = core::array::from_fn(|k| Simd::splat(fv[k]));
+    let mut out = [0u8; 16];
+    for r in 0..4 {
+        let mut acc = Simd::<i32, 4>::splat(64);
+        for (k, tap) in fv_v.iter().enumerate() {
+            acc += temp[r + k] * tap;
+        }
+        let res = (acc >> seven).simd_clamp(zero, max);
+        out[r * 4..r * 4 + 4].copy_from_slice(&res.cast::<u8>().to_array());
+    }
     out
 }
 
@@ -2166,6 +2268,81 @@ mod tests {
                 assert_eq!(out[r * 4 + c], want, "({r},{c})");
             }
         }
+    }
+
+    // Round-269 dispatcher equivalence (scalar vs the public entry,
+    // which is SIMD under nightly + `simd`). Mirrors the §14
+    // `*_simd_matches_scalar_on_stress_inputs` pairs. On stable / no
+    // `simd` feature this exercises the scalar-vs-scalar identity
+    // (harmless); on nightly + `simd` it's the primary safety net:
+    // `sixtap_2d` dispatches to `sixtap_2d_simd` and must be byte-exact
+    // against `sixtap_2d_scalar` on every fixture.
+
+    #[test]
+    fn sixtap_2d_simd_matches_scalar_on_stress_inputs() {
+        // Structured halos: flat extremes, opposing ramps, alternating
+        // extremes (the worst case for the clamp endpoints), plus
+        // deterministic LCG halos — for every (mx, my) eighth-pixel
+        // fraction pair and both §18.3 filter sets.
+        let mut hramp = [0u8; 81];
+        let mut vramp = [0u8; 81];
+        let mut checker = [0u8; 81];
+        for r in 0..9 {
+            for c in 0..9 {
+                hramp[r * 9 + c] = (c * 31) as u8;
+                vramp[r * 9 + c] = (r * 31) as u8;
+                checker[r * 9 + c] = if (r + c) % 2 == 0 { 255 } else { 0 };
+            }
+        }
+        // All-floor, all-ceiling, the structured halos, then the LCG set.
+        let mut halos: Vec<[u8; 81]> = vec![[0u8; 81], [255u8; 81], hramp, vramp, checker];
+        for seed in 0..8u64 {
+            halos.push(rand_halo(seed * 6661 + 7));
+        }
+
+        for set in [&SIXTAP_FILTERS, &BILINEAR_FILTERS] {
+            for (h, halo) in halos.iter().enumerate() {
+                for mx in 0..8 {
+                    for my in 0..8 {
+                        let got = sixtap_2d(halo, mx, my, set);
+                        let want = sixtap_2d_scalar(halo, mx, my, set);
+                        assert_eq!(got, want, "halo={h} mx={mx} my={my}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sixtap_2d_accumulator_extremes_match_scalar() {
+        // The §18.3 dot product over the half-pel taps {3, -16, 77, 77,
+        // -16, 3} spans [-32·255, 160·255] = [-8160, 40800] — past
+        // i16::MAX, the reason the SIMD lanes are i32. Drive both
+        // extremes through output column 0 (support columns c + k for
+        // c = 0 are exactly k = 0..6): 255 on the positive-tap columns
+        // {0, 2, 3, 5} maxes the sum (→ clamp ceiling), 255 on the
+        // negative-tap columns {1, 4} alone mins it (→ clamp floor).
+        let mut max_halo = [0u8; 81];
+        let mut min_halo = [0u8; 81];
+        for r in 0..9 {
+            for c in 0..9 {
+                let pos_tap = matches!(c % 6, 0 | 2 | 3 | 5);
+                max_halo[r * 9 + c] = if pos_tap { 255 } else { 0 };
+                min_halo[r * 9 + c] = if pos_tap { 0 } else { 255 };
+            }
+        }
+        let got_max = sixtap_2d(&max_halo, 4, 4, &SIXTAP_FILTERS);
+        assert_eq!(got_max, sixtap_2d_scalar(&max_halo, 4, 4, &SIXTAP_FILTERS));
+        // Column 0 hits the positive overflow region: clamp255((40800 +
+        // 64) >> 7) = 255 in the horizontal pass, then the constant-255
+        // column interpolates to 255 (taps sum to 128).
+        assert_eq!(got_max[0], 255);
+
+        let got_min = sixtap_2d(&min_halo, 4, 4, &SIXTAP_FILTERS);
+        assert_eq!(got_min, sixtap_2d_scalar(&min_halo, 4, 4, &SIXTAP_FILTERS));
+        // Column 0 hits the negative extreme: clamp255((-8160 + 64) >>
+        // 7) = 0, then the constant-0 column stays 0.
+        assert_eq!(got_min[0], 0);
     }
 
     // ----- §20.14 build_mc_border halo fetch -------------------------

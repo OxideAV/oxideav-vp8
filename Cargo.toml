@@ -25,17 +25,21 @@ registry = ["dep:oxideav-core"]
 # `inverse_wht_4x4_simd`/`inverse_dct_4x4_simd`/`forward_*`), the
 # §14.1 dequantize kernel under `Simd<i32, 16>` (sixteen independent
 # coefficient×factor multiplies per 4×4 block — see `src/dequant.rs`,
-# `dequant_block_simd`), and the §12.2 TM_PRED intra kernel under
+# `dequant_block_simd`), the §12.2 TM_PRED intra kernel under
 # `Simd<i16, N>` row vectors (N = 16 luma / 8 chroma — see
-# `src/intra_predict.rs`, `predict_tm_simd`). Requires a nightly
+# `src/intra_predict.rs`, `predict_tm_simd`), and the §18.3 / §20.14
+# six-tap sub-pixel interpolation kernel under `Simd<i32, 4>` row
+# vectors (four independent dot products per convolution row — see
+# `src/motion_comp.rs`, `sixtap_2d_simd`). Requires a nightly
 # toolchain because `core::simd` is currently nightly-only. The
 # default (stable) build keeps the scalar fallback bit-for-bit
 # identical to the spec listing; the SIMD path is byte-exact against
 # the scalar path on every test fixture
 # (`dct_simd_matches_scalar_on_stress_inputs`,
 # `wht_simd_matches_scalar_on_stress_inputs`,
-# `dequant_block_simd_matches_scalar_on_stress_inputs`, and
-# `predict_tm_simd_matches_scalar_on_stress_inputs` enforce that,
+# `dequant_block_simd_matches_scalar_on_stress_inputs`,
+# `predict_tm_simd_matches_scalar_on_stress_inputs`, and
+# `sixtap_2d_simd_matches_scalar_on_stress_inputs` enforce that,
 # both on stable and on nightly+simd).
 simd = []
 

@@ -4,6 +4,51 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §12.2 TM_PRED intra SIMD kernel (round 268, 2026-06-10)
+
+Round 268 is a depth-mode SIMD round extending the nightly-only `simd`
+feature onto the §12.2 TM_PRED intra-prediction kernel — the only
+§12.2 mode with per-pixel arithmetic (`X_{rc} = clamp255(L_r + A_c -
+P)` over all 256 luma / 64 chroma cells; DC / V / H are fills and row
+copies the compiler already vectorises).
+
+`src/intra_predict.rs` `predict_tm` is now a dispatcher:
+
+* **scalar** (`predict_tm_scalar`) — the longhand §12.2 double loop,
+  unchanged, the default on stable and on nightly without `simd`, and
+  the fallback for any non-§12.2 block width.
+* **SIMD** (`predict_tm_simd::<N>`, `#[cfg(feature = "simd")]`, N = 16
+  luma / 8 chroma) — forms the row-invariant column term `A_c - P`
+  once as a `Simd<i16, N>` vector, then per row adds a splat of `L_r`,
+  clamps every lane into `0..=255` with `simd_clamp`, and narrows back
+  to `u8`. The `i16` working type reproduces the scalar `i32`
+  arithmetic exactly (every intermediate lies in `-255..=510`), and
+  the post-clamp `cast::<u8>()` of a value already in `0..=255` equals
+  the scalar `as u8`, so the byte-equivalence is unconditional.
+
+Two new tests: `predict_tm_simd_matches_scalar_on_stress_inputs`
+asserts the dispatcher is byte-exact against the scalar fallback at
+both widths across the clamp endpoints (floor `-255`, ceiling `510`),
+flat mid-range, opposing ramps, alternating extremes, and 16
+deterministic LCG triples per width; and
+`predict_tm_public_entry_points_route_through_dispatcher` pins the
+public `predict_y16x16_tm` / `predict_uv8x8_tm` bytes to the scalar
+listing on a clamp-straddling input. Both run on stable
+(scalar-vs-scalar, harmless) and are the primary safety net on
+nightly + `simd`. Verified passing on nightly 1.97 with `simd`.
+
+A `predict_y16x16_tm` entry joins the round-258 `intra_predict_dc16`
+criterion bench as the A/B anchor: 44.15 ns scalar → 5.46 ns SIMD
+(**−87.7 %**) on `aarch64-apple-darwin` (criterion `--quick`) — the
+largest per-kernel SIMD delta in the crate so far (the 16 rows
+collapse from 256 scalar clamp chains to 16 vector ops on a hoisted
+column term).
+
+Note for `simd` builders: current nightlies' `core::simd` dropped the
+`LaneCount<N>: SupportedLaneCount` bound (`Simd<T, N>` is now generic
+over any `const N: usize`), so `predict_tm_simd` carries no
+lane-count where-clause.
+
 ### Added — §14.1 dequantize SIMD primitive (round 267, 2026-06-10)
 
 Round 267 is a depth-mode SIMD round extending the nightly-only `simd`

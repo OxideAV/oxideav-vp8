@@ -153,7 +153,33 @@ fn predict_h(out: &mut [u8], n: usize, left: &[u8]) {
 
 /// Generic TM_PRED helper. `above[c] = A_c`, `left[r] = L_r`, `p` is
 /// the single pixel above-and-left of the block (`P` in §12.2).
+///
+/// Dispatch: the §12.2 block sizes (16×16 luma, 8×8 chroma) take the
+/// SIMD row kernel on nightly + `simd`, everything else (and every
+/// stable build) the scalar listing. The SIMD path is byte-exact
+/// against the scalar listing on every test fixture
+/// (`predict_tm_simd_matches_scalar_on_stress_inputs`).
 fn predict_tm(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8) {
+    #[cfg(feature = "simd")]
+    {
+        match n {
+            16 => return predict_tm_simd::<16>(out, above, left, p),
+            8 => return predict_tm_simd::<8>(out, above, left, p),
+            _ => {}
+        }
+    }
+    predict_tm_scalar(out, n, above, left, p);
+}
+
+/// Scalar §12.2 TM_PRED — the spec formula written out longhand:
+/// `X_{rc} = clamp255(L_r + A_c - P)` for every cell of the n×n block.
+///
+/// The public [`predict_tm`] dispatches here on stable builds (and on
+/// nightly without the `simd` feature); the `simd` feature swaps in
+/// [`predict_tm_simd`] for the §12.2 block sizes (16 and 8), which is
+/// itself byte-exact against this implementation
+/// (`predict_tm_simd_matches_scalar_on_stress_inputs`).
+fn predict_tm_scalar(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8) {
     debug_assert_eq!(out.len(), n * n);
     debug_assert_eq!(above.len(), n);
     debug_assert_eq!(left.len(), n);
@@ -163,6 +189,50 @@ fn predict_tm(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8) {
             // RFC 6386 §12.2: X_{ij} = clamp255(L_i + A_j - P).
             out[r * n + c] = clamp255(left[r] as i32 + above[c] as i32 - p);
         }
+    }
+}
+
+/// SIMD §12.2 TM_PRED — `core::simd::Simd<i16, N>` row rewrite of
+/// [`predict_tm_scalar`] for the two §12.2 block widths (N = 16 luma,
+/// N = 8 chroma).
+///
+/// §12.2 computes `X_{rc} = clamp255(L_r + A_c - P)`. The column term
+/// `A_c - P` is row-invariant, so it is formed once as an `i16` vector
+/// (`above` widened lane-wise, minus a splat of `p`); each row then
+/// adds a splat of `L_r`, clamps every lane into `0..=255`, and
+/// narrows back to `u8`.
+///
+/// The `i16` working type reproduces the scalar `i32` arithmetic
+/// exactly: every intermediate lies in `-255..=510` (`L_r + A_c - P`
+/// with all three inputs in `0..=255`), well inside `i16`, so no lane
+/// can wrap before the clamp; `simd_clamp(0, 255)` is the lane-wise
+/// `clamp(0, 255)`; and the post-clamp `cast::<u8>()` truncation of a
+/// value already in `0..=255` equals the scalar `as u8`. The
+/// byte-exactness is enforced on every fixture by
+/// `predict_tm_simd_matches_scalar_on_stress_inputs`.
+#[cfg(feature = "simd")]
+#[inline]
+fn predict_tm_simd<const N: usize>(out: &mut [u8], above: &[u8], left: &[u8], p: u8) {
+    use core::simd::cmp::SimdOrd;
+    use core::simd::num::{SimdInt, SimdUint};
+    use core::simd::Simd;
+
+    debug_assert_eq!(out.len(), N * N);
+    debug_assert_eq!(above.len(), N);
+    debug_assert_eq!(left.len(), N);
+
+    // Row-invariant column term: A_c - P, widened to i16 lanes.
+    let above_v: Simd<i16, N> = Simd::<u8, N>::from_slice(above).cast::<i16>();
+    let a_minus_p = above_v - Simd::<i16, N>::splat(p as i16);
+    let zero = Simd::<i16, N>::splat(0);
+    let max = Simd::<i16, N>::splat(255);
+
+    for (r, row) in out.chunks_exact_mut(N).enumerate() {
+        // RFC 6386 §12.2: X_{rc} = clamp255(L_r + A_c - P), one row
+        // per vector: splat L_r, add the precomputed (A - P) lanes,
+        // clamp into 0..=255, narrow back to u8.
+        let v = (a_minus_p + Simd::<i16, N>::splat(left[r] as i16)).simd_clamp(zero, max);
+        row.copy_from_slice(&v.cast::<u8>().to_array()[..]);
     }
 }
 
@@ -1023,5 +1093,109 @@ mod tests {
                 assert_eq!(v, 100, "mode {mode:?} pixel {i} != 100");
             }
         }
+    }
+
+    // ---------------------------------------------------------------
+    // SIMD vs scalar byte-exact equivalence test (round-268 TM_PRED
+    // SIMD). Mirrors the §14 `*_simd_matches_scalar_on_stress_inputs`
+    // pairs. On stable / no `simd` feature this exercises the scalar
+    // path twice (the public `predict_tm` dispatch and the directly-
+    // named `_scalar` fn) — harmless; keeps CI green. On nightly +
+    // `simd` it's the primary safety net: `predict_tm` dispatches to
+    // the SIMD row kernel for n = 16 / n = 8 while
+    // `predict_tm_scalar` stays reachable as the fallback, so the
+    // assertion compares the two bit-for-bit, including the clamp
+    // floor (L + A - P = -255) and ceiling (= 510) endpoints.
+    // ---------------------------------------------------------------
+
+    /// Deterministic byte generator for the stress fixtures (a small
+    /// LCG; no external dep, reproducible across hosts).
+    fn lcg_bytes(seed: &mut u32, n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (*seed >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// (above, left, p) stress fixtures for one block width `n`,
+    /// covering the §12.2 clamp endpoints (floor: L = A = 0, P = 255
+    /// → -255; ceiling: L = A = 255, P = 0 → 510), flat mid-range
+    /// inputs, opposing ramps, alternating extremes, and
+    /// deterministic pseudo-random triples.
+    fn tm_stress_inputs(n: usize) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
+        let mut v: Vec<(Vec<u8>, Vec<u8>, u8)> = Vec::new();
+        // Clamp floor: every cell hits 0 - the deepest underflow.
+        v.push((vec![0u8; n], vec![0u8; n], 255));
+        // Clamp ceiling: every cell hits 510 before the clamp.
+        v.push((vec![255u8; n], vec![255u8; n], 0));
+        // Flat mid-range identity (L + A - P = A).
+        v.push((vec![100u8; n], vec![100u8; n], 100));
+        // Opposing ramps straddle both clamp edges within one block.
+        let ramp_up: Vec<u8> = (0..n).map(|i| (i * 255 / (n - 1)) as u8).collect();
+        let ramp_down: Vec<u8> = ramp_up.iter().rev().copied().collect();
+        for &p in &[0u8, 64, 128, 200, 255] {
+            v.push((ramp_up.clone(), ramp_down.clone(), p));
+        }
+        // Alternating extremes exercise neighbouring-lane divergence.
+        let alt: Vec<u8> = (0..n).map(|i| if i % 2 == 0 { 0 } else { 255 }).collect();
+        v.push((alt.clone(), ramp_up.clone(), 127));
+        v.push((ramp_down.clone(), alt, 128));
+        // Deterministic pseudo-random triples.
+        let mut seed = 0x5EED_0000u32 ^ (n as u32);
+        for _ in 0..16 {
+            let above = lcg_bytes(&mut seed, n);
+            let left = lcg_bytes(&mut seed, n);
+            let p = lcg_bytes(&mut seed, 1)[0];
+            v.push((above, left, p));
+        }
+        v
+    }
+
+    #[test]
+    fn predict_tm_simd_matches_scalar_on_stress_inputs() {
+        for n in [16usize, 8] {
+            for (idx, (above, left, p)) in tm_stress_inputs(n).iter().enumerate() {
+                // `predict_tm` is the dispatcher: SIMD on nightly +
+                // `simd` (for n = 16 / 8), scalar otherwise. Compare
+                // it against the directly-named scalar fallback on
+                // the identical input.
+                let mut via_dispatch = vec![0u8; n * n];
+                predict_tm(&mut via_dispatch, n, above, left, *p);
+
+                let mut via_scalar = vec![0u8; n * n];
+                super::predict_tm_scalar(&mut via_scalar, n, above, left, *p);
+
+                assert_eq!(
+                    via_dispatch, via_scalar,
+                    "predict_tm (dispatch) diverged from scalar on \
+                     stress input #{idx} (n {n}, p {p})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn predict_tm_public_entry_points_route_through_dispatcher() {
+        // The two public §12.2 TM kernels must agree with the scalar
+        // listing on a clamp-straddling input — proving the dispatch
+        // rewrite didn't change the public surface's bytes.
+        let above16: [u8; 16] = core::array::from_fn(|i| (i * 17) as u8);
+        let left16: [u8; 16] = core::array::from_fn(|i| 255 - (i * 13) as u8);
+        let p = 77u8;
+        let mut via_public = [0u8; 256];
+        predict_y16x16_tm(&mut via_public, &above16, &left16, p);
+        let mut via_scalar = [0u8; 256];
+        super::predict_tm_scalar(&mut via_scalar, 16, &above16, &left16, p);
+        assert_eq!(via_public.as_slice(), via_scalar.as_slice());
+
+        let above8: [u8; 8] = core::array::from_fn(|i| (i * 31) as u8);
+        let left8: [u8; 8] = core::array::from_fn(|i| 255 - (i * 29) as u8);
+        let mut via_public = [0u8; 64];
+        predict_uv8x8_tm(&mut via_public, &above8, &left8, p);
+        let mut via_scalar = [0u8; 64];
+        super::predict_tm_scalar(&mut via_scalar, 8, &above8, &left8, p);
+        assert_eq!(via_public.as_slice(), via_scalar.as_slice());
     }
 }

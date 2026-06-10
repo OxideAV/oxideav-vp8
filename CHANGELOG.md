@@ -4,6 +4,56 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — whole-pixel non-SPLITMV MB batching (`fetch_luma_mb_whole_pixel` / `fetch_chroma_mb_whole_pixel`) (round 272, 2026-06-10)
+
+Round 272 closes the round-271 BENCHMARKS next-round candidate
+"whole-pixel non-SPLITMV MB batching" — the whole-pixel analogue of the
+round-270 / round-271 sub-pixel MB-batching work. When the shared §18.1
+motion vector of a non-SPLITMV inter macroblock is *whole-pixel*
+(`mv & 7 == 0` per component), the §18.3 prediction is "simply copied"
+(no convolution), so the whole 16×16 luma / 8×8 chroma block is one
+contiguous source region rather than sixteen / four overlapping 4×4 ones:
+
+* **`fetch_luma_mb_whole_pixel`** (new public fn) — the MB-scale analogue
+  of `fetch_block_whole_pixel`: fetches the whole 16×16 luma block in one
+  pass at integer offset `(mb_x, mb_y) + (mv >> 3)`, replicating any
+  out-of-plane read at the nearest edge pixel (§20.14 `build_mc_border`),
+  with the same in-bounds contiguous-row fast path / per-pixel clamp
+  fallback split as the per-sub-block fetch. Row-major, stride 16,
+  matching the `ReconstructedMb::y` layout.
+* **`fetch_chroma_mb_whole_pixel`** (new public fn) — the chroma analogue:
+  fetches the whole 8×8 chroma block in one pass, row-major stride 8.
+* **`predict_inter_mb` whole-pixel branches rewired** — the luma branch
+  now issues one `fetch_luma_mb_whole_pixel` instead of sixteen
+  `fetch_block_whole_pixel` copies; each chroma plane issues one
+  `fetch_chroma_mb_whole_pixel` instead of four. Byte-identical output
+  (both read the same contiguous source region under the shared §18.1
+  vector); the gain is pure gather amortisation — one bounds check and one
+  border-straddle decision per MB instead of per sub-block.
+
+Five new equivalence / clamp tests anchor the batched fetch against the
+per-sub-block `fetch_block_whole_pixel` assembly: in-bounds luma + chroma
+byte-equality, top-left luma + bottom-right chroma border-clamp, and a
+real corner-MB prediction through `predict_inter_mb`
+(`predict_inter_mb_whole_pixel_at_border_uses_mb_batch_clamp`, covering Y
++ U + V). The existing `reconstruct_inter_mb_matches_legacy_for_whole_pixel`
+test continues to anchor the full reconstruct path. Lib test count
+474 → 479.
+
+New `motion_comp_subpel_luma/mb_*_whole_pixel_*` criterion benches measure
+the batched fetch against the per-sub-block assembly on a 64×64
+deterministic source (Apple M4 / aarch64, criterion `--quick`):
+
+| Bench | Per-sub-block | Batched | Delta |
+|---|---:|---:|---:|
+| whole 16×16 luma copy | 46.89 ns | **13.13 ns** | **−72 %** |
+| whole 8×8 chroma copy | 8.49 ns | **4.74 ns** | **−44 %** |
+
+This is the path `predict_inter_mb` takes for every whole-pixel
+non-SPLITMV inter MB (the common case for low-motion content where the
+§17 search snaps to the integer grid). No new decode / encode feature
+coverage; clean-room from RFC 6386 §18.2 / §20.14.
+
 ### Added — MB-scale §18.3 chroma batching (`sixtap_mb_chroma`) (round 271, 2026-06-10)
 
 Round 271 closes the round-270 BENCHMARKS next-round candidate "MB-scale

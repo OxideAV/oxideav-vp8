@@ -13,7 +13,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use oxideav_vp8::motion_comp::{
-    fetch_chroma_mb_halo, fetch_luma_mb_halo, filter_block_4x4, filter_set_for_version, sixtap_2d,
+    fetch_block_whole_pixel, fetch_chroma_mb_halo, fetch_chroma_mb_whole_pixel, fetch_luma_mb_halo,
+    fetch_luma_mb_whole_pixel, filter_block_4x4, filter_set_for_version, sixtap_2d,
     sixtap_mb_chroma, sixtap_mb_luma, FilterSet,
 };
 use oxideav_vp8::motion_vector::Mv;
@@ -169,11 +170,96 @@ fn bench_mb_chroma_batched(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_mb_whole_pixel_batched(c: &mut Criterion) {
+    // Round-272 whole-pixel non-SPLITMV MB batching: when the shared §18.1
+    // vector is whole-pixel, the §18.3 prediction is a pure copy (no
+    // convolution). The whole 16×16 luma / 8×8 chroma block is one
+    // contiguous source region, fetched in one pass
+    // (`fetch_luma_mb_whole_pixel` / `fetch_chroma_mb_whole_pixel`) instead
+    // of sixteen / four 4×4 `fetch_block_whole_pixel` copies. Both produce
+    // byte-identical output; this measures the gather amortisation.
+    let plane = make_plane(64, 64);
+    // Whole-pixel vector: integer offset (1, 2), no fractional bits.
+    let mv = Mv { row: 8, col: 16 };
+
+    let mut g = c.benchmark_group("motion_comp_subpel_luma");
+
+    // Batched whole-MB luma fetch: one 16×16 contiguous copy.
+    g.bench_function("mb_luma_whole_pixel_batched_16x16", |b| {
+        b.iter(|| {
+            let out =
+                fetch_luma_mb_whole_pixel(black_box(&plane), 64, 64, 64, 16, 16, black_box(mv));
+            black_box(out[0])
+        });
+    });
+    // Per-sub-block partner: sixteen 4×4 `fetch_block_whole_pixel` copies
+    // assembled into a 16×16 block (the pre-round-272 luma whole-pixel
+    // path).
+    g.bench_function("mb_luma_whole_pixel_per_subblock_16x16", |b| {
+        b.iter(|| {
+            let mut out = [0u8; 256];
+            for sb in 0..4 {
+                for sc in 0..4 {
+                    let blk = fetch_block_whole_pixel(
+                        black_box(&plane),
+                        64,
+                        64,
+                        64,
+                        16 + sc * 4,
+                        16 + sb * 4,
+                        black_box(mv),
+                    );
+                    for r in 0..4 {
+                        let dst = (sb * 4 + r) * 16 + sc * 4;
+                        out[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+                    }
+                }
+            }
+            black_box(out[0])
+        });
+    });
+
+    // Batched whole-MB chroma fetch: one 8×8 contiguous copy.
+    g.bench_function("mb_chroma_whole_pixel_batched_8x8", |b| {
+        b.iter(|| {
+            let out =
+                fetch_chroma_mb_whole_pixel(black_box(&plane), 64, 64, 64, 8, 8, black_box(mv));
+            black_box(out[0])
+        });
+    });
+    // Per-sub-block partner: four 4×4 `fetch_block_whole_pixel` copies.
+    g.bench_function("mb_chroma_whole_pixel_per_subblock_8x8", |b| {
+        b.iter(|| {
+            let mut out = [0u8; 64];
+            for sb in 0..2 {
+                for sc in 0..2 {
+                    let blk = fetch_block_whole_pixel(
+                        black_box(&plane),
+                        64,
+                        64,
+                        64,
+                        8 + sc * 4,
+                        8 + sb * 4,
+                        black_box(mv),
+                    );
+                    for r in 0..4 {
+                        let dst = (sb * 4 + r) * 8 + sc * 4;
+                        out[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+                    }
+                }
+            }
+            black_box(out[0])
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_filter_block_4x4_subpel,
     bench_mb_sixtap_2d,
     bench_mb_luma_batched,
-    bench_mb_chroma_batched
+    bench_mb_chroma_batched,
+    bench_mb_whole_pixel_batched
 );
 criterion_main!(benches);

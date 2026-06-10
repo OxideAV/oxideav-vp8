@@ -1140,6 +1140,128 @@ pub fn fetch_block_whole_pixel(
     out
 }
 
+/// Fetch the whole 16×16 luma block of a non-SPLITMV inter MB under a
+/// *whole-pixel* motion vector — the MB-scale analogue of
+/// [`fetch_block_whole_pixel`], RFC 6386 §18.2 / §20.14 `build_mc_border`.
+///
+/// All sixteen luma sub-blocks of a non-SPLITMV MB share one motion vector
+/// (§18.1); when that vector is whole-pixel (`mv & 7 == 0` per component)
+/// the §18.3 prediction is "simply copied" — no convolution. The whole
+/// 16×16 block is then one contiguous source region at integer offset
+/// `(mb_x, mb_y) + (mv >> 3)`, so it can be fetched in one pass instead of
+/// sixteen overlapping 4×4 [`fetch_block_whole_pixel`] calls (the
+/// round-271 BENCHMARKS candidate "whole-pixel non-SPLITMV MB batching" —
+/// pure gather amortisation, no convolution).
+///
+/// `(mb_x, mb_y)` is the MB's top-left luma position in pixels (before the
+/// motion offset); `w` / `h` are the reference plane's pixel dimensions.
+/// Source positions outside `[0, w) × [0, h)` replicate the nearest edge
+/// pixel, exactly as [`fetch_block_whole_pixel`] does per 4×4 sub-block —
+/// the §20.14 `build_mc_border` row / column replication. The result is
+/// row-major with stride 16, matching the `out.y` layout
+/// [`predict_inter_mb`] writes.
+pub fn fetch_luma_mb_whole_pixel(
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mv: Mv,
+) -> [u8; 256] {
+    // §18.2: integer pixel offset is the eighth-pixel vector shifted right
+    // 3 with sign propagation.
+    let off_x = (mv.col >> 3) as isize;
+    let off_y = (mv.row >> 3) as isize;
+    let src_x0 = mb_x as isize + off_x;
+    let src_y0 = mb_y as isize + off_y;
+
+    let w_i = w as isize;
+    let h_i = h as isize;
+    let mut out = [0u8; 256];
+
+    // Fast path mirroring [`fetch_block_whole_pixel`]: when all 16×16
+    // source positions land strictly inside the plane (the dominant case
+    // mid-frame), each output row is a contiguous 16-byte slice of the
+    // reference. The fallback below is bit-identical for MBs that straddle
+    // the picture border (§20.14 `build_mc_border` semantics preserved).
+    if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 16 <= w_i && src_y0 + 16 <= h_i {
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        for r in 0..16 {
+            let row_start = (y0 + r) * stride + x0;
+            out[r * 16..r * 16 + 16].copy_from_slice(&plane[row_start..row_start + 16]);
+        }
+        return out;
+    }
+
+    for r in 0..16 {
+        // §20.14 build_mc_border: rows past the top / bottom edge read the
+        // first / last in-bounds row (edge replication).
+        let sy = (src_y0 + r as isize).clamp(0, h_i - 1) as usize;
+        for c in 0..16 {
+            // Columns past the left / right edge read the first / last
+            // in-bounds column.
+            let sx = (src_x0 + c as isize).clamp(0, w_i - 1) as usize;
+            out[r * 16 + c] = plane[sy * stride + sx];
+        }
+    }
+    out
+}
+
+/// Fetch the whole 8×8 chroma block of a non-SPLITMV inter MB under a
+/// *whole-pixel* (averaged) motion vector — the chroma analogue of
+/// [`fetch_luma_mb_whole_pixel`], RFC 6386 §18.2 / §20.14
+/// `build_mc_border`.
+///
+/// The four chroma sub-blocks of a non-SPLITMV MB share one §18.1 averaged
+/// vector ([`chroma_mv`]); when that vector is whole-pixel the whole 8×8
+/// block is one contiguous source region at integer offset
+/// `(mb_x, mb_y) + (mv >> 3)`, fetched in one pass instead of four
+/// overlapping 4×4 [`fetch_block_whole_pixel`] calls per plane.
+///
+/// `(mb_x, mb_y)` is the chroma-MB top-left position in pixels; `w` / `h`
+/// are the chroma plane's pixel dimensions. Out-of-plane reads replicate
+/// the nearest edge pixel. The result is row-major with stride 8, matching
+/// the `out.u` / `out.v` layout [`predict_inter_mb`] writes.
+pub fn fetch_chroma_mb_whole_pixel(
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mv: Mv,
+) -> [u8; 64] {
+    let off_x = (mv.col >> 3) as isize;
+    let off_y = (mv.row >> 3) as isize;
+    let src_x0 = mb_x as isize + off_x;
+    let src_y0 = mb_y as isize + off_y;
+
+    let w_i = w as isize;
+    let h_i = h as isize;
+    let mut out = [0u8; 64];
+
+    if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 8 <= w_i && src_y0 + 8 <= h_i {
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        for r in 0..8 {
+            let row_start = (y0 + r) * stride + x0;
+            out[r * 8..r * 8 + 8].copy_from_slice(&plane[row_start..row_start + 8]);
+        }
+        return out;
+    }
+
+    for r in 0..8 {
+        let sy = (src_y0 + r as isize).clamp(0, h_i - 1) as usize;
+        for c in 0..8 {
+            let sx = (src_x0 + c as isize).clamp(0, w_i - 1) as usize;
+            out[r * 8 + c] = plane[sy * stride + sx];
+        }
+    }
+    out
+}
+
 /// Fetch the 9×9 edge-replicated halo a six-tap 4×4 interpolation needs —
 /// RFC 6386 §20.14 `build_mc_border` / `recon_1_edge_block`.
 ///
@@ -1500,23 +1622,12 @@ pub fn predict_inter_mb(
     let mx = (ymv.col & 7) as usize;
     let my = (ymv.row & 7) as usize;
     if mx == 0 && my == 0 {
-        for sb in 0..4 {
-            for sc in 0..4 {
-                let blk = fetch_block_whole_pixel(
-                    reference.y,
-                    reference.y_stride,
-                    lw,
-                    lh,
-                    y_x0 + sc * 4,
-                    y_y0 + sb * 4,
-                    ymv,
-                );
-                for r in 0..4 {
-                    let dst = (sb * 4 + r) * 16 + sc * 4;
-                    out.y[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
-                }
-            }
-        }
+        // Whole-pixel: the whole 16×16 luma block is one contiguous source
+        // region (all sixteen sub-blocks share `ymv`, §18.1), fetched in
+        // one pass ([`fetch_luma_mb_whole_pixel`]) instead of sixteen 4×4
+        // [`fetch_block_whole_pixel`] copies — byte-identical, amortising
+        // the per-sub-block gather setup.
+        out.y = fetch_luma_mb_whole_pixel(reference.y, reference.y_stride, lw, lh, y_x0, y_y0, ymv);
     } else {
         let halo = fetch_luma_mb_halo(reference.y, reference.y_stride, lw, lh, y_x0, y_y0, ymv);
         out.y = sixtap_mb_luma(&halo, mx, my, filters);
@@ -1533,33 +1644,29 @@ pub fn predict_inter_mb(
     let cmx = (uvmv.col & 7) as usize;
     let cmy = (uvmv.row & 7) as usize;
     if cmx == 0 && cmy == 0 {
-        for sb in 0..2 {
-            for sc in 0..2 {
-                let ublk = fetch_block_whole_pixel(
-                    reference.u,
-                    reference.uv_stride,
-                    cw,
-                    ch,
-                    uv_x0 + sc * 4,
-                    uv_y0 + sb * 4,
-                    uvmv,
-                );
-                let vblk = fetch_block_whole_pixel(
-                    reference.v,
-                    reference.uv_stride,
-                    cw,
-                    ch,
-                    uv_x0 + sc * 4,
-                    uv_y0 + sb * 4,
-                    uvmv,
-                );
-                for r in 0..4 {
-                    let dst = (sb * 4 + r) * 8 + sc * 4;
-                    out.u[dst..dst + 4].copy_from_slice(&ublk[r * 4..r * 4 + 4]);
-                    out.v[dst..dst + 4].copy_from_slice(&vblk[r * 4..r * 4 + 4]);
-                }
-            }
-        }
+        // Whole-pixel chroma: each 8×8 plane is one contiguous source
+        // region (all four sub-blocks share `uvmv`, §18.1), fetched in one
+        // pass per plane ([`fetch_chroma_mb_whole_pixel`]) instead of four
+        // 4×4 [`fetch_block_whole_pixel`] copies — the chroma analogue of
+        // the luma whole-pixel batch above.
+        out.u = fetch_chroma_mb_whole_pixel(
+            reference.u,
+            reference.uv_stride,
+            cw,
+            ch,
+            uv_x0,
+            uv_y0,
+            uvmv,
+        );
+        out.v = fetch_chroma_mb_whole_pixel(
+            reference.v,
+            reference.uv_stride,
+            cw,
+            ch,
+            uv_x0,
+            uv_y0,
+            uvmv,
+        );
     } else {
         let uhalo =
             fetch_chroma_mb_halo(reference.u, reference.uv_stride, cw, ch, uv_x0, uv_y0, uvmv);
@@ -3574,5 +3681,159 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full, legacy);
+    }
+
+    // ----- whole-pixel MB batching -----------------------------------
+
+    #[test]
+    fn fetch_luma_mb_whole_pixel_matches_per_subblock_in_bounds() {
+        // The whole 16×16 luma fetch must be byte-identical to assembling
+        // it from sixteen 4×4 `fetch_block_whole_pixel` copies — both read
+        // the same contiguous source region under the shared §18.1 vector.
+        let w = 48;
+        let h = 48;
+        let plane = ramp_plane(w, h);
+        let mb_x = 16;
+        let mb_y = 16;
+        // Whole-pixel vector: integer offset (1, 2), no fractional bits.
+        let mv = Mv { row: 8, col: 16 };
+        let mb = fetch_luma_mb_whole_pixel(&plane, w, w, h, mb_x, mb_y, mv);
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let blk =
+                    fetch_block_whole_pixel(&plane, w, w, h, mb_x + sc * 4, mb_y + sb * 4, mv);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let mr = sb * 4 + r;
+                        let mc = sc * 4 + c;
+                        assert_eq!(
+                            mb[mr * 16 + mc],
+                            blk[r * 4 + c],
+                            "sb={sb} sc={sc} ({r},{c})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_chroma_mb_whole_pixel_matches_per_subblock_in_bounds() {
+        // Chroma analogue: the whole 8×8 fetch == four 4×4
+        // `fetch_block_whole_pixel` copies.
+        let w = 32;
+        let h = 32;
+        let plane = ramp_plane(w, h);
+        let mb_x = 8;
+        let mb_y = 8;
+        let mv = Mv { row: 16, col: 8 }; // whole-pixel, integer offset (2, 1)
+        let mb = fetch_chroma_mb_whole_pixel(&plane, w, w, h, mb_x, mb_y, mv);
+        for sb in 0..2 {
+            for sc in 0..2 {
+                let blk =
+                    fetch_block_whole_pixel(&plane, w, w, h, mb_x + sc * 4, mb_y + sb * 4, mv);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let mr = sb * 4 + r;
+                        let mc = sc * 4 + c;
+                        assert_eq!(mb[mr * 8 + mc], blk[r * 4 + c], "sb={sb} sc={sc} ({r},{c})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_luma_mb_whole_pixel_clamps_at_top_left_corner() {
+        // MB at (0,0) with a vector that pushes the integer origin off the
+        // top-left edge: every out-of-plane read must replicate the nearest
+        // edge pixel (build_mc_border), matching the per-pixel clamp
+        // formula and the per-sub-block `fetch_block_whole_pixel` fallback.
+        let w = 24;
+        let h = 24;
+        let plane = ramp_plane(w, h);
+        let mv = Mv { row: -32, col: -32 }; // integer offset (-4, -4)
+        let mb = fetch_luma_mb_whole_pixel(&plane, w, w, h, 0, 0, mv);
+        for r in 0..16 {
+            for c in 0..16 {
+                let sy = (r as isize - 4).clamp(0, h as isize - 1) as usize;
+                let sx = (c as isize - 4).clamp(0, w as isize - 1) as usize;
+                assert_eq!(mb[r * 16 + c], plane[sy * w + sx], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_chroma_mb_whole_pixel_clamps_at_bottom_right_corner() {
+        // Chroma block whose integer origin pushes past the bottom-right
+        // edge: out-of-plane rows / cols replicate the last in-bounds
+        // row / col.
+        let w = 16;
+        let h = 16;
+        let plane = ramp_plane(w, h);
+        let mb_x = 8;
+        let mb_y = 8;
+        let mv = Mv { row: 32, col: 32 }; // integer offset (4, 4) → origin (12,12)
+        let mb = fetch_chroma_mb_whole_pixel(&plane, w, w, h, mb_x, mb_y, mv);
+        for r in 0..8 {
+            for c in 0..8 {
+                let sy = (mb_y as isize + 4 + r as isize).clamp(0, h as isize - 1) as usize;
+                let sx = (mb_x as isize + 4 + c as isize).clamp(0, w as isize - 1) as usize;
+                assert_eq!(mb[r * 8 + c], plane[sy * w + sx], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn predict_inter_mb_whole_pixel_at_border_uses_mb_batch_clamp() {
+        // Exercise the batched whole-pixel path through the border-clamp
+        // fallback: predict the corner MB (0,0) with a whole-pixel vector
+        // that straddles the top-left edge. The whole-MB result must still
+        // equal the per-sub-block `fetch_block_whole_pixel` assembly,
+        // proving the batched fetch's clamp agrees with build_mc_border on
+        // a real prediction.
+        let (y, u, v) = build_reference(2, 2);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 32,
+            uv_stride: 16,
+            mb_cols: 2,
+            mb_rows: 2,
+        };
+        // Whole-pixel vector pushing the integer origin off the top-left.
+        let luma_mv = Mv { row: -16, col: -16 };
+        let pred = predict_inter_mb(&reference, 0, 0, luma_mv, false, &SIXTAP_FILTERS);
+
+        let ymv = stored_luma_mv(luma_mv);
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let blk = fetch_block_whole_pixel(&y, 32, 32, 32, sc * 4, sb * 4, ymv);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let pr = sb * 4 + r;
+                        let pc = sc * 4 + c;
+                        assert_eq!(pred.y[pr * 16 + pc], blk[r * 4 + c], "luma ({pr},{pc})");
+                    }
+                }
+            }
+        }
+
+        let uvmv = chroma_mv(ymv);
+        for sb in 0..2 {
+            for sc in 0..2 {
+                let ublk = fetch_block_whole_pixel(&u, 16, 16, 16, sc * 4, sb * 4, uvmv);
+                let vblk = fetch_block_whole_pixel(&v, 16, 16, 16, sc * 4, sb * 4, uvmv);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let pr = sb * 4 + r;
+                        let pc = sc * 4 + c;
+                        assert_eq!(pred.u[pr * 8 + pc], ublk[r * 4 + c], "u ({pr},{pc})");
+                        assert_eq!(pred.v[pr * 8 + pc], vblk[r * 4 + c], "v ({pr},{pc})");
+                    }
+                }
+            }
+        }
     }
 }

@@ -643,6 +643,48 @@ border-clamp), and two real-prediction tests
 `predict_inter_mb_chroma_sub_pixel_at_border_uses_mb_halo_clamp` corner) on
 both U and V. Stable lib 468 → 474; nightly + `simd` lib 470 → 476.
 
+## Round 272 — whole-pixel non-SPLITMV MB batching (`fetch_luma_mb_whole_pixel` / `fetch_chroma_mb_whole_pixel`)
+
+Round 272 (2026-06-10) closes the round-271 next-round candidate
+"whole-pixel non-SPLITMV MB batching". When the shared §18.1 motion
+vector of a non-SPLITMV inter MB is *whole-pixel* (`mv & 7 == 0` per
+component), the §18.3 prediction is a pure copy — no convolution. The
+sixteen luma sub-blocks (or four chroma sub-blocks per plane) then share
+one contiguous source region at integer offset `(mb_x, mb_y) + (mv >> 3)`,
+so the whole block can be fetched in one pass instead of sixteen / four
+overlapping 4×4 `fetch_block_whole_pixel` copies. Unlike the round-270 /
+round-271 sub-pixel paths this is pure gather amortisation: one bounds
+check + one border-straddle decision per MB rather than per sub-block, no
+SIMD needed.
+
+`predict_inter_mb`'s whole-pixel luma branch now issues one
+`fetch_luma_mb_whole_pixel` (16×16, stride 16) and each chroma plane one
+`fetch_chroma_mb_whole_pixel` (8×8, stride 8), both with the same
+in-bounds contiguous-row fast path / per-pixel §20.14 `build_mc_border`
+clamp fallback split as the per-sub-block fetch.
+
+The new `motion_comp_subpel_luma/mb_*_whole_pixel_*` benches measure the
+batched fetch against the per-sub-block assembly on a 64×64 deterministic
+source (Apple M4 / aarch64, criterion `--quick`):
+
+| Bench | Per-sub-block | Batched | Delta |
+|---|---:|---:|---:|
+| whole 16×16 luma copy | 46.89 ns | **13.13 ns** | **−72 %** |
+| whole 8×8 chroma copy | 8.49 ns | **4.74 ns** | **−44 %** |
+
+Reading the result: the per-sub-block luma path pays sixteen
+`fetch_block_whole_pixel` calls, each with its own in-bounds test and its
+own four-row `copy_from_slice` loop into a `[u8; 16]` scratch that is then
+re-copied four rows at a time into `out.y`; the batched path does one
+in-bounds test and sixteen direct 16-byte row copies straight into
+`out.y`. The chroma ratio is smaller (four sub-blocks vs sixteen) but the
+same shape. Byte-exactness is anchored five ways against the
+per-sub-block `fetch_block_whole_pixel` assembly (in-bounds luma + chroma,
+top-left luma + bottom-right chroma clamp, and a real corner-MB
+`predict_inter_mb` covering Y + U + V); the existing
+`reconstruct_inter_mb_matches_legacy_for_whole_pixel` test anchors the
+full reconstruct path. Stable lib 474 → 479.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -650,14 +692,13 @@ both U and V. Stable lib 468 → 474; nightly + `simd` lib 470 → 476.
   (`_xzm_*`) should have shifted; re-profile to find the next biggest
   short-lived `Vec` (the §11 mode picker + `near_mv` MV-candidate
   scratch are the most likely remaining offenders).
-* **SPLITMV / chroma whole-pixel MB batching** — rounds 270 + 271 landed
-  the whole-MB sub-pixel luma + chroma paths (`sixtap_mb_luma` 21×21 /
-  `Simd<i32, 16>`, `sixtap_mb_chroma` 13×13 / `Simd<i32, 8>`). SPLITMV luma
-  stays per-sub-block by construction (sixteen distinct vectors), so it
-  can't use the shared-vector MB halo; the whole-pixel non-SPLITMV path
-  still copies sixteen / four 4×4 sub-blocks via `fetch_block_whole_pixel`
-  and could batch into one 16×16 / 8×8 `copy_from_slice`-per-row fetch
-  (no convolution, pure gather amortisation).
+* **SPLITMV whole-pixel sub-block batching** — rounds 270–272 landed the
+  whole-MB sub-pixel luma + chroma paths and the whole-pixel non-SPLITMV
+  luma + chroma copy paths. SPLITMV luma stays per-sub-block by
+  construction (sixteen distinct vectors), so it can't use the shared MB
+  region; the only remaining gather to amortise is the SPLITMV
+  whole-pixel case where adjacent sub-blocks happen to share a vector
+  (data-dependent, lower expected return).
 * **Whole-frame `keyframe_encode` re-measure under nightly + `simd`**
   — round 247's per-primitive `--quick` numbers imply a sub-percent
   whole-frame win, deep below the bench's `--quick` noise envelope. A

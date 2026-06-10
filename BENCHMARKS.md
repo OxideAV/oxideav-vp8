@@ -722,13 +722,74 @@ per-MB SPLITMV prediction, so neither form moves whole-frame inter encode
 materially — the value of the round is the documented A/B closing the
 candidate.
 
+## Round 276 — MV-cost `log2` table + allocation-free tree walks
+
+Round 276 (2026-06-11) re-profiled the inter-encode bench per the
+standing "remaining allocator churn" candidate below. The fresh
+`sample(1)` profile (15 s attach, 1 ms interval, `--measurement-time
+30`) put three related symbols high in self-time:
+
+| Self-samples | Symbol |
+|---:|---|
+| 411 | `log2` (libsystem_m) — #6 overall |
+| 200 | `motion_vector::mv_component_bits::small_mv_bits::find_path` |
+| 122 | `encoder::treed_bits::find_path` |
+| ~540 | `_xzm_free` / `_xzm_xzone_malloc` / `_malloc_zone_malloc` / `RawVec::finish_grow` / `grow_one` combined |
+
+Caller attribution placed the malloc churn squarely under
+`mv_component_bits` (per-candidate-MV RD costing inside motion search)
+and the §11 mode-RD `treed_bits` walk — exactly the "next biggest
+short-lived `Vec`" the round-272 candidate predicted. Three fixes, all
+producing bit-identical encoder output:
+
+1. **`mv_component_bits` joins the round-170 `-log2(p/256)` lookup
+   table.** The §17.1 MV-component costing still computed an inline libm
+   `log2` per priced bool; it now reads the same 256-entry
+   `BIT_COST_BY_FALSE_PROB` table the block-RD `bool_bits` has used
+   since round 170. For every `(prob, value)` pair the table entry is
+   the *exact* double the inline expression produced (same clamps, same
+   dyadic arguments), locked by a new full-range regression test
+   (`mv_component_bits_matches_reference_over_full_range`: every value
+   in `-1023..=1023` × three contexts including a 0/255 clamp-corner
+   sweep, `==` on f64 — not approximate).
+2. **`small_mv_bits` / `write_small_mv` drop the recursive DFS + `Vec`.**
+   §17.1 `small_mvtree` is a perfect depth-3 tree whose spec listing
+   comments give the leaf↔path correspondence directly (`0 = "000"` …
+   `7 = "111"`), so both walks now descend the tree with the 3-bit
+   binary expansion of the leaf (MSB first), still indexing
+   `SMALL_MVTREE` for the node-halved probability offsets and
+   debug-asserting the landing leaf. No allocation, no search.
+3. **`treed_bits` / `BoolEncoder::write_treed` get a fixed-buffer DFS.**
+   The shared `treed_find_path` helper writes the path into a stack
+   `[bool; 16]` (a §8.1 path visits distinct internal nodes, and the
+   deepest tree the crate walks — `BMODE_TREE` — has 9), replacing the
+   per-call `Vec<bool>` in both the §11 mode-cost and mode-emit walks.
+
+### Measured A/B (criterion `--quick`, Apple M4 / aarch64, stable)
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 10.32 ms | **9.38 ms** | **−9.1 %** |
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 5.83 ms | **5.53 ms** | **−5.2 %** |
+
+Throughput: inter 6.35 → **6.99 Mpx/s**, keyframe 13.17 → **13.89
+Mpx/s**. The post-change profile (same attach methodology) confirms the
+causal chain: libm `log2` disappears from the top-of-stack list
+entirely (411 → 0 samples), the `mv_component_bits` family drops 305 →
+123, the tree walk shows up only as the allocation-free
+`treed_find_path::dfs` (115 samples), and the malloc/free family drops
+~540 → ~300 samples. Encoder output is bit-identical: the RD costs are
+the same doubles, so every pick is unchanged — the full fixture /
+roundtrip suite passes untouched (lib tests 481 → 482 with the new
+full-range cost regression anchor).
+
 ## What didn't get touched yet (next-round candidates)
 
-* **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
-  the token-path `Vec`, the round-170 profile's #2/#4/#5/#7 hits
-  (`_xzm_*`) should have shifted; re-profile to find the next biggest
-  short-lived `Vec` (the §11 mode picker + `near_mv` MV-candidate
-  scratch are the most likely remaining offenders).
+* **Remaining allocator churn (`malloc` / `free`)** — round 276 cleared
+  the `mv_component_bits` / `treed_bits` / `write_treed` `Vec` churn
+  (see above) but ~300 samples of `_xzm_*` remain in the inter profile;
+  the next attribution pass should look at the `near_mv` MV-candidate
+  scratch and the per-frame partition assembly in `stream`.
 * **~~SPLITMV whole-pixel sub-block batching~~** — closed negative in round
   274 (see the round-274 section above): SPLITMV sub-blocks carry distinct
   vectors so the shared-halo batch can't apply, and the only remaining

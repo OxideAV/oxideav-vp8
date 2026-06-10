@@ -4,6 +4,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — MV-cost `log2` lookup table + allocation-free tree walks (round 276, 2026-06-11)
+
+Profile-guided micro-optimisation of the encoder's RD-costing hot path,
+closing the BENCHMARKS "remaining allocator churn" candidate's biggest
+remaining offenders. Three changes, bit-identical encoder output:
+
+* `motion_vector::mv_component_bits` now prices each §17.1 bool through
+  the encoder's round-170 `-log2(p / 256)` lookup table instead of an
+  inline libm `log2` per bit — the round-276 inter-encode profile's #6
+  self-time symbol (411 samples) drops to zero. The table read returns
+  the exact double the inline expression computed for every
+  `(prob, value)` pair, locked by a new full-range regression test
+  (`mv_component_bits_matches_reference_over_full_range`, `==` on f64
+  across `-1023..=1023` × spec-default + clamp-corner contexts).
+* `small_mv_bits` / `write_small_mv` replace the recursive
+  `Vec`-allocating DFS with a direct §17.1 depth-3 descent: the
+  `small_mvtree` listing's own comments give the leaf↔path
+  correspondence (`0 = "000"` … `7 = "111"`), so the path bits are the
+  leaf's 3-bit binary expansion MSB-first; the descent still walks
+  `SMALL_MVTREE` for the node-halved probability offsets and
+  debug-asserts the landing leaf.
+* `encoder::treed_bits` and `BoolEncoder::write_treed` share a new
+  `treed_find_path` helper that runs the same DFS into a stack
+  `[bool; 16]` (deepest in-crate tree: `BMODE_TREE`, 9 internal nodes)
+  instead of a per-call `Vec<bool>`.
+
+Measured (criterion `--quick`, Apple M4 / aarch64, stable):
+`inter_encode_4f_128x128_qi32` 10.32 → 9.38 ms (**−9.1 %**),
+`encode_keyframe_320x240_qi32` 5.83 → 5.53 ms (**−5.2 %**). The
+post-change profile confirms libm `log2` gone, the `mv_component_bits`
+family 305 → 123 self-samples, and the malloc/free family ~540 → ~300.
+See BENCHMARKS.md "Round 276" for the full A/B + profile evidence.
+Lib tests 481 → 482. No change to encode/decode output bytes.
+
 ### Added — `filter_block_4x4_into` strided-write primitive + round-274 SPLITMV write-strategy A/B (round 274, 2026-06-11)
 
 Round 274 closes the long-standing BENCHMARKS next-round candidate "SPLITMV

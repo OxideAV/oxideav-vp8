@@ -353,28 +353,14 @@ impl BoolEncoder {
         F: Fn(usize) -> u8,
     {
         // Depth-first search for the bit path from the root (node 0) to
-        // the leaf `-leaf`.
-        fn find_path(tree: &[i8], i: i8, target: i8, path: &mut Vec<bool>) -> bool {
-            for bit in 0..2 {
-                let next = tree[i as usize + bit];
-                path.push(bit == 1);
-                if next == target {
-                    return true;
-                }
-                if next > 0 && find_path(tree, next, target, path) {
-                    return true;
-                }
-                path.pop();
-            }
-            false
-        }
-        let mut path = Vec::new();
-        let found = find_path(tree, 0, -(leaf as i8), &mut path);
-        debug_assert!(found, "leaf {leaf} not reachable in tree {tree:?}");
+        // the leaf `-leaf`, into a fixed stack buffer (no per-call heap
+        // allocation — see `treed_find_path`).
+        let mut path = [false; 16];
+        let len = treed_find_path(tree, leaf, &mut path);
         // Replay the path, calling `prob_lookup` with the same
         // node-halved index the decoder uses at each step.
         let mut i: i8 = 0;
-        for bit in path {
+        for &bit in &path[..len] {
             self.write_bool(prob_lookup((i as usize) >> 1), bit);
             i = tree[i as usize + bit as usize];
         }
@@ -1935,7 +1921,7 @@ fn block_ssd(recon: &[u8], src: &[u8]) -> u64 {
 /// `p = 0` (encoded bit guaranteed 0, asked for true) case staying at
 /// the same `8.0` floor for symmetry.
 #[inline]
-fn bool_bits(prob: u8, value: bool) -> f64 {
+pub(crate) fn bool_bits(prob: u8, value: bool) -> f64 {
     if value {
         // -log2(1 - prob/256). prob == 0 ⇒ index = 256, but we clamp
         // it to 255 (i.e. -log2(1/256) = 8.0) so the asymmetric
@@ -1968,6 +1954,39 @@ static BIT_COST_BY_FALSE_PROB: std::sync::LazyLock<[f64; 256]> = std::sync::Lazy
     t
 });
 
+/// Depth-first search for the bit path from the root (node 0) of `tree`
+/// to the leaf `-leaf`, written into the caller's fixed `path` buffer.
+/// Returns the path length (0 when the leaf is unreachable, matching the
+/// empty-path behaviour of the previous heap-allocating walk; debug
+/// builds assert reachability).
+///
+/// The buffer is 16 entries: a §8.1 tree path visits distinct internal
+/// nodes, so its length is bounded by the node count `tree.len() / 2`,
+/// and the largest tree this crate walks (`BMODE_TREE`, 18 entries) has
+/// 9 internal nodes. Round-276 profiling showed the per-call `Vec` this
+/// replaces was a top allocator-churn source in the mode-RD loop.
+fn treed_find_path(tree: &[i8], leaf: u8, path: &mut [bool; 16]) -> usize {
+    fn dfs(tree: &[i8], i: i8, target: i8, path: &mut [bool; 16], len: &mut usize) -> bool {
+        for bit in 0..2 {
+            let next = tree[i as usize + bit];
+            path[*len] = bit == 1;
+            *len += 1;
+            if next == target {
+                return true;
+            }
+            if next > 0 && dfs(tree, next, target, path, len) {
+                return true;
+            }
+            *len -= 1;
+        }
+        false
+    }
+    let mut len = 0;
+    let found = dfs(tree, 0, -(leaf as i8), path, &mut len);
+    debug_assert!(found, "leaf {leaf} not reachable in tree {tree:?}");
+    len
+}
+
 /// Cost in fractional bits of writing `value` through `tree` with the
 /// per-node probability `prob_lookup`, mirroring [`BoolEncoder::write_treed`]
 /// but accumulating `-log2(p)` instead of emitting. Used to price the
@@ -1976,26 +1995,11 @@ fn treed_bits<F>(tree: &[i8], prob_lookup: F, leaf: u8) -> f64
 where
     F: Fn(usize) -> u8,
 {
-    fn find_path(tree: &[i8], i: i8, target: i8, path: &mut Vec<bool>) -> bool {
-        for bit in 0..2 {
-            let next = tree[i as usize + bit];
-            path.push(bit == 1);
-            if next == target {
-                return true;
-            }
-            if next > 0 && find_path(tree, next, target, path) {
-                return true;
-            }
-            path.pop();
-        }
-        false
-    }
-    let mut path = Vec::new();
-    let found = find_path(tree, 0, -(leaf as i8), &mut path);
-    debug_assert!(found, "leaf {leaf} not reachable in tree {tree:?}");
+    let mut path = [false; 16];
+    let len = treed_find_path(tree, leaf, &mut path);
     let mut bits = 0.0;
     let mut i: i8 = 0;
-    for bit in path {
+    for &bit in &path[..len] {
         bits += bool_bits(prob_lookup((i as usize) >> 1), bit);
         i = tree[i as usize + bit as usize];
     }

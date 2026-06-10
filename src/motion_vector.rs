@@ -245,30 +245,27 @@ pub fn read_mv(dec: &mut BoolDecoder<'_>, contexts: &MvContexts) -> Result<Mv, B
 /// per-node probability offset the decoder reads at.
 fn write_small_mv(enc: &mut BoolEncoder, p: &MvContext, leaf: i32) {
     debug_assert!((0..=7).contains(&leaf));
-    fn find_path(tree: &[i8], i: usize, target: i8, path: &mut Vec<bool>) -> bool {
-        for bit in 0..2 {
-            let next = tree[i + bit];
-            path.push(bit == 1);
-            if next <= 0 {
-                if next == -target {
-                    return true;
-                }
-            } else if find_path(tree, next as usize, target, path) {
-                return true;
-            }
-            path.pop();
-        }
-        false
-    }
-    let mut path = Vec::new();
-    let found = find_path(&SMALL_MVTREE, 0, leaf as i8, &mut path);
-    debug_assert!(found, "no SMALL_MVTREE path for leaf {leaf}");
+    // §17.1 `small_mvtree` is a perfect depth-3 tree whose listing
+    // comments spell out the leaf↔path correspondence directly
+    // (`0 = "000"` … `7 = "111"`), so the bit path to leaf `A` is the
+    // 3-bit binary expansion of `A`, most-significant bit first. Descend
+    // the tree with those bits instead of allocating a DFS path — the
+    // round-276 inter-encode profile flagged the per-call `Vec` here as
+    // allocator churn. The descent still indexes [`SMALL_MVTREE`] for
+    // the node-halved probability offsets, and debug builds assert it
+    // lands on the expected leaf.
     let mut i: usize = 0;
-    for &bit in &path {
+    for k in (0..3).rev() {
+        let bit = (leaf >> k) & 1 != 0;
         let prob = p[MVP_SHORT + (i >> 1)];
         enc.write_bool(prob, bit);
         let next = SMALL_MVTREE[i + bit as usize];
         if next <= 0 {
+            debug_assert_eq!(
+                next,
+                -(leaf as i8),
+                "§17.1 small_mvtree descent must land on leaf {leaf}"
+            );
             break;
         }
         i = next as usize;
@@ -347,37 +344,29 @@ pub fn write_mv(enc: &mut BoolEncoder, contexts: &MvContexts, mv: Mv) {
 /// MV — negligible for a per-MB ZEROMV-vs-NEWMV comparison).
 pub fn mv_component_bits(p: &MvContext, value: i32) -> f64 {
     debug_assert!((-1023..=1023).contains(&value));
-    #[inline]
-    fn bool_bits(prob: u8, value: bool) -> f64 {
-        let p0 = (prob.max(1) as f64) / 256.0;
-        let p = if value { 1.0 - p0 } else { p0 };
-        -p.max(1.0 / 256.0).log2()
-    }
+    // Shares the encoder's precomputed `-log2(p / 256)` lookup table
+    // (round 170): for every `(prob, value)` pair the table read returns
+    // the exact double the previous inline `prob.max(1)` + 1/256-floored
+    // `log2` computed, so RD comparisons are bit-identical — without the
+    // libm `log2` call the round-276 profile showed as a top self-time
+    // symbol under motion search.
+    use crate::encoder::bool_bits;
     fn small_mv_bits(p: &MvContext, leaf: i32) -> f64 {
-        fn find_path(tree: &[i8], i: usize, target: i8, path: &mut Vec<bool>) -> bool {
-            for bit in 0..2 {
-                let next = tree[i + bit];
-                path.push(bit == 1);
-                if next <= 0 {
-                    if next == -target {
-                        return true;
-                    }
-                } else if find_path(tree, next as usize, target, path) {
-                    return true;
-                }
-                path.pop();
-            }
-            false
-        }
-        let mut path = Vec::new();
-        let found = find_path(&SMALL_MVTREE, 0, leaf as i8, &mut path);
-        debug_assert!(found);
+        // Direct §17.1 depth-3 descent — see `write_small_mv` for the
+        // leaf↔path correspondence; this is the costing mirror of the
+        // same loop (no DFS, no allocation).
         let mut bits = 0.0;
         let mut i: usize = 0;
-        for &bit in &path {
+        for k in (0..3).rev() {
+            let bit = (leaf >> k) & 1 != 0;
             bits += bool_bits(p[MVP_SHORT + (i >> 1)], bit);
             let next = SMALL_MVTREE[i + bit as usize];
             if next <= 0 {
+                debug_assert_eq!(
+                    next,
+                    -(leaf as i8),
+                    "§17.1 small_mvtree descent must land on leaf {leaf}"
+                );
                 break;
             }
             i = next as usize;
@@ -825,6 +814,98 @@ mod tests {
             "non-zero bool cost expected for V=0, got {bits}"
         );
         assert!(bits < 8.0, "V=0 emits a handful of bools, got {bits}");
+    }
+
+    /// Literal re-statement of the §17.1 costing the table-backed
+    /// `mv_component_bits` replaced in round 276: a recursive
+    /// `SMALL_MVTREE` DFS for the short-form path plus an inline
+    /// `-log2` per bool. The rewrite must be bit-identical (same f64,
+    /// not merely close) for every representable component against
+    /// every probability value the contexts can carry.
+    fn mv_component_bits_reference(p: &MvContext, value: i32) -> f64 {
+        fn bool_bits(prob: u8, value: bool) -> f64 {
+            let p0 = (prob.max(1) as f64) / 256.0;
+            let p = if value { 1.0 - p0 } else { p0 };
+            -p.max(1.0 / 256.0).log2()
+        }
+        fn find_path(tree: &[i8], i: usize, target: i8, path: &mut Vec<bool>) -> bool {
+            for bit in 0..2 {
+                let next = tree[i + bit];
+                path.push(bit == 1);
+                if next <= 0 {
+                    if next == -target {
+                        return true;
+                    }
+                } else if find_path(tree, next as usize, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            false
+        }
+        let a = value.unsigned_abs() as i32;
+        let mut bits = 0.0;
+        if a > 7 {
+            bits += bool_bits(p[MVP_IS_SHORT], true);
+            for i in 0..3 {
+                bits += bool_bits(p[MVP_BITS + i], (a >> i) & 1 != 0);
+            }
+            let mut i = 9;
+            loop {
+                bits += bool_bits(p[MVP_BITS + i], (a >> i) & 1 != 0);
+                i -= 1;
+                if i <= 3 {
+                    break;
+                }
+            }
+            if (a & 0xfff0) != 0 {
+                bits += bool_bits(p[MVP_BITS + 3], (a >> 3) & 1 != 0);
+            }
+        } else {
+            bits += bool_bits(p[MVP_IS_SHORT], false);
+            // The short-tree cost is accumulated in its own local sum
+            // before being added to the running total, mirroring the
+            // shipped `small_mv_bits` helper structure (f64 addition is
+            // order-sensitive, and this test demands bit-identity).
+            let mut path = Vec::new();
+            assert!(find_path(&SMALL_MVTREE, 0, a as i8, &mut path));
+            let mut tree_bits = 0.0;
+            let mut i: usize = 0;
+            for &bit in &path {
+                tree_bits += bool_bits(p[MVP_SHORT + (i >> 1)], bit);
+                let next = SMALL_MVTREE[i + bit as usize];
+                if next <= 0 {
+                    break;
+                }
+                i = next as usize;
+            }
+            bits += tree_bits;
+        }
+        if a != 0 {
+            bits += bool_bits(p[MVP_SIGN], value < 0);
+        }
+        bits
+    }
+
+    #[test]
+    fn mv_component_bits_matches_reference_over_full_range() {
+        // Spec-default context plus a synthetic context sweeping every
+        // probability byte (including the 0 and 255 clamp corners) across
+        // the 19 positions.
+        let mut synthetic = [0u8; MV_PROB_COUNT];
+        for (i, slot) in synthetic.iter_mut().enumerate() {
+            *slot = [0u8, 1, 7, 128, 200, 254, 255][i % 7];
+        }
+        for ctx in [DEFAULT_MV_CONTEXT[0], DEFAULT_MV_CONTEXT[1], synthetic] {
+            for value in -1023..=1023 {
+                let got = super::mv_component_bits(&ctx, value);
+                let want = mv_component_bits_reference(&ctx, value);
+                assert!(
+                    got == want,
+                    "mv_component_bits({value}) = {got}, reference = {want}"
+                );
+            }
+        }
     }
 
     #[test]

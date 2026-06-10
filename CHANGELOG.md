@@ -4,6 +4,44 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_mb_batch_motion_comp` fuzz target (round 273, 2026-06-10)
+
+Round 273 adds the fifteenth `cargo-fuzz` target, closing a coverage gap
+opened by the rounds 270–272 MB-batching work: the six public MB-scale
+§18.3 / §20.14 batched motion-compensation primitives
+(`fetch_luma_mb_halo` + `sixtap_mb_luma`, `fetch_chroma_mb_halo` +
+`sixtap_mb_chroma`, `fetch_luma_mb_whole_pixel` /
+`fetch_chroma_mb_whole_pixel`) landed *after* the round-257
+`panic_free_sixtap_subpel` target was written, so no existing harness
+reached them. The fourteen targets above hit §18 only through the §17
+motion-search descent ladder (which snaps every per-candidate MV to a
+sub-block grid and never reaches the MB-scale orchestrator) or through
+`decode_vp8` / `Vp8DecoderState::decode_frame` /
+`encode_p_frame_multi_ref` (which gate the MB-scale fetch behind a
+fully-formed reference picture + §9.7 refresh state machine, so the
+§20.14 `build_mc_border` clamp inside the MB-halo fetch never sees an
+origin parked across a picture boundary by an arbitrary `i16` vector).
+
+`panic_free_mb_batch_motion_comp` drives the MB-scale surface directly
+with an attacker-shaped `(plane dimension, MB origin, MV, fractional
+offset, filter set, border-position class)` envelope — every border
+class (mid-plane fast path, top-left corner, bottom-right corner,
+adversarial full-`i16` MV) and every `(mx, my) ∈ {0..7}²` fraction
+across both §18.3 filter sets. Three equivalence cross-checks are
+asserted on every iteration (panic on mismatch): the 21×21 luma halo and
+the 13×13 chroma halo must each contain every per-sub-block 9×9
+`fetch_block_halo` window at offset `(sb*4, sc*4)`, and the whole-pixel
+MB luma / chroma copy must equal the per-sub-block
+`fetch_block_whole_pixel` assembly tiled into the MB raster — the
+round-270 / 271 / 272 in-tree containment invariants, now re-asserted
+under the attacker-shaped border-clamp envelope the mid-plane-only
+in-tree tests never reach.
+
+26-second smoke pass landed `cov: 355, ft: 569, corp: 65/1063b` across
+810 049 iterations from an empty seed on aarch64-apple-darwin at
+~31 155 exec/s, peak RSS 495 MiB, zero panics. No library / public-API
+change; fuzz-crate only.
+
 ### Added — whole-pixel non-SPLITMV MB batching (`fetch_luma_mb_whole_pixel` / `fetch_chroma_mb_whole_pixel`) (round 272, 2026-06-10)
 
 Round 272 closes the round-271 BENCHMARKS next-round candidate

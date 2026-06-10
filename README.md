@@ -275,7 +275,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships fourteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships fifteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -533,6 +533,40 @@ that exercise the public encode and decode surface for panic-freedom:
   25-second smoke pass landed `cov: 437, ft: 1005, corp: 105` across
   2 375 327 iterations from an empty seed on aarch64-apple-darwin at
   ~43 700 exec/s, zero panics.
+* `panic_free_mb_batch_motion_comp` — the MB-scale §18.3 / §20.14
+  batched motion-compensation primitives landed in rounds 270–272:
+  `fetch_luma_mb_halo` + `sixtap_mb_luma` (21×21 halo → 16×16 luma
+  convolution), `fetch_chroma_mb_halo` + `sixtap_mb_chroma` (13×13 halo
+  → 8×8 chroma convolution), and the whole-pixel non-SPLITMV copy paths
+  `fetch_luma_mb_whole_pixel` / `fetch_chroma_mb_whole_pixel`
+  (round 273). These six public functions synthesise (or copy) a whole
+  macroblock's prediction in one pass and landed *after* the round-257
+  `panic_free_sixtap_subpel` target was written, so no existing harness
+  reaches them: the fourteen targets above hit §18 only through the §17
+  motion-search descent ladder (which snaps every per-candidate MV to a
+  sub-block grid and never reaches the MB-scale orchestrator) or through
+  `decode_vp8` / `Vp8DecoderState::decode_frame` /
+  `encode_p_frame_multi_ref` (which gate the MB-scale fetch behind a
+  fully-formed reference picture + §9.7 refresh state machine, so the
+  §20.14 `build_mc_border` clamp inside the MB-halo fetch never sees an
+  origin parked across a picture boundary by an arbitrary `i16` vector).
+  This target drives the MB-scale surface directly with an
+  attacker-shaped `(plane dimension, MB origin, MV, fractional offset,
+  filter set, border-position class)` envelope — every border class
+  (mid-plane fast path, top-left corner, bottom-right corner,
+  adversarial full-`i16` MV) and every `(mx, my) ∈ {0..7}²` fraction
+  across both §18.3 filter sets — plus three equivalence cross-checks
+  asserted on every iteration (panic on mismatch): the 21×21 luma halo
+  and the 13×13 chroma halo must each contain every per-sub-block 9×9
+  `fetch_block_halo` window at offset `(sb*4, sc*4)`, and the
+  whole-pixel MB luma / chroma copy must equal the per-sub-block
+  `fetch_block_whole_pixel` assembly tiled into the MB raster — the
+  round-270 / 271 / 272 in-tree containment invariants, now re-asserted
+  under the attacker-shaped border-clamp envelope the mid-plane-only
+  in-tree tests never reach. 26-second smoke pass landed `cov: 355,
+  ft: 569, corp: 65/1063b` across 810 049 iterations from an empty seed
+  on aarch64-apple-darwin at ~31 155 exec/s, peak RSS 495 MiB, zero
+  panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

@@ -14,10 +14,12 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use oxideav_vp8::motion_comp::{
     fetch_block_whole_pixel, fetch_chroma_mb_halo, fetch_chroma_mb_whole_pixel, fetch_luma_mb_halo,
-    fetch_luma_mb_whole_pixel, filter_block_4x4, filter_set_for_version, sixtap_2d,
-    sixtap_mb_chroma, sixtap_mb_luma, FilterSet,
+    fetch_luma_mb_whole_pixel, filter_block_4x4, filter_block_4x4_into, filter_set_for_version,
+    sixtap_2d, sixtap_mb_chroma, sixtap_mb_luma, split_chroma_mvs, stored_luma_mv, FilterSet,
+    ReferencePlanes,
 };
 use oxideav_vp8::motion_vector::Mv;
+use oxideav_vp8::ReconstructedMb;
 
 /// Build a 64×64 8-bit luma plane with a deterministic gradient
 /// pattern. The plane is bigger than the MB so the §20.14 edge-replication
@@ -254,12 +256,190 @@ fn bench_mb_whole_pixel_batched(c: &mut Criterion) {
     g.finish();
 }
 
+/// Round-274 SPLITMV write-strategy A/B. SPLITMV sub-blocks carry sixteen
+/// distinct luma vectors (plus four chroma), so the MB-scale shared-halo
+/// batch (rounds 270–272) cannot apply — the only freedom left is *how* the
+/// per-sub-block synthesis lands in the MB raster. This bench measures two
+/// strategies that produce byte-identical output:
+///
+/// * **scratch_copy** — `filter_block_4x4` builds a contiguous `[u8; 16]`
+///   block, then four contiguous 4-byte rows are copied into the stride-16
+///   / stride-8 raster (the form `predict_split_mv` ships).
+/// * **strided_write** — `filter_block_4x4_into` writes each synthesised
+///   sub-block directly into the destination at its strided offset, with no
+///   intermediate `[u8; 16]`.
+///
+/// Counter-intuitively the scratch_copy form wins (~+23 % on Apple M4):
+/// the contiguous block lets the compiler vectorise the per-row writes,
+/// where the scattered strided writes into a stride-16 raster can't. This
+/// is the measured reason `predict_split_mv` keeps the scratch path and the
+/// long-standing "SPLITMV sub-block batching" candidate is closed negative.
+fn bench_splitmv_predict(c: &mut Criterion) {
+    // 3×3 MB grid so the centre MB's per-sub-block reads stay in-bounds.
+    let lw = 48;
+    let lh = 48;
+    let cw = 24;
+    let ch = 24;
+    let y = make_plane(lw, lh);
+    let u = make_plane(cw, ch);
+    let v = make_plane(cw, ch);
+    let reference = ReferencePlanes {
+        y: &y,
+        u: &u,
+        v: &v,
+        y_stride: lw,
+        uv_stride: cw,
+        mb_cols: 3,
+        mb_rows: 3,
+    };
+    let filters = filter_set_for_version(0).taps();
+
+    // Sixteen distinct vectors mixing whole-pixel and sub-pixel fractions.
+    let mut mvs = [Mv { row: 0, col: 0 }; 16];
+    for (i, m) in mvs.iter_mut().enumerate() {
+        let frac_r = if i % 2 == 0 { 0 } else { (i as i16 % 7) + 1 };
+        let frac_c = if i % 3 == 0 { 0 } else { (i as i16 % 5) + 1 };
+        *m = Mv {
+            row: ((i as i16 % 3) - 1) * 8 + frac_r,
+            col: ((i as i16 % 4) - 2) * 8 + frac_c,
+        };
+    }
+
+    let mut g = c.benchmark_group("motion_comp_subpel_luma");
+
+    // Strided-write strategy: `filter_block_4x4_into` writes each sub-block
+    // directly into the raster (no intermediate `[u8; 16]`).
+    g.bench_function("splitmv_predict_strided_write", |b| {
+        b.iter(|| {
+            let mvs = black_box(&mvs);
+            let mut out = ReconstructedMb::default();
+            for sb in 0..4 {
+                for sc in 0..4 {
+                    let ymv = stored_luma_mv(mvs[sb * 4 + sc]);
+                    filter_block_4x4_into(
+                        &mut out.y,
+                        16,
+                        sc * 4,
+                        sb * 4,
+                        reference.y,
+                        reference.y_stride,
+                        lw,
+                        lh,
+                        16 + sc * 4,
+                        16 + sb * 4,
+                        ymv,
+                        filters,
+                    );
+                }
+            }
+            let chroma = split_chroma_mvs(mvs);
+            for sb in 0..2 {
+                for sc in 0..2 {
+                    let uvmv = chroma[sb * 2 + sc];
+                    filter_block_4x4_into(
+                        &mut out.u,
+                        8,
+                        sc * 4,
+                        sb * 4,
+                        reference.u,
+                        reference.uv_stride,
+                        cw,
+                        ch,
+                        8 + sc * 4,
+                        8 + sb * 4,
+                        uvmv,
+                        filters,
+                    );
+                    filter_block_4x4_into(
+                        &mut out.v,
+                        8,
+                        sc * 4,
+                        sb * 4,
+                        reference.v,
+                        reference.uv_stride,
+                        cw,
+                        ch,
+                        8 + sc * 4,
+                        8 + sb * 4,
+                        uvmv,
+                        filters,
+                    );
+                }
+            }
+            black_box(out.y[0])
+        });
+    });
+
+    // Scratch-copy strategy (the form `predict_split_mv` ships):
+    // `filter_block_4x4` into a `[u8; 16]` scratch +
+    // four-row strided copy into the MB raster, for every sub-block.
+    g.bench_function("splitmv_predict_scratch_copy", |b| {
+        b.iter(|| {
+            let mvs = black_box(&mvs);
+            let mut out = ReconstructedMb::default();
+            for sb in 0..4 {
+                for sc in 0..4 {
+                    let ymv = stored_luma_mv(mvs[sb * 4 + sc]);
+                    let blk = filter_block_4x4(
+                        reference.y,
+                        reference.y_stride,
+                        lw,
+                        lh,
+                        16 + sc * 4,
+                        16 + sb * 4,
+                        ymv,
+                        filters,
+                    );
+                    for r in 0..4 {
+                        let dst = (sb * 4 + r) * 16 + sc * 4;
+                        out.y[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+                    }
+                }
+            }
+            let chroma = split_chroma_mvs(mvs);
+            for sb in 0..2 {
+                for sc in 0..2 {
+                    let uvmv = chroma[sb * 2 + sc];
+                    let ublk = filter_block_4x4(
+                        reference.u,
+                        reference.uv_stride,
+                        cw,
+                        ch,
+                        8 + sc * 4,
+                        8 + sb * 4,
+                        uvmv,
+                        filters,
+                    );
+                    let vblk = filter_block_4x4(
+                        reference.v,
+                        reference.uv_stride,
+                        cw,
+                        ch,
+                        8 + sc * 4,
+                        8 + sb * 4,
+                        uvmv,
+                        filters,
+                    );
+                    for r in 0..4 {
+                        let dst = (sb * 4 + r) * 8 + sc * 4;
+                        out.u[dst..dst + 4].copy_from_slice(&ublk[r * 4..r * 4 + 4]);
+                        out.v[dst..dst + 4].copy_from_slice(&vblk[r * 4..r * 4 + 4]);
+                    }
+                }
+            }
+            black_box(out.y[0])
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_filter_block_4x4_subpel,
     bench_mb_sixtap_2d,
     bench_mb_luma_batched,
     bench_mb_chroma_batched,
-    bench_mb_whole_pixel_batched
+    bench_mb_whole_pixel_batched,
+    bench_splitmv_predict
 );
 criterion_main!(benches);

@@ -1361,6 +1361,92 @@ pub fn filter_block_4x4(
     }
 }
 
+/// Predict one 4×4 sub-block and write it directly into a destination
+/// raster — the strided-write companion of [`filter_block_4x4`].
+///
+/// [`filter_block_4x4`] returns a fixed `[u8; 16]` block that the caller
+/// then re-copies row-by-row into a strided macroblock buffer (`out.y` /
+/// `out.u` / `out.v`). For the per-sub-block SPLITMV path (sixteen luma plus
+/// eight chroma calls per MB, RFC 6386 §16.4) every sub-block pays that
+/// `[u8; 16]` scratch plus the four-row second copy. This entry point
+/// folds the synthesis and the write into one pass:
+///
+/// * **Whole-pixel** (`mv & 7 == 0`, the §18.3 "simply copied" case): the
+///   in-bounds fast path copies each source row straight into `dst` at
+///   `(dst_x, dst_y)` — no `[u8; 16]` round trip. The border-straddle
+///   fallback is the §20.14 `build_mc_border` per-pixel edge replication,
+///   bit-identical to [`fetch_block_whole_pixel`]'s slow path.
+/// * **Sub-pixel**: delegates the pixel computation to [`filter_block_4x4`]
+///   unchanged (so the `sixtap_2d` SIMD dispatch and its byte-exactness
+///   proof carry verbatim) and writes the returned block strided in one
+///   place.
+///
+/// `dst` is the destination plane, `dst_stride` its row stride, and
+/// `(dst_x, dst_y)` the sub-block's top-left position within it. The
+/// remaining arguments match [`filter_block_4x4`]. Byte-exact against
+/// "[`filter_block_4x4`] then a four-row strided copy" on every input
+/// (`filter_block_4x4_into_matches_filter_block_4x4`).
+#[allow(clippy::too_many_arguments)] // mirrors filter_block_4x4 plus the destination triple.
+pub fn filter_block_4x4_into(
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_x: usize,
+    dst_y: usize,
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    blk_x: usize,
+    blk_y: usize,
+    mv: Mv,
+    filters: &[[i32; 6]; 8],
+) {
+    let mx = (mv.col & 7) as usize;
+    let my = (mv.row & 7) as usize;
+    if mx == 0 && my == 0 {
+        // §18.3 whole-pixel: the prediction sub-block is the source region
+        // at integer offset `(blk_x, blk_y) + (mv >> 3)`, copied directly
+        // into `dst` without the intermediate `[u8; 16]` block.
+        let off_x = (mv.col >> 3) as isize;
+        let off_y = (mv.row >> 3) as isize;
+        let src_x0 = blk_x as isize + off_x;
+        let src_y0 = blk_y as isize + off_y;
+        let w_i = w as isize;
+        let h_i = h as isize;
+
+        if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 4 <= w_i && src_y0 + 4 <= h_i {
+            // Fast path: each source row is a contiguous 4-byte run copied
+            // straight into the destination row.
+            let x0 = src_x0 as usize;
+            let y0 = src_y0 as usize;
+            for r in 0..4 {
+                let src = (y0 + r) * stride + x0;
+                let d = (dst_y + r) * dst_stride + dst_x;
+                dst[d..d + 4].copy_from_slice(&plane[src..src + 4]);
+            }
+        } else {
+            // §20.14 build_mc_border edge replication, bit-identical to
+            // `fetch_block_whole_pixel`'s slow path.
+            for r in 0..4 {
+                let sy = (src_y0 + r as isize).clamp(0, h_i - 1) as usize;
+                let d = (dst_y + r) * dst_stride + dst_x;
+                for c in 0..4 {
+                    let sx = (src_x0 + c as isize).clamp(0, w_i - 1) as usize;
+                    dst[d + c] = plane[sy * stride + sx];
+                }
+            }
+        }
+    } else {
+        // Sub-pixel: reuse the exact `filter_block_4x4` synthesis (SIMD
+        // dispatch + byte-exactness preserved), write the result strided.
+        let blk = filter_block_4x4(plane, stride, w, h, blk_x, blk_y, mv, filters);
+        for r in 0..4 {
+            let d = (dst_y + r) * dst_stride + dst_x;
+            dst[d..d + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+        }
+    }
+}
+
 /// Build the §18.2 whole-pixel prediction buffer for a non-SPLITMV
 /// inter-predicted macroblock.
 ///
@@ -1853,7 +1939,17 @@ pub fn predict_split_mv(
 
     let mut out = ReconstructedMb::default();
 
-    // Luma: each 4×4 sub-block under its own §18.1-doubled vector.
+    // Luma: each 4×4 sub-block under its own §18.1-doubled vector. The
+    // sixteen vectors are distinct (SPLITMV), so the MB-scale shared-halo
+    // batch ([`sixtap_mb_luma`], rounds 270–272) does not apply. The
+    // per-sub-block synthesis builds a contiguous `[u8; 16]` block and
+    // copies it four contiguous rows at a time into `out.y`: a round-274
+    // bench (`motion_comp_subpel_luma/splitmv_predict_*`) measured this
+    // scratch-then-copy form ~23 % FASTER than a strided-write variant
+    // (`filter_block_4x4_into`) that writes each sub-block directly into the
+    // stride-16 raster — the contiguous block lets the compiler vectorise
+    // the per-row writes where the scattered strided writes can't. See
+    // `BENCHMARKS.md` round-274 for the A/B.
     let y_x0 = mb_col * 16;
     let y_y0 = mb_row * 16;
     for sb in 0..4 {
@@ -3833,6 +3929,181 @@ mod tests {
                         assert_eq!(pred.v[pr * 8 + pc], vblk[r * 4 + c], "v ({pr},{pc})");
                     }
                 }
+            }
+        }
+    }
+
+    // ----- §16.4 SPLITMV strided-write equivalence -------------------
+
+    #[test]
+    fn filter_block_4x4_into_matches_filter_block_4x4() {
+        // The strided-write entry point must produce, at the destination
+        // sub-block, exactly the bytes [`filter_block_4x4`] returns — across
+        // whole-pixel (copy) AND sub-pixel (six-tap) vectors, in-bounds and
+        // at a border-straddling origin.
+        let w = 48;
+        let h = 48;
+        let plane = ramp_plane(w, h);
+        let filters = filter_set_for_version(0).taps();
+        // (blk_x, blk_y, mv): whole-pixel in-bounds, sub-pixel in-bounds,
+        // whole-pixel straddling the top-left corner, sub-pixel near the
+        // bottom-right corner.
+        let cases = [
+            (20, 20, Mv { row: 16, col: 8 }),  // whole-pixel, offset (1, 2)
+            (20, 20, Mv { row: 5, col: 3 }),   // sub-pixel (mx=3, my=5)
+            (0, 0, Mv { row: -32, col: -32 }), // whole-pixel, clamps top-left
+            (40, 40, Mv { row: 5, col: 3 }),   // sub-pixel near bottom-right
+        ];
+        for (blk_x, blk_y, mv) in cases {
+            let expected = filter_block_4x4(&plane, w, w, h, blk_x, blk_y, mv, filters);
+            // Write into a destination raster at a non-zero strided origin
+            // to exercise the (dst_x, dst_y, dst_stride) arithmetic.
+            let dst_stride = 16usize;
+            let (dst_x, dst_y) = (8usize, 12usize);
+            let mut dst = vec![0xABu8; dst_stride * 24];
+            filter_block_4x4_into(
+                &mut dst, dst_stride, dst_x, dst_y, &plane, w, w, h, blk_x, blk_y, mv, filters,
+            );
+            for r in 0..4 {
+                for c in 0..4 {
+                    let d = (dst_y + r) * dst_stride + dst_x + c;
+                    assert_eq!(
+                        dst[d],
+                        expected[r * 4 + c],
+                        "mv={mv:?} blk=({blk_x},{blk_y}) ({r},{c})"
+                    );
+                }
+            }
+            // Pixels outside the 4×4 footprint must be untouched.
+            assert_eq!(dst[0], 0xAB, "out-of-footprint corruption for mv={mv:?}");
+        }
+    }
+
+    /// Assemble a SPLITMV prediction using the strided-write primitive
+    /// [`filter_block_4x4_into`] — the alternative write strategy the
+    /// round-274 bench measures against [`predict_split_mv`]'s shipped
+    /// scratch-copy form. Used only to prove the two strategies agree
+    /// byte-for-byte (the bench shows scratch-copy is the faster of the
+    /// two, so the production path keeps it).
+    fn predict_split_mv_via_strided_into(
+        reference: &ReferencePlanes<'_>,
+        mb_col: usize,
+        mb_row: usize,
+        split_luma_mvs: &[Mv; 16],
+        full_pixel: bool,
+        filters: &[[i32; 6]; 8],
+    ) -> ReconstructedMb {
+        let lw = reference.mb_cols * 16;
+        let lh = reference.mb_rows * 16;
+        let cw = reference.mb_cols * 8;
+        let ch = reference.mb_rows * 8;
+        let mut out = ReconstructedMb::default();
+        let y_x0 = mb_col * 16;
+        let y_y0 = mb_row * 16;
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let mut ymv = stored_luma_mv(split_luma_mvs[sb * 4 + sc]);
+                if full_pixel {
+                    ymv = apply_full_pixel(ymv);
+                }
+                filter_block_4x4_into(
+                    &mut out.y,
+                    16,
+                    sc * 4,
+                    sb * 4,
+                    reference.y,
+                    reference.y_stride,
+                    lw,
+                    lh,
+                    y_x0 + sc * 4,
+                    y_y0 + sb * 4,
+                    ymv,
+                    filters,
+                );
+            }
+        }
+        let chroma = split_chroma_mvs(split_luma_mvs);
+        let uv_x0 = mb_col * 8;
+        let uv_y0 = mb_row * 8;
+        for sb in 0..2 {
+            for sc in 0..2 {
+                let mut uvmv = chroma[sb * 2 + sc];
+                if full_pixel {
+                    uvmv = apply_full_pixel(uvmv);
+                }
+                filter_block_4x4_into(
+                    &mut out.u,
+                    8,
+                    sc * 4,
+                    sb * 4,
+                    reference.u,
+                    reference.uv_stride,
+                    cw,
+                    ch,
+                    uv_x0 + sc * 4,
+                    uv_y0 + sb * 4,
+                    uvmv,
+                    filters,
+                );
+                filter_block_4x4_into(
+                    &mut out.v,
+                    8,
+                    sc * 4,
+                    sb * 4,
+                    reference.v,
+                    reference.uv_stride,
+                    cw,
+                    ch,
+                    uv_x0 + sc * 4,
+                    uv_y0 + sb * 4,
+                    uvmv,
+                    filters,
+                );
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn strided_into_assembly_matches_predict_split_mv() {
+        // Sixteen distinct luma vectors mixing whole-pixel and sub-pixel
+        // fractions, assembled via `filter_block_4x4_into`, must equal the
+        // shipped `predict_split_mv` (scratch-copy) output byte-for-byte at a
+        // mid-grid MB (in-bounds) and the top-left corner MB
+        // (border-straddle), under both `full_pixel` polarities.
+        let (y, u, v) = build_reference(3, 3);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 48,
+            uv_stride: 24,
+            mb_cols: 3,
+            mb_rows: 3,
+        };
+        let filters = filter_set_for_version(0).taps();
+
+        // Sixteen distinct vectors: alternate whole-pixel and sub-pixel
+        // fractions and vary the integer offset per sub-block.
+        let mut mvs = [Mv { row: 0, col: 0 }; 16];
+        for (i, m) in mvs.iter_mut().enumerate() {
+            let frac_r = if i % 2 == 0 { 0 } else { (i as i16 % 7) + 1 };
+            let frac_c = if i % 3 == 0 { 0 } else { (i as i16 % 5) + 1 };
+            *m = Mv {
+                row: ((i as i16 % 3) - 1) * 8 + frac_r,
+                col: ((i as i16 % 4) - 2) * 8 + frac_c,
+            };
+        }
+
+        for full_pixel in [false, true] {
+            for (mb_col, mb_row) in [(1usize, 1usize), (0, 0)] {
+                let got = predict_split_mv_via_strided_into(
+                    &reference, mb_col, mb_row, &mvs, full_pixel, filters,
+                );
+                let want = predict_split_mv(&reference, mb_col, mb_row, &mvs, full_pixel, filters);
+                assert_eq!(got.y, want.y, "luma MB ({mb_col},{mb_row}) fp={full_pixel}");
+                assert_eq!(got.u, want.u, "U MB ({mb_col},{mb_row}) fp={full_pixel}");
+                assert_eq!(got.v, want.v, "V MB ({mb_col},{mb_row}) fp={full_pixel}");
             }
         }
     }

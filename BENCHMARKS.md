@@ -685,6 +685,43 @@ top-left luma + bottom-right chroma clamp, and a real corner-MB
 `reconstruct_inter_mb_matches_legacy_for_whole_pixel` test anchors the
 full reconstruct path. Stable lib 474 → 479.
 
+## Round 274 — SPLITMV write-strategy A/B (negative result)
+
+Round 274 (2026-06-11) closes the rounds 270–272 next-round candidate
+"SPLITMV whole-pixel sub-block batching" with a measured negative result.
+SPLITMV macroblocks (RFC 6386 §16.4) carry sixteen distinct luma vectors
+(plus four chroma), so the MB-scale shared-halo batch (`sixtap_mb_luma` /
+`sixtap_mb_chroma`, `fetch_*_mb_whole_pixel`) cannot apply — every sub-block
+is synthesised independently. The only remaining freedom is *how* each
+per-sub-block result lands in the macroblock raster. Two byte-identical
+strategies were benchmarked (`motion_comp_subpel_luma/splitmv_predict_*`):
+
+| Strategy | Wall time |
+|---|---:|
+| `splitmv_predict_scratch_copy` (shipped) | **398.8 ns** |
+| `splitmv_predict_strided_write` (`filter_block_4x4_into`) | 480.5 ns |
+
+* **scratch_copy** builds a contiguous `[u8; 16]` block per sub-block
+  (`filter_block_4x4`), then copies four contiguous 4-byte rows into the
+  stride-16 (luma) / stride-8 (chroma) raster — the form `predict_split_mv`
+  ships.
+* **strided_write** writes each synthesised sub-block directly into the
+  raster at its strided offset via the new `filter_block_4x4_into`, with no
+  intermediate block.
+
+The scratch-copy form wins by ~17 % on Apple M4 / aarch64: the contiguous
+`[u8; 16]` lets the compiler vectorise the per-row writes, where the
+scattered strided writes into a stride-16 raster cannot. `predict_split_mv`
+therefore keeps the scratch path. `filter_block_4x4_into` is retained as a
+public primitive (for callers that already own a destination raster) and is
+byte-exact against `filter_block_4x4` + a strided copy
+(`filter_block_4x4_into_matches_filter_block_4x4`,
+`strided_into_assembly_matches_predict_split_mv`). The 16-sub-block
+synthesis cost dominates; the write strategy is a ~4–5 % slice of total
+per-MB SPLITMV prediction, so neither form moves whole-frame inter encode
+materially — the value of the round is the documented A/B closing the
+candidate.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -692,13 +729,12 @@ full reconstruct path. Stable lib 474 → 479.
   (`_xzm_*`) should have shifted; re-profile to find the next biggest
   short-lived `Vec` (the §11 mode picker + `near_mv` MV-candidate
   scratch are the most likely remaining offenders).
-* **SPLITMV whole-pixel sub-block batching** — rounds 270–272 landed the
-  whole-MB sub-pixel luma + chroma paths and the whole-pixel non-SPLITMV
-  luma + chroma copy paths. SPLITMV luma stays per-sub-block by
-  construction (sixteen distinct vectors), so it can't use the shared MB
-  region; the only remaining gather to amortise is the SPLITMV
-  whole-pixel case where adjacent sub-blocks happen to share a vector
-  (data-dependent, lower expected return).
+* **~~SPLITMV whole-pixel sub-block batching~~** — closed negative in round
+  274 (see the round-274 section above): SPLITMV sub-blocks carry distinct
+  vectors so the shared-halo batch can't apply, and the only remaining
+  freedom (the per-sub-block write strategy) measured ~17 % SLOWER as a
+  strided write than the shipped contiguous `[u8; 16]`-scratch copy. The
+  candidate is retired.
 * **Whole-frame `keyframe_encode` re-measure under nightly + `simd`**
   — round 247's per-primitive `--quick` numbers imply a sub-percent
   whole-frame win, deep below the bench's `--quick` noise envelope. A

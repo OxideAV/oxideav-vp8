@@ -4,6 +4,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `filter_block_4x4_into` strided-write primitive + round-274 SPLITMV write-strategy A/B (round 274, 2026-06-11)
+
+Round 274 closes the long-standing BENCHMARKS next-round candidate "SPLITMV
+whole-pixel sub-block batching" — with a **measured negative result** that
+keeps the production path unchanged and documents why.
+
+SPLITMV macroblocks (RFC 6386 §16.4) carry sixteen distinct luma motion
+vectors (plus four chroma), so the MB-scale shared-halo batch landed in
+rounds 270–272 cannot apply — each sub-block must be synthesised
+independently. The only freedom left is *how* each per-sub-block result
+lands in the macroblock raster:
+
+* **`filter_block_4x4_into`** (new public fn) — the strided-write companion
+  of `filter_block_4x4`: synthesises one 4×4 sub-block and writes it
+  directly into a destination raster at `(dst_x, dst_y)` / `dst_stride`,
+  with no intermediate `[u8; 16]`. The whole-pixel branch copies source rows
+  straight into the destination (§18.3 "simply copied" / §20.14
+  `build_mc_border` edge replication on the border-straddle path); the
+  sub-pixel branch delegates the pixel computation to `filter_block_4x4`
+  verbatim (so the `sixtap_2d` SIMD dispatch and its byte-exactness proof
+  carry) and writes the result strided.
+
+* **The shipped `predict_split_mv` path stays scratch-then-copy.** A new
+  `motion_comp_subpel_luma/splitmv_predict_*` criterion bench measures the
+  two write strategies, which produce byte-identical output: the
+  scratch-copy form (`filter_block_4x4` → `[u8; 16]` → four contiguous 4-byte
+  row copies) runs ~17 % FASTER than the strided-write form (398.8 ns vs
+  480.5 ns, Apple M4 / aarch64, criterion `--quick`). The contiguous block
+  lets the compiler vectorise the per-row writes, where scattered strided
+  writes into a stride-16 raster cannot. `predict_split_mv` therefore keeps
+  the scratch path; the round-270/271/272 MB-batch candidate list's SPLITMV
+  entry is closed negative.
+
+`filter_block_4x4_into` is retained as a public primitive (useful for
+callers that already own a destination raster) with two equivalence
+guards: `filter_block_4x4_into_matches_filter_block_4x4` (strided write ==
+`filter_block_4x4` across whole-pixel / sub-pixel / corner-clamp cases) and
+`strided_into_assembly_matches_predict_split_mv` (a full strided-write MB
+assembly == the shipped `predict_split_mv`, sixteen distinct vectors, both
+`full_pixel` polarities, in-bounds + corner MB). Lib tests 479 → 481. No
+change to encode / decode output bytes.
+
 ### Added — `panic_free_mb_batch_motion_comp` fuzz target (round 273, 2026-06-10)
 
 Round 273 adds the fifteenth `cargo-fuzz` target, closing a coverage gap

@@ -275,7 +275,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships fifteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships sixteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom:
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
@@ -567,6 +567,36 @@ that exercise the public encode and decode surface for panic-freedom:
   ft: 569, corp: 65/1063b` across 810 049 iterations from an empty seed
   on aarch64-apple-darwin at ~31 155 exec/s, peak RSS 495 MiB, zero
   panics.
+* `panic_free_filter_block_into` — the §16.4 SPLITMV strided-write
+  motion-comp primitive `filter_block_4x4_into` landed in round 274: the
+  companion of `filter_block_4x4` that synthesises one 4×4 sub-block
+  (§20.14 `filter_block`) and writes it directly into a destination
+  raster at `(dst_x, dst_y)` / `dst_stride` — whole-pixel branch copies
+  source rows straight in (§18.3 "simply copied" / §20.14
+  `build_mc_border` edge replication on the border-straddle path),
+  sub-pixel branch delegates to `filter_block_4x4` and writes strided. It
+  landed *after* the round-257 `panic_free_sixtap_subpel` target (which
+  drives `filter_block_4x4` itself), so no existing harness reaches its
+  destination-raster triple: the in-tree round-274 equivalence tests
+  drive fixed inputs on one mid-plane geometry, and `predict_split_mv`
+  keeps the shipped scratch-copy form so the decode / encode stack never
+  exposes `(dst_x, dst_y, dst_stride)` to an attacker. This target drives
+  it directly with an attacker-shaped `(plane dimension, block origin,
+  mv, fraction, filter set, border-position class, destination geometry)`
+  envelope — every border class (mid-plane fast path, top-left corner,
+  bottom-right corner, adversarial full-`i16` MV), both whole-pixel and
+  sub-pixel vectors, both §18.3 filter sets, and a `dst_stride` / `dst_x`
+  / `dst_y` swept across `16..=32` — plus two equivalence cross-checks
+  asserted on every iteration (panic on mismatch): the 4×4 footprint at
+  `(dst_x, dst_y)` must equal `filter_block_4x4`'s `[u8; 16]` block byte
+  for byte (the round-274 `filter_block_4x4_into_matches_filter_block_4x4`
+  invariant, under the attacker-shaped clamp + destination envelope the
+  in-tree test never reaches), and every destination byte outside the 4×4
+  footprint must retain its pre-fill sentinel (a stride / length
+  regression that strided past the window is caught here). 31-second smoke
+  pass landed `cov: 248, ft: 369, corp: 63/1738b` across 3 961 583
+  iterations from an empty seed on aarch64-apple-darwin at ~127 793
+  exec/s, peak RSS 428 MiB, zero panics.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

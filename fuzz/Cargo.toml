@@ -505,3 +505,9 @@ name = "panic_free_mb_batch_motion_comp"
 path = "fuzz_targets/panic_free_mb_batch_motion_comp.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "panic_free_filter_block_into"
+path = "fuzz_targets/panic_free_filter_block_into.rs"
+test = false
+doc = false

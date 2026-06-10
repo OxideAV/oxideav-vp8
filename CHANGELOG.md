@@ -4,6 +4,32 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — compile-time SPLITMV partition-group table (round 277, 2026-06-11)
+
+Profile-guided allocation elimination in the §16.4 SPLITMV encoder
+path, closing the round-276 "remaining allocator churn" candidate. The
+fresh inter-encode profile attributed essentially all of the residual
+malloc/free samples to `encoder::partition_groups` (a per-call
+`Vec<Vec<usize>>` rebuilt for every (macroblock, partition shape) the
+SPLITMV scorer visits) plus the two per-candidate `Vec`s inside
+`SplitMvCandidate`. Two changes, bit-identical encoder output:
+
+* `partition_groups` now returns `&'static PartitionGroups` from a
+  table built **at compile time** (`const fn`) from the §20.13
+  `MV_PARTITIONS` constant — same single source of truth, zero runtime
+  work, zero allocation. Group slices keep the raster (ascending)
+  member order, so `group[0]` remains the §16.4 anchor.
+* `SplitMvCandidate::{submv_modes, submv_new_diffs}` switch from
+  per-candidate `Vec`s to fixed `[_; 16]` arrays indexed by group id
+  (entries past the partition's group count stay at their fill value
+  and are never read).
+
+Measured on the `inter_encode_short_clip` bench (Apple M4, 30 s
+measurement): 8.96 ms → 8.83 ms (−1.4 %); the sample(1) call-tree
+allocator-family count drops 794 → 40 samples and the allocator
+disappears from the ≥5-sample top-of-stack list entirely. Output is
+bit-identical (full suite + an 18-frame 3-resolution A/B byte hash).
+
 ### Changed — MV-cost `log2` lookup table + allocation-free tree walks (round 276, 2026-06-11)
 
 Profile-guided micro-optimisation of the encoder's RD-costing hot path,

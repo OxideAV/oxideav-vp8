@@ -4492,12 +4492,17 @@ struct SplitMvCandidate {
     /// vectors, in raster order (matching `MV_PARTITIONS` layout).
     split_mvs: [crate::motion_vector::Mv; 16],
     /// The per-partition-group `sub_mv_ref` mode (indexed in partition-id
-    /// order: group 0 first, then 1, …). Length is the partition's group
-    /// count (2 for TopBottom/LeftRight, 4 for Quarters, 16 for Mv16).
-    submv_modes: Vec<crate::near_mv::SubMvRefMode>,
+    /// order: group 0 first, then 1, …). Only the partition's group
+    /// count (2 for TopBottom/LeftRight, 4 for Quarters, 16 for Mv16)
+    /// leading entries are meaningful; the rest stay at the `Zero4x4`
+    /// fill and are never read (the emitter iterates exactly the
+    /// partition's groups). Fixed-size since round 277 — the previous
+    /// per-candidate `Vec` pair was a measurable slice of the encoder's
+    /// residual allocator churn.
+    submv_modes: [crate::near_mv::SubMvRefMode; 16],
     /// The per-group NEW4X4 differential (zero `Mv` for groups whose
-    /// `sub_mv_ref` mode is not NEW4X4). Same length as `submv_modes`.
-    submv_new_diffs: Vec<crate::motion_vector::Mv>,
+    /// `sub_mv_ref` mode is not NEW4X4). Same indexing as `submv_modes`.
+    submv_new_diffs: [crate::motion_vector::Mv; 16],
     /// Total `J = sum_groups group_SAD + lambda * (mv_ref_tree("1111") +
     /// mvpartition_tree(p) + sum_groups sub_mv_ref_tree + NEW4X4 bits)`
     /// for this partition. Lower wins.
@@ -4646,22 +4651,76 @@ fn group_small_diamond_search(
 /// The §16.4 sub-block index ordering — `MV_PARTITIONS` is indexed by
 /// sub-block raster id and stores group ids, but the partition decode
 /// emits groups in `partition_id` order with the anchor as the first
-/// sub-block carrying that group id. This helper precomputes
+/// sub-block carrying that group id. [`PartitionGroups`] precomputes
 /// `groups[g] = [list of sub-block indices belonging to group g]` for
-/// a given partition.
-fn partition_groups(p: crate::near_mv::MvPartition) -> Vec<Vec<usize>> {
-    let pid = crate::near_mv::partition_id(p);
-    let table = &crate::near_mv::MV_PARTITIONS[pid];
-    let num_groups = match p {
-        crate::near_mv::MvPartition::TopBottom | crate::near_mv::MvPartition::LeftRight => 2,
-        crate::near_mv::MvPartition::Quarters => 4,
-        crate::near_mv::MvPartition::Mv16 => 16,
-    };
-    let mut groups: Vec<Vec<usize>> = (0..num_groups).map(|_| Vec::new()).collect();
-    for (idx, &g) in table.iter().enumerate() {
-        groups[g as usize].push(idx);
+/// each of the four partitions — at compile time, since the §20.13
+/// `MV_PARTITIONS` table is a constant. Round 277 replaced the previous
+/// per-call `Vec<Vec<usize>>` builder with this table: the SPLITMV
+/// scorer runs once per (MB, partition shape) and the nested-`Vec`
+/// build dominated the encoder's residual allocator churn.
+struct PartitionGroups {
+    /// `members[g][..len[g]]` — the raster sub-block indices of group
+    /// `g`, ascending (so `members[g][0]` is the §16.4 group anchor,
+    /// "the first sub-block whose partition entry is `g`").
+    members: [[usize; 16]; 16],
+    /// Per-group member count.
+    len: [usize; 16],
+    /// Number of groups in this partition (2 / 2 / 4 / 16).
+    num_groups: usize,
+}
+
+impl PartitionGroups {
+    /// Decompose row `pid` of [`crate::near_mv::MV_PARTITIONS`]
+    /// (`pid` = the §16.4 `partition_id`) into its member groups.
+    const fn build(pid: usize) -> Self {
+        let table = &crate::near_mv::MV_PARTITIONS[pid];
+        let mut members = [[0usize; 16]; 16];
+        let mut len = [0usize; 16];
+        let mut num_groups = 0usize;
+        let mut idx = 0usize;
+        while idx < 16 {
+            let g = table[idx] as usize;
+            members[g][len[g]] = idx;
+            len[g] += 1;
+            if g + 1 > num_groups {
+                num_groups = g + 1;
+            }
+            idx += 1;
+        }
+        PartitionGroups {
+            members,
+            len,
+            num_groups,
+        }
     }
-    groups
+
+    /// The member sub-block indices of group `g` (`g < num_groups`).
+    #[inline]
+    fn group(&self, g: usize) -> &[usize] {
+        &self.members[g][..self.len[g]]
+    }
+
+    /// Iterate the groups in partition-id order.
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &[usize]> + '_ {
+        (0..self.num_groups).map(move |g| self.group(g))
+    }
+}
+
+/// The four [`PartitionGroups`] decompositions, indexed by
+/// `crate::near_mv::partition_id` order (TopBottom / LeftRight /
+/// Quarters / Mv16) — built at compile time from the §20.13 table.
+static PARTITION_GROUP_TABLE: [PartitionGroups; 4] = [
+    PartitionGroups::build(0),
+    PartitionGroups::build(1),
+    PartitionGroups::build(2),
+    PartitionGroups::build(3),
+];
+
+/// Look up the precomputed group decomposition for partition `p`.
+#[inline]
+fn partition_groups(p: crate::near_mv::MvPartition) -> &'static PartitionGroups {
+    &PARTITION_GROUP_TABLE[crate::near_mv::partition_id(p)]
 }
 
 /// Per-group `sub_mv_ref` mode cost in fractional bits — the
@@ -4736,14 +4795,13 @@ fn score_split_partition(
     lambda: f64,
 ) -> Option<SplitMvCandidate> {
     let groups = partition_groups(partition);
-    let num_groups = groups.len();
     let mut split_mvs = [crate::motion_vector::Mv::default(); 16];
-    let mut submv_modes: Vec<crate::near_mv::SubMvRefMode> = Vec::with_capacity(num_groups);
-    let mut submv_new_diffs: Vec<crate::motion_vector::Mv> = Vec::with_capacity(num_groups);
+    let mut submv_modes = [crate::near_mv::SubMvRefMode::Zero4x4; 16];
+    let mut submv_new_diffs = [crate::motion_vector::Mv::default(); 16];
     let mut total_sad: u32 = 0;
     let mut total_submv_bits: f64 = 0.0;
 
-    for group in groups.iter() {
+    for (g_idx, group) in groups.iter().enumerate() {
         // The anchor is the smallest sub-block index in the group
         // (§16.4 / §20.11 "find the first sub-block whose partition
         // entry is j" — `partition_groups` already collects in raster
@@ -4861,8 +4919,8 @@ fn score_split_partition(
         if matches!(best_mode, M::New4x4) {
             total_submv_bits += crate::motion_vector::mv_bits(mv_contexts, best_group_diff);
         }
-        submv_modes.push(best_mode);
-        submv_new_diffs.push(best_group_diff);
+        submv_modes[g_idx] = best_mode;
+        submv_new_diffs[g_idx] = best_group_diff;
     }
 
     // Total J adds the partition's §16.4 `mvpartition_tree` bits to
@@ -8598,6 +8656,48 @@ mod tests {
     use crate::coded_header::Vp8CodedHeader;
     use crate::decode_vp8;
     use crate::frame_header::Vp8FrameHeader;
+
+    /// Equivalence proof for the round-277 compile-time
+    /// `PARTITION_GROUP_TABLE`: for each of the four §16.4 partitions,
+    /// the precomputed groups must be exactly what a direct walk of the
+    /// §20.13 `MV_PARTITIONS` row produces — the right group count
+    /// (2 / 2 / 4 / 16), every sub-block in the group whose id the
+    /// table assigns it, raster-ascending member order (so `group[0]`
+    /// is the §16.4 anchor), and all 16 sub-blocks covered exactly
+    /// once.
+    #[test]
+    fn partition_group_table_matches_mv_partitions() {
+        use crate::near_mv::{partition_id, MvPartition, MV_PARTITIONS};
+        for (p, expected_groups) in [
+            (MvPartition::TopBottom, 2usize),
+            (MvPartition::LeftRight, 2),
+            (MvPartition::Quarters, 4),
+            (MvPartition::Mv16, 16),
+        ] {
+            let groups = partition_groups(p);
+            assert_eq!(groups.num_groups, expected_groups, "{p:?} group count");
+            let table = &MV_PARTITIONS[partition_id(p)];
+            let mut seen = [false; 16];
+            for g in 0..groups.num_groups {
+                let members = groups.group(g);
+                assert!(!members.is_empty(), "{p:?} group {g} empty");
+                let mut prev: Option<usize> = None;
+                for &b in members {
+                    assert_eq!(
+                        table[b] as usize, g,
+                        "{p:?} sub-block {b} listed under group {g}"
+                    );
+                    assert!(!seen[b], "{p:?} sub-block {b} listed twice");
+                    seen[b] = true;
+                    if let Some(prev) = prev {
+                        assert!(prev < b, "{p:?} group {g} not raster-ascending");
+                    }
+                    prev = Some(b);
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "{p:?} does not cover all 16");
+        }
+    }
 
     /// Equivalence proof for the precomputed `TOKEN_BIT_PATHS` table:
     /// for every reachable `(start_index, token)` combination, the

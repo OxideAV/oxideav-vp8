@@ -783,13 +783,62 @@ the same doubles, so every pick is unchanged — the full fixture /
 roundtrip suite passes untouched (lib tests 481 → 482 with the new
 full-range cost regression anchor).
 
+## Round 277 — compile-time SPLITMV partition-group table
+
+Round 277 (2026-06-11) ran the attribution pass the round-276 candidate
+asked for. A fresh `sample(1)` profile of the inter-encode bench (15 s
+attach, 1 ms interval, `--measurement-time 60`) counted ~335
+allocator-family top-of-stack self-samples (`_xzm_free` 98,
+`_xzm_xzone_malloc` 43, `_malloc_zone_malloc` 24, `finish_grow` 25,
+`grow_one` 20, plus dedup/realloc tails). Call-tree attribution put
+essentially **all** of it under `encoder::partition_groups` — NOT the
+`near_mv` census (which is stack-only) nor the per-frame `stream`
+assembly the candidate guessed. `partition_groups` rebuilt a
+`Vec<Vec<usize>>` (1 outer + up to 16 inner allocations) on every call,
+and the SPLITMV scorer calls it once per (MB, partition shape) — 4× per
+MB per reference frame; the per-candidate `SplitMvCandidate`
+`submv_modes` / `submv_new_diffs` `Vec` pair accounted for the rest.
+
+Two changes, bit-identical encoder output:
+
+1. **`partition_groups` becomes a compile-time table.** A `const fn`
+   decomposes each row of the §20.13 `MV_PARTITIONS` constant into a
+   `PartitionGroups { members: [[usize; 16]; 16], len, num_groups }`
+   record; the four records live in a `static` and the function now
+   returns `&'static PartitionGroups`. Same single source of truth
+   (the spec table), zero runtime work, zero allocation. Member order
+   inside each group stays raster-ascending so `group[0]` remains the
+   §16.4 anchor.
+2. **`SplitMvCandidate` drops its two `Vec`s** for fixed `[_; 16]`
+   arrays indexed by group id; the emit path already walks exactly
+   `num_groups` entries so the tail fill values are never read.
+
+### Measured A/B (criterion, 30 s measurement, Apple M4 / aarch64, stable)
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 8.96 ms | **8.83 ms** | **−1.4 %** |
+
+Throughput: inter 7.31 → **7.39 Mpx/s** (same-session A/B; criterion's
+stored-baseline estimate said −2.2 %). The post-change profile confirms
+the causal chain: the allocator family disappears from the ≥5-sample
+top-of-stack list entirely, and the same call-tree counting script
+drops 794 → **40** allocator samples — what remains is the bounded
+per-frame `stream` assembly (BoolEncoder output growth), not per-MB
+churn. Bit-identity was checked two ways: the full 482-test suite plus
+fixture/roundtrip integration suites, and an 18-frame A/B byte-hash
+(3 resolutions × 6 frames × 3 quantisers through
+`Vp8InterStreamEncoder`) — identical FNV-1a before/after.
+
 ## What didn't get touched yet (next-round candidates)
 
-* **Remaining allocator churn (`malloc` / `free`)** — round 276 cleared
-  the `mv_component_bits` / `treed_bits` / `write_treed` `Vec` churn
-  (see above) but ~300 samples of `_xzm_*` remain in the inter profile;
-  the next attribution pass should look at the `near_mv` MV-candidate
-  scratch and the per-frame partition assembly in `stream`.
+* **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
+  round 277 (see above): the churn was `partition_groups`'
+  per-call `Vec<Vec<usize>>` + the `SplitMvCandidate` `Vec` pair, both
+  now allocation-free. The residual ~40 call-tree allocator samples are
+  the per-frame partition assembly (`BoolEncoder` output `Vec` growth
+  in `stream`) — bounded per frame, not per MB, and not worth a
+  speculative pre-reserve without a fresh profile pointing at it.
 * **~~SPLITMV whole-pixel sub-block batching~~** — closed negative in round
   274 (see the round-274 section above): SPLITMV sub-blocks carry distinct
   vectors so the shared-halo batch can't apply, and the only remaining

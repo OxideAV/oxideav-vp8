@@ -536,6 +536,61 @@ product extremes through output column 0 under the ½-displacement
 taps). The full lib suite passes on stable (463) and nightly + `simd`
 (465).
 
+## Round 270 — MB-scale §18.3 luma batching (`sixtap_mb_luma`)
+
+Round 270 (2026-06-10) closes the round-269 next-round candidate
+"MB-scale §18.3 batching". The round-269 per-4×4 `sixtap_2d` SIMD win
+was capped by the 4-wide block geometry; the real headroom is one layer
+up in `predict_inter_mb`, where all sixteen luma sub-blocks of a
+non-SPLITMV MB share one §18.1 motion vector. Instead of sixteen
+overlapping 9×9 `fetch_block_halo` + `sixtap_2d` calls, the sub-pixel
+luma path now fetches one 21×21 halo (`fetch_luma_mb_halo`) and
+synthesises the whole 16×16 luma block in a single two-pass convolution
+(`sixtap_mb_luma`): a horizontal pass of 21 rows × 16 cols then a
+vertical pass of 16 rows × 16 cols. The SIMD partner widens each pass to
+`Simd<i32, 16>` — one sixteen-lane vector per output row, the clamped
+horizontal intermediate resident in `i32` vectors so the vertical pass
+runs with zero loads.
+
+The new `motion_comp_subpel_luma/mb_luma_batched_16x16` bench measures
+the whole-MB synthesis against the per-sub-block partner
+`mb_luma_per_subblock_16x16` (sixteen `sixtap_2d` calls on the same
+sub-pixel workload). Numbers on `aarch64-apple-darwin` (criterion
+`--quick`, nightly toolchain for both columns so the compiler version
+cancels):
+
+| Bench | Per-sub-block | Batched scalar | Batched SIMD |
+|---|---:|---:|---:|
+| whole 16×16 luma block | 260–268 ns | **158.8 ns** | **140.2 ns** |
+
+Reading the result:
+
+* **Batched scalar vs per-sub-block: −41 %** (158.8 vs ~267.9 ns). The
+  bulk of the MB-scale win is structural, not SIMD: one 21×21 fetch +
+  one tight two-pass loop replaces sixteen 9×9 fetches and sixteen
+  separate two-pass calls, amortising the per-block border / gather
+  setup the round-170 profile attributed ~90 self-samples to
+  (`fetch_block_halo` + `fetch_block_whole_pixel`).
+* **Batched SIMD vs batched scalar: −12 %** (140.2 vs 158.8 ns). The
+  `Simd<i32, 16>` rewrite quadruples the lane width vs round-269's
+  `Simd<i32, 4>` 4×4-block form, so each horizontal-pass row is one
+  sixteen-lane vector and the per-block setup the 4-wide form paid 16×
+  is paid once.
+* **Batched SIMD vs per-sub-block: −47 %** end-to-end (140.2 vs
+  ~265 ns) — the headline. This is the path `predict_inter_mb` takes for
+  every sub-pixel non-SPLITMV inter MB on nightly + `simd`.
+
+Byte-exactness is anchored three ways:
+`sixtap_mb_luma_matches_per_subblock_path` (whole-MB vs sixteen
+`sixtap_2d` calls over the carved 9×9 sub-halos, every `(mx, my)` × both
+filter sets), `sixtap_mb_luma_simd_matches_scalar_on_stress_inputs`
+(dispatcher vs scalar over the flat / ramp / checker / LCG stress set),
+and `predict_inter_mb_sub_pixel_at_border_uses_mb_halo_clamp` (a real
+corner-MB prediction through the MB-halo border-clamp fallback). The
+chroma path keeps the per-sub-block dispatch (the 8×8 chroma block gains
+little from MB-scale batching, and the §18.1 averaged-vector / SPLITMV
+cases use per-sub-block vectors).
+
 ## What didn't get touched yet (next-round candidates)
 
 * **Remaining allocator churn (`malloc` / `free`)** — after r204 removed
@@ -543,12 +598,14 @@ taps). The full lib suite passes on stable (463) and nightly + `simd`
   (`_xzm_*`) should have shifted; re-profile to find the next biggest
   short-lived `Vec` (the §11 mode picker + `near_mv` MV-candidate
   scratch are the most likely remaining offenders).
-* **MB-scale §18.3 batching** — the round-269 per-4×4 `sixtap_2d`
-  SIMD win is capped by the 4-wide block geometry; real headroom is
-  one layer up in `predict_inter_mb`, which runs sixteen independent
-  4×4 interpolations off one 21×21 halo. A whole-MB horizontal pass
-  (16-wide rows, `Simd<u8/i32, 16>` stripes) would amortise the per-
-  block setup and quadruple the lane utilisation.
+* **MB-scale §18.3 chroma + SPLITMV batching** — round 270 landed the
+  whole-MB luma path (`sixtap_mb_luma`, 21×21 halo, `Simd<i32, 16>`,
+  −47 % end-to-end). The chroma planes still run per-sub-block (four
+  4×4 interpolations off four 9×9 halos per plane); an 8×8 MB-scale
+  chroma pass (`Simd<i32, 8>` over a 13×13 halo) would extend the same
+  amortisation, though the smaller block gives a smaller absolute win.
+  SPLITMV luma stays per-sub-block by construction (sixteen distinct
+  vectors), so it can't use the shared-vector MB halo.
 * **Whole-frame `keyframe_encode` re-measure under nightly + `simd`**
   — round 247's per-primitive `--quick` numbers imply a sub-percent
   whole-frame win, deep below the bench's `--quick` noise envelope. A

@@ -623,6 +623,232 @@ fn sixtap_2d_simd(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8]
     out
 }
 
+/// Fetch the 21×21 edge-replicated halo a whole-macroblock six-tap luma
+/// interpolation needs — RFC 6386 §20.14 `build_mc_border`, MB-scale.
+///
+/// All sixteen luma sub-blocks of a non-SPLITMV macroblock share one
+/// motion vector (§18.1), so the six-tap support of the whole 16×16 luma
+/// block is one contiguous `(16 + 5) × (16 + 5) = 21×21` region — the
+/// 16×16 block plus the two-before / three-after support pixels in each
+/// dimension. This is the MB-scale analogue of the per-sub-block
+/// [`fetch_block_halo`]: it covers source positions
+/// `[src_y0 - 2, src_y0 + 18] × [src_x0 - 2, src_x0 + 18]` (where
+/// `(src_x0, src_y0) = (mb_x, mb_y) + (mv >> 3)` is the integer-offset MB
+/// origin), clamping any out-of-plane read to the nearest edge pixel.
+/// The result is row-major with stride 21; the 16×16 block origin sits at
+/// `halo[(2, 2)]`, matching [`sixtap_mb_luma`]'s expectation.
+///
+/// Fetching one 21×21 region once and convolving it whole replaces the
+/// sixteen overlapping 9×9 [`fetch_block_halo`] fetches the per-sub-block
+/// path would issue, amortising the border / gather setup across the
+/// whole MB (the round-269 BENCHMARKS candidate "MB-scale §18.3
+/// batching").
+pub fn fetch_luma_mb_halo(
+    plane: &[u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    mb_x: usize,
+    mb_y: usize,
+    mv: Mv,
+) -> [u8; 21 * 21] {
+    let off_x = (mv.col >> 3) as isize;
+    let off_y = (mv.row >> 3) as isize;
+    // The halo origin is two pixels above/left of the integer MB origin
+    // (the first six-tap support pixel).
+    let src_x0 = mb_x as isize + off_x - 2;
+    let src_y0 = mb_y as isize + off_y - 2;
+
+    let w_i = w as isize;
+    let h_i = h as isize;
+    let mut out = [0u8; 21 * 21];
+
+    // Fast path mirroring [`fetch_block_halo`]: when the 21×21 halo lands
+    // strictly inside the plane (the dominant case for inter-MBs that
+    // don't touch the picture border), each output row is a contiguous
+    // 21-byte slice of the reference plane — no per-pixel `.clamp()`. The
+    // fallback below is bit-identical for halos that straddle the border.
+    if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 21 <= w_i && src_y0 + 21 <= h_i {
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        for r in 0..21 {
+            let row_start = (y0 + r) * stride + x0;
+            out[r * 21..r * 21 + 21].copy_from_slice(&plane[row_start..row_start + 21]);
+        }
+        return out;
+    }
+
+    for r in 0..21 {
+        let sy = (src_y0 + r as isize).clamp(0, h_i - 1);
+        for c in 0..21 {
+            let sx = (src_x0 + c as isize).clamp(0, w_i - 1);
+            out[r * 21 + c] = plane[sy as usize * stride + sx as usize];
+        }
+    }
+    out
+}
+
+/// Two-dimensional six-tap interpolation of a whole 16×16 luma block —
+/// the MB-scale analogue of [`sixtap_2d`], RFC 6386 §18.3 / §20.14.
+///
+/// `halo` is the 21×21 edge-replicated source region from
+/// [`fetch_luma_mb_halo`]: row-major, stride 21, with the 16×16 block
+/// origin at `halo[(2, 2)]`. The horizontal pass synthesises a
+/// 16-wide × 21-tall intermediate (the 16 block rows plus the two-above /
+/// three-below support the vertical pass needs); the vertical pass then
+/// synthesises the final 16×16. `(mx, my)` are the eighth-pixel fractions
+/// (`mv & 7`); `filters` is the version-selected tap set.
+///
+/// This is byte-exact with applying [`sixtap_2d`] to each of the sixteen
+/// 4×4 sub-blocks separately: the §18.3 `interp` dot product is the same
+/// per output sample regardless of how the support is tiled, and the
+/// horizontal-pass intermediate is clamped identically (the §20.14
+/// `temp` buffer is 8-bit per sample). The win is fetching + convolving
+/// one 21×21 region instead of sixteen overlapping 9×9 regions.
+///
+/// Dispatch: SIMD path on nightly + `simd`, scalar otherwise — same shape
+/// as [`sixtap_2d`].
+pub fn sixtap_mb_luma(
+    halo: &[u8; 21 * 21],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> [u8; 256] {
+    #[cfg(feature = "simd")]
+    {
+        sixtap_mb_luma_simd(halo, mx, my, filters)
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        sixtap_mb_luma_scalar(halo, mx, my, filters)
+    }
+}
+
+/// Scalar MB-scale §20.14 `sixtap_2d` over a 16×16 luma block.
+///
+/// Horizontal pass: 21 rows × 16 cols, each output sample the §18.3
+/// `interp` of the six horizontal support samples `halo[r*21 + c ..][..6]`
+/// (block origin at halo column 2, so output column c reads
+/// `halo[r*21 + c+2-2 ..= c+2+3]`). Intermediate clamped to 8-bit, stride
+/// 16. Vertical pass: 16 rows × 16 cols reading the intermediate at block
+/// origin row 2 (`temp` rows `r ..= r+5`).
+#[allow(dead_code)] // Used by `sixtap_mb_luma` only on the !simd path.
+fn sixtap_mb_luma_scalar(
+    halo: &[u8; 21 * 21],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> [u8; 256] {
+    let fh = &filters[mx];
+    let fv = &filters[my];
+
+    // Horizontal pass: 21 rows of 16 output samples.
+    let mut temp = [0u8; 21 * 16];
+    for r in 0..21 {
+        let row_base = r * 21;
+        for c in 0..16 {
+            let mut support = [0u8; 6];
+            for (k, s) in support.iter_mut().enumerate() {
+                // Block origin is column 2; output column c reads
+                // halo[c+2-2 ..= c+2+3] = halo[c ..= c+5].
+                *s = halo[row_base + c + k];
+            }
+            temp[r * 16 + c] = interp(fh, &support);
+        }
+    }
+
+    // Vertical pass: 16 rows of 16 output samples, reading the
+    // intermediate at block origin row 2.
+    let mut out = [0u8; 256];
+    for r in 0..16 {
+        for c in 0..16 {
+            let mut support = [0u8; 6];
+            for (k, s) in support.iter_mut().enumerate() {
+                // Block origin row is 2; output row r reads temp rows
+                // r+2-2 ..= r+2+3 = r ..= r+5.
+                *s = temp[(r + k) * 16 + c];
+            }
+            out[r * 16 + c] = interp(fv, &support);
+        }
+    }
+    out
+}
+
+/// SIMD MB-scale §18.3 / §20.14 `sixtap_2d` over a 16×16 luma block —
+/// `core::simd::Simd<i32, 16>` row rewrite of [`sixtap_mb_luma_scalar`].
+///
+/// Each of the 21 horizontal-pass rows produces sixteen output samples
+/// whose four §18.3 `interp` dot products are independent — only the
+/// support window slides by one sample per output column. The whole row
+/// is computed as one sixteen-lane vector: for tap `k` the sixteen lanes'
+/// support samples are the contiguous source run `halo[r*21 + k ..][..16]`,
+/// so the six taps become six widen-multiply-accumulates of sixteen lanes
+/// each in place of 96 scalar multiply-accumulates per row. The
+/// horizontal pass's clamped intermediate stays resident in `i32` vectors
+/// (every lane already in `0..=255` after the lane-wise clamp), so the
+/// vertical pass — sixteen output rows, each one sixteen-lane vector
+/// summing six intermediate rows under the vertical taps — runs with zero
+/// loads.
+///
+/// Lane type: the accumulator must be `i32`, not `i16`, for the same
+/// reason as [`sixtap_2d_simd`]: the §18.3 six-tap dot product over `u8`
+/// support spans `[-8160, 40800]` (the ½-displacement row sums positive
+/// taps to 160), past `i16::MAX`. The `i32` lanes reproduce the scalar
+/// `i32` arithmetic exactly. Byte-exactness against
+/// [`sixtap_mb_luma_scalar`] (and, transitively, the per-sub-block
+/// [`sixtap_2d`]) is enforced by
+/// `sixtap_mb_luma_simd_matches_scalar_on_stress_inputs` /
+/// `sixtap_mb_luma_matches_per_subblock_path`.
+#[cfg(feature = "simd")]
+#[inline]
+fn sixtap_mb_luma_simd(
+    halo: &[u8; 21 * 21],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> [u8; 256] {
+    use core::simd::cmp::SimdOrd;
+    use core::simd::num::{SimdInt, SimdUint};
+    use core::simd::Simd;
+
+    let zero = Simd::<i32, 16>::splat(0);
+    let max = Simd::<i32, 16>::splat(255);
+    let seven = Simd::<i32, 16>::splat(7);
+
+    // Horizontal pass: 21 rows × 16 cols. Output column c's tap-k support
+    // sample is halo[r*21 + c + k] (block origin at column 2), so the
+    // sixteen lanes of tap k are the contiguous run
+    // halo[r*21 + k .. r*21 + k + 16].
+    let fh = &filters[mx];
+    let fh_v: [Simd<i32, 16>; 6] = core::array::from_fn(|k| Simd::splat(fh[k]));
+    let mut temp = [Simd::<i32, 16>::splat(0); 21];
+    for (r, trow) in temp.iter_mut().enumerate() {
+        let row = &halo[r * 21..r * 21 + 21];
+        let mut acc = Simd::<i32, 16>::splat(64);
+        for (k, tap) in fh_v.iter().enumerate() {
+            let support: Simd<i32, 16> = Simd::<u8, 16>::from_slice(&row[k..k + 16]).cast::<i32>();
+            acc += support * tap;
+        }
+        *trow = (acc >> seven).simd_clamp(zero, max);
+    }
+
+    // Vertical pass: 16 rows × 16 cols reading the intermediate at block
+    // origin row 2. Output row r's tap-k support row is temp row r + k
+    // (= ref0 + r + k - 2 with ref0 = 2), already a sixteen-lane vector.
+    let fv = &filters[my];
+    let fv_v: [Simd<i32, 16>; 6] = core::array::from_fn(|k| Simd::splat(fv[k]));
+    let mut out = [0u8; 256];
+    for r in 0..16 {
+        let mut acc = Simd::<i32, 16>::splat(64);
+        for (k, tap) in fv_v.iter().enumerate() {
+            acc += temp[r + k] * tap;
+        }
+        let res = (acc >> seven).simd_clamp(zero, max);
+        out[r * 16..r * 16 + 16].copy_from_slice(&res.cast::<u8>().to_array());
+    }
+    out
+}
+
 /// Fetch a 4×4 whole-pixel prediction block from a reference plane with
 /// the §20.14 `build_mc_border` edge-replication rule.
 ///
@@ -1040,26 +1266,37 @@ pub fn predict_inter_mb(
 
     let mut out = ReconstructedMb::default();
 
-    // Luma: sixteen 4×4 sub-blocks, each filtered with the same ymv.
+    // Luma: all sixteen 4×4 sub-blocks share `ymv` (§18.1), so a
+    // sub-pixel vector is interpolated as one whole-MB §18.3 pass off a
+    // single 21×21 halo ([`sixtap_mb_luma`]) — byte-exact with sixteen
+    // separate [`filter_block_4x4`] / [`sixtap_2d`] calls but amortising
+    // the fetch + setup. A whole-pixel vector keeps the per-sub-block
+    // copy fast path (`filter_block_4x4` → `fetch_block_whole_pixel`).
     let y_x0 = mb_col * 16;
     let y_y0 = mb_row * 16;
-    for sb in 0..4 {
-        for sc in 0..4 {
-            let blk = filter_block_4x4(
-                reference.y,
-                reference.y_stride,
-                lw,
-                lh,
-                y_x0 + sc * 4,
-                y_y0 + sb * 4,
-                ymv,
-                filters,
-            );
-            for r in 0..4 {
-                let dst = (sb * 4 + r) * 16 + sc * 4;
-                out.y[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+    let mx = (ymv.col & 7) as usize;
+    let my = (ymv.row & 7) as usize;
+    if mx == 0 && my == 0 {
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let blk = fetch_block_whole_pixel(
+                    reference.y,
+                    reference.y_stride,
+                    lw,
+                    lh,
+                    y_x0 + sc * 4,
+                    y_y0 + sb * 4,
+                    ymv,
+                );
+                for r in 0..4 {
+                    let dst = (sb * 4 + r) * 16 + sc * 4;
+                    out.y[dst..dst + 4].copy_from_slice(&blk[r * 4..r * 4 + 4]);
+                }
             }
         }
+    } else {
+        let halo = fetch_luma_mb_halo(reference.y, reference.y_stride, lw, lh, y_x0, y_y0, ymv);
+        out.y = sixtap_mb_luma(&halo, mx, my, filters);
     }
 
     // Chroma: four 4×4 sub-blocks per plane, each filtered with uvmv.
@@ -2343,6 +2580,199 @@ mod tests {
         // Column 0 hits the negative extreme: clamp255((-8160 + 64) >>
         // 7) = 0, then the constant-0 column stays 0.
         assert_eq!(got_min[0], 0);
+    }
+
+    // ----- MB-scale §18.3 luma batching ------------------------------
+
+    /// Pseudo-random 21×21 halo for cross-checking the MB-scale
+    /// convolution.
+    fn rand_mb_halo(seed: u64) -> [u8; 21 * 21] {
+        let mut s = seed;
+        let mut h = [0u8; 21 * 21];
+        for px in h.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *px = (s >> 33) as u8;
+        }
+        h
+    }
+
+    #[test]
+    fn sixtap_mb_luma_matches_per_subblock_path() {
+        // The whole-MB §18.3 luma synthesis must be byte-identical to
+        // running the per-sub-block sixtap_2d on each of the sixteen 4×4
+        // sub-blocks of the same 16×16 block. Both consume the same
+        // source samples and the same §18.3 interp dot product per output
+        // pixel; only the tiling differs. Sweep every (mx, my) sub-pixel
+        // fraction pair and both filter sets over deterministic halos.
+        for set in [&SIXTAP_FILTERS, &BILINEAR_FILTERS] {
+            for seed in 0..4u64 {
+                let mb_halo = rand_mb_halo(seed * 4099 + 17);
+                for mx in 0..8 {
+                    for my in 0..8 {
+                        let got = sixtap_mb_luma(&mb_halo, mx, my, set);
+                        // Build the per-sub-block reference: each 4×4
+                        // sub-block (sb, sc) extracts its own 9×9 halo
+                        // from the 21×21 MB halo (the sub-block origin is
+                        // at MB-halo position (2 + sb*4, 2 + sc*4); the
+                        // 9×9 sub-halo starts two pixels up/left of that).
+                        for sb in 0..4 {
+                            for sc in 0..4 {
+                                let mut sub = [0u8; 81];
+                                for r in 0..9 {
+                                    for c in 0..9 {
+                                        // MB-halo position of this sub-halo
+                                        // pixel: the sub-block origin in
+                                        // the MB halo is (2 + sb*4, 2 +
+                                        // sc*4); the sub-halo origin is two
+                                        // up/left of that.
+                                        let mr = sb * 4 + r;
+                                        let mc = sc * 4 + c;
+                                        sub[r * 9 + c] = mb_halo[mr * 21 + mc];
+                                    }
+                                }
+                                let sub_out = sixtap_2d(&sub, mx, my, set);
+                                for r in 0..4 {
+                                    for c in 0..4 {
+                                        let mr = sb * 4 + r;
+                                        let mc = sc * 4 + c;
+                                        assert_eq!(
+                                            got[mr * 16 + mc],
+                                            sub_out[r * 4 + c],
+                                            "mx={mx} my={my} sb={sb} sc={sc} ({r},{c})"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sixtap_mb_luma_simd_matches_scalar_on_stress_inputs() {
+        // Dispatcher (SIMD under nightly + `simd`) vs the scalar listing
+        // on the MB-scale path — the §14 `*_simd_matches_scalar` shape,
+        // MB-scale. Flat extremes, opposing ramps, alternating-extreme
+        // checker (the worst case for the clamp endpoints) and a
+        // deterministic LCG set, for every (mx, my) and both filter sets.
+        let mut hramp = [0u8; 21 * 21];
+        let mut vramp = [0u8; 21 * 21];
+        let mut checker = [0u8; 21 * 21];
+        for r in 0..21 {
+            for c in 0..21 {
+                hramp[r * 21 + c] = (c * 12) as u8;
+                vramp[r * 21 + c] = (r * 12) as u8;
+                checker[r * 21 + c] = if (r + c) % 2 == 0 { 255 } else { 0 };
+            }
+        }
+        let mut halos: Vec<[u8; 21 * 21]> =
+            vec![[0u8; 21 * 21], [255u8; 21 * 21], hramp, vramp, checker];
+        for seed in 0..6u64 {
+            halos.push(rand_mb_halo(seed * 7919 + 3));
+        }
+
+        for set in [&SIXTAP_FILTERS, &BILINEAR_FILTERS] {
+            for (h, halo) in halos.iter().enumerate() {
+                for mx in 0..8 {
+                    for my in 0..8 {
+                        let got = sixtap_mb_luma(halo, mx, my, set);
+                        let want = sixtap_mb_luma_scalar(halo, mx, my, set);
+                        assert_eq!(got, want, "halo={h} mx={mx} my={my}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_luma_mb_halo_matches_subblock_halos_in_bounds() {
+        // The 21×21 MB halo must contain every per-sub-block 9×9 halo as a
+        // window: sub-block (sb, sc) at plane position (mb_x + sc*4,
+        // mb_y + sb*4) under the same vector reads a 9×9 region whose
+        // top-left is two pixels up/left of the sub-block origin, which in
+        // the MB halo is position (sb*4, sc*4) (the MB halo origin is two
+        // up/left of the MB origin).
+        let w = 48;
+        let h = 48;
+        let plane = ramp_plane(w, h);
+        let mv = Mv { row: 11, col: 19 }; // sub-pixel, integer offset (1, 2)
+        let mb_x = 16;
+        let mb_y = 16;
+        let mb_halo = fetch_luma_mb_halo(&plane, w, w, h, mb_x, mb_y, mv);
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let sub = fetch_block_halo(&plane, w, w, h, mb_x + sc * 4, mb_y + sb * 4, mv);
+                for r in 0..9 {
+                    for c in 0..9 {
+                        let mr = sb * 4 + r;
+                        let mc = sc * 4 + c;
+                        assert_eq!(
+                            mb_halo[mr * 21 + mc],
+                            sub[r * 9 + c],
+                            "sb={sb} sc={sc} ({r},{c})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fetch_luma_mb_halo_clamps_at_top_left_corner() {
+        // MB at (0,0), zero mv: halo origin (-2,-2). Out-of-plane
+        // rows/cols replicate the nearest edge (build_mc_border), and the
+        // result must equal the per-pixel clamp formula.
+        let w = 24;
+        let h = 24;
+        let plane = ramp_plane(w, h);
+        let mb_halo = fetch_luma_mb_halo(&plane, w, w, h, 0, 0, Mv { row: 0, col: 0 });
+        for r in 0..21 {
+            for c in 0..21 {
+                let sy = (r as isize - 2).clamp(0, h as isize - 1) as usize;
+                let sx = (c as isize - 2).clamp(0, w as isize - 1) as usize;
+                assert_eq!(mb_halo[r * 21 + c], plane[sy * w + sx], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn predict_inter_mb_sub_pixel_at_border_uses_mb_halo_clamp() {
+        // Exercise the MB-scale path through the border-clamp fallback:
+        // predict the corner MB (0,0) with a sub-pixel vector so the
+        // 21×21 halo straddles the top-left edge. The whole-MB result
+        // must still equal the per-sub-block filter_block_4x4 path (each
+        // sub-block fetches its own clamped 9×9 halo), proving the MB-halo
+        // clamp agrees with build_mc_border on a real prediction.
+        let (y, u, v) = build_reference(2, 2);
+        let reference = ReferencePlanes {
+            y: &y,
+            u: &u,
+            v: &v,
+            y_stride: 32,
+            uv_stride: 16,
+            mb_cols: 2,
+            mb_rows: 2,
+        };
+        let luma_mv = Mv { row: 3, col: 5 }; // sub-pixel after §18.1
+        let pred = predict_inter_mb(&reference, 0, 0, luma_mv, false, &SIXTAP_FILTERS);
+
+        let ymv = stored_luma_mv(luma_mv);
+        for sb in 0..4 {
+            for sc in 0..4 {
+                let blk = filter_block_4x4(&y, 32, 32, 32, sc * 4, sb * 4, ymv, &SIXTAP_FILTERS);
+                for r in 0..4 {
+                    for c in 0..4 {
+                        let pr = sb * 4 + r;
+                        let pc = sc * 4 + c;
+                        assert_eq!(pred.y[pr * 16 + pc], blk[r * 4 + c], "luma ({pr},{pc})");
+                    }
+                }
+            }
+        }
     }
 
     // ----- §20.14 build_mc_border halo fetch -------------------------

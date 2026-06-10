@@ -4,6 +4,74 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — MB-scale §18.3 luma batching (`sixtap_mb_luma`) (round 270, 2026-06-10)
+
+Round 270 lands the round-269 BENCHMARKS next-round candidate "MB-scale
+§18.3 batching". All sixteen luma sub-blocks of a non-SPLITMV inter
+macroblock share one motion vector (§18.1), so the six-tap support of
+the whole 16×16 luma block is one contiguous region rather than sixteen
+overlapping ones. `predict_inter_mb`'s sub-pixel luma path now exploits
+that:
+
+* **`fetch_luma_mb_halo`** (new public fn) — the MB-scale analogue of
+  `fetch_block_halo`: fetches one `(16+5)×(16+5) = 21×21` edge-replicated
+  halo (§20.14 `build_mc_border`) for the whole 16×16 luma block, block
+  origin at `halo[(2, 2)]`, with the same in-bounds fast-path / clamp
+  fallback split as the per-sub-block fetch.
+* **`sixtap_mb_luma`** (new public fn) — the MB-scale `sixtap_2d`:
+  horizontal pass of 21 rows × 16 cols then vertical pass of 16 rows ×
+  16 cols over the 21×21 halo, producing the 16×16 luma block in one
+  two-pass convolution. Byte-identical to applying `sixtap_2d` to each of
+  the sixteen 4×4 sub-blocks (the §18.3 `interp` dot product per output
+  sample is independent of how the support is tiled, and the
+  horizontal-pass intermediate is clamped identically).
+* **`sixtap_mb_luma` dispatcher** — scalar (`sixtap_mb_luma_scalar`,
+  default on stable / nightly-without-`simd`) vs SIMD
+  (`sixtap_mb_luma_simd`, `#[cfg(feature = "simd")]`). The SIMD path
+  widens each pass to `Simd<i32, 16>`: one sixteen-lane vector per output
+  row (tap k's sixteen lanes are the contiguous source run
+  `halo[r*21 + k ..][..16]`), six widen-multiply-accumulates per row in
+  place of 96 scalar MACs, with the clamped horizontal intermediate
+  resident in `i32` vectors so the vertical pass runs with zero loads.
+  Lane type is `i32` for the same §18.3 overflow reason as `sixtap_2d`
+  (`[-8160, 40800]` dot-product span past `i16::MAX`).
+
+`predict_inter_mb`'s luma loop now routes a sub-pixel `ymv` through the
+batched path and keeps the per-sub-block whole-pixel copy fast path for
+a whole-pixel vector; the chroma path is unchanged (the four chroma
+sub-blocks span only 8×8 and gain little from MB-scale batching, and the
+two §18.1 averaged-vector / SPLITMV cases keep their per-sub-block
+dispatch).
+
+Five new tests (stable lib 463 → 468, nightly + `simd` lib 465 → 470):
+
+* `sixtap_mb_luma_matches_per_subblock_path` — the whole-MB synthesis is
+  byte-exact against sixteen separate `sixtap_2d` calls over the
+  corresponding 9×9 sub-halos carved from the 21×21 MB halo, for every
+  `(mx, my)` fraction pair and both §18.3 filter sets.
+* `sixtap_mb_luma_simd_matches_scalar_on_stress_inputs` — dispatcher vs
+  `sixtap_mb_luma_scalar` over flat extremes, opposing ramps,
+  alternating-extreme checker, and a deterministic LCG set × all 64
+  `(mx, my)` × both filter sets (the primary SIMD safety net on
+  nightly + `simd`).
+* `fetch_luma_mb_halo_matches_subblock_halos_in_bounds` /
+  `fetch_luma_mb_halo_clamps_at_top_left_corner` — the MB halo contains
+  every per-sub-block 9×9 halo as a window in-bounds, and replicates the
+  nearest edge pixel exactly like `build_mc_border` at the corner.
+* `predict_inter_mb_sub_pixel_at_border_uses_mb_halo_clamp` — a real
+  corner-MB (0,0) sub-pixel prediction through the MB-halo border-clamp
+  fallback still equals the per-sub-block `filter_block_4x4` path.
+
+New `motion_comp_subpel_luma` bench points
+`mb_luma_batched_16x16` / `mb_luma_per_subblock_16x16`
+(`aarch64-apple-darwin`, criterion `--quick`): scalar batched 158.8 ns,
+SIMD batched 140.2 ns, per-sub-block partner ≈ 260–268 ns — **−47 %**
+end-to-end (SIMD batched vs per-sub-block) and **−12 %** SIMD-over-scalar
+on the batched path. The bulk of the win is the amortised single 21×21
+fetch + tighter loop (the scalar batched path alone is −41 % vs
+per-sub-block); the wider `i32×16` lanes add the further −12 %. Verified
+passing on nightly 1.97 with `simd` and on stable.
+
 ### Added — §18.3 six-tap sub-pixel SIMD kernel (round 269, 2026-06-10)
 
 Round 269 is a depth-mode SIMD round extending the nightly-only `simd`

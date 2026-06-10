@@ -238,12 +238,74 @@ impl MbDequantFactors {
 /// Dequantize one raster-order 4×4 block in place: coefficient 0 (DC) is
 /// multiplied by `dc_factor`, coefficients 1..=15 (AC) by `ac_factor`. The
 /// product is computed in `i32` and stored back as `i16` (§14.1 page 76).
+///
+/// Dispatch: SIMD path on nightly + `simd`, scalar otherwise. The SIMD
+/// path is byte-exact against the scalar listing on every test fixture
+/// (`dequant_block_simd_matches_scalar_on_stress_inputs`).
 #[inline]
 fn dequant_block(block: &mut [i16; 16], dc_factor: i16, ac_factor: i16) {
+    #[cfg(feature = "simd")]
+    {
+        dequant_block_simd(block, dc_factor, ac_factor);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        dequant_block_scalar(block, dc_factor, ac_factor);
+    }
+}
+
+/// Scalar §14.1 dequantize — the multiply written out longhand: lane 0
+/// scaled by `dc_factor`, lanes 1..=15 by `ac_factor`. Each product is
+/// formed in `i32` and truncated back to `i16`, matching the §14.1 page
+/// 76 *"computed and stored using 16-bit signed integers"* convention.
+///
+/// The public [`dequant_block`] dispatches here on stable builds (and on
+/// nightly without the `simd` feature); the `simd` feature swaps in
+/// [`dequant_block_simd`], which is itself byte-exact against this
+/// implementation (`dequant_block_simd_matches_scalar_on_stress_inputs`).
+#[allow(dead_code)] // Used by `dequant_block` only on the !simd path.
+#[inline]
+fn dequant_block_scalar(block: &mut [i16; 16], dc_factor: i16, ac_factor: i16) {
     block[0] = (block[0] as i32 * dc_factor as i32) as i16;
     for c in block.iter_mut().skip(1) {
         *c = (*c as i32 * ac_factor as i32) as i16;
     }
+}
+
+/// SIMD §14.1 dequantize — `core::simd::Simd<i32, 16>` rewrite of
+/// [`dequant_block_scalar`].
+///
+/// The whole 4×4 block is sixteen independent coefficient×factor
+/// multiplies with no cross-lane dependency, so it maps directly onto a
+/// single 16-wide vector: widen the `i16` coefficients to `i32`, multiply
+/// lane-wise by a per-lane factor vector (`dc_factor` in lane 0,
+/// `ac_factor` in lanes 1..=15), then truncate each product back to `i16`.
+///
+/// The widening + truncation reproduce the scalar `as i32` / `as i16`
+/// casts exactly: `Simd::<i16,16>::cast::<i32>()` is the lane-wise
+/// sign-extending widen, lane-wise `*` on `Simd<i32, 16>` is wrapping i32
+/// multiply, and `cast::<i16>()` truncates each lane to its low 16 bits
+/// (the `as i16` conversion of an `i32`). With every lane independent there
+/// is no reassociation question — the SIMD path computes the identical
+/// sixteen products as the scalar loop. The byte-exactness is enforced on
+/// every fixture by `dequant_block_simd_matches_scalar_on_stress_inputs`.
+#[cfg(feature = "simd")]
+#[inline]
+fn dequant_block_simd(block: &mut [i16; 16], dc_factor: i16, ac_factor: i16) {
+    use core::simd::num::SimdInt;
+    use core::simd::Simd;
+
+    // Per-lane factor vector: dc_factor for the DC coefficient (lane 0),
+    // ac_factor for the fifteen AC coefficients (lanes 1..=15).
+    let mut factors = [ac_factor as i32; 16];
+    factors[0] = dc_factor as i32;
+    let factor_v: Simd<i32, 16> = Simd::from_array(factors);
+
+    // Widen the i16 coefficients to i32 (sign-extending), multiply
+    // lane-wise (wrapping i32), then truncate each product back to i16.
+    let coeff_v: Simd<i32, 16> = Simd::<i16, 16>::from_array(*block).cast::<i32>();
+    let product: Simd<i32, 16> = coeff_v * factor_v;
+    *block = product.cast::<i16>().to_array();
 }
 
 /// Bitstream→dequant wrapper: decode one macroblock's raw quantized
@@ -660,5 +722,88 @@ mod tests {
             (f_large.y2_dc as i32 * raw_dc as i32) > (f_small.y2_dc as i32 * raw_dc as i32),
             "larger quantizer must yield a larger dequantized Y2 DC"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // SIMD vs scalar byte-exact equivalence test (round-267 dequant SIMD).
+    //
+    // Mirrors the transform-side `*_simd_matches_scalar_on_stress_inputs`
+    // pairs. On stable / no `simd` feature this exercises the scalar path
+    // twice (the public `dequant_block` dispatch and the directly-named
+    // `_scalar` fn) — harmless; keeps CI green. On nightly + `simd` it's
+    // the primary safety net: `dequant_block` dispatches to the SIMD path
+    // while `dequant_block_scalar` stays reachable as the fallback, so the
+    // assertion compares the two bit-for-bit, including the i16-overflow
+    // truncation cases that distinguish `cast::<i16>()` from saturation.
+    // -----------------------------------------------------------------
+
+    /// (coefficient block, dc_factor, ac_factor) stress fixtures covering
+    /// all-zero, DC-only, single-AC at each lane, mixed patterns, and the
+    /// i16-overflow cases that force the `as i16` / `cast::<i16>()`
+    /// wrap-around path. The factors span the real §14.1 range
+    /// (`dc_qlookup[0]=4` .. Y2-AC `440`) plus deliberate overflow drivers.
+    fn dequant_stress_inputs() -> Vec<([i16; 16], i16, i16)> {
+        let mut v: Vec<([i16; 16], i16, i16)> = Vec::new();
+        // All-zero block (dequant of zeros is a no-op).
+        v.push(([0i16; 16], 4, 8));
+        // DC-only, every real factor pairing.
+        for &(dc_f, ac_f) in &[(4i16, 8i16), (157, 284), (314, 440), (132, 20)] {
+            let mut b = [0i16; 16];
+            b[0] = 17;
+            v.push((b, dc_f, ac_f));
+        }
+        // Single non-zero AC at each lane (1..=15).
+        for pos in 1..16 {
+            let mut b = [0i16; 16];
+            b[pos] = 23;
+            v.push((b, 17, 29));
+        }
+        // Mixed sign / magnitude block at a mid-range factor.
+        v.push((
+            [
+                40, -8, 4, -2, //
+                -6, 5, -3, 1, //
+                3, -2, 1, -1, //
+                -1, 1, 0, 2,
+            ],
+            41,
+            37,
+        ));
+        // i16-overflow drivers: large coefficient × large factor wraps the
+        // i32 product when narrowed to i16 — the case where saturating and
+        // truncating casts diverge. Both lanes must agree on `as i16` wrap.
+        v.push(([i16::MAX; 16], 440, 440));
+        v.push(([i16::MIN; 16], 440, 440));
+        v.push((
+            [
+                30000, -30000, 20000, -20000, //
+                12345, -23456, 32000, -32000, //
+                500, -500, 9999, -9999, //
+                32767, -32768, 16384, -16384,
+            ],
+            314,
+            440,
+        ));
+        v
+    }
+
+    #[test]
+    fn dequant_block_simd_matches_scalar_on_stress_inputs() {
+        for (idx, &(block, dc_f, ac_f)) in dequant_stress_inputs().iter().enumerate() {
+            // `dequant_block` is the public dispatcher: SIMD on nightly +
+            // `simd`, scalar otherwise. Compare it against the directly-
+            // named scalar fallback on the identical input.
+            let mut via_dispatch = block;
+            dequant_block(&mut via_dispatch, dc_f, ac_f);
+
+            let mut via_scalar = block;
+            super::dequant_block_scalar(&mut via_scalar, dc_f, ac_f);
+
+            assert_eq!(
+                via_dispatch, via_scalar,
+                "dequant_block (dispatch) diverged from scalar on stress \
+                 input #{idx} (dc_factor {dc_f}, ac_factor {ac_f})"
+            );
+        }
     }
 }

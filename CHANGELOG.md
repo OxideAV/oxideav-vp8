@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §14.1 dequantize SIMD primitive (round 267, 2026-06-10)
+
+Round 267 is a depth-mode SIMD round extending the nightly-only `simd`
+feature from the §14.3 / §14.4 transforms onto the §14.1 dequantize
+hot path. RFC 6386 §14.1 (page 76) multiplies every decoded coefficient
+of a 4×4 block by one of two factors — the DC factor for coefficient 0,
+the AC factor for coefficients 1..=15 — with each product formed in
+`i32` and stored back as `i16`. The sixteen multiplies are fully
+independent (no cross-lane dependency), so they map onto a single
+16-wide vector.
+
+`src/dequant.rs` `dequant_block` is now a dispatcher:
+
+* **scalar** (`dequant_block_scalar`) — the longhand multiply loop,
+  unchanged, the default on stable and on nightly without `simd`.
+* **SIMD** (`dequant_block_simd`, `#[cfg(feature = "simd")]`) — widens
+  the `i16` block to `Simd<i32, 16>` (sign-extending `cast`), multiplies
+  lane-wise against a per-lane factor vector (`dc_factor` in lane 0,
+  `ac_factor` in lanes 1..=15), and truncates each product back to `i16`
+  with `cast::<i16>()`. The int→int `cast` truncates exactly like the
+  scalar `as i16`, including the i16-overflow wrap-around.
+
+A new `dequant_block_simd_matches_scalar_on_stress_inputs` test asserts
+the dispatcher is byte-exact against the scalar fallback across all-zero,
+DC-only, single-AC-per-lane, mixed-sign, and i16-overflow stress blocks
+(`[i16::MAX; 16] × 440`, `[i16::MIN; 16] × 440`, and a 16-lane
+near-extreme pattern) — the overflow fixtures are what distinguish
+truncating `cast` from a saturating one. The test runs on stable
+(scalar-vs-scalar, harmless) and is the primary safety net on nightly +
+`simd` (SIMD-vs-scalar). Verified passing on nightly 1.97 with `simd`.
+
 ### Added — `panic_free_inter_mb_reconstruct` fuzz target (round 265, 2026-06-09)
 
 Round 265 is the depth-mode fuzz round on the §16 inter-MB

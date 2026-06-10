@@ -13,8 +13,8 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use oxideav_vp8::motion_comp::{
-    fetch_luma_mb_halo, filter_block_4x4, filter_set_for_version, sixtap_2d, sixtap_mb_luma,
-    FilterSet,
+    fetch_chroma_mb_halo, fetch_luma_mb_halo, filter_block_4x4, filter_set_for_version, sixtap_2d,
+    sixtap_mb_chroma, sixtap_mb_luma, FilterSet,
 };
 use oxideav_vp8::motion_vector::Mv;
 
@@ -132,10 +132,48 @@ fn bench_mb_luma_batched(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_mb_chroma_batched(c: &mut Criterion) {
+    // Round-271 MB-scale §18.3 chroma batching: the whole 8×8 chroma block
+    // of a non-SPLITMV inter MB synthesised in one pass off a single 13×13
+    // halo, versus the 4 separate `sixtap_2d` calls (each off its own 9×9
+    // halo) the per-sub-block path issues. Both produce byte-identical
+    // output; this measures the amortised-fetch / wider-lane win.
+    let plane = make_plane(64, 64);
+    let mv = Mv { row: 5, col: 3 }; // (mx, my) = (3, 5) sub-pixel
+    let filters: &[[i32; 6]; 8] = match filter_set_for_version(0) {
+        FilterSet::Sixtap => &oxideav_vp8::motion_comp::SIXTAP_FILTERS,
+        FilterSet::Bilinear => &oxideav_vp8::motion_comp::BILINEAR_FILTERS,
+    };
+    let mb_halo = fetch_chroma_mb_halo(&plane, 64, 64, 64, 16, 16, mv);
+    let sub_halo = oxideav_vp8::motion_comp::fetch_block_halo(&plane, 64, 64, 64, 20, 20, mv);
+
+    let mut g = c.benchmark_group("motion_comp_subpel_luma");
+    // Batched whole-MB synthesis: one 13×13 halo → one 8×8 chroma block.
+    g.bench_function("mb_chroma_batched_8x8", |b| {
+        b.iter(|| {
+            let out = sixtap_mb_chroma(black_box(&mb_halo), 3, 5, black_box(filters));
+            black_box(out[0])
+        });
+    });
+    // Per-sub-block partner on the same workload: 4 sixtap_2d calls.
+    g.bench_function("mb_chroma_per_subblock_8x8", |b| {
+        b.iter(|| {
+            let mut acc = 0u32;
+            for _ in 0..4 {
+                let out = sixtap_2d(black_box(&sub_halo), 3, 5, black_box(filters));
+                acc = acc.wrapping_add(out[0] as u32);
+            }
+            black_box(acc)
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_filter_block_4x4_subpel,
     bench_mb_sixtap_2d,
-    bench_mb_luma_batched
+    bench_mb_luma_batched,
+    bench_mb_chroma_batched
 );
 criterion_main!(benches);

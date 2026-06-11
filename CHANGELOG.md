@@ -4,6 +4,35 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Documentation — whole-frame keyframe path measured under nightly + `simd` (round 278, 2026-06-11)
+
+Measurement-only depth round closing the standing BENCHMARKS candidate
+"whole-frame `keyframe_encode` re-measure under nightly + `simd`". No
+code change — the round publishes a trustworthy whole-frame number for
+the `simd` feature on the keyframe path, replacing the round-247
+sub-percent prediction (which predated the round-267 dequant and
+round-268 TM_PRED kernels and under-counted the inlined inverse-DCT
+win):
+
+* `keyframe_encode/encode_keyframe_320x240_qi32`: nightly scalar mean
+  5.456 ms → nightly + `simd` mean 4.957 ms (**−9.2 %**, 14.08 → 15.49
+  Mpx/s).
+* `keyframe_decode/decode_keyframe_320x240_qi32`: nightly scalar mean
+  151.8 µs → nightly + `simd` mean 120.0 µs (**−21.0 %**, 506 → 640
+  Mpx/s).
+* Stable 1.95 default-features anchors (5.454 ms / 154.7 µs) agree with
+  the nightly scalar column, so the delta is the `simd` dispatch, not
+  the compiler version.
+
+Methodology: 30 s measurement time (no `--quick`), three interleaved
+scalar/simd run pairs (non-overlapping populations; consecutive
+same-config change estimates ≤ 2 %), nightly toolchain on both A/B
+columns, separate target dirs. `sample(1)` attribution: the scalar
+encode profile's #2 self-time symbol `inverse_dct_4x4` (≈ 16 %, 24
+calls per MB in the §11 RD-reconstruct loop) disappears from the
+top-of-stack list under `simd`; `predict_y16x16_tm` drops 32 → 7
+samples. Full table + analysis in `BENCHMARKS.md` § Round 278.
+
 ### Changed — compile-time SPLITMV partition-group table (round 277, 2026-06-11)
 
 Profile-guided allocation elimination in the §16.4 SPLITMV encoder

@@ -830,6 +830,61 @@ fixture/roundtrip integration suites, and an 18-frame A/B byte-hash
 (3 resolutions × 6 frames × 3 quantisers through
 `Vp8InterStreamEncoder`) — identical FNV-1a before/after.
 
+## Round 278 — whole-frame keyframe path under nightly + `simd` (measurement round)
+
+Round 278 (2026-06-11) closes the standing "whole-frame `keyframe_encode`
+re-measure under nightly + `simd`" candidate. The round-247 note predicted
+a sub-percent whole-frame delta, but that arithmetic only counted the
+§14.3 / §14.4 *forward* primitives — since then the `simd` feature grew
+the §14.1 dequant (round 267), §12.2 TM_PRED (round 268) and §18.3
+six-tap (rounds 269–271, inter-only) kernels, all of which sit on the
+keyframe encode's §11 RD-reconstruct loop or the decode path. The fresh
+measurement says the whole-frame win is now far from sub-percent.
+
+Methodology: `--measurement-time 30 --warm-up-time 3` (no `--quick`),
+three interleaved scalar/simd run pairs per bench so thermal drift
+cancels, nightly 1.97 toolchain for both A/B columns so the compiler
+version cancels, separate `CARGO_TARGET_DIR`s per config, no concurrent
+load. Stable 1.95 default-features runs provide the default-path anchor.
+`keyframe_decode` rides along as the other half of the keyframe path
+(the SIMD kernels mostly live on reconstruct/decode).
+
+| Bench | Stable default | Nightly scalar (3 runs) | Nightly + `simd` (3 runs) | Δ (simd vs scalar) |
+|---|---:|---:|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 5.454 ms | 5.385 / 5.482 / 5.500 ms (mean 5.456) | 4.928 / 4.976 / 4.967 ms (mean **4.957**) | **−9.2 %** |
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 154.7 µs | 151.0 / 152.7 / 151.6 µs (mean 151.8) | 120.6 / 119.6 / 119.8 µs (mean **120.0**) | **−21.0 %** |
+
+Throughput: keyframe encode 14.08 → **15.49 Mpx/s** (+10 %); keyframe
+decode 506 → **640 Mpx/s** (+27 %). Stable default agrees with the
+nightly scalar column within run-to-run spread on both benches, so the
+whole delta is the `simd` dispatch, not the compiler version. Every
+scalar run sits in 5.385–5.500 ms and every simd run in 4.928–4.976 ms
+— the two populations don't overlap, so the deltas are far outside the
+measurement envelope (criterion's own change estimates between
+consecutive same-config runs were ≤ 2 %).
+
+Attribution (`sample(1)` PID-attach, 10 s, 1 ms interval, on the encode
+bench under `--measurement-time 60`): the scalar profile's #2 self-time
+symbol is `inverse_transform::inverse_dct_4x4` at 1350 samples (≈ 16 %
+of in-process time — it fires 24× per MB inside the §11 RD loop's
+reconstruct leg *and* per coded block in the final reconstruct); under
+`simd` that symbol disappears from the ≥ 5-sample top-of-stack list
+entirely (the `Simd<i32, 4>` body inlines into
+`encode_mb_block_set_with_neighbors`). Secondary movers:
+`intra_predict::predict_y16x16_tm` 32 → 7 samples (the round-268
+−87.7 % kernel) and `inverse_wht_4x4` 6 → absent. The takeaway over the
+round-180 micro-bench (which measured the inverse DCT SIMD at only −1
+to −5 % per isolated call): in the real inlined context — back-to-back
+calls over 24 sub-blocks with surrounding dequant + add-and-clamp code
+— the vectorised body wins far more than the isolated-call number
+suggested. Micro-bench deltas under-predict inlined whole-frame deltas
+in both directions (round 226 saw the reverse); whole-frame A/B with
+extended measurement time is the deciding instrument.
+
+No code change shipped this round (measurement + attribution only), so
+bit-identity is structural; the full stable lib suite (483) + nightly +
+`simd` lib suite (485) were re-run green as a sanity anchor.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
@@ -845,8 +900,17 @@ fixture/roundtrip integration suites, and an 18-frame A/B byte-hash
   freedom (the per-sub-block write strategy) measured ~17 % SLOWER as a
   strided write than the shipped contiguous `[u8; 16]`-scratch copy. The
   candidate is retired.
-* **Whole-frame `keyframe_encode` re-measure under nightly + `simd`**
-  — round 247's per-primitive `--quick` numbers imply a sub-percent
-  whole-frame win, deep below the bench's `--quick` noise envelope. A
-  profile-depth round with `--measurement-time` extended could attribute
-  it cleanly instead of letting it sit inside the per-frame noise.
+* **~~Whole-frame `keyframe_encode` re-measure under nightly + `simd`~~**
+  — CLOSED in round 278 (see above): measured **−9.2 %** whole-frame
+  keyframe encode and **−21.0 %** keyframe decode under nightly +
+  `simd`, attributed primarily to `inverse_dct_4x4_simd` in the §11
+  RD-reconstruct loop (scalar profile's #2 self-time symbol at ≈ 16 %,
+  gone under `simd`). The round-247 sub-percent prediction predated the
+  round-267/268 dequant + TM_PRED kernels and under-counted the inlined
+  inverse-DCT win.
+* **Whole-frame `inter_encode_short_clip` re-measure under nightly +
+  `simd`** — the symmetric closure of the round-278 keyframe-path
+  measurement: rounds 269–272 only published micro / `--quick` numbers
+  for the §18.3 six-tap + MB-batching kernels. An interleaved
+  extended-measurement A/B (same methodology as round 278) would put a
+  trustworthy whole-frame number on the inter path's `simd` dispatch.

@@ -27,8 +27,14 @@ debug-arithmetic overflow, or out-of-bounds index.
 | `panic_free_mb_batch_motion_comp` | `fetch_luma_mb_halo`, `sixtap_mb_luma`, `fetch_chroma_mb_halo`, `sixtap_mb_chroma`, `fetch_luma_mb_whole_pixel`, `fetch_chroma_mb_whole_pixel` (cross-checked against `fetch_block_halo` / `fetch_block_whole_pixel`) | MB-scale §18.3 / §20.14 batched motion-compensation primitives landed in rounds 270–272. These six public functions synthesise (or copy) a whole macroblock's luma / chroma prediction in one pass and landed *after* the round-257 `panic_free_sixtap_subpel` target was written, so no existing harness reaches them: the fourteen targets above hit §18 only through the §17 motion-search descent ladder (which snaps every per-candidate MV to a sub-block grid and never reaches the MB-scale orchestrator) or through `decode_vp8` / `Vp8DecoderState::decode_frame` / `encode_p_frame_multi_ref` (which gate the MB-scale fetch behind a fully-formed reference picture + §9.7 refresh state machine, so the §20.14 `build_mc_border` clamp inside the MB-halo fetch never sees an origin parked across a picture boundary by an arbitrary `i16` vector). This target drives the MB-scale surface directly with an attacker-shaped `(plane dimension, MB origin, MV, fractional offset, filter set, border-position class)` envelope — every border class (mid-plane fast path, top-left corner, bottom-right corner, adversarial full-`i16` MV) and every `(mx, my) ∈ {0..7}²` fraction across both §18.3 filter sets — plus three equivalence cross-checks asserted on every iteration (panic on mismatch): the 21×21 luma halo and the 13×13 chroma halo must each contain every per-sub-block 9×9 `fetch_block_halo` window at offset `(sb*4, sc*4)`, and the whole-pixel MB luma / chroma copy must equal the per-sub-block `fetch_block_whole_pixel` assembly tiled into the MB raster — the round-270 / 271 / 272 in-tree containment invariants, now re-asserted under the attacker-shaped border-clamp envelope the mid-plane-only in-tree tests never reach. |
 | `panic_free_filter_block_into` | `filter_block_4x4_into` (cross-checked against `filter_block_4x4`), `filter_set_for_version` | §16.4 SPLITMV strided-write motion-comp primitive landed in round 274. `filter_block_4x4_into` synthesises one 4×4 sub-block (§20.14 `filter_block`) and writes it directly into a destination raster at `(dst_x, dst_y)` / `dst_stride` — whole-pixel branch copies source rows straight in (§18.3 "simply copied" / §20.14 `build_mc_border` edge replication on the border path), sub-pixel branch delegates to `filter_block_4x4` and writes strided. It landed *after* the round-257 `panic_free_sixtap_subpel` target (which drives `filter_block_4x4` itself), so no existing harness reaches its destination-raster triple: the in-tree round-274 equivalence tests drive fixed inputs on one mid-plane geometry, and `predict_split_mv` keeps the shipped scratch-copy form so the decode / encode stack never exposes `(dst_x, dst_y, dst_stride)` to an attacker. This target drives it with an attacker-shaped `(plane dimension, block origin, mv, fraction, filter set, border-position class, destination geometry)` envelope — every border class (mid-plane fast path, top-left corner, bottom-right corner, adversarial full-`i16` MV), both whole-pixel and sub-pixel vectors, both §18.3 filter sets, `dst_stride` / `dst_x` / `dst_y` swept across `16..=32` — plus two equivalence cross-checks asserted on every iteration (panic on mismatch): the 4×4 footprint at `(dst_x, dst_y)` must equal `filter_block_4x4`'s `[u8; 16]` block byte for byte (the round-274 `filter_block_4x4_into_matches_filter_block_4x4` invariant, under the clamp + destination envelope the in-tree test never reaches), and every destination byte outside the footprint must retain its pre-fill sentinel (a stride / length regression that strided past the window is caught here). |
 
+| `encode_decode_pixel_lockstep` | `encode_keyframe_with_reconstruction_and_token_updates` → `decode_vp8` (pixel differential) | Pixel-exact encode→decode lockstep differential (§9 / §12 / §13.4 / §14 / §15 / §19.2), landed in round 280. The round-264 `panic_free_encode_decode_e2e` target stitches the two halves into one iteration but its oracle stops at the §9.1 visible width / height round-trip — decoded *pixels* are never compared against anything. This target uses the encoder's own post-§15 reconstruction planes (returned by `encode_keyframe_with_reconstruction_and_token_updates`; the §15.1 contract is that a compliant decoder reproduces them exactly, since the encoder predicts each MB from its own reconstruction precisely to stay in lockstep) as a bit-exact differential oracle: every visible Y / U / V byte of the decoder's output is asserted equal to the encoder's reconstruction, so a single-pixel drift anywhere in the §12 intra-prediction / §14 dequant + inverse-transform / §15 loop-filter / §9.1 visible-crop chain panics instead of hiding behind a dimensions-only check. Three gaps closed: (1) first pixel-content oracle in the suite; (2) non-MB-aligned dimensions — each axis is drawn in raw luma pixels (width 1..=64, height 1..=144, the tall end populating all 8 §9.5 DCT partitions via the §20.4 `row % N` round-robin), so nearly every iteration carries partial right / bottom macroblocks (encoder edge-replication padding, §15 filtering over the *padded* raster, decoder visible-crop), where the e2e target only ever encodes whole-MB frames; (3) the §13.4 `token_prob_update()` **write** path — no other target drives the encoder-side emitter (`parse_headers` / `panic_free_token_block` fuzz the read side only); half of all iterations thread a sparse fuzz-shaped `TokenProbUpdates` payload (up to 8 positions, raw 0..=255 probability bytes — the full §13.4 L(8) wire range, wider than the `[1, 255]` band the in-tree fitter emits), locking the merged `coeff_probs` table pixel-exact end-to-end at probability extremes. Parameters are normalised into their legal §9.4 / §9.5 / §9.6 ranges, so an `Err` from either side, any dimension / MB-grid drift, or any pixel mismatch is a finding (panic), not a silent early-return. |
+
 The contract these harnesses enforce is **panic-freedom on the
-public API surface**, not output equivalence.
+public API surface** — plus, where a target carries an equivalence
+leg (`panic_free_mb_batch_motion_comp`, `panic_free_filter_block_into`,
+the `panic_free_loop_filter_writeback` round-trip, and the
+`encode_decode_pixel_lockstep` pixel differential), byte-exact
+agreement between the paired surfaces.
 
 ## OOM caps
 
@@ -65,6 +71,9 @@ gating data short-circuits before the decoder runs:
 | Min input length (`panic_free_inter_mb_reconstruct`) | 11 B | The harness reads an 11-byte header (1 flags + 1 mb_cols + 1 mb_rows + 1 mb_col + 1 mb_row + 2 luma_mv.row + 2 luma_mv.col + 1 prob_last + 1 prob_gf); inputs shorter than that early-return so libFuzzer learns the boundary |
 | Max plane dimensions (`panic_free_inter_mb_reconstruct`) | 3 × 3 MBs (48 × 48 luma px) | `mb_cols` / `mb_rows` ∈ {1, 2, 3} so the I420 reference-plane allocation stays bounded — each plane is at most 9 × the per-MB byte count (≤ 3 456 B total per `ReferencePlanes`) |
 | Max input length (`panic_free_inter_mb_reconstruct`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth. Per-iteration allocations: three `Vec<u8>` for the I420 reference planes (capped as above); every §14 coefficient array is stack-allocated |
+| Min input length (`encode_decode_pixel_lockstep`) | 31 B | The harness reads a 7-byte scalar header (width + height + `y_ac_qi` + `loop_filter_level` + `sharpness_level` + partition selector + flags) plus eight 3-byte §13.4 update triples; inputs shorter than that early-return so libFuzzer learns the boundary |
+| Max luma pixels per frame (`encode_decode_pixel_lockstep`) | 64 × 144 (9 216) | Width drawn as `1 + (b % 64)`, height as `1 + (b % 144)` raw luma px — deliberately NOT MB-aligned so the §9.1 partial-MB padding / visible-crop seam is hot; the tall end (≥ 113 px → 8 MB rows) populates all 8 §9.5 DCT partitions. ≤ 36 MBs bounds the full encode + decode + two plane-set allocation per iteration |
+| Max input length (`encode_decode_pixel_lockstep`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth. Per-iteration allocations: three source planes (≤ ~14 KiB total), the emitted bitstream, the encoder's reconstruction plane set, and the decoder's visible-cropped plane set — all bounded by the 64 × 144 dimension cap |
 
 The `parse_headers` target has **no** dimension cap — it allocates
 nothing beyond the parsers' own internal state, so even wire-extreme
@@ -94,6 +103,10 @@ cargo +nightly fuzz run panic_free_bool_codec
 cargo +nightly fuzz run panic_free_transform_4x4_roundtrip
 cargo +nightly fuzz run panic_free_loop_filter_writeback
 cargo +nightly fuzz run panic_free_inter_mb_reconstruct
+cargo +nightly fuzz run panic_free_encode_decode_e2e
+cargo +nightly fuzz run panic_free_mb_batch_motion_comp
+cargo +nightly fuzz run panic_free_filter_block_into
+cargo +nightly fuzz run encode_decode_pixel_lockstep
 ```
 
 `cargo-fuzz` requires the nightly toolchain for libFuzzer's
@@ -120,6 +133,13 @@ the primitive-layer loop-filter target). A 25-second smoke run on
 §16 inter-MB reconstruction orchestrator is the slowest harness in
 the suite because every input fully reconstructs an `mb_cols × mb_rows`
 I420 reference plane plus three §14 inverse-transform fan-outs).
+The round-280 `encode_decode_pixel_lockstep` qualification run (from
+a 5-input locally-seeded corpus — partial-MB, tall 8-partition frame,
+§13.4 probability extremes, 1×1 strip, lf-skip + updates) landed
+`cov: 3710, ft: 17209, corp: 1294/579Kb` across 79 957 iterations in
+661 s under ASan (~120 exec/s; every iteration runs the full §9–§19
+encode pipeline AND the full decode pipeline plus a whole-frame
+three-plane byte comparison), peak RSS 472 MiB, zero findings.
 
 ## CI
 

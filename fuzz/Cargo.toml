@@ -385,6 +385,44 @@ cargo-fuzz = true
 #                                     decoder's even though both
 #                                     halves pass their isolated
 #                                     sweeps.
+#   * `encode_decode_pixel_lockstep`
+#                                  — pixel-exact encode→decode lockstep
+#                                     differential. The round-264 e2e
+#                                     target's oracle stops at the §9.1
+#                                     visible width / height round-trip;
+#                                     this target compares the decoder's
+#                                     full visible Y / U / V output
+#                                     byte-for-byte against the
+#                                     encoder's own post-§15
+#                                     reconstruction planes
+#                                     (`encode_keyframe_with_
+#                                     reconstruction_and_token_updates`
+#                                     returns them; the §15.1 contract
+#                                     is that a compliant decoder
+#                                     reproduces them exactly). Three
+#                                     gaps closed: (1) first pixel-
+#                                     content oracle in the suite,
+#                                     (2) non-MB-aligned dimensions
+#                                     (raw 1..=64 × 1..=144 luma px, so
+#                                     the §9.1 partial-MB padding /
+#                                     visible-crop seam — including §15
+#                                     filtering over the padded raster —
+#                                     is in lockstep on almost every
+#                                     iteration; the e2e target only
+#                                     ever encodes whole-MB frames),
+#                                     (3) the §13.4 token_prob_update()
+#                                     WRITE path (no other target
+#                                     drives it; `parse_headers` /
+#                                     `panic_free_token_block` fuzz the
+#                                     read side only) with raw 0..=255
+#                                     probability bytes — wider than
+#                                     the [1, 255] band the in-tree
+#                                     fitter emits. Parameters are
+#                                     normalised into their legal §9.4 /
+#                                     §9.5 / §9.6 ranges, so an Err
+#                                     from either side, any dimension /
+#                                     MB-grid drift, or any single-byte
+#                                     pixel mismatch panics.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -509,5 +547,11 @@ doc = false
 [[bin]]
 name = "panic_free_filter_block_into"
 path = "fuzz_targets/panic_free_filter_block_into.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_decode_pixel_lockstep"
+path = "fuzz_targets/encode_decode_pixel_lockstep.rs"
 test = false
 doc = false

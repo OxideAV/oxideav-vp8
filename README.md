@@ -275,8 +275,10 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships sixteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
-that exercise the public encode and decode surface for panic-freedom:
+The crate ships eighteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+that exercise the public encode and decode surface for panic-freedom
+(plus, where a target carries an equivalence leg, byte-exact agreement
+between the paired surfaces):
 
 * `panic_free_decode_keyframe` — one-shot `decode_vp8`, dimension-gated
   at 256 × 256.
@@ -597,6 +599,31 @@ that exercise the public encode and decode surface for panic-freedom:
   pass landed `cov: 248, ft: 369, corp: 63/1738b` across 3 961 583
   iterations from an empty seed on aarch64-apple-darwin at ~127 793
   exec/s, peak RSS 428 MiB, zero panics.
+* `panic_free_encode_decode_e2e` — per-frame symmetric
+  `encode_keyframe` → `decode_vp8` round-trip (round 264): every
+  `(I420Frame, KeyframeParams)` pair the encoder accepts is decoded in
+  the same iteration, with the §9.1 visible width / height asserted to
+  round-trip. MB-aligned dimensions (1..=16 MB units per axis).
+* `encode_decode_pixel_lockstep` — pixel-exact encode→decode lockstep
+  differential (round 280). Strengthens the e2e target's
+  dimensions-only oracle to full pixel content: the decoder's visible
+  Y / U / V planes are asserted byte-equal to the encoder's own
+  post-§15 reconstruction (returned by
+  `encode_keyframe_with_reconstruction_and_token_updates`; per the
+  §15.1 lockstep contract a compliant decoder reproduces those exact
+  pixels), so a single-pixel drift anywhere in the §12 / §14 / §15 /
+  §9.1-crop chain panics. Dimensions are raw (non-MB-aligned) luma
+  pixels — width 1..=64, height 1..=144 (the tall end populating all
+  8 §9.5 DCT partitions) — so the partial-macroblock padding / crop
+  seam is hot on nearly every iteration, and half of all iterations
+  thread a fuzz-shaped sparse §13.4 `token_prob_update()` payload (raw
+  0..=255 probability bytes) through the only fuzz path that drives
+  the §13.4 **write** side. Parameters are normalised into their legal
+  ranges, so an `Err` from either half is itself a finding. The
+  deterministic in-CI companions live in
+  `tests/encoder_decoder_pixel_lockstep.rs` (5 anchors: partial-MB +
+  normal filter, simple-filter extremes, 1-px strips, 8-partition
+  populated/empty layouts, §13.4 L(8) probability extremes 0 / 255).
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

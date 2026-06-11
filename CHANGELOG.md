@@ -4,7 +4,49 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
-### Performance — MB-batched sub-pixel SAD scoring in the §17 motion search (round 279, 2026-06-11)
+### Fuzzing — pixel-exact encode→decode lockstep differential target (round 280, 2026-06-12)
+
+New `cargo-fuzz` target `encode_decode_pixel_lockstep` (the suite's
+eighteenth), plus its deterministic in-CI companion suite
+`tests/encoder_decoder_pixel_lockstep.rs` (5 anchors). No `src/`
+changes.
+
+* **Oracle** — the round-264 `panic_free_encode_decode_e2e` target
+  stitches `encode_keyframe` → `decode_vp8` but only asserts the §9.1
+  visible width / height round-trip; decoded pixels were never
+  compared against anything. The new target uses the encoder's own
+  post-§15 reconstruction planes (returned by
+  `encode_keyframe_with_reconstruction_and_token_updates`; per the
+  §15.1 lockstep contract a compliant decoder reproduces them exactly)
+  as a bit-exact differential oracle: every visible Y / U / V byte of
+  the decoder's output is asserted equal, so a single-pixel drift in
+  the §12 intra-prediction / §14 dequant + inverse-transform / §15
+  loop-filter / §9.1 visible-crop chain panics. Parameters are
+  normalised into their legal §9.4 / §9.5 / §9.6 ranges, so an `Err`
+  from either half, any dimension / MB-grid drift, or any pixel
+  mismatch is a finding rather than a silent early-return.
+* **Coverage gaps closed** — (1) first pixel-content oracle in the
+  fuzz suite; (2) non-MB-aligned dimensions (raw 1..=64 × 1..=144 luma
+  px, the tall end populating all 8 §9.5 DCT partitions via the §20.4
+  `row % N` round-robin), putting the partial-macroblock
+  edge-replication padding / §15-on-padded-raster / visible-crop seam
+  on the hot path — the e2e target only ever encodes whole-MB frames;
+  (3) the §13.4 `token_prob_update()` **write** path (previously
+  unfuzzed; `parse_headers` / `panic_free_token_block` cover the read
+  side only) with raw 0..=255 probability bytes — the full L(8) wire
+  range, wider than the `[1, 255]` band the in-tree fitter emits.
+* **Run** — 5-input seed corpus (partial-MB, tall 8-partition frame,
+  §13.4 probability extremes, 1×1 strip, lf-skip + updates), then
+  79 957 execs over 661 s wall on aarch64-apple-darwin under ASan
+  (~120 exec/s — every iteration runs the full encode + decode
+  pipeline): `cov: 3710, ft: 17209`, corpus grew to 1 294 inputs, peak
+  RSS 472 MiB, **zero findings** — no panic, no encode / decode
+  rejection, no dimension drift, no pixel drift.
+* **Test delta** — +5 integration tests (partial-MB normal filter,
+  simple-filter §9.4 extremes, 1-pixel strips, 8-partition
+  populated / empty layouts, §13.4 L(8) extremes 0 / 255 under both
+  the §15 skip and filtered paths). Full crate suite green: 664
+  passed, 0 failed.
 
 Whole-frame `inter_encode_short_clip` A/B under nightly + `simd`
 (closing the round-278 symmetric next-round candidate) measured the

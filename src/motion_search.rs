@@ -62,13 +62,16 @@
 //!   quarter-pixel MV into the §18 eighth-pixel resolution the §18.3
 //!   filter table indexes.
 //! * RFC 6386 §18.3 — six-tap sub-pixel interpolation (`version == 0`
-//!   bicubic / `version != 0` bilinear); the half-pixel refinement runs
-//!   the same `filter_block_4x4` synthesis the decoder will reproduce.
+//!   bicubic / `version != 0` bilinear); the sub-pixel refinements run
+//!   the MB-batched [`crate::motion_comp::sixtap_mb_luma`] synthesis,
+//!   byte-exact with the per-sub-block `filter_block_4x4` tiling the
+//!   decoder reproduces.
 //! * RFC 6386 §20.14 — `build_mc_border` edge replication for fetches
 //!   that walk off the picture.
 
 use crate::motion_comp::{
-    fetch_block_whole_pixel, filter_block_4x4, filter_set_for_version, stored_luma_mv,
+    fetch_block_whole_pixel, fetch_luma_mb_halo, fetch_luma_mb_whole_pixel, filter_set_for_version,
+    sixtap_mb_luma, stored_luma_mv,
 };
 use crate::motion_vector::Mv;
 
@@ -115,10 +118,13 @@ pub const QUARTER_PIXEL_STEP: i16 = 1;
 /// `aarch64-apple-darwin` (4.08 ns vs 6.43 ns) but the
 /// `half_pixel_refine_luma_8_offsets` / `quarter_pixel_refine_luma_8_offsets`
 /// descent stages regress by **+13 %** under the same configuration —
-/// inlining the SIMD leaf into the 16-call-per-MB `mb_luma_sad_at_mv`
-/// body increases NEON register pressure across the surrounding
-/// `filter_block_4x4` loop and pessimises the surrounding scheduling
-/// enough to swamp the leaf-level win. Routing the public dispatcher
+/// inlining the SIMD leaf into the `mb_luma_sad_at_mv` body increases
+/// NEON register pressure across the surrounding §18.3 synthesis loop
+/// (measured on the pre-round-279 per-4×4
+/// [`crate::motion_comp::filter_block_4x4`] shape; round 279 batched
+/// that synthesis into one [`sixtap_mb_luma`] pass per candidate) and
+/// pessimises the surrounding scheduling enough to swamp the
+/// leaf-level win. Routing the public dispatcher
 /// to [`block_sad_16x16_scalar`] under every feature configuration
 /// keeps the descent stages on their fastest measured shape; the
 /// `_simd` implementation stays in place so a future round can
@@ -409,14 +415,20 @@ pub fn small_diamond_search_luma(
 ///
 /// Unlike [`mb_luma_sad_at_whole_mv`] this routine accepts any §17.1
 /// MV whose components are multiples of [`HALF_PIXEL_STEP`] (i.e.
-/// whole-pixel ∪ half-pixel). The §18.3 prediction synthesis goes
-/// through the same [`filter_block_4x4`] / [`crate::motion_comp::sixtap_2d`]
-/// path the decoder runs at decode time, with the version=0 bicubic
-/// six-tap tap-set — the encoder commits to `version == 0` in every
-/// emitted frame tag, so this is the tap-set the decoder will reproduce
-/// on its half-pixel MV path. Sub-blocks whose §18.1-doubled fraction
-/// is zero (whole-pixel) collapse to the §18.3 "subblock is simply
-/// copied" path inside [`filter_block_4x4`].
+/// whole-pixel ∪ half-pixel). The §18.3 prediction synthesis runs the
+/// same MB-batched path the encoder's reconstruct leg uses
+/// ([`crate::motion_comp::predict_inter_mb`]'s luma half): all sixteen
+/// luma sub-blocks of a non-SPLITMV candidate share the one MV (§18.1),
+/// so a sub-pixel candidate is one [`fetch_luma_mb_halo`] 21×21 fetch +
+/// one [`sixtap_mb_luma`] whole-MB convolution — byte-exact with
+/// sixteen separate [`crate::motion_comp::filter_block_4x4`] /
+/// [`crate::motion_comp::sixtap_2d`] calls (the per-sub-block tiling the
+/// decoder runs), with the version=0 bicubic six-tap tap-set — the
+/// encoder commits to `version == 0` in every emitted frame tag, so
+/// this is the tap-set the decoder will reproduce on its sub-pixel MV
+/// path. A candidate whose §18.1-doubled fractions are both zero
+/// (whole-pixel) collapses to the §18.3 "simply copied" path, batched
+/// as one [`fetch_luma_mb_whole_pixel`] contiguous 16×16 fetch.
 ///
 /// The MV must be inside `[MV_MIN, MV_MAX]` per §17.1; debug builds
 /// assert. Quarter-pixel positions (`mv.row & 1 != 0`, etc.) are not
@@ -445,29 +457,42 @@ pub fn mb_luma_sad_at_mv(
     // this candidate.
     let filters = filter_set_for_version(0).taps();
 
-    let mut pred = [0u8; 256];
-    for sub_r in 0..4 {
-        for sub_c in 0..4 {
-            let blk_x = blk_x0 + sub_c * 4;
-            let blk_y = blk_y0 + sub_r * 4;
-            let patch = filter_block_4x4(
-                reference.plane,
-                reference.stride,
-                reference.width,
-                reference.height,
-                blk_x,
-                blk_y,
-                mv_eighth,
-                filters,
-            );
-            for r in 0..4 {
-                let dst_row = sub_r * 4 + r;
-                let dst_col = sub_c * 4;
-                pred[dst_row * 16 + dst_col..dst_row * 16 + dst_col + 4]
-                    .copy_from_slice(&patch[r * 4..r * 4 + 4]);
-            }
-        }
-    }
+    // §18.3 fraction selectors (`mv & 7` on the eighth-pixel vector) —
+    // the same gate `predict_inter_mb` uses to pick the batched path.
+    let mx = (mv_eighth.col & 7) as usize;
+    let my = (mv_eighth.row & 7) as usize;
+    let pred = if mx == 0 && my == 0 {
+        // Whole-pixel: the §18.3 prediction is "simply copied", and all
+        // sixteen sub-blocks share the MV, so the whole 16×16 block is
+        // one contiguous source region fetched in a single pass —
+        // byte-identical to sixteen per-sub-block copy fetches
+        // (`fetch_luma_mb_whole_pixel_matches_per_subblock_in_bounds`).
+        fetch_luma_mb_whole_pixel(
+            reference.plane,
+            reference.stride,
+            reference.width,
+            reference.height,
+            blk_x0,
+            blk_y0,
+            mv_eighth,
+        )
+    } else {
+        // Sub-pixel: one shared 21×21 halo + one whole-MB §18.3 six-tap
+        // pass — byte-exact with sixteen separate `filter_block_4x4` /
+        // `sixtap_2d` calls (`predict_inter_mb_sub_pixel_matches_per_block`
+        // and the `sixtap_mb_luma` equivalence tests), replacing sixteen
+        // overlapping 9×9 halo fetches per candidate.
+        let halo = fetch_luma_mb_halo(
+            reference.plane,
+            reference.stride,
+            reference.width,
+            reference.height,
+            blk_x0,
+            blk_y0,
+            mv_eighth,
+        );
+        sixtap_mb_luma(&halo, mx, my, filters)
+    };
 
     block_sad_16x16(src_y, &pred)
 }
@@ -676,6 +701,7 @@ pub fn quarter_pixel_refine_luma(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion_comp::filter_block_4x4;
 
     /// Render a luma plane sized for at least one 16×16 macroblock at
     /// `(mb_col, mb_row) = (0, 0)`, filled with a horizontal ramp

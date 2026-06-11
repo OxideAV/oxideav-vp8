@@ -4,6 +4,41 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Performance — MB-batched sub-pixel SAD scoring in the §17 motion search (round 279, 2026-06-11)
+
+Whole-frame `inter_encode_short_clip` A/B under nightly + `simd`
+(closing the round-278 symmetric next-round candidate) measured the
+`simd` dispatch at only **−1.8 %** on the inter path and attributed the
+gap: `motion_comp::sixtap_2d` was the #1 self-time symbol on *both*
+scalar and simd builds (≈ 2160 / 2186 of ~7700 samples), living in
+`mb_luma_sad_at_mv` — the §17 half-/quarter-pixel refinement scored
+each of its 17 candidates per MB as sixteen separate
+`filter_block_4x4` calls (sixteen overlapping 9×9 halo fetches +
+sixteen 4×4 six-tap passes), a shape the rounds 270–271 MB-batched
+kernels never reached.
+
+* `mb_luma_sad_at_mv` now synthesises a candidate exactly the way
+  `predict_inter_mb`'s luma half does: a whole-pixel candidate is one
+  contiguous `fetch_luma_mb_whole_pixel` 16×16 fetch; a sub-pixel
+  candidate is one 21×21 `fetch_luma_mb_halo` fetch + one whole-MB
+  `sixtap_mb_luma` §18.3 pass (RFC 6386 §18.1: all sixteen luma
+  sub-blocks of a non-SPLITMV candidate share the one MV). Byte-exact
+  with the per-sub-block tiling by the existing equivalence tests, so
+  every candidate SAD, MV decision, and emitted bit is unchanged.
+* Measured (interleaved extended-measurement A/B, Apple M4):
+  `inter_encode_short_clip/inter_encode_4f_128x128_qi32` **−16.6 %**
+  stable default (8.907 → 7.431 ms), **−18.3 %** nightly scalar (mean
+  9.024 → 7.368 ms), **−21.5 %** nightly + `simd` (mean 8.859 →
+  6.953 ms); the simd-vs-scalar whole-frame gap widens from −1.8 % to
+  **−5.6 %** now that the search leg runs the batched (and on `simd`,
+  vectorised) kernel. Full tables + attribution in `BENCHMARKS.md`
+  round 279.
+* Bit-identity proof: full stable suite (483 lib + integration) +
+  nightly `simd` lib suite (485) green, plus a 54-frame
+  `Vp8InterStreamEncoder` byte-hash A/B (3 resolutions × 6 frames ×
+  3 quantisers, keyframe interval 3) — identical FNV-1a pre-/post-
+  change on stable and under nightly + `simd`.
+
 ### Documentation — whole-frame keyframe path measured under nightly + `simd` (round 278, 2026-06-11)
 
 Measurement-only depth round closing the standing BENCHMARKS candidate

@@ -885,6 +885,85 @@ No code change shipped this round (measurement + attribution only), so
 bit-identity is structural; the full stable lib suite (483) + nightly +
 `simd` lib suite (485) were re-run green as a sanity anchor.
 
+## Round 279 — whole-frame inter path under nightly + `simd`, and the MB-batched sub-pixel SAD
+
+Round 279 (2026-06-11) closes the round-278 next-round candidate: the
+symmetric whole-frame `inter_encode_short_clip` A/B under nightly +
+`simd`, same methodology (`--measurement-time 30 --warm-up-time 3`,
+three interleaved scalar/simd run pairs, nightly 1.97 for both columns,
+separate `CARGO_TARGET_DIR`s, stable 1.95 default-features anchor).
+
+### Measurement (pre-change crate state)
+
+| Bench | Stable default | Nightly scalar (3 runs) | Nightly + `simd` (3 runs) | Δ (simd vs scalar) |
+|---|---:|---:|---:|---:|
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 8.907 ms | 8.977 / 9.035 / 9.061 ms (mean 9.024) | 8.823 / 8.905 / 8.850 ms (mean **8.859**) | **−1.8 %** |
+
+The populations don't overlap (every scalar run ≥ 8.977 ms, every simd
+run ≤ 8.905 ms) so the −1.8 % is real — but it's an order of magnitude
+smaller than the keyframe path's −9.2 %, and the attribution explains
+why. `sample(1)` PID-attach (10 s, 1 ms interval) on the **scalar**
+build puts `motion_comp::sixtap_2d` at #1 self-time (2162 of ~7700
+in-process samples); on the **simd** build the same symbol is *still*
+#1 at 2186 samples — flat. The call tree shows where it lives: the §17
+sub-pixel refinements (`half_pixel_refine_luma` +
+`quarter_pixel_refine_luma`) are ≈ 38 % of in-process time, almost all
+inside `mb_luma_sad_at_mv`, which synthesised each of the 17 candidate
+predictions per searched MB (center + 8 half-pel + 8 quarter-pel) as
+**sixteen separate `filter_block_4x4` calls** — sixteen overlapping 9×9
+`fetch_block_halo` fetches + sixteen 4×4 `sixtap_2d` convolutions per
+candidate. In that shape the 4×4 `sixtap_2d_simd` kernel buys nothing
+whole-frame (the rounds 269–271 MB-batched kernels only served the
+*reconstruct* leg, one MB-pass per coded MB; the search leg dwarfs it
+at 17 candidate syntheses per MB). The simd column's whole −1.8 % is
+the §14 transform/dequant kernels on the RD/reconstruct leg
+(`inverse_dct_4x4` 277 scalar samples → absent under `simd`), the
+round-278 finding scaled to a 4-frame inter clip.
+
+### The flagged hotspot, and the one targeted change
+
+The measurement flags a clear scalar-shape hotspot that is *not* a
+missing SIMD kernel: `mb_luma_sad_at_mv` should synthesise a candidate
+the same way `predict_inter_mb`'s luma half already does. All sixteen
+luma sub-blocks of a non-SPLITMV candidate share the one MV (§18.1), so
+the round-270/271 MB-batched primitives apply verbatim:
+
+* whole-pixel candidate (`stored_luma_mv(mv) & 7 == 0` both axes) →
+  one contiguous [`fetch_luma_mb_whole_pixel`] 16×16 fetch;
+* sub-pixel candidate → one 21×21 [`fetch_luma_mb_halo`] fetch + one
+  whole-MB [`sixtap_mb_luma`] §18.3 pass.
+
+Both are byte-exact with the per-sub-block tiling by the existing
+equivalence proofs (`predict_inter_mb_sub_pixel_matches_per_block`,
+`fetch_luma_mb_whole_pixel_matches_per_subblock_in_bounds`, the border
+clamp tests, and the `sixtap_mb_luma` scalar/simd stress tests), so
+every candidate SAD — and therefore every MV decision and every emitted
+bit — is unchanged.
+
+### Measured A/B (same interleaved extended-measurement methodology)
+
+| Bench (post-change) | Stable default | Nightly scalar (3 runs) | Nightly + `simd` (3 runs) | Δ vs pre-change |
+|---|---:|---:|---:|---:|
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 7.431 ms (**−16.6 %**) | 7.459 / 7.320 / 7.326 ms (mean 7.368, **−18.3 %**) | 6.955 / 6.952 / 6.953 ms (mean **6.953**, **−21.5 %**) | — |
+
+Throughput: stable default 7.36 → **8.82 Mpx/s**; nightly scalar 7.26 →
+**8.90 Mpx/s**; nightly simd 7.40 → **9.43 Mpx/s**. The simd-vs-scalar
+whole-frame gap widens from −1.8 % to **−5.6 %** — the search leg now
+runs through `sixtap_mb_luma`, whose SIMD body finally gets to act on
+the dominant call site. Post-change simd attribution: `sixtap_2d`
+disappears from the ≥ 5-sample top-of-stack list entirely;
+`fetch_luma_mb_halo` shows 410 samples and `mb_luma_sad_at_mv` 1510
+(the inlined batched kernel), down from the ~2960-sample refinement
+cluster.
+
+Bit-identity was checked three ways: the full stable suite (483 lib +
+integration, 36 green targets), the nightly + `simd` lib suite (485),
+and a 54-frame byte-hash A/B — 3 resolutions (64×48 / 128×128 /
+176×144) × 6 frames × 3 quantisers (qi 12 / 32 / 96), keyframe
+interval 3 so each stream carries two K + four P frames, all through
+`Vp8InterStreamEncoder` — FNV-1a `2f655ee6d2a8a303` identical
+pre-/post-change on stable *and* under nightly + `simd`.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
@@ -908,9 +987,25 @@ bit-identity is structural; the full stable lib suite (483) + nightly +
   gone under `simd`). The round-247 sub-percent prediction predated the
   round-267/268 dequant + TM_PRED kernels and under-counted the inlined
   inverse-DCT win.
-* **Whole-frame `inter_encode_short_clip` re-measure under nightly +
-  `simd`** — the symmetric closure of the round-278 keyframe-path
-  measurement: rounds 269–272 only published micro / `--quick` numbers
-  for the §18.3 six-tap + MB-batching kernels. An interleaved
-  extended-measurement A/B (same methodology as round 278) would put a
-  trustworthy whole-frame number on the inter path's `simd` dispatch.
+* **~~Whole-frame `inter_encode_short_clip` re-measure under nightly +
+  `simd`~~** — CLOSED in round 279 (see above): the pre-change simd
+  dispatch was worth only **−1.8 %** whole-frame because the dominant
+  §18.3 six-tap work sat in the *search* scoring path
+  (`mb_luma_sad_at_mv`, 17 per-4×4-tiled candidate syntheses per MB),
+  not the reconstruct leg the MB-batched kernels served. Routing that
+  scoring path through the round-270/271 MB-batched primitives (bit-
+  identical, 54-frame byte-hash proof) measured **−16.6 %** stable /
+  **−18.3 %** nightly scalar / **−21.5 %** nightly simd whole-frame,
+  and widened the simd-vs-scalar gap to **−5.6 %**.
+* **Whole-pixel SAD scoring batching** — the post-round-279 simd
+  profile's new top-of-stack pair is `fetch_block_whole_pixel` (1824
+  samples) + `group_sad_at_whole_mv` (1120): the §17 integer-pixel
+  descent (`mb_luma_sad_at_whole_mv`) and the SPLITMV group scoring
+  still fetch sixteen (or per-group fewer) separate 4×4 patches per
+  whole-pixel candidate. The non-SPLITMV descent shares one MV per
+  candidate, so `fetch_luma_mb_whole_pixel` (or a fused
+  fetch-and-SAD that never materialises the patch) applies the same
+  way round 279 applied the sub-pixel batch; the SPLITMV group path
+  carries distinct per-group MVs (the round-274 caveat) but each
+  *group* is still single-MV, leaving room for a per-group contiguous
+  fetch. Needs the same byte-hash A/B discipline.

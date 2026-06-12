@@ -265,6 +265,36 @@ decode (stable / nightly + `simd`), decoded output bit-identical
 (two equivalence-anchor tests + a 55-frame decode-side byte-hash
 A/B on both toolchains — see `BENCHMARKS.md` round 283).
 
+### Hot-path harnesses + ranked hotspot table (round 285)
+
+Round 285 (bench-only, no `src/` change) gave the r283/r284 hot paths
+their own A/B instruments and re-ranked both pipelines with fresh
+`sample(1)` profiles (see `BENCHMARKS.md` round 285):
+
+```sh
+cargo bench -p oxideav-vp8 --bench token_decode
+cargo bench -p oxideav-vp8 --bench reconstruct_inter_mb -- --quick
+cargo bench -p oxideav-vp8 --bench subpel_sad_scoring -- --quick
+```
+
+* `token_decode` — the fused §13.2 descent in isolation
+  (`decode_mb_coeffs` over self-encoded, setup-verified 64-MB token
+  partitions: dense ≈ 7.8 µs/MB, sparse ≈ 0.75 µs/MB) plus an
+  inter-heavy 1K + 11P 176×144 whole-stream decode (1.36 ms stable /
+  1.09 ms simd, 224 / 279 Mpx/s).
+* `reconstruct_inter_mb` — the round-283 #1 decoder symbol in its
+  three shapes (sub-pixel full-residue 569/464 ns, whole-pixel
+  424/344 ns, skip 280/273 ns stable/simd); the decomposition shows
+  ~95 % of the whole-pixel cost in the §14.4/§14.5 residue chain.
+* `subpel_sad_scoring` — one §17 sub-pixel SAD candidate ≈ 184 ns
+  (fetch 22 / convolve ≈ 156 / SAD ≈ 6), the micro-bench the standing
+  fused-row-SAD candidate required.
+* Ranked tables (decoder + encoder) land in `BENCHMARKS.md`; the named
+  next profile-opt target is **`reconstruct_inter_mb` §14.4/§14.5
+  residue fusion** (IDCT output pass fused with the add-clamp over the
+  strided prediction raster, dropping the per-sub-block
+  `extract_4x4`/`insert_4x4` scratch round-trips).
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

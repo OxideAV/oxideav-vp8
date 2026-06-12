@@ -1275,6 +1275,131 @@ through `decode_vp8`, hashing every decoded Y/U/V plane byte
 (1 324 800 bytes) — FNV-1a `ec93aa4f7f728ebe` identical
 pre-/post-change on stable *and* under nightly + `simd`.
 
+## Round 285 — harnesses for the r283/r284 hot paths + ranked hotspot table (bench round)
+
+Round 285 (2026-06-12) is a bench-only round: no `src/` change (decoder
+and encoder are byte-identical to round 284 — structural bit-identity,
+re-anchored by the full stable lib suite, 488 green). Three new bench
+binaries close the harness gaps the round-283 profile left, and two
+fresh `sample(1)` profiles produce the ranked table below.
+
+### 1. `token_decode` — the fused §13.2 descent in isolation + an inter-heavy stream
+
+The round-283 fused descent (`decode_block_core`) had no isolated A/B
+target — both whole-frame decode benches wrap it in prediction +
+transforms + loop filter. The new harness drives `decode_mb_coeffs`
+directly over 64-MB token partitions produced by the crate's own §13
+encoder (`TokenEncoder`), decoded once at setup with a full
+coefficient-equality assertion so the measured loop is a proven-valid
+bitstream walk:
+
+* **dense** — every block carries an 11-coefficient run sweeping the
+  §13.2 token classes through Cat4 (the descent + extra-bits + sign
+  worst case);
+* **sparse** — zero-runs + early/immediate EOBs (the §13.2
+  "skip dct_eob after DCT_0" inner-loop shape of well-predicted inter
+  residue).
+
+Plus `inter_decode_12f_176x144_token_heavy`: a whole-stream decode of a
+1-keyframe + 11-P-frame 176×144 clip (textured drifting gradient + a
+travelling high-contrast checker square) — the round-283 target
+workload at a P-frame share three times `inter_decode_short_clip`'s.
+
+| Bench | Stable (1.95) | Nightly + `simd` (1.97) |
+|---|---:|---:|
+| `token_decode/decode_mb_coeffs_dense_64mb` | 501.7 µs (7.84 µs/MB) | 494.8 µs |
+| `token_decode/decode_mb_coeffs_sparse_64mb` | 48.16 µs (0.75 µs/MB) | 47.90 µs |
+| `token_decode/inter_decode_12f_176x144_token_heavy` | 1.359 ms (224 Mpx/s) | **1.091 ms** (279 Mpx/s, −20 %) |
+
+The dense/sparse 10× spread is the per-token cost surface: a dense MB
+decodes ~330 tokens (≈ 24 ns/token end-to-end through context updates),
+a sparse MB ~50. The micro pair is toolchain-flat (no `simd` dispatch
+in the token layer), while the whole-stream number inherits the §14/§18
+kernel wins.
+
+### 2. `reconstruct_inter_mb` — the round-283 #1 decoder symbol
+
+The §14.2/§18 per-MB inter reconstruction orchestrator in its three
+workload shapes (interior MB, in-bounds fast paths):
+
+| Bench | Stable (1.95) | Nightly + `simd` (1.97) |
+|---|---:|---:|
+| `reconstruct_inter_mb/subpel_full_residue` | 569 ns | **464 ns** (−18 %) |
+| `reconstruct_inter_mb/whole_pixel_full_residue` | 424 ns | **344 ns** (−19 %) |
+| `reconstruct_inter_mb/subpel_skip` | 280 ns | 273 ns |
+
+Decomposition reading: the whole-pixel prediction is ~19 ns of the
+344 ns whole-pixel row (`mb_luma_whole_pixel_batched_16x16` 14 ns +
+chroma 5 ns), so the §14.3 WHT + 24 × §14.4 IDCT + §14.5
+extract-add-insert residue chain is ≈ **325 ns — ~95 % of the
+whole-pixel reconstruct and ~70 % of the sub-pixel one**. At 24 IDCTs
+× ~10 ns ≈ 240 ns, the remaining ~85 ns is the per-sub-block
+`extract_4x4` → `add_residue_4x4` → `insert_4x4` scratch round-trip —
+the concrete fusion surface the ranked table below names.
+
+### 3. `subpel_sad_scoring` — the encoder's #1 cluster, decomposed
+
+The micro-bench the standing "sub-pixel SAD without patch
+materialisation" candidate asked for — one §17 refinement candidate
+through `mb_luma_sad_at_mv`, plus the 21×21 halo fetch alone:
+
+| Bench | Stable (1.95) | Nightly + `simd` (1.97) |
+|---|---:|---:|
+| `subpel_sad_scoring/mb_luma_sad_at_mv_half_pel` | 187.8 ns | 179.9 ns |
+| `subpel_sad_scoring/mb_luma_sad_at_mv_quarter_pel` | 184.5 ns | 183.0 ns |
+| `subpel_sad_scoring/mb_luma_sad_at_mv_whole_pel` | 18.5 ns | 20.0 ns |
+| `subpel_sad_scoring/fetch_luma_mb_halo_21x21_in_bounds` | 22.2 ns | 21.9 ns |
+
+A sub-pixel candidate costs ≈ 184 ns: fetch 22 + whole-MB §18.3
+convolution ≈ 156 (`mb_luma_batched_16x16`) + SAD ≈ 6
+(`block_sad_16x16_single_pair`). The fused row-SAD candidate can only
+attack the convolution's narrow-to-u8 store + reload and the final
+256-byte SAD read-back — call it ≤ 20 ns/candidate of headroom (~10 %),
+× 16 sub-pixel candidates per searched MB. These rows are the A/B
+instrument for that change; the whole-pel row (the round-281 fused
+fetch-and-SAD) is the 10× cheaper shape the §17 ladder's diamond stage
+rides.
+
+### 4. Ranked hotspot table (fresh `sample(1)` profiles, 12 s @ 1 ms, nightly + `simd`, `--measurement-time 60`)
+
+Decoder — `inter_decode_short_clip` (~10.4k in-process samples), with
+the token-heavy stream's shift in parentheses:
+
+| Rank | Symbol | Self-samples | Share | Status |
+|---:|---|---:|---:|---|
+| 1 | `motion_comp::reconstruct_inter_mb` | 2447 | ≈ 23 % | **next PROFILE-OPT target** (see below) |
+| 2 | `dct_tokens::decode_block_core` | 2225 | ≈ 21 % | round-283-fused; grows to ≈ 45 % on the token-heavy stream (4340 samples) — re-ranks #1 on dense-residue content |
+| 3 | `memmove`/`memset` family | ≈ 1600 | ≈ 15 % | per-frame reference-slot plane copying (r283 attribution: `decode_frame` body + `RefFrameSlot::clone`) |
+| 4 | `Vp8DecoderState::decode_frame` body | 542 | ≈ 5 % | slot bookkeeping around #3 |
+| 5 | `coded_header::parse_token_prob_update` | 522 | ≈ 5 % | per-frame fixed cost; specialised flag-read loop still open |
+
+Encoder — `inter_encode_short_clip` (~10.2k in-process samples):
+
+| Rank | Symbol | Self-samples | Share | Status |
+|---:|---|---:|---:|---|
+| 1 | `mb_luma_sad_at_mv` + `fetch_luma_mb_halo` | 1992 + 564 | ≈ 25 % | sub-pixel SAD cluster — now decomposed by `subpel_sad_scoring`; fused row-SAD headroom ≈ 10 % of the cluster |
+| 2 | `encoder::group_sad_at_whole_mv` | 2205 | ≈ 22 % | round-281 fused loops (work moved into the caller's own body — tight row SAD, not call churn) |
+| 3 | RD/emit trio (`…_pick` 651 / `encode_mb_block_set_with_neighbors` 569 / `estimate_block_bits` 437) | 1657 | ≈ 16 % | token-emission side, already table-driven (r204/r276) |
+| 4 | `forward_dct_4x4` + `transform_whole_block_luma` | 509 | ≈ 5 % | scalar-dispatch by design (r247) |
+
+**Named next PROFILE-OPT target: `reconstruct_inter_mb` §14.4/§14.5
+residue fusion.** #1 decoder self-time (23 %, and #2 even on
+token-heavy content at 18 %), and the new micro-bench shows ~95 % of
+its whole-pixel cost is the residue chain, of which ~85 ns/MB is pure
+data movement: each of the 24 sub-blocks runs `extract_4x4` (strided
+raster → `[u8; 16]` scratch), `add_residue_4x4`, `insert_4x4` (scratch
+→ strided raster), plus a `[i16; 16]` residue scratch per IDCT. Fusing
+the §14.4 inverse transform's output pass with the §14.5 add-clamp
+directly over the prediction raster (strided, per sub-block row —
+4-lane wide, matching the existing `inverse_dct_4x4_simd` layout)
+removes both scratch round-trips at unchanged arithmetic. Byte-identity
+provable with the existing stress-matrix pattern; expected impact spans
+both decode benches and the encoder's RD-reconstruct leg
+(`reconstruct_inter_mb` is 131 encoder samples, but
+`encode_mb_block_set_with_neighbors` shares the same add-residue
+shape). Runner-up: the rank-3 reference-slot copy churn (slot-swap /
+copy-on-write planes), unchanged from the round-283 list.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
@@ -1341,5 +1466,19 @@ pre-/post-change on stable *and* under nightly + `simd`.
   an `i32` vector already under `simd`), skipping the narrow-to-u8
   store + reload — but the clamp-to-u8 must stay bit-exact, and the
   scalar path's auto-vectorisation may already cover most of the
-  margin. Needs a micro-bench first; the round-258 lesson (SIMD leaf
-  inlining regressing the surrounding descent) applies.
+  margin. The micro-bench it needed landed in round 285
+  (`subpel_sad_scoring`): a sub-pixel candidate costs ≈ 184 ns
+  (fetch 22 / convolve ≈ 156 / SAD ≈ 6), bounding the fusion headroom
+  at roughly 10 % of the cluster — the round-258 lesson (SIMD leaf
+  inlining regressing the surrounding descent) applies before
+  committing.
+* **`reconstruct_inter_mb` §14.4/§14.5 residue fusion** — NAMED next
+  profile-opt target by the round-285 ranked table (see above): #1
+  decoder self-time (≈ 23 %), with the round-285 micro-bench showing
+  ~95 % of the whole-pixel reconstruct cost in the residue chain and
+  ~85 ns/MB of it pure `extract_4x4`/`insert_4x4`/scratch data
+  movement. Fuse the §14.4 inverse-DCT output pass with the §14.5
+  add-clamp directly over the strided prediction raster; arithmetic
+  unchanged, byte-identity provable with the existing stress-matrix
+  pattern. Runner-up: reference-slot copy churn (slot-swap /
+  copy-on-write planes, rank 3 at ≈ 15 %).

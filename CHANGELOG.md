@@ -4,6 +4,36 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — hot-path bench harnesses + ranked hotspot table (round 285, 2026-06-12)
+
+Bench-only round; decoder and encoder behaviour byte-identical (no
+`src/` change). Three new criterion binaries close the harness gaps the
+round-283 profile left, and fresh `sample(1)` profiles of both inter
+benches produce a ranked hotspot table in `BENCHMARKS.md`:
+
+* `benches/token_decode.rs` — the fused §13.2 token descent in
+  isolation: `decode_mb_coeffs` over 64-MB token partitions produced by
+  the crate's own §13 `TokenEncoder` and verified coefficient-exact at
+  setup (dense ≈ 7.8 µs/MB, sparse ≈ 0.75 µs/MB), plus an inter-heavy
+  1-keyframe + 11-P-frame 176×144 whole-stream decode
+  (1.36 ms stable / 1.09 ms nightly + `simd`).
+* `benches/reconstruct_inter_mb.rs` — the round-283 #1 decoder
+  self-time symbol in its three workload shapes (sub-pixel
+  full-residue 569/464 ns, whole-pixel full-residue 424/344 ns,
+  skip 280/273 ns, stable / nightly + `simd`).
+* `benches/subpel_sad_scoring.rs` — the encoder's #1 cluster
+  decomposed: one §17 sub-pixel `mb_luma_sad_at_mv` candidate
+  ≈ 184 ns = halo fetch 22 + whole-MB §18.3 convolution ≈ 156 +
+  SAD ≈ 6 — the micro-bench the standing "sub-pixel SAD without patch
+  materialisation" candidate required.
+
+The ranked table names the next profile-opt target:
+`reconstruct_inter_mb` §14.4/§14.5 residue fusion (the per-sub-block
+`extract_4x4`/`insert_4x4`/scratch round-trips are ~85 ns/MB of pure
+data movement; fuse the inverse-DCT output pass with the add-clamp over
+the strided prediction raster). Runner-up: per-frame reference-slot
+plane-copy churn (slot-swap / copy-on-write).
+
 ### Fixed — `decode_vp8` rejected spec-legal frames with a sub-2-byte consumed DCT partition (round 284, 2026-06-12)
 
 Fuzz-depth round on the round-283 hot-path rewrite. The new

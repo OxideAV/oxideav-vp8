@@ -137,3 +137,25 @@ harness = false
 [[bench]]
 name = "motion_search_descent"
 harness = false
+
+# Round 285 benches — harnesses for the r283/r284 hot paths. `token_decode`
+# isolates the fused §13.2 token-descent layer (dense + sparse 64-MB
+# partitions produced by the crate's own §13 encoder and verified at setup)
+# and adds an inter-heavy 1K+11P 176×144 whole-stream decode;
+# `reconstruct_inter_mb` times the §14.2/§18 per-MB inter reconstruction
+# orchestrator (the round-283 #1 decoder self-time symbol) in its three
+# workload shapes; `subpel_sad_scoring` is the per-candidate encoder SAD
+# micro-bench the "sub-pixel SAD without patch materialisation" candidate
+# asked for (half-/quarter-/whole-pel `mb_luma_sad_at_mv` + the halo fetch
+# share in isolation).
+[[bench]]
+name = "token_decode"
+harness = false
+
+[[bench]]
+name = "reconstruct_inter_mb"
+harness = false
+
+[[bench]]
+name = "subpel_sad_scoring"
+harness = false

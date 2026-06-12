@@ -423,8 +423,48 @@ cargo-fuzz = true
 #                                     from either side, any dimension /
 #                                     MB-grid drift, or any single-byte
 #                                     pixel mismatch panics.
+#   * `decode_stream_token_descent`
+#                                  — full-frame multi-packet decode
+#                                     driver aimed at the round-283
+#                                     hot-path rewrite: the fused §13.2
+#                                     coefficient-tree descent
+#                                     (`decode_block_core`), the §20.16
+#                                     zigzag-direct coefficient writes
+#                                     (`decode_mb_coeffs`), and the §7.3
+#                                     batched bool-decoder
+#                                     renormalisation. Seeded with
+#                                     packet streams derived from the
+#                                     crate's `tests/fixtures/` IVF
+#                                     corpus (keyframes AND inter
+#                                     frames) so mutations corrupt real
+#                                     §13 token partitions instead of
+#                                     dying at the §9.1 header check.
+#                                     Three oracles beyond
+#                                     panic-freedom: a fresh
+#                                     `Vp8DecoderState` vs one-shot
+#                                     `decode_vp8` cross-entry-point
+#                                     differential on the first packet
+#                                     (Ok/Err polarity + byte-identical
+#                                     planes), an FNV-1a fold over every
+#                                     decoded plane byte, and — under
+#                                     the `simd` feature, this crate's
+#                                     default — a scalar-vs-SIMD
+#                                     differential over the §14.1 /
+#                                     §14.3 / §14.4 / §12.2 / §18.3
+#                                     kernel pairs on attacker-shaped
+#                                     inputs.
 #
 # The harness is a panic-freedom sweep over the public surface.
+
+[features]
+# cargo-fuzz always builds on nightly, where the `core::simd` kernels
+# compile — so the SIMD dispatch path (the one production nightly
+# builds run) is what gets fuzzed by default, and the
+# `decode_stream_token_descent` differential leg keeps the scalar
+# kernels covered by asserting scalar == SIMD on every iteration.
+# Build with `--no-default-features` to fuzz the pure-scalar dispatch.
+default = ["simd"]
+simd = ["oxideav-vp8/simd"]
 
 [dependencies]
 libfuzzer-sys = "0.4"
@@ -553,5 +593,11 @@ doc = false
 [[bin]]
 name = "encode_decode_pixel_lockstep"
 path = "fuzz_targets/encode_decode_pixel_lockstep.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_stream_token_descent"
+path = "fuzz_targets/decode_stream_token_descent.rs"
 test = false
 doc = false

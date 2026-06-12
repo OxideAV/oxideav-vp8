@@ -1,0 +1,21 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Auto-discovers
+# every target in fuzz/fuzz_targets/ and splits the 30-minute budget
+# across them (19 targets as of round 284 → ~94 s each), running under
+# ASan on nightly. The committed decode_stream_token_descent seed corpus
+# (fixture-derived keyframe + inter-frame packet streams) ships in the
+# checkout; libFuzzer-discovered corpus entries persist across runs via
+# the reusable workflow's cache.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"   # daily 05:23 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

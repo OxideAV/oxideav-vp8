@@ -949,6 +949,73 @@ pub fn sixtap_mb_chroma(
     }
 }
 
+/// Differential probe for the fuzz harness: run the §18.3 / §20.14 4×4
+/// sub-pixel synthesis through BOTH [`sixtap_2d_scalar`] and
+/// [`sixtap_2d_simd`] and return `(scalar, simd)` so the caller can assert
+/// byte-equality. Same argument contract as [`sixtap_2d`]
+/// (`mx`, `my` ∈ 0..8).
+///
+/// Only compiled under the `simd` feature (without it there is exactly one
+/// implementation and nothing to compare). Behaviour-neutral: nothing in
+/// the decode or encode pipeline calls this — it exists so the
+/// `decode_stream_token_descent` fuzz target can turn any scalar/SIMD
+/// divergence on attacker-shaped inputs into a finding.
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn sixtap_2d_parity_pair(
+    halo: &[u8; 81],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> ([u8; 16], [u8; 16]) {
+    (
+        sixtap_2d_scalar(halo, mx, my, filters),
+        sixtap_2d_simd(halo, mx, my, filters),
+    )
+}
+
+/// Differential probe for the fuzz harness: run the MB-scale §18.3 /
+/// §20.14 luma synthesis through BOTH [`sixtap_mb_luma_scalar`] and
+/// [`sixtap_mb_luma_simd`] and return `(scalar, simd)` so the caller can
+/// assert byte-equality. Same argument contract as [`sixtap_mb_luma`].
+///
+/// Only compiled under the `simd` feature; behaviour-neutral (see
+/// [`sixtap_2d_parity_pair`]).
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn sixtap_mb_luma_parity_pair(
+    halo: &[u8; 21 * 21],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> ([u8; 256], [u8; 256]) {
+    (
+        sixtap_mb_luma_scalar(halo, mx, my, filters),
+        sixtap_mb_luma_simd(halo, mx, my, filters),
+    )
+}
+
+/// Differential probe for the fuzz harness: run the MB-scale §18.3 /
+/// §20.14 chroma synthesis through BOTH [`sixtap_mb_chroma_scalar`] and
+/// [`sixtap_mb_chroma_simd`] and return `(scalar, simd)` so the caller can
+/// assert byte-equality. Same argument contract as [`sixtap_mb_chroma`].
+///
+/// Only compiled under the `simd` feature; behaviour-neutral (see
+/// [`sixtap_2d_parity_pair`]).
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn sixtap_mb_chroma_parity_pair(
+    halo: &[u8; 13 * 13],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> ([u8; 64], [u8; 64]) {
+    (
+        sixtap_mb_chroma_scalar(halo, mx, my, filters),
+        sixtap_mb_chroma_simd(halo, mx, my, filters),
+    )
+}
+
 /// Scalar MB-scale §20.14 `sixtap_2d` over an 8×8 chroma block.
 ///
 /// Horizontal pass: 13 rows × 8 cols, each output sample the §18.3 `interp`

@@ -236,6 +236,35 @@ fn predict_tm_simd<const N: usize>(out: &mut [u8], above: &[u8], left: &[u8], p:
     }
 }
 
+/// Differential probe for the fuzz harness: run the §12.2 TM_PRED fill for
+/// one of the two §12.2 block widths (`n` = 16 luma or 8 chroma) through
+/// BOTH [`predict_tm_scalar`] and [`predict_tm_simd`] and return
+/// `(scalar, simd)` as `n*n`-byte rasters so the caller can assert
+/// byte-equality. `above` and `left` must each hold `n` pixels.
+///
+/// Only compiled under the `simd` feature (without it there is exactly one
+/// implementation and nothing to compare). Behaviour-neutral: nothing in
+/// the decode or encode pipeline calls this — it exists so the
+/// `decode_stream_token_descent` fuzz target can turn any scalar/SIMD
+/// divergence on attacker-shaped inputs into a finding.
+///
+/// # Panics
+///
+/// Panics if `n` is not 16 or 8 (the only widths the SIMD kernel serves).
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn predict_tm_parity_pair(n: usize, above: &[u8], left: &[u8], p: u8) -> (Vec<u8>, Vec<u8>) {
+    let mut scalar = vec![0u8; n * n];
+    predict_tm_scalar(&mut scalar, n, above, left, p);
+    let mut simd = vec![0u8; n * n];
+    match n {
+        16 => predict_tm_simd::<16>(&mut simd, above, left, p),
+        8 => predict_tm_simd::<8>(&mut simd, above, left, p),
+        other => panic!("predict_tm_parity_pair: unsupported §12.2 width {other}"),
+    }
+    (scalar, simd)
+}
+
 /// Generic DC-prediction helper for the §12.2 / §12.3 rules.
 ///
 /// * If both `above` and `left` are present, the DC value is the

@@ -308,6 +308,29 @@ fn dequant_block_simd(block: &mut [i16; 16], dc_factor: i16, ac_factor: i16) {
     *block = product.cast::<i16>().to_array();
 }
 
+/// Differential probe for the fuzz harness: run the §14.1 dequantize on
+/// `block` through BOTH [`dequant_block_scalar`] and [`dequant_block_simd`]
+/// and return `(scalar, simd)` so the caller can assert byte-equality.
+///
+/// Only compiled under the `simd` feature (without it there is exactly one
+/// implementation and nothing to compare). Behaviour-neutral: nothing in
+/// the decode or encode pipeline calls this — it exists so the
+/// `decode_stream_token_descent` fuzz target can turn any scalar/SIMD
+/// divergence on attacker-shaped inputs into a finding.
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn dequant_block_parity_pair(
+    block: &[i16; 16],
+    dc_factor: i16,
+    ac_factor: i16,
+) -> ([i16; 16], [i16; 16]) {
+    let mut scalar = *block;
+    dequant_block_scalar(&mut scalar, dc_factor, ac_factor);
+    let mut simd = *block;
+    dequant_block_simd(&mut simd, dc_factor, ac_factor);
+    (scalar, simd)
+}
+
 /// Bitstream→dequant wrapper: decode one macroblock's raw quantized
 /// coefficient tokens (§13.3) and apply the §14.1 dequant factors,
 /// producing the pre-dequantized [`MbCoeffs`] that [`decode_keyframe`]

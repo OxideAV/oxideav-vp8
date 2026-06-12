@@ -595,6 +595,50 @@ fn inverse_dct_4x4_simd(input: &[i16; 16], output: &mut [i16; 16]) {
     }
 }
 
+/// Differential probe for the fuzz harness: run the §14.3 inverse WHT on
+/// `input` through BOTH [`inverse_wht_4x4_scalar`] and
+/// [`inverse_wht_4x4_simd`] and return `(scalar, simd)` so the caller can
+/// assert byte-equality.
+///
+/// Only compiled under the `simd` feature (without it there is exactly one
+/// implementation and nothing to compare). Behaviour-neutral: nothing in
+/// the decode or encode pipeline calls this — it exists so the
+/// `decode_stream_token_descent` fuzz target can turn any scalar/SIMD
+/// divergence on attacker-shaped inputs into a finding. `input` must stay
+/// inside the §14.2 coefficient envelope (the same contract the public
+/// [`inverse_wht_4x4`] carries).
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn inverse_wht_4x4_parity_pair(input: &[i16; 16]) -> ([i16; 16], [i16; 16]) {
+    let mut scalar = [0i16; 16];
+    inverse_wht_4x4_scalar(input, &mut scalar);
+    let mut simd = [0i16; 16];
+    inverse_wht_4x4_simd(input, &mut simd);
+    (scalar, simd)
+}
+
+/// Differential probe for the fuzz harness: run the §14.4 inverse DCT on
+/// `input` through BOTH [`inverse_dct_4x4_scalar`] and
+/// [`inverse_dct_4x4_simd`] and return `(scalar, simd)` so the caller can
+/// assert byte-equality.
+///
+/// Only compiled under the `simd` feature (without it there is exactly one
+/// implementation and nothing to compare). Behaviour-neutral: nothing in
+/// the decode or encode pipeline calls this — it exists so the
+/// `decode_stream_token_descent` fuzz target can turn any scalar/SIMD
+/// divergence on attacker-shaped inputs into a finding. `input` must stay
+/// inside the §14.2 coefficient envelope (the same contract the public
+/// [`inverse_dct_4x4`] carries).
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn inverse_dct_4x4_parity_pair(input: &[i16; 16]) -> ([i16; 16], [i16; 16]) {
+    let mut scalar = [0i16; 16];
+    inverse_dct_4x4_scalar(input, &mut scalar);
+    let mut simd = [0i16; 16];
+    inverse_dct_4x4_simd(input, &mut simd);
+    (scalar, simd)
+}
+
 /// §14.5 summation of predictor and residue for one 4×4 sub-block.
 ///
 /// Each output pixel is `clamp255(prediction[i] + residue[i])`, with

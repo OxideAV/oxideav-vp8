@@ -4,6 +4,69 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Fixed — `decode_vp8` rejected spec-legal frames with a sub-2-byte consumed DCT partition (round 284, 2026-06-12)
+
+Fuzz-depth round on the round-283 hot-path rewrite. The new
+`decode_stream_token_descent` target's cross-entry-point differential
+(fresh `Vp8DecoderState::decode_frame` vs one-shot `decode_vp8` on the
+same first packet) found a real divergence within its first minute of
+execution: `decode_residuals` (the `decode_vp8` keyframe path)
+initialised consumed DCT partitions with the strict control-partition
+`BoolDecoder::init`, which rejects `len < 2` with `InputTooShort`,
+while the stateful keyframe path (`state::decode_intra_residuals`)
+uses the tolerant §20.2 `init_bool_decoder` form
+(`BoolDecoder::init_partition`: `sz < 2` → zero-initialised value
+register, empty input) — what the RFC 6386 §20.2 reference listing
+does. A spec-legal key frame whose DCT-partition carve leaves a
+consumed partition shorter than 2 bytes therefore decoded through
+`Vp8DecoderState` but errored through `decode_vp8`.
+
+`decode_residuals` now uses `BoolDecoder::init_partition`, matching
+the stateful path and the §20.2 reference. Regression pinned with the
+fuzz-found 57-byte witness in
+`tests/decode_short_dct_partition_parity.rs` (both entry points must
+accept it and produce byte-identical planes); the witness is also
+committed as a corpus seed. Fixture-corpus byte-identity: all 13
+`tests/fixtures/*/input.ivf` streams (27 frames, 205 056 decoded
+plane bytes) hash to FNV-1a `65266afd221ea43c` before AND after the
+fix, on stable and on nightly + `simd` — the fix only changes
+behaviour on streams the one-shot path previously rejected.
+
+### Added — fuzz depth on the round-283 fused token-descent decode path (round 284, 2026-06-12)
+
+* **`decode_stream_token_descent` fuzz target** — full-frame
+  multi-packet decode driver aimed at the round-283 rewrite (fused
+  §13.2 descent, §20.16 zigzag-direct writes, §7.3 batched
+  renormalisation), with the suite's first committed seed corpus: the
+  13 `tests/fixtures/*/input.ivf` streams (keyframes AND inter
+  frames) re-framed as `[u16-LE len][payload]` packet sequences, so
+  mutations corrupt real token partitions and inter-frame mode/MV
+  data against valid reference state. Oracles: cross-entry-point
+  differential (above), an FNV-1a fold over every decoded plane byte,
+  and a scalar-vs-SIMD kernel differential.
+* **Scalar↔SIMD parity probes** (`#[doc(hidden)]`, `simd`-gated,
+  behaviour-neutral — nothing in the decode/encode pipeline calls
+  them): `dequant::dequant_block_parity_pair` (§14.1),
+  `inverse_transform::inverse_wht_4x4_parity_pair` /
+  `inverse_dct_4x4_parity_pair` (§14.3 / §14.4),
+  `intra_predict::predict_tm_parity_pair` (§12.2), and
+  `motion_comp::sixtap_2d_parity_pair` /
+  `sixtap_mb_luma_parity_pair` / `sixtap_mb_chroma_parity_pair`
+  (§18.3 / §20.14). Each runs the private scalar and SIMD
+  implementations on the same input and returns both results so the
+  fuzz harness turns any divergence into a finding — extending the
+  fixed-stress-set in-tree equivalence tests to attacker-shaped
+  inputs.
+* **Fuzz crate defaults to `simd`** — cargo-fuzz always builds on
+  nightly, so the SIMD dispatch path (what production nightly builds
+  run) is what gets fuzzed by default across all 19 targets, while
+  the differential leg keeps the scalar kernels covered in the same
+  process. `--no-default-features` fuzzes the pure-scalar dispatch.
+* **Scheduled `Fuzz` workflow** (`.github/workflows/fuzz.yml`) —
+  daily ASan run over every discovered target via the shared
+  `crate-fuzz` reusable workflow (30-minute budget, corpus cached
+  across runs).
+
 ### Performance — fused §13 token descent + batched bool-decoder renormalisation (round 283, 2026-06-12)
 
 Takes the round-282 ranked candidate #1 (§13 token decode, ≈ 31 % of

@@ -412,24 +412,22 @@ fn decode_residuals(
     // the cursor persisting across rows that share a partition (the §20.4
     // round-robin rule). Partitions that no row routes to — e.g. the
     // 1-byte padding partitions of a 16×16 / 4-partition frame, where only
-    // partition 0 is ever read — are left `None` and never initialised, so
-    // their (potentially sub-2-byte) padding does not trip the bool-decoder
-    // minimum-length check. Initialising a needed partition that is itself
-    // too short still surfaces a clean error.
+    // partition 0 is ever read — are left `None` and never initialised.
+    // Consumed partitions use the tolerant §20.2 `init_bool_decoder` form
+    // ([`BoolDecoder::init_partition`]): a DCT partition that rounds down
+    // to a 0- or 1-byte slice is spec-legal (`sz < 2` → zero-initialised
+    // value register, empty input) and must decode, matching the
+    // stateful keyframe path in `state::decode_intra_residuals`. The
+    // round-284 `decode_stream_token_descent` fuzz target's
+    // cross-entry-point differential caught this path still using the
+    // strict control-partition `init` and rejecting such frames with
+    // `InputTooShort`.
     let mut partition_decoders: Vec<Option<BoolDecoder<'_>>> =
         (0..num_partitions).map(|_| None).collect();
     for mb_row in 0..mb_rows {
         let part_idx = mb_row % num_partitions;
         if partition_decoders[part_idx].is_none() {
-            let bd =
-                BoolDecoder::init(partitions[part_idx]).map_err(|e| DecodeError::MbCoeffs {
-                    index: mb_row * mb_cols,
-                    source: MbCoeffError::Block {
-                        index: 0,
-                        source: e.into(),
-                    },
-                })?;
-            partition_decoders[part_idx] = Some(bd);
+            partition_decoders[part_idx] = Some(BoolDecoder::init_partition(partitions[part_idx]));
         }
     }
 

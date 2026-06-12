@@ -320,7 +320,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships eighteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships nineteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -669,6 +669,22 @@ between the paired surfaces):
   `tests/encoder_decoder_pixel_lockstep.rs` (5 anchors: partial-MB +
   normal filter, simple-filter extremes, 1-px strips, 8-partition
   populated/empty layouts, §13.4 L(8) probability extremes 0 / 255).
+* `decode_stream_token_descent` — full-frame multi-packet decode
+  driver aimed at the round-283 hot-path rewrite (fused §13.2 token
+  descent, §20.16 zigzag-direct coefficient writes, §7.3 batched
+  bool-decoder renormalisation), landed in round 284. Seeded with the
+  13 fixture IVF streams (keyframes AND inter frames) re-framed as
+  length-prefixed packet sequences so mutations corrupt real §13
+  token partitions against valid reference state. Three oracles:
+  fresh-`Vp8DecoderState`-vs-`decode_vp8` cross-entry-point
+  differential (Ok/Err polarity + byte-identical planes — caught the
+  round-284 short-DCT-partition fix within its first minute), an
+  FNV-1a fold over every decoded plane byte, and a scalar-vs-SIMD
+  differential over the §14.1 / §14.3 / §14.4 / §12.2 / §18.3 kernel
+  pairs (the fuzz crate builds with `simd` by default, so the SIMD
+  dispatch path is fuzzed while the differential keeps the scalar
+  kernels covered). Daily scheduled `Fuzz` workflow runs every target
+  under ASan since round 284.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

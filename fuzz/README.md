@@ -29,12 +29,15 @@ debug-arithmetic overflow, or out-of-bounds index.
 
 | `encode_decode_pixel_lockstep` | `encode_keyframe_with_reconstruction_and_token_updates` → `decode_vp8` (pixel differential) | Pixel-exact encode→decode lockstep differential (§9 / §12 / §13.4 / §14 / §15 / §19.2), landed in round 280. The round-264 `panic_free_encode_decode_e2e` target stitches the two halves into one iteration but its oracle stops at the §9.1 visible width / height round-trip — decoded *pixels* are never compared against anything. This target uses the encoder's own post-§15 reconstruction planes (returned by `encode_keyframe_with_reconstruction_and_token_updates`; the §15.1 contract is that a compliant decoder reproduces them exactly, since the encoder predicts each MB from its own reconstruction precisely to stay in lockstep) as a bit-exact differential oracle: every visible Y / U / V byte of the decoder's output is asserted equal to the encoder's reconstruction, so a single-pixel drift anywhere in the §12 intra-prediction / §14 dequant + inverse-transform / §15 loop-filter / §9.1 visible-crop chain panics instead of hiding behind a dimensions-only check. Three gaps closed: (1) first pixel-content oracle in the suite; (2) non-MB-aligned dimensions — each axis is drawn in raw luma pixels (width 1..=64, height 1..=144, the tall end populating all 8 §9.5 DCT partitions via the §20.4 `row % N` round-robin), so nearly every iteration carries partial right / bottom macroblocks (encoder edge-replication padding, §15 filtering over the *padded* raster, decoder visible-crop), where the e2e target only ever encodes whole-MB frames; (3) the §13.4 `token_prob_update()` **write** path — no other target drives the encoder-side emitter (`parse_headers` / `panic_free_token_block` fuzz the read side only); half of all iterations thread a sparse fuzz-shaped `TokenProbUpdates` payload (up to 8 positions, raw 0..=255 probability bytes — the full §13.4 L(8) wire range, wider than the `[1, 255]` band the in-tree fitter emits), locking the merged `coeff_probs` table pixel-exact end-to-end at probability extremes. Parameters are normalised into their legal §9.4 / §9.5 / §9.6 ranges, so an `Err` from either side, any dimension / MB-grid drift, or any pixel mismatch is a finding (panic), not a silent early-return. |
 
+| `decode_stream_token_descent` | `Vp8DecoderState::decode_frame` (multi-packet), `decode_vp8` (cross-entry differential), scalar↔SIMD kernel pairs (§14.1 / §14.3 / §14.4 / §12.2 / §18.3) | Full-frame decode driver aimed at the round-283 hot-path rewrite — the fused §13.2 coefficient-tree descent (`dct_tokens::decode_block_core`, the branch-coded walk with the DCT_0 zero-run re-entry loop), the §20.16 zigzag-direct coefficient writes in `decode_mb_coeffs`, and the §7.3 batched bool-decoder renormalisation. Landed in round 284. Random bytes almost never survive the §9.1 / §19.2 header validation long enough to reach a deep token descent, so this is the first target in the suite with a **committed seed corpus**: the 13 `tests/fixtures/*/input.ivf` streams (keyframes AND inter frames — `i-frame-then-p-frame-64x64`, `golden-update-cycle`, `altref-arnr-on`, …) re-framed into the `[u16-LE len][payload]` packet format, so libFuzzer mutations corrupt real §13 token partitions and §16 inter-frame mode/MV data against valid reference state instead of dying at the frame tag. Three oracles beyond panic-freedom: (1) cross-entry-point differential — the first packet is also fed to the stateless `decode_vp8`; a fresh `Vp8DecoderState` and the one-shot path both start from the §13.5 / §16.1 / §17.2 defaults, so Ok/Err polarity AND every visible plane byte must agree (this oracle caught the round-284 short-DCT-partition divergence on its first minute of execution — see `tests/decode_short_dct_partition_parity.rs`); (2) every decoded plane byte is folded into an FNV-1a accumulator so short-write / stale-length bugs surface under ASan; (3) under the `simd` feature (this fuzz crate's default — cargo-fuzz always builds on nightly) the §14.1 dequant, §14.3 inverse WHT, §14.4 inverse DCT, §12.2 TM_PRED, and §18.3 / §20.14 six-tap kernel pairs are each run through their scalar AND SIMD implementations (`*_parity_pair` probes) on attacker-shaped inputs drawn from the same bytes, panicking on any divergence — so the full-frame decode fuzzes the SIMD dispatch path while the differential leg keeps the scalar kernels covered in the same process. |
+
 The contract these harnesses enforce is **panic-freedom on the
 public API surface** — plus, where a target carries an equivalence
 leg (`panic_free_mb_batch_motion_comp`, `panic_free_filter_block_into`,
-the `panic_free_loop_filter_writeback` round-trip, and the
-`encode_decode_pixel_lockstep` pixel differential), byte-exact
-agreement between the paired surfaces.
+the `panic_free_loop_filter_writeback` round-trip, the
+`encode_decode_pixel_lockstep` pixel differential, and the
+`decode_stream_token_descent` cross-entry-point + scalar↔SIMD
+differentials), byte-exact agreement between the paired surfaces.
 
 ## OOM caps
 
@@ -74,6 +77,9 @@ gating data short-circuits before the decoder runs:
 | Min input length (`encode_decode_pixel_lockstep`) | 31 B | The harness reads a 7-byte scalar header (width + height + `y_ac_qi` + `loop_filter_level` + `sharpness_level` + partition selector + flags) plus eight 3-byte §13.4 update triples; inputs shorter than that early-return so libFuzzer learns the boundary |
 | Max luma pixels per frame (`encode_decode_pixel_lockstep`) | 64 × 144 (9 216) | Width drawn as `1 + (b % 64)`, height as `1 + (b % 144)` raw luma px — deliberately NOT MB-aligned so the §9.1 partial-MB padding / visible-crop seam is hot; the tall end (≥ 113 px → 8 MB rows) populates all 8 §9.5 DCT partitions. ≤ 36 MBs bounds the full encode + decode + two plane-set allocation per iteration |
 | Max input length (`encode_decode_pixel_lockstep`) | 4 KiB | libFuzzer default; re-checked at harness entry as defence-in-depth. Per-iteration allocations: three source planes (≤ ~14 KiB total), the emitted bitstream, the encoder's reconstruction plane set, and the decoder's visible-cropped plane set — all bounded by the 64 × 144 dimension cap |
+| Max input length (`decode_stream_token_descent`) | 16 KiB | The committed fixture-derived seeds top out under 3 KiB; the wider cap leaves libFuzzer mutation headroom for multi-packet growth |
+| Max packets per iteration (`decode_stream_token_descent`) | 12 | Bounds per-iteration wall time; the longest committed seed (`altref-arnr-on`) carries 10 frames |
+| Max luma pixels per decoded frame (`decode_stream_token_descent`) | 256 × 256 (65 536) | [`accept_dimensions`] applied to every packet that parses as a key frame; inter frames inherit the already-capped locked geometry |
 
 The `parse_headers` target has **no** dimension cap — it allocates
 nothing beyond the parsers' own internal state, so even wire-extreme
@@ -107,6 +113,7 @@ cargo +nightly fuzz run panic_free_encode_decode_e2e
 cargo +nightly fuzz run panic_free_mb_batch_motion_comp
 cargo +nightly fuzz run panic_free_filter_block_into
 cargo +nightly fuzz run encode_decode_pixel_lockstep
+cargo +nightly fuzz run decode_stream_token_descent
 ```
 
 `cargo-fuzz` requires the nightly toolchain for libFuzzer's
@@ -115,7 +122,18 @@ the fuzz binaries need nightly.
 
 ## Corpus
 
-The repository ships **no** seed corpus. libFuzzer starts from empty
+The repository ships a seed corpus for **one** target:
+`fuzz/corpus/decode_stream_token_descent/` carries the 13
+`tests/fixtures/*/input.ivf` streams re-framed into the harness's
+`[u16-LE len][payload]` packet format (committed explicitly past the
+directory-level `.gitignore` — libFuzzer-discovered corpus entries
+stay untracked) plus the round-284 short-DCT-partition witness.
+Full-frame decode needs structurally-valid §9.1 / §19.2 headers
+before any §13 token descent runs, and inter-frame coverage
+additionally needs a previously-decoded reference frame — neither of
+which libFuzzer discovers from empty input in useful time.
+
+Every other target ships no seeds: libFuzzer starts from empty
 and discovers structure on its own; the targets each converge
 on coverage of their respective surface within a few minutes on a
 single core. A 20-second smoke run on `panic_free_two_pass_stream`
@@ -141,10 +159,32 @@ a 5-input locally-seeded corpus — partial-MB, tall 8-partition frame,
 encode pipeline AND the full decode pipeline plus a whole-frame
 three-plane byte comparison), peak RSS 472 MiB, zero findings.
 
+The round-284 `decode_stream_token_descent` qualification run (from
+the committed 13-stream fixture-derived seed corpus, `simd` build)
+landed `cov: 4418, ft: 20324, corp: 2374/3375Kb` across 890 816
+iterations in 601 s under ASan (~1 482 exec/s; every iteration runs
+up to 12 full-frame decodes plus the cross-entry-point and
+scalar↔SIMD differentials), peak RSS 610 MiB. Its cross-entry-point
+oracle found the round-284 short-DCT-partition `decode_vp8`
+divergence within the first minute of its first-ever run (fixed in
+the same round, pinned in
+`tests/decode_short_dct_partition_parity.rs`); zero findings after
+the fix. The same round re-ran all 18 pre-existing targets under
+ASan at 75 s each (~174 M combined iterations, from
+~28.7 M `panic_free_decode_keyframe` / 20.9 M
+`panic_free_decoder_state` / 19.8 M `panic_free_loopfilter_segment`
+down to ~8.4 K `encode_decode_pixel_lockstep`), zero findings — the
+first whole-suite sweep on the `simd`-default build.
+
 ## CI
 
 The fuzz crate is intentionally a separate nested workspace
 (`[workspace] members = ["."]` in its `Cargo.toml`) so it is NOT
 pulled into the umbrella's `crates/*` glob. The umbrella CI does
-not run fuzz iterations; the targets are exercised on demand by
-maintainers and during pre-release hardening.
+not run fuzz iterations. Since round 284 the repo's scheduled
+`Fuzz` workflow (`.github/workflows/fuzz.yml`, daily +
+`workflow_dispatch`) runs every target under ASan via the shared
+`crate-fuzz` reusable workflow, splitting a 30-minute budget across
+the discovered targets and persisting the libFuzzer corpus across
+runs; the committed `decode_stream_token_descent` seeds are picked
+up from the checkout on every run.

@@ -111,6 +111,21 @@ harness = false
 name = "loop_filter_mb_edge"
 harness = false
 
+# Round 282 benches — the decoder-side whole-frame gaps. The decode
+# half of the §16 inter roundtrip (`Vp8DecoderState` consuming the same
+# 1K+3P 128×128 stream `inter_encode_short_clip` produces) had no bench
+# at all, and the §15 / §20.6 whole-frame loop-filter pass (`filter_frame`
+# / `filter_inter_frame` — per-MB level resolution + skip rules + the
+# raster MB-edge / sub-block-edge cascade) was only covered at the
+# per-edge primitive layer (`loop_filter_normal`, `loop_filter_mb_edge`).
+[[bench]]
+name = "inter_decode_short_clip"
+harness = false
+
+[[bench]]
+name = "loop_filter_frame"
+harness = false
+
 # Round 255 bench. The §17.1 / §18.3 luma motion-search descent ladder
 # — `small_diamond_search_luma` (whole-pixel), `half_pixel_refine_luma`
 # (8 half-pixel offsets) and `quarter_pixel_refine_luma` (8 quarter-pixel

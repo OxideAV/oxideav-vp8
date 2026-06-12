@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Benchmarks — decoder-side coverage + full-suite refresh (round 282, 2026-06-12)
+
+Bench-only round; `src/` is byte-identical to round 281. Two new
+criterion benches close the decoder-side coverage gaps:
+
+* `benches/inter_decode_short_clip.rs` — the decode half of the §16
+  inter roundtrip: `Vp8DecoderState` replaying the 1K+3P 128×128
+  stream the `inter_encode_short_clip` clip produces (stream built in
+  setup, unmeasured). Baseline on Apple M4 / aarch64: **188.2 µs /
+  348 Mpx/s stable, 161.7 µs / 405 Mpx/s nightly + `simd`** (−14 %).
+* `benches/loop_filter_frame.rs` — the whole-frame §15 / §20.6 deblock
+  pass (`filter_frame` normal + simple, `filter_inter_frame` normal)
+  on a fully-coded 20×15-MB frame at filter level 26: 334.6 / 78.5 /
+  346.9 µs stable. The per-edge primitives were already benched
+  (`loop_filter_normal`, `loop_filter_mb_edge`); the frame-level pass
+  — per-MB level resolution, §15.1 skip rules, raster edge cascade —
+  was not.
+
+The full regression table in `BENCHMARKS.md` was re-measured on both
+toolchains (whole-frame benches at `--measurement-time 30`, micro at
+`--quick`), confirming the r278–r281 state within session drift; the
+`rate_control_qi_sweep` outputs are byte-identical to the round-194
+record while its wall column dropped ~30 % (the accumulated r204–r281
+encoder wins at constant output). Fresh `sample(1)` decoder profiles
+(keyframe stable, inter stable, inter simd) rank the next decoder
+candidates: §13 token decode (`dct_tokens::decode_block` +
+`decode_mb_coeffs`, ≈ 31 % of inter decode under `simd`), per-frame
+reference-slot plane copying in `Vp8DecoderState::decode_frame`
+(`memmove` family ≈ 11–14 %, mostly `RefFrameSlot::clone`), and the
+§13.4 `parse_token_prob_update` per-frame fixed cost (≈ 5 %).
+
 ### Performance — fused whole-pixel SAD scoring in motion search (round 281, 2026-06-12)
 
 Closes the round-279 BENCHMARKS candidate "whole-pixel SAD scoring

@@ -1042,6 +1042,159 @@ harness drives a different deterministic source — a drifting gradient
 plus a moving high-contrast square so SPLITMV does real work; what
 matters is pre == post within the round, on both toolchains.)
 
+## Round 282 — decoder-side bench coverage + full-suite refresh (bench round)
+
+Round 282 (2026-06-12) is a bench-only round: no `src/` change (the
+decoder and encoder are byte-identical to round 281). Three things
+landed.
+
+### 1. Two new decoder-side benches
+
+The bench suite had whole-frame coverage for keyframe decode but
+nothing for the §16 **inter decode** path, and the §15 loop filter was
+only covered at the per-edge primitive layer (`loop_filter_normal`,
+`loop_filter_mb_edge`) — never as the whole-frame §20.6 pass the
+decoder runs per frame.
+
+* **`inter_decode_short_clip/inter_decode_4f_128x128_qi32`** — a
+  `Vp8DecoderState` consuming the one-K + three-P 128×128 stream that
+  `Vp8InterStreamEncoder` produces from the same deterministic drift
+  clip the `inter_encode_short_clip` bench encodes (the stream is built
+  once in setup, unmeasured). Per iteration this runs §16.1 ref
+  selection, §16.2/§17 MV decode, §18 motion compensation (whole-pixel
+  copies + §18.3 six-tap synthesis), §14 transforms, and the §15.1
+  inter loop filter — the decode half of the inter roundtrip.
+* **`loop_filter_frame/{filter_frame_keyframe_320x240_normal,
+  filter_frame_keyframe_320x240_simple,
+  filter_inter_frame_320x240_normal}`** — the whole-frame §15 pass
+  (per-MB §20.6 level resolution + §15.1 skip rules + the raster
+  MB-edge / sub-block-edge cascade over Y, U, V) on a 20×15-MB frame
+  whose every MB carries a coded coefficient (the fully-coded worst
+  case; level 26, sharpness 0). The planes carry a per-MB checkerboard
+  DC offset so every edge does real clamp work. Each iteration runs on
+  a fresh clone via `iter_batched` (clone unmeasured). Note the
+  whole-frame decode benches don't exercise this worst case — their
+  synthetic streams resolve to light filtering (the §15 symbols don't
+  reach the decode profiles' top-of-stack lists) — so this bench is
+  the standing A/B instrument for any future §15 rewrite.
+
+### 2. Full-suite refresh (post r279–r281 state)
+
+All numbers re-measured this round on the same machine: Apple
+M4-class aarch64, macOS 25.1; **stable** = rustc 1.95.0 default
+features, **nightly + `simd`** = 1.97.0-nightly with the `simd`
+feature. Whole-frame benches under `--measurement-time 30
+--warm-up-time 3`; micro-benches under `--quick`; separate
+`CARGO_TARGET_DIR` per config. Micro-bench rows compare across the
+two columns only loosely (different compiler versions); rows whose
+kernels have no `simd` dispatch (loop filter, intra DC/V/H, SAD,
+SPLITMV write strategies) differ by toolchain alone.
+
+| Bench | Stable (1.95) | Nightly + `simd` (1.97) |
+|---|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 5.297 ms (14.4 Mpx/s) | **5.118 ms** (15.0 Mpx/s) |
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 154.2 µs (500 Mpx/s) | **122.9 µs** (622 Mpx/s, −20 %) |
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 6.182 ms (10.6 Mpx/s) | **5.947 ms** (11.0 Mpx/s) |
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` (NEW) | 188.2 µs (348 Mpx/s) | **161.7 µs** (405 Mpx/s, −14 %) |
+| `loop_filter_frame/filter_frame_keyframe_320x240_normal` (NEW) | 334.6 µs | 376.2 µs |
+| `loop_filter_frame/filter_frame_keyframe_320x240_simple` (NEW) | 78.5 µs | 84.9 µs |
+| `loop_filter_frame/filter_inter_frame_320x240_normal` (NEW) | 346.9 µs | 352.4 µs |
+| `inverse_transform_4x4/inverse_dct_4x4` | 10.14 ns | 9.82 ns |
+| `inverse_transform_4x4/inverse_wht_4x4` | 9.41 ns | 7.73 ns |
+| `forward_transform_4x4/forward_dct_4x4` | 10.97 ns | 10.80 ns |
+| `forward_transform_4x4/forward_wht_4x4` | 10.80 ns | 9.00 ns |
+| `intra_predict_dc16/predict_y16x16_dc` | 4.76 ns | 4.96 ns |
+| `intra_predict_dc16/predict_y16x16_v` | 3.64 ns | 3.74 ns |
+| `intra_predict_dc16/predict_y16x16_h` | 3.73 ns | 3.95 ns |
+| `intra_predict_dc16/predict_y16x16_tm` | 44.72 ns | **5.89 ns** |
+| `loop_filter_normal/subblock_filter_4_4` | 2.14 ns | 2.23 ns |
+| `loop_filter_normal/simple_segment_4` | 2.10 ns | 2.33 ns |
+| `loop_filter_mb_edge/mb_filter_wide` | 5.71 ns | 5.83 ns |
+| `loop_filter_mb_edge/mb_filter_hev` | 5.28 ns | 6.26 ns |
+| `loop_filter_mb_edge/subblock_filter_low_variance` | 5.06 ns | 5.31 ns |
+| `loop_filter_mb_edge/common_adjust_outer_taps` | 2.87 ns | 3.01 ns |
+| `loop_filter_mb_edge/common_adjust_no_outer` | 2.66 ns | 2.76 ns |
+| `motion_comp_subpel_luma/filter_block_4x4_sub3x5` | 24.73 ns | 26.37 ns |
+| `motion_comp_subpel_luma/mb_sixtap_2d_16x4x4` | 264.8 ns | 270.3 ns |
+| `motion_comp_subpel_luma/mb_luma_batched_16x16` | 158.8 ns | **142.3 ns** |
+| `motion_comp_subpel_luma/mb_luma_per_subblock_16x16` | 264.5 ns | 265.6 ns |
+| `motion_comp_subpel_luma/mb_chroma_batched_8x8` | 43.7 ns | **40.3 ns** |
+| `motion_comp_subpel_luma/mb_chroma_per_subblock_8x8` | 66.4 ns | 70.0 ns |
+| `motion_comp_subpel_luma/mb_luma_whole_pixel_batched_16x16` | 13.4 ns | 14.1 ns |
+| `motion_comp_subpel_luma/mb_luma_whole_pixel_per_subblock_16x16` | 47.1 ns | 49.5 ns |
+| `motion_comp_subpel_luma/mb_chroma_whole_pixel_batched_8x8` | 4.79 ns | 5.27 ns |
+| `motion_comp_subpel_luma/mb_chroma_whole_pixel_per_subblock_8x8` | 8.53 ns | 9.46 ns |
+| `motion_comp_subpel_luma/splitmv_predict_scratch_copy` | 379.0 ns | 388.1 ns |
+| `motion_comp_subpel_luma/splitmv_predict_strided_write` | 455.3 ns | 484.6 ns |
+| `motion_search_descent/small_diamond_search_luma_iters_8` | 82.2 ns | 88.6 ns |
+| `motion_search_descent/half_pixel_refine_luma_8_offsets` | 1.494 µs | 1.409 µs |
+| `motion_search_descent/quarter_pixel_refine_luma_8_offsets` | 1.490 µs | 1.461 µs |
+| `motion_search_descent/full_descent_whole_half_quarter` | 3.065 µs | 2.867 µs |
+| `motion_search_descent/block_sad_16x16_single_pair` | 6.31 ns | 6.83 ns |
+
+Headline reads: the whole-frame numbers confirm the r278–r281 state
+within session drift (keyframe encode ≈ 5.3 ms, inter encode ≈ 6.2 ms
+stable, keyframe decode −20 % under `simd` matching round 278's
+−21 %). The new inter-decode number establishes the baseline at
+**188 µs / 348 Mpx/s stable, 162 µs / 405 Mpx/s under `simd`** for
+the 4-frame 128×128 clip. The `rate_control_qi_sweep` byte column was
+re-run as an encoder regression sanity check: all ten outputs are
+byte-identical to the round-194 record (1701 / 676 / 612 / 595 / 480 /
+466 / 461 / 360 / 355 / 299 B) while the wall column dropped from
+7.3–9.3 ms to 5.3–5.7 ms — the accumulated r204–r281 encoder wins at
+constant output.
+
+### 3. Decoder profile evidence + ranked candidates
+
+`sample(1)` PID-attach profiles (12 s, 1 ms interval, bench looping
+under `--measurement-time 60`) of `keyframe_decode` (stable),
+`inter_decode_short_clip` (stable), and `inter_decode_short_clip`
+(nightly + `simd`). Top self-time symbols:
+
+| keyframe stable | inter stable | inter simd |
+|---|---|---|
+| `inverse_dct_4x4` 2178 | `decode_block` 1919 | `decode_block` 2265 |
+| `decode_block` 1823 | `inverse_dct_4x4` 1919 | `reconstruct_inter_mb` 2086 |
+| `decode_keyframe_mb_non_bpred` 1406 | `memmove` 1125 | `memmove` 1054 |
+| `memmove` 945 | `reconstruct_inter_mb` 1037 | `decode_mb_coeffs` 616 |
+| `decode_mb_coeffs` 570 | `decode_mb_coeffs` 559 | `decode_frame` 550 |
+| `predict_y16x16_tm` 507 | `decode_frame` 487 | `parse_token_prob_update` 445 |
+| `parse_mb_modes` 333 | `parse_token_prob_update` 361 | `decode_keyframe_mb_non_bpred` 309 |
+
+Call-tree attribution of the inter-stable `memmove`/`memset` family
+(~1100 samples): ≈ 624 under `Vp8DecoderState::decode_frame`'s own
+body and ≈ 393 under `RefFrameSlot::clone` — i.e. essentially all of
+it is per-frame reference-slot plane copying, plus ≈ 59 in
+`crop_to_visible`. Ranked next decoder candidates:
+
+1. **§13 token decode (`dct_tokens::decode_block` +
+   `decode_mb_coeffs`)** — #1 under `simd` (2265 + 616 of ~9300
+   in-process samples, ≈ 31 %) and #1/#2 in every profile. The
+   per-coefficient bool-decoder tree descent is the decoder's mirror
+   of the encoder hot path that rounds 170/204/276 collapsed; the same
+   playbook applies (branch-reduced descent, precomputed
+   tree-walk tables, batched context fetch for the §13.2 band/has-coeff
+   state). Biggest single lever on both decode benches.
+2. **Per-frame reference-slot copy churn in
+   `Vp8DecoderState::decode_frame`** — the `memmove` family is #3 in
+   both inter profiles (≈ 11–14 % of inter decode), attributed to
+   `RefFrameSlot::clone` + in-body plane copies when refreshing LAST /
+   GOLDEN / ALTREF. Candidate: share or swap the plane buffers
+   (slot-swap when refresh flags allow, or reference-counted planes
+   with copy-on-write) instead of cloning whole planes per frame.
+   Relative weight grows as frames shrink; still visible at 320×240.
+3. **`coded_header::parse_token_prob_update`** — 361 (stable) / 445
+   (simd) self-samples ≈ 5 % of inter decode: the per-frame fixed cost
+   of reading the 4×8×3×11 §13.4 update-flag bools. Candidate: a
+   specialised flag-read loop (the flags are overwhelmingly false at
+   these probs — hoist the bool-decoder state and inline the
+   common-path renormalise), amortised once per frame so it matters
+   most for small-frame / high-fps streams.
+
+The stable-only `inverse_dct_4x4` #1 (keyframe profile, 2178 samples
+≈ 16 %) is already solved by the existing `simd` feature (round 278
+measured it gone under `simd`); it stays closed rather than ranked.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
@@ -1084,6 +1237,13 @@ matters is pre == post within the round, on both toolchains.)
   nightly + `simd` whole-frame on `inter_encode_short_clip`;
   `fetch_block_whole_pixel` self-time collapsed 2290 → 356 samples;
   bit-identical (3 new equivalence anchors + 54-frame byte-hash A/B).
+* **Decoder-side trio (round-282 profile)** — §13 token decode
+  (`decode_block` + `decode_mb_coeffs`, ≈ 31 % of inter decode under
+  `simd`), per-frame reference-slot plane copying in
+  `Vp8DecoderState::decode_frame` (`memmove` family ≈ 11–14 %), and
+  the §13.4 `parse_token_prob_update` per-frame fixed cost (≈ 5 %).
+  See the round-282 ranked list above for the evidence and the
+  suggested shapes.
 * **Sub-pixel SAD without patch materialisation** — the post-round-281
   profile's #1 is the sub-pixel `mb_luma_sad_at_mv` leg (2103
   self-samples) + `fetch_luma_mb_halo` (590): each half-/quarter-pixel

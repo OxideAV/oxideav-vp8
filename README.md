@@ -220,6 +220,34 @@ wall-time picture is two-pronged: future SIMD / unroll work needs
 to target both poles. Same input as `loop_filter_normal` so the two
 deblock micro-benches compare directly.
 
+### Decoder-side whole-frame benches (round 282)
+
+Round 282 closed the two decoder-side bench gaps and refreshed the
+full regression table (see `BENCHMARKS.md` round 282):
+
+```sh
+cargo bench -p oxideav-vp8 --bench inter_decode_short_clip
+cargo bench -p oxideav-vp8 --bench loop_filter_frame -- --quick
+```
+
+* `inter_decode_short_clip/inter_decode_4f_128x128_qi32` —
+  `Vp8DecoderState` replaying the 1-keyframe + 3-P-frame stream the
+  `inter_encode_short_clip` clip encodes to: **188 µs (348 Mpx/s)
+  stable, 162 µs (405 Mpx/s) under nightly + `simd`** on Apple M4 /
+  aarch64. The decode half of the §16 inter roundtrip finally has a
+  whole-frame baseline next to `keyframe_decode` (154 µs stable /
+  123 µs simd at 320×240).
+* `loop_filter_frame/*` — the whole-frame §15 / §20.6 deblock pass
+  (`filter_frame` keyframe normal ≈ 335 µs and simple ≈ 78 µs,
+  `filter_inter_frame` normal ≈ 347 µs at 320×240, every MB coded —
+  the fully-coded worst case the synthetic decode streams never
+  reach).
+* The round-282 `sample(1)` decoder profiles rank the next decoder
+  candidates: §13 token decode (`decode_block`, ≈ 31 % of inter
+  decode under `simd`), per-frame reference-slot plane copying in
+  `Vp8DecoderState` (≈ 11–14 %), and the §13.4
+  `parse_token_prob_update` per-frame fixed cost (≈ 5 %).
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

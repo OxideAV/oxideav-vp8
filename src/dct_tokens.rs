@@ -10,10 +10,18 @@
 //!
 //! **What is in this module:**
 //!
-//! * The §13.2 token-tree walker (`treed_read_coef`), with the §13.2
-//!   "skip the dct_eob branch when the previous coefficient was a
-//!   DCT_0" optimisation. Implemented as a one-step descent past the
-//!   first internal node rather than a separate tree.
+//! * The §13.2 token-tree walk, with the §13.2 "skip the dct_eob
+//!   branch when the previous coefficient was a DCT_0" optimisation.
+//!   The tree is fixed (`COEFF_TREE` transcribes the §13.2 listing),
+//!   so the production descent in `decode_block_core` is written out
+//!   branch-by-branch — each internal node reads `probs[node >> 1]`
+//!   exactly as the generic §8.1 `treed_read` walk would, but without
+//!   the per-step tree-table loads, and each leaf flows straight into
+//!   its §13.2 consequence (zero / small value / `DCTextra` category /
+//!   end-of-block). The "skip dct_eob" rule becomes the inner
+//!   zero-run loop re-entering at the DCT_0 node. Bit-equivalence
+//!   against a generic table-driven walker over the same `COEFF_TREE`
+//!   is enforced by `fused_descent_matches_generic_tree_walk`.
 //! * The §13.2 `DCTextra` extra-bits decoder over the six fixed
 //!   probability tables `Pcat1..Pcat6`.
 //! * The §13.2 sign bit (read at probability 128).
@@ -138,11 +146,11 @@ impl BlockType {
 pub enum DctTokenError {
     /// Underlying bool-decoder ran out of bytes mid-token.
     BoolDecoder(BoolDecoderError),
-    /// The token tree walked into a leaf index outside `0..=11`. The
-    /// tree-table transcription is constant data, so this only fires
-    /// if `decode_block` is given a tree-table table corrupted by a
-    /// caller — kept as an error rather than `panic!` so all
-    /// failure modes flow through `Result`.
+    /// Historical variant: a generic tree walk stepped to a leaf index
+    /// outside `0..=11`. The production descent is now written out
+    /// branch-by-branch over the fixed §13.2 tree, so this can no
+    /// longer occur; the variant is retained for API compatibility
+    /// (it is part of the public error surface).
     InvalidTokenIndex,
 }
 
@@ -174,6 +182,14 @@ impl std::error::Error for DctTokenError {}
 /// Encoded verbatim from the §13.2 listing. The leading `-Eob` entry
 /// is at index 0; when the previous coefficient was zero the walker
 /// starts at index 2 (skipping the EOB branch) — see [`decode_block`].
+///
+/// The production descent (`decode_block_core`) writes this fixed tree
+/// out branch-by-branch instead of walking the table, so the constant
+/// is no longer loaded on the hot path. It stays as the §13.2
+/// transcription anchor: the test-side token encoder and the generic
+/// reference walker (`fused_descent_matches_generic_tree_walk`) both
+/// consume it to prove the fused descent agrees with the listing.
+#[allow(dead_code)] // production reads are fused; tests consume the table.
 const COEFF_TREE: [i8; 22] = [
     -(DctToken::Eob as i8),
     2, // eob = "0"
@@ -427,45 +443,10 @@ pub fn merge_default_token_probs(updates: &TokenProbUpdates) -> CoeffProbs {
     out
 }
 
-/// Walk the §13.2 coefficient tree starting at `start_index` (0 for
-/// "may decode dct_eob", 2 for "skip dct_eob — previous coefficient
-/// was zero"). The probability for each internal node `i` is
-/// `probs[i >> 1]`, matching RFC 6386 §8.1 `treed_read`.
-fn treed_read_coef(
-    dec: &mut BoolDecoder<'_>,
-    probs: &[u8; 11],
-    start_index: i8,
-) -> Result<DctToken, DctTokenError> {
-    let mut i: i8 = start_index;
-    loop {
-        let prob = probs[(i as usize) >> 1];
-        let bit = dec.read_bool(prob)? as usize;
-        let next = COEFF_TREE[i as usize + bit];
-        if next <= 0 {
-            let leaf = -next as u8;
-            return Ok(match leaf {
-                0 => DctToken::Dct0,
-                1 => DctToken::Dct1,
-                2 => DctToken::Dct2,
-                3 => DctToken::Dct3,
-                4 => DctToken::Dct4,
-                5 => DctToken::Cat1,
-                6 => DctToken::Cat2,
-                7 => DctToken::Cat3,
-                8 => DctToken::Cat4,
-                9 => DctToken::Cat5,
-                10 => DctToken::Cat6,
-                11 => DctToken::Eob,
-                _ => return Err(DctTokenError::InvalidTokenIndex),
-            });
-        }
-        i = next;
-    }
-}
-
 /// Decode the variable-length "extra bits" trailing a `Cat1..Cat6`
 /// token (RFC 6386 §13.2 `DCTextra`). `cat_probs` is the cat's
 /// fixed probability list (`Pcat1..Pcat6`, terminator omitted).
+#[inline]
 fn read_extra_bits(dec: &mut BoolDecoder<'_>, cat_probs: &[u8]) -> Result<u16, BoolDecoderError> {
     let mut v: u16 = 0;
     for &p in cat_probs {
@@ -473,6 +454,116 @@ fn read_extra_bits(dec: &mut BoolDecoder<'_>, cat_probs: &[u8]) -> Result<u16, B
         v = (v << 1) | bit;
     }
     Ok(v)
+}
+
+/// Identity write-order table — [`decode_block`]'s public contract is
+/// scan-order output, so its core invocation writes position `c` to
+/// slot `c`. The per-macroblock walk passes [`ZIGZAG`] instead and
+/// gets raster-order output without a separate reorder pass.
+const SCAN_IDENTITY: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// The §13.3 token loop with the §13.2 `coeff_tree` descent written
+/// out branch-by-branch.
+///
+/// Each `read_bool` below sits at one internal node of the §13.2
+/// `coeff_tree` and reads `probs[node >> 1]`, exactly as the generic
+/// §8.1 `treed_read` walk over [`COEFF_TREE`] would — the node-by-node
+/// mapping is: `probs[0]` eob-vs-rest (node 0), `probs[1]` DCT_0
+/// (node 2), `probs[2]` DCT_1 (node 4), `probs[3]` small-vs-category
+/// (node 6), `probs[4]`/`probs[5]` DCT_2/3/4 (nodes 8/10),
+/// `probs[6]`..`probs[10]` the cat1..cat6 fan-out (nodes 12..20).
+/// Flattening the walk removes the per-step tree-table loads and lets
+/// every leaf flow directly into its consequence — the §13.2 "skip
+/// the dct_eob branch after a DCT_0" rule becomes the inner zero-run
+/// loop re-entering at the DCT_0 node (with the §13.3 zero-class
+/// `ctx3 = 0` row), so the `prevCoeffWasZero` flag disappears
+/// entirely. The bit-read sequence is identical to the generic walk:
+/// tree bits, then `DCTextra` bits, then the sign bit at probability
+/// 128 (`fused_descent_matches_generic_tree_walk` proves it).
+///
+/// `plane_probs` is the resolved per-plane `[band][prev_ctx][11]`
+/// slice of [`CoeffProbs`]; `seed_ctx3` the §13.3 neighbour-count
+/// context for the first coefficient; `write_order[c]` the output
+/// slot for scan position `c` ([`SCAN_IDENTITY`] or [`ZIGZAG`]).
+/// Returns the number of non-zero coefficients written.
+#[inline]
+fn decode_block_core(
+    dec: &mut BoolDecoder<'_>,
+    plane_probs: &[[[u8; 11]; 3]; 8],
+    first_coeff: usize,
+    seed_ctx3: usize,
+    write_order: &[usize; 16],
+    coeffs: &mut [i16; 16],
+) -> Result<usize, DctTokenError> {
+    let mut ctx3 = seed_ctx3;
+    let mut non_zero_count = 0usize;
+    let mut i = first_coeff;
+    'position: while i < 16 {
+        let mut probs = &plane_probs[COEFF_BANDS[i]][ctx3];
+        // Node 0 — dct_eob vs everything else. Only reachable when the
+        // previous token was not a DCT_0 (or at the first coefficient).
+        if !dec.read_bool(probs[0])? {
+            break;
+        }
+        // Node 2 — DCT_0 vs non-zero. A DCT_0 forbids dct_eob at the
+        // next position (§13.2), so a run of zeros loops here directly,
+        // each subsequent position using the §13.3 zero-class row.
+        while !dec.read_bool(probs[1])? {
+            coeffs[write_order[i]] = 0;
+            i += 1;
+            if i == 16 {
+                break 'position;
+            }
+            probs = &plane_probs[COEFF_BANDS[i]][0];
+        }
+        // Non-zero magnitude. §13.3: the next position's context class
+        // is 1 for |value| == 1, 2 for |value| > 1.
+        let abs_value: u16 = if !dec.read_bool(probs[2])? {
+            // Node 4 — DCT_1.
+            ctx3 = 1;
+            1
+        } else {
+            ctx3 = 2;
+            if !dec.read_bool(probs[3])? {
+                // Node 6 left — DCT_2 / DCT_3 / DCT_4 (nodes 8, 10).
+                if !dec.read_bool(probs[4])? {
+                    2
+                } else if !dec.read_bool(probs[5])? {
+                    3
+                } else {
+                    4
+                }
+            } else if !dec.read_bool(probs[6])? {
+                // Node 12 left — cat1 / cat2 (node 14).
+                if !dec.read_bool(probs[7])? {
+                    CAT_BASE[0] + read_extra_bits(dec, PCAT1)?
+                } else {
+                    CAT_BASE[1] + read_extra_bits(dec, PCAT2)?
+                }
+            } else if !dec.read_bool(probs[8])? {
+                // Node 16 left — cat3 / cat4 (node 18).
+                if !dec.read_bool(probs[9])? {
+                    CAT_BASE[2] + read_extra_bits(dec, PCAT3)?
+                } else {
+                    CAT_BASE[3] + read_extra_bits(dec, PCAT4)?
+                }
+            } else if !dec.read_bool(probs[10])? {
+                // Node 20 — cat5 / cat6.
+                CAT_BASE[4] + read_extra_bits(dec, PCAT5)?
+            } else {
+                CAT_BASE[5] + read_extra_bits(dec, PCAT6)?
+            }
+        };
+        // Non-zero coefficients carry a sign bit at fixed probability
+        // 128 (§13.2 page 62). §13.2 cat6 max value is 67 + (2^11 - 1)
+        // = 2114, which still fits in i16 with sign.
+        let sign = dec.read_bool(128)?;
+        let signed = abs_value as i16;
+        coeffs[write_order[i]] = if sign { -signed } else { signed };
+        non_zero_count += 1;
+        i += 1;
+    }
+    Ok(non_zero_count)
 }
 
 /// Decode one DCT-token sub-block per RFC 6386 §13.3 and return the
@@ -506,83 +597,25 @@ pub fn decode_block(
     // §13.3 page 65: the third context-index (`ctx3`) is seeded by
     // the count of non-zero neighbours for the very first coefficient
     // only. After the first coefficient the field rolls over to the
-    // class of the last decoded coefficient (see end of loop).
-    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
-    let plane = block_type.plane_index();
-    let first_coeff = block_type.first_coeff();
-
+    // class of the last decoded coefficient (handled inside the core).
+    //
     // §13.3 page 67 calls the "skip dct_eob branch" flag
     // `prevCoeffWasZero`. It is `false` for the first coefficient
     // because there is no previous coefficient at all (i.e. we DO
-    // permit an immediate dct_eob). After the first iteration the
-    // value is updated to `(token == DCT_0)` — see the trailing
-    // assignment in the loop.
-    let mut prev_was_zero = false;
-
-    let mut non_zero_count = 0usize;
-
-    let mut i = first_coeff;
-    while i < 16 {
-        let band = COEFF_BANDS[i];
-        let probs = &coeff_probs[plane][band][ctx3];
-
-        // §13.2: skip the eob branch if previous coefficient was a DCT_0.
-        // The eob branch is the i=0/i=1 edge of the tree; entering at
-        // index 2 (the DCT_0 branch) bypasses it.
-        let start = if prev_was_zero { 2i8 } else { 0i8 };
-        let token = treed_read_coef(dec, probs, start)?;
-
-        if token == DctToken::Eob {
-            break;
-        }
-
-        let abs_value: u16 = match token {
-            DctToken::Dct0 => 0,
-            DctToken::Dct1 => 1,
-            DctToken::Dct2 => 2,
-            DctToken::Dct3 => 3,
-            DctToken::Dct4 => 4,
-            DctToken::Cat1 => CAT_BASE[0] + read_extra_bits(dec, PCAT1)?,
-            DctToken::Cat2 => CAT_BASE[1] + read_extra_bits(dec, PCAT2)?,
-            DctToken::Cat3 => CAT_BASE[2] + read_extra_bits(dec, PCAT3)?,
-            DctToken::Cat4 => CAT_BASE[3] + read_extra_bits(dec, PCAT4)?,
-            DctToken::Cat5 => CAT_BASE[4] + read_extra_bits(dec, PCAT5)?,
-            DctToken::Cat6 => CAT_BASE[5] + read_extra_bits(dec, PCAT6)?,
-            DctToken::Eob => unreachable!("eob handled above"),
-        };
-
-        if abs_value != 0 {
-            // Non-zero coefficients carry a sign bit at fixed
-            // probability 128 (§13.2 page 62).
-            let sign = dec.read_bool(128)?;
-            // §13.2 cat6 max value is 67 + (2^11 - 1) = 2114, which
-            // still fits in i16 with sign. Cast is safe.
-            let signed = abs_value as i16;
-            coeffs[i] = if sign { -signed } else { signed };
-            non_zero_count += 1;
-        } else {
-            coeffs[i] = 0;
-        }
-
-        // §13.3 page 67: rollover of `ctx3` to the absolute-value
-        // class of the coefficient we just decoded.
-        ctx3 = if abs_value == 0 {
-            0
-        } else if abs_value == 1 {
-            1
-        } else {
-            2
-        };
-
-        // Spec-typo correction (see module-level doc comment): set
-        // `prev_was_zero` to whether the token was DCT_0, NOT the
-        // literal `true` the spec listing types.
-        prev_was_zero = token == DctToken::Dct0;
-
-        i += 1;
-    }
-
-    Ok(non_zero_count)
+    // permit an immediate dct_eob). After that, the spec-typo-corrected
+    // semantics (see the module-level doc comment) — `prevCoeffWasZero
+    // = (token == DCT_0)`, NOT the literal `true` the spec listing
+    // types — are realised structurally by `decode_block_core`'s inner
+    // zero-run loop, which re-enters the tree at the DCT_0 node.
+    let ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    decode_block_core(
+        dec,
+        &coeff_probs[block_type.plane_index()],
+        block_type.first_coeff(),
+        ctx3,
+        &SCAN_IDENTITY,
+        coeffs,
+    )
 }
 
 // ===========================================================================
@@ -692,7 +725,12 @@ impl std::error::Error for MbCoeffError {}
 /// Reorder a scan-order coefficient block into raster (natural) order via
 /// the §20.16 zig-zag table. `scan[c]` (scan position `c`) is placed at
 /// raster position `ZIGZAG[c]`.
-#[inline]
+///
+/// The production per-macroblock walk no longer needs this pass — it
+/// hands [`ZIGZAG`] to `decode_block_core` as the write-order table so
+/// each coefficient lands in its raster slot as it is decoded. Kept as
+/// the test-side reference permutation.
+#[cfg(test)]
 fn scan_to_raster(scan: &[i16; 16]) -> [i16; 16] {
     let mut raster = [0i16; 16];
     for (c, &v) in scan.iter().enumerate() {
@@ -765,25 +803,30 @@ pub fn decode_mb_coeffs(
     }
 
     // Decode one residual block: select the predictor slots, run the
-    // per-coefficient token loop, reorder to raster, and write back the
-    // non-zero status into both predictor vectors. `block_index` is the
-    // §20.16 residual block index (0..=24).
+    // per-coefficient token loop (writing each coefficient straight
+    // into its raster slot via the §20.16 `ZIGZAG` write order — no
+    // separate reorder pass), and write back the non-zero status into
+    // both predictor vectors. `block_index` is the §20.16 residual
+    // block index (0..=24).
     let decode_one = |dec: &mut BoolDecoder<'_>,
                       block_index: usize,
                       block_type: BlockType,
                       above: &mut MbEntropyCtx,
-                      left: &mut MbEntropyCtx|
-     -> Result<[i16; 16], MbCoeffError> {
+                      left: &mut MbEntropyCtx,
+                      raster: &mut [i16; 16]|
+     -> Result<(), MbCoeffError> {
         let a_slot = ABOVE_CONTEXT_INDEX[block_index];
         let l_slot = LEFT_CONTEXT_INDEX[block_index];
-        let mut scan = [0i16; 16];
-        let nz = decode_block(
+        // §13.3 page 65: ctx3 for the first coefficient is the count
+        // of non-zero neighbours.
+        let ctx3 = (above.nonzero[a_slot] as usize) + (left.nonzero[l_slot] as usize);
+        let nz = decode_block_core(
             dec,
-            block_type,
-            coeff_probs,
-            above.nonzero[a_slot],
-            left.nonzero[l_slot],
-            &mut scan,
+            &coeff_probs[block_type.plane_index()],
+            block_type.first_coeff(),
+            ctx3,
+            &ZIGZAG,
+            raster,
         )
         .map_err(|source| MbCoeffError::Block {
             index: block_index,
@@ -794,7 +837,7 @@ pub fn decode_mb_coeffs(
         let has_coeffs = nz != 0;
         above.nonzero[a_slot] = has_coeffs;
         left.nonzero[l_slot] = has_coeffs;
-        Ok(scan_to_raster(&scan))
+        Ok(())
     };
 
     // §13 / §14.2 residual order: Y2 (when present) → 16 Y → 4 U → 4 V.
@@ -802,7 +845,7 @@ pub fn decode_mb_coeffs(
     // when a Y2 block carries the DCs, else `YNoY2` (DCT starts at 0).
     if has_y2 {
         // Y2 is residual block 24 in the §20.16 index tables.
-        out.y2 = decode_one(dec, 24, BlockType::Y2, above, left)?;
+        decode_one(dec, 24, BlockType::Y2, above, left, &mut out.y2)?;
     }
 
     let y_plane = if has_y2 {
@@ -811,15 +854,15 @@ pub fn decode_mb_coeffs(
         BlockType::YNoY2
     };
     for (i, y_block) in out.y.iter_mut().enumerate() {
-        *y_block = decode_one(dec, i, y_plane, above, left)?;
+        decode_one(dec, i, y_plane, above, left, y_block)?;
     }
 
     // U occupies residual blocks 16..=19, V occupies 20..=23.
     for (i, u_block) in out.u.iter_mut().enumerate() {
-        *u_block = decode_one(dec, 16 + i, BlockType::UV, above, left)?;
+        decode_one(dec, 16 + i, BlockType::UV, above, left, u_block)?;
     }
     for (i, v_block) in out.v.iter_mut().enumerate() {
-        *v_block = decode_one(dec, 20 + i, BlockType::UV, above, left)?;
+        decode_one(dec, 20 + i, BlockType::UV, above, left, v_block)?;
     }
 
     Ok(out)
@@ -1338,6 +1381,198 @@ mod tests {
         let nz = decode_block(&mut dec, BlockType::Y2, probs, false, false, &mut out).unwrap();
         assert_eq!(nz, 1);
         assert_eq!(out[0], 2114);
+    }
+
+    /// Reference §8.1 `treed_read` over [`COEFF_TREE`]: the generic
+    /// table-driven walk the fused production descent replaced. Ground
+    /// truth for `fused_descent_matches_generic_tree_walk`.
+    fn treed_read_coef_reference(
+        dec: &mut BoolDecoder<'_>,
+        probs: &[u8; 11],
+        start_index: i8,
+    ) -> Result<DctToken, DctTokenError> {
+        let mut i: i8 = start_index;
+        loop {
+            let prob = probs[(i as usize) >> 1];
+            let bit = dec.read_bool(prob)? as usize;
+            let next = COEFF_TREE[i as usize + bit];
+            if next <= 0 {
+                let leaf = -next as u8;
+                return Ok(match leaf {
+                    0 => DctToken::Dct0,
+                    1 => DctToken::Dct1,
+                    2 => DctToken::Dct2,
+                    3 => DctToken::Dct3,
+                    4 => DctToken::Dct4,
+                    5 => DctToken::Cat1,
+                    6 => DctToken::Cat2,
+                    7 => DctToken::Cat3,
+                    8 => DctToken::Cat4,
+                    9 => DctToken::Cat5,
+                    10 => DctToken::Cat6,
+                    11 => DctToken::Eob,
+                    _ => return Err(DctTokenError::InvalidTokenIndex),
+                });
+            }
+            i = next;
+        }
+    }
+
+    /// Reference §13.3 token loop built on the generic tree walk — the
+    /// pre-fusion `decode_block` body, kept verbatim as ground truth.
+    fn decode_block_reference(
+        dec: &mut BoolDecoder<'_>,
+        block_type: BlockType,
+        coeff_probs: &CoeffProbs,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+        coeffs: &mut [i16; 16],
+    ) -> Result<usize, DctTokenError> {
+        let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+        let plane = block_type.plane_index();
+        let first_coeff = block_type.first_coeff();
+        let mut prev_was_zero = false;
+        let mut non_zero_count = 0usize;
+        let mut i = first_coeff;
+        while i < 16 {
+            let band = COEFF_BANDS[i];
+            let probs = &coeff_probs[plane][band][ctx3];
+            let start = if prev_was_zero { 2i8 } else { 0i8 };
+            let token = treed_read_coef_reference(dec, probs, start)?;
+            if token == DctToken::Eob {
+                break;
+            }
+            let abs_value: u16 = match token {
+                DctToken::Dct0 => 0,
+                DctToken::Dct1 => 1,
+                DctToken::Dct2 => 2,
+                DctToken::Dct3 => 3,
+                DctToken::Dct4 => 4,
+                DctToken::Cat1 => CAT_BASE[0] + read_extra_bits(dec, PCAT1)?,
+                DctToken::Cat2 => CAT_BASE[1] + read_extra_bits(dec, PCAT2)?,
+                DctToken::Cat3 => CAT_BASE[2] + read_extra_bits(dec, PCAT3)?,
+                DctToken::Cat4 => CAT_BASE[3] + read_extra_bits(dec, PCAT4)?,
+                DctToken::Cat5 => CAT_BASE[4] + read_extra_bits(dec, PCAT5)?,
+                DctToken::Cat6 => CAT_BASE[5] + read_extra_bits(dec, PCAT6)?,
+                DctToken::Eob => unreachable!("eob handled above"),
+            };
+            if abs_value != 0 {
+                let sign = dec.read_bool(128)?;
+                let signed = abs_value as i16;
+                coeffs[i] = if sign { -signed } else { signed };
+                non_zero_count += 1;
+            } else {
+                coeffs[i] = 0;
+            }
+            ctx3 = if abs_value == 0 {
+                0
+            } else if abs_value == 1 {
+                1
+            } else {
+                2
+            };
+            prev_was_zero = token == DctToken::Dct0;
+            i += 1;
+        }
+        Ok(non_zero_count)
+    }
+
+    #[test]
+    fn fused_descent_matches_generic_tree_walk() {
+        // Drive the fused production `decode_block` and the generic
+        // table-driven reference over a deterministic randomised corpus
+        // covering every plane type, every neighbour-context seed, and
+        // a sparsity/magnitude mix that reaches every tree leaf
+        // (zero runs, DCT_1..4, all six DCTextra categories, immediate
+        // EOB, and full-16 blocks). Outputs, non-zero counts, and the
+        // complete bool-decoder end state must agree exactly — proving
+        // the fused walk consumes the identical bit sequence.
+        let mut seed = 0x9e3779b9u32;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let block_types = [
+            BlockType::YAfterY2,
+            BlockType::Y2,
+            BlockType::UV,
+            BlockType::YNoY2,
+        ];
+        // A second probability table with overlays, so the corpus is
+        // not tied to the defaults.
+        let mut updates: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+        updates[0][1][0][0] = Some(90);
+        updates[1][0][1][3] = Some(17);
+        updates[3][6][2][1] = Some(201);
+        let overlaid = merge_default_token_probs(&updates);
+        let tables = [&DEFAULT_COEFF_PROBS, &overlaid];
+
+        for trial in 0..400 {
+            let block_type = block_types[(rng() % 4) as usize];
+            let probs = tables[(trial % 2) as usize];
+            let above = rng() & 1 == 1;
+            let left = rng() & 1 == 1;
+            // Sparsity dial: 0 = empty block, up to dense full blocks.
+            let density = rng() % 17;
+            let mut coeffs = [0i16; 16];
+            for slot in coeffs.iter_mut().skip(block_type.first_coeff()) {
+                if rng() % 16 < density {
+                    // Magnitude classes hitting every leaf: 1..4 small,
+                    // 5..2114 across cat1..cat6.
+                    let m = match rng() % 8 {
+                        0 => 1,
+                        1 => 2,
+                        2 => 3,
+                        3 => 4,
+                        4 => 5 + (rng() % 6) as i16,     // cat1/cat2
+                        5 => 11 + (rng() % 24) as i16,   // cat3/cat4
+                        6 => 35 + (rng() % 32) as i16,   // cat5
+                        _ => 67 + (rng() % 2048) as i16, // cat6
+                    };
+                    *slot = if rng() & 1 == 1 { -m } else { m };
+                }
+            }
+            let buf = encode_block(&coeffs, block_type, probs, above, left);
+
+            let mut dec_fused = BoolDecoder::init(&buf).unwrap();
+            let mut out_fused = [0i16; 16];
+            let nz_fused = decode_block(
+                &mut dec_fused,
+                block_type,
+                probs,
+                above,
+                left,
+                &mut out_fused,
+            )
+            .unwrap();
+
+            let mut dec_ref = BoolDecoder::init(&buf).unwrap();
+            let mut out_ref = [0i16; 16];
+            let nz_ref =
+                decode_block_reference(&mut dec_ref, block_type, probs, above, left, &mut out_ref)
+                    .unwrap();
+
+            assert_eq!(nz_fused, nz_ref, "trial {trial}: non-zero count");
+            assert_eq!(out_fused, out_ref, "trial {trial}: coefficients");
+            assert_eq!(out_fused, coeffs, "trial {trial}: roundtrip");
+            assert_eq!(
+                dec_fused.range(),
+                dec_ref.range(),
+                "trial {trial}: range state"
+            );
+            assert_eq!(
+                dec_fused.value(),
+                dec_ref.value(),
+                "trial {trial}: value state"
+            );
+            assert_eq!(
+                dec_fused.remaining_input(),
+                dec_ref.remaining_input(),
+                "trial {trial}: input cursor"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

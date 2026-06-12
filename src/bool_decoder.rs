@@ -154,6 +154,7 @@ impl<'a> BoolDecoder<'a> {
     /// one. `prob` must lie in `1..=255` per the encoder's contract
     /// (RFC 6386 §7.2); a probability of zero or 256 has no meaning
     /// because `split` would degenerate.
+    #[inline]
     pub fn read_bool(&mut self, prob: u8) -> Result<bool, BoolDecoderError> {
         // split is approximately (range * prob) / 256 and is strictly
         // greater than 0 and strictly less than range.
@@ -226,20 +227,44 @@ impl<'a> BoolDecoder<'a> {
     ///
     /// This is the inner loop of `read_bool` (RFC 6386 §7.3) lifted
     /// out so it can be reused in `init`-time tests.
+    ///
+    /// The §7.3 listing doubles `range` / `value` one bit at a time
+    /// until `range` is back in `128..=255`. The number of doublings is
+    /// a pure function of `range` (which is in `1..=255` after a
+    /// `read_bool` interval split), so the loop is collapsed here into
+    /// a single shift computed from `range.leading_zeros()`. At most
+    /// one fresh input byte can be needed per renormalisation — the
+    /// shift caps at 7 and `bit_count` is at most 7, so the §7.3
+    /// "shift counter reaches 8" byte pull fires at most once — and it
+    /// lands in `value` at bit offset `bit_count + shift - 8`, exactly
+    /// where the bit-at-a-time listing accumulates it (the byte is
+    /// OR-ed in when the counter wraps, then shifted up by the
+    /// doublings still outstanding). The `EndOfStream` trigger
+    /// condition is unchanged: a byte is required iff
+    /// `bit_count + shift >= 8`. The batched form is bit-exact against
+    /// the §7.3 listing on every decode
+    /// (`batched_renormalize_matches_bit_at_a_time_listing`).
+    #[inline]
     fn renormalize(&mut self) -> Result<(), BoolDecoderError> {
-        while self.range < 128 {
-            self.value <<= 1;
-            self.range <<= 1;
-            self.bit_count += 1;
-            if self.bit_count == 8 {
-                self.bit_count = 0;
-                let (next, rest) = match self.input.split_first() {
-                    Some(pair) => pair,
-                    None => return Err(BoolDecoderError::EndOfStream),
-                };
-                self.value |= *next as u32;
-                self.input = rest;
-            }
+        // `range` is in 1..=255 here; bringing it into 128..=255 takes
+        // exactly its leading-zero count above bit 7 (0..=7 doublings).
+        let shift = self.range.leading_zeros() - 24;
+        if shift == 0 {
+            return Ok(());
+        }
+        self.value <<= shift;
+        self.range <<= shift;
+        let bit_count = self.bit_count + shift;
+        if bit_count >= 8 {
+            let (next, rest) = match self.input.split_first() {
+                Some(pair) => pair,
+                None => return Err(BoolDecoderError::EndOfStream),
+            };
+            self.bit_count = bit_count - 8;
+            self.value |= (*next as u32) << self.bit_count;
+            self.input = rest;
+        } else {
+            self.bit_count = bit_count;
         }
         Ok(())
     }
@@ -489,6 +514,81 @@ mod tests {
         let _ = dec.read_bool(1).unwrap();
         let err = dec.read_bool(1).unwrap_err();
         assert_eq!(err, BoolDecoderError::EndOfStream);
+    }
+
+    /// Reference §7.3 `read_bool`: the same interval split as the
+    /// production method, but with the renormalisation written as the
+    /// literal bit-at-a-time listing (double `range`/`value`, count
+    /// shifted bits, pull a fresh byte when the counter reaches 8).
+    /// The production `renormalize` collapses that loop into a single
+    /// `leading_zeros`-derived shift; this is the ground truth it must
+    /// match state-for-state.
+    fn read_bool_reference(d: &mut BoolDecoder<'_>, prob: u8) -> Result<bool, BoolDecoderError> {
+        let split = 1 + (((d.range - 1) * prob as u32) >> 8);
+        let big_split = split << 8;
+        let retval = if d.value >= big_split {
+            d.value -= big_split;
+            d.range -= split;
+            true
+        } else {
+            d.range = split;
+            false
+        };
+        while d.range < 128 {
+            d.value <<= 1;
+            d.range <<= 1;
+            d.bit_count += 1;
+            if d.bit_count == 8 {
+                d.bit_count = 0;
+                let (next, rest) = match d.input.split_first() {
+                    Some(pair) => pair,
+                    None => return Err(BoolDecoderError::EndOfStream),
+                };
+                d.value |= *next as u32;
+                d.input = rest;
+            }
+        }
+        Ok(retval)
+    }
+
+    #[test]
+    fn batched_renormalize_matches_bit_at_a_time_listing() {
+        // Drive the production decoder and the bit-at-a-time reference
+        // in lockstep over a probability sweep that exercises every
+        // renormalisation depth (shift 0 through 7, byte pulls landing
+        // at every bit_count offset) and assert the full decoder state
+        // matches after every read.
+        let mut enc = TestEncoder::new();
+        let mut probs = Vec::new();
+        let mut bits = Vec::new();
+        let mut seed = 0x2545f491u32;
+        for _ in 0..4096 {
+            // xorshift32 — deterministic prob/bit stream.
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let p = (seed % 254 + 1) as u8;
+            let b = (seed >> 16) & 1 == 1;
+            probs.push(p);
+            bits.push(b);
+            enc.write_bool(p, b);
+        }
+        let buf = enc.finish();
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut dec_ref = BoolDecoder::init(&buf).unwrap();
+        for (i, (&p, &expected)) in probs.iter().zip(bits.iter()).enumerate() {
+            let got = dec.read_bool(p).unwrap();
+            let got_ref = read_bool_reference(&mut dec_ref, p).unwrap();
+            assert_eq!(got, expected, "decoded bit {i} (prob {p})");
+            assert_eq!(got, got_ref, "reference disagreement at bit {i}");
+            assert_eq!(dec.range, dec_ref.range, "range diverged at bit {i}");
+            assert_eq!(dec.value, dec_ref.value, "value diverged at bit {i}");
+            assert_eq!(
+                dec.bit_count, dec_ref.bit_count,
+                "bit_count diverged at bit {i}"
+            );
+            assert_eq!(dec.input, dec_ref.input, "input cursor diverged at bit {i}");
+        }
     }
 
     #[test]

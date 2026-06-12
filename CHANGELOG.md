@@ -4,6 +4,48 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Performance — fused §13 token descent + batched bool-decoder renormalisation (round 283, 2026-06-12)
+
+Takes the round-282 ranked candidate #1 (§13 token decode, ≈ 31 % of
+inter decode under `simd`) with the decoder-side mirror of the
+round-204 encoder playbook. Three pieces, all output-bit-identical:
+
+* **Fused branch-coded §13.2 descent** (`dct_tokens::decode_block_core`)
+  — the per-coefficient generic `COEFF_TREE` table walk + double
+  token-enum dispatch is written out branch-by-branch over the fixed
+  tree; each leaf flows straight into its consequence and the §13.2
+  "skip dct_eob after DCT_0" rule becomes an inner zero-run loop, so
+  the `prevCoeffWasZero` flag and per-position restart disappear.
+* **Write-order-table raster output** — `decode_mb_coeffs` hands the
+  §20.16 `ZIGZAG` table to the core as the write order, landing every
+  coefficient in its raster slot as it is decoded; the scan-order
+  scratch block, the 16-lane `scan_to_raster` permute, and the
+  per-block return copy are gone. The public `decode_block` keeps its
+  scan-order contract via an identity table.
+* **Batched bool-decoder renormalisation** (`bool_decoder`) — the §7.3
+  bit-at-a-time doubling loop (up to 7 dependent iterations per
+  `read_bool`) collapses into a single `leading_zeros`-derived shift
+  plus at most one input-byte splice. Decoder-wide: every header,
+  mode, MV, and token bool benefits.
+
+Measured (three interleaved pre/post pairs per config, 30 s
+measurement, Apple M4 / aarch64): `keyframe_decode` **−7.2 %** stable
+/ **−9.7 %** nightly + `simd` (152.98 → 141.95 µs / 121.40 →
+109.66 µs); `inter_decode_short_clip` **−7.8 %** / **−8.5 %**
+(189.12 → 174.37 µs / 159.77 → 146.25 µs); non-overlapping pre/post
+populations in all four configs. The §13 pair's self-time share drops
+≈ 31 % → ≈ 24 % and cedes profile #1 to `reconstruct_inter_mb`.
+
+Bit-identity: two new equivalence anchors
+(`batched_renormalize_matches_bit_at_a_time_listing`,
+`fused_descent_matches_generic_tree_walk` — lib 486 → 488 stable,
+488 → 490 nightly + `simd`), the full 38-target suite, and a 55-frame
+decode-side byte-hash A/B (3 resolutions × 3 quantisers × 6 frames
+through `Vp8DecoderState` + the 320×240 keyframe through
+`decode_vp8`; FNV-1a `ec93aa4f7f728ebe` over 1 324 800 decoded plane
+bytes) identical pre-/post-change on both toolchains. See
+`BENCHMARKS.md` round 283.
+
 ### Benchmarks — decoder-side coverage + full-suite refresh (round 282, 2026-06-12)
 
 Bench-only round; `src/` is byte-identical to round 281. Two new

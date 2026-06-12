@@ -248,6 +248,23 @@ cargo bench -p oxideav-vp8 --bench loop_filter_frame -- --quick
   `Vp8DecoderState` (≈ 11–14 %), and the §13.4
   `parse_token_prob_update` per-frame fixed cost (≈ 5 %).
 
+### Fused §13 token descent + batched renormalisation (round 283)
+
+Round 283 took that ranked list's #1. The §13.2 coefficient-token
+descent is now written out branch-by-branch over the fixed
+`coeff_tree` (no per-step tree-table loads, no token-enum
+re-dispatch; the "skip dct_eob after DCT_0" rule is an inner
+zero-run loop), the per-macroblock walk lands each coefficient in
+its raster slot as it is decoded (the §20.16 zig-zag table is the
+write order — the scratch block + permute + copy pass are gone), and
+the §7.3 bool-decoder renormalisation collapses its bit-at-a-time
+doubling loop into one `leading_zeros`-derived shift, which every
+header/mode/MV/token bool in the decoder shares. Whole-frame:
+**−7.2 % / −9.7 %** keyframe decode and **−7.8 % / −8.5 %** inter
+decode (stable / nightly + `simd`), decoded output bit-identical
+(two equivalence-anchor tests + a 55-frame decode-side byte-hash
+A/B on both toolchains — see `BENCHMARKS.md` round 283).
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

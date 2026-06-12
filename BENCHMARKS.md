@@ -1195,6 +1195,86 @@ The stable-only `inverse_dct_4x4` #1 (keyframe profile, 2178 samples
 ≈ 16 %) is already solved by the existing `simd` feature (round 278
 measured it gone under `simd`); it stays closed rather than ranked.
 
+## Round 283 — fused §13 token descent + batched bool-decoder renormalisation
+
+Round 283 (2026-06-12) takes the round-282 ranked list's #1: §13 token
+decode (`dct_tokens::decode_block` + `decode_mb_coeffs`, ≈ 31 % of
+inter decode under `simd`, #1/#2 self-time in every decoder profile).
+The decoder-side mirror of the round-204 encoder playbook ("the
+descent is a pure function of a fixed tree — stop walking the table"),
+in three pieces, all output-bit-identical:
+
+1. **Fused branch-coded §13.2 descent** (`decode_block_core`). The
+   per-coefficient `treed_read_coef` walked the 22-entry `COEFF_TREE`
+   table step-by-step, returned a `DctToken` enum, then re-dispatched
+   on it twice (EOB check + magnitude match). The tree is fixed, so
+   the descent is now written out branch-by-branch — each `read_bool`
+   sits at one named tree node reading `probs[node >> 1]` exactly as
+   the generic §8.1 walk would, and each leaf flows straight into its
+   consequence (zero / small value / `DCTextra` category / EOB). The
+   §13.2 "skip dct_eob after DCT_0" rule becomes an inner zero-run
+   loop re-entering at the DCT_0 node with the §13.3 zero-class row,
+   eliminating the `prevCoeffWasZero` flag and the per-position
+   restart entirely.
+2. **Write-order-table raster output**. `decode_mb_coeffs` decoded
+   each block into a scan-order scratch `[i16; 16]`, then ran a
+   16-lane `scan_to_raster` permute and copied the result into the
+   `MbCoeffs` block. The core now takes a write-order table
+   (`ZIGZAG` for the MB walk, identity for the public scan-order
+   `decode_block`) and lands every coefficient in its raster slot as
+   it is decoded — no scratch, no permute pass, no return copy.
+3. **Batched bool-decoder renormalisation**. The §7.3 listing doubles
+   `range`/`value` one bit at a time until `range >= 128` — up to 7
+   dependent loop iterations per `read_bool`. The doubling count is a
+   pure function of `range` (`leading_zeros() - 24`), and at most one
+   input byte can be needed per renormalisation, so the loop is now a
+   single shift + one conditional byte splice at bit offset
+   `bit_count + shift - 8`. This one is decoder-wide: every §9/§10/§11
+   header bool, §13.4 `parse_token_prob_update` flag, mode/MV tree and
+   token bit goes through it.
+
+### Measured A/B (`--measurement-time 30 --warm-up-time 3`, three interleaved pre/post pairs per config, Apple M4 / aarch64)
+
+| Bench / config | Pre (3 runs) | Post (3 runs) | Δ (means) |
+|---|---:|---:|---:|
+| `keyframe_decode` stable 1.95 | 154.50 / 152.85 / 151.60 µs (mean 152.98) | 143.32 / 142.73 / 139.81 µs (mean **141.95**) | **−7.2 %** |
+| `keyframe_decode` nightly 1.97 + `simd` | 123.58 / 121.95 / 118.67 µs (mean 121.40) | 110.96 / 110.11 / 107.91 µs (mean **109.66**) | **−9.7 %** |
+| `inter_decode_short_clip` stable 1.95 | 192.45 / 189.07 / 185.85 µs (mean 189.12) | 177.10 / 175.18 / 170.84 µs (mean **174.37**) | **−7.8 %** |
+| `inter_decode_short_clip` nightly 1.97 + `simd` | 161.13 / 159.99 / 158.18 µs (mean 159.77) | 144.70 / 144.54 / 149.52 µs (mean **146.25**) | **−8.5 %** |
+
+Throughput: keyframe decode 502 → **541 Mpx/s** stable, 633 →
+**700 Mpx/s** simd; inter decode 347 → **376 Mpx/s** stable, 410 →
+**448 Mpx/s** simd. The pre/post populations don't overlap in any
+config (worst margin: inter simd, every pre ≥ 158.18 µs vs every post
+≤ 149.52 µs), so the deltas sit far outside the measurement envelope.
+The pre columns agree with the round-282 baselines within session
+drift.
+
+Post-change attribution (same `sample(1)` methodology, 12 s @ 1 ms on
+the nightly + `simd` inter bench, ~9237 in-process samples): the §13
+pair drops from 2881 (≈ 31 %) to `decode_block_core` 2060 +
+`decode_mb_coeffs` 175 = **2235 (≈ 24 %)** and cedes #1 to
+`reconstruct_inter_mb` (2242); the per-frame reference-slot `memmove`
+family (1236 + memset/bzero ≈ 274) is now the clearest next lever,
+with `parse_token_prob_update` at 534 (≈ 6 %) behind it.
+
+Bit-identity was checked three ways: the full stable suite (38 green
+targets, lib 486 → 488 with the new equivalence anchors
+`batched_renormalize_matches_bit_at_a_time_listing` — a 4096-bool
+xorshift prob/bit stream decoded in lockstep against the literal §7.3
+bit-at-a-time listing with the full decoder state asserted after every
+read — and `fused_descent_matches_generic_tree_walk` — 400 randomised
+blocks across every plane type, neighbour-context seed, and magnitude
+class, fused vs generic `COEFF_TREE` walk, asserting coefficients,
+non-zero counts, and the complete bool-decoder end state); the
+nightly + `simd` lib suite (488 → 490); and a 55-frame decode-side
+byte-hash A/B — 3 resolutions (64×48 / 128×128 / 176×144) × 6 frames
+× 3 quantisers (qi 12 / 32 / 96) at keyframe interval 3 decoded
+through `Vp8DecoderState`, plus the bench's exact 320×240 keyframe
+through `decode_vp8`, hashing every decoded Y/U/V plane byte
+(1 324 800 bytes) — FNV-1a `ec93aa4f7f728ebe` identical
+pre-/post-change on stable *and* under nightly + `simd`.
+
 ## What didn't get touched yet (next-round candidates)
 
 * **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
@@ -1237,13 +1317,21 @@ measured it gone under `simd`); it stays closed rather than ranked.
   nightly + `simd` whole-frame on `inter_encode_short_clip`;
   `fetch_block_whole_pixel` self-time collapsed 2290 → 356 samples;
   bit-identical (3 new equivalence anchors + 54-frame byte-hash A/B).
-* **Decoder-side trio (round-282 profile)** — §13 token decode
-  (`decode_block` + `decode_mb_coeffs`, ≈ 31 % of inter decode under
-  `simd`), per-frame reference-slot plane copying in
-  `Vp8DecoderState::decode_frame` (`memmove` family ≈ 11–14 %), and
-  the §13.4 `parse_token_prob_update` per-frame fixed cost (≈ 5 %).
-  See the round-282 ranked list above for the evidence and the
-  suggested shapes.
+* **Decoder-side trio (round-282 profile)** — ~~§13 token decode~~
+  CLOSED in round 283 (see above): fused branch-coded §13.2 descent +
+  write-order-table raster output + batched bool-decoder
+  renormalisation, **−7.2/−9.7 %** whole-frame keyframe decode and
+  **−7.8/−8.5 %** inter decode (stable / nightly + `simd`),
+  bit-identical (two new equivalence anchors + 55-frame decode-side
+  byte-hash A/B). Still open from the trio: per-frame reference-slot
+  plane copying in `Vp8DecoderState::decode_frame` (`memmove` family —
+  post-round-283 it is the #3 self-time cluster at ≈ 1510 of ~9237
+  samples with `reconstruct_inter_mb` now #1; candidate shape:
+  slot-swap when refresh flags allow, or reference-counted planes
+  with copy-on-write) and the §13.4 `parse_token_prob_update`
+  per-frame fixed cost (534 samples ≈ 6 % — already cheapened in
+  absolute terms by the round-283 batched renormalise; the remaining
+  shape is the specialised flag-read loop).
 * **Sub-pixel SAD without patch materialisation** — the post-round-281
   profile's #1 is the sub-pixel `mb_luma_sad_at_mv` leg (2103
   self-samples) + `fetch_luma_mb_halo` (590): each half-/quarter-pixel

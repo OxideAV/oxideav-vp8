@@ -123,11 +123,15 @@ the fuzz binaries need nightly.
 ## Corpus
 
 The repository ships a seed corpus for **one** target:
-`fuzz/corpus/decode_stream_token_descent/` carries the 13
+`fuzz/corpus/decode_stream_token_descent/seeds/` carries the 13
 `tests/fixtures/*/input.ivf` streams re-framed into the harness's
-`[u16-LE len][payload]` packet format (committed explicitly past the
-directory-level `.gitignore` — libFuzzer-discovered corpus entries
-stay untracked) plus the round-284 short-DCT-partition witness.
+`[u16-LE len][payload]` packet format plus the round-284
+short-DCT-partition witness. libFuzzer reads corpus directories
+recursively, so the committed `seeds/` subdirectory is picked up on
+every run, while newly-discovered corpus entries land in the
+top-level target directory — which stays gitignored, keeping the
+working tree clean (and keeping release tooling happy: committed
+files must not also be ignored).
 Full-frame decode needs structurally-valid §9.1 / §19.2 headers
 before any §13 token descent runs, and inter-frame coverage
 additionally needs a previously-decoded reference frame — neither of

@@ -1,4 +1,7 @@
 target
-corpus
+corpus/*
+!corpus/decode_stream_token_descent/
+corpus/decode_stream_token_descent/*
+!corpus/decode_stream_token_descent/seeds/
 artifacts
 coverage

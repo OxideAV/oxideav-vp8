@@ -1362,29 +1362,29 @@ rides.
 
 ### 4. Ranked hotspot table (fresh `sample(1)` profiles, 12 s @ 1 ms, nightly + `simd`, `--measurement-time 60`)
 
-Decoder — `inter_decode_short_clip` (~10.4k in-process samples), with
+Decoder — `inter_decode_short_clip` (~10.1k in-process samples), with
 the token-heavy stream's shift in parentheses:
 
 | Rank | Symbol | Self-samples | Share | Status |
 |---:|---|---:|---:|---|
-| 1 | `motion_comp::reconstruct_inter_mb` | 2447 | ≈ 23 % | **next PROFILE-OPT target** (see below) |
-| 2 | `dct_tokens::decode_block_core` | 2225 | ≈ 21 % | round-283-fused; grows to ≈ 45 % on the token-heavy stream (4340 samples) — re-ranks #1 on dense-residue content |
-| 3 | `memmove`/`memset` family | ≈ 1600 | ≈ 15 % | per-frame reference-slot plane copying (r283 attribution: `decode_frame` body + `RefFrameSlot::clone`) |
+| 1 | `motion_comp::reconstruct_inter_mb` | 2447 | ≈ 24 % | **next PROFILE-OPT target** (see below) |
+| 2 | `dct_tokens::decode_block_core` | 2225 | ≈ 22 % | round-283-fused; grows to ≈ 47 % on the token-heavy stream (4340 of ~9.3k samples) — re-ranks #1 on dense-residue content |
+| 3 | `memmove`/`memset` family | ≈ 1600 | ≈ 16 % | per-frame reference-slot plane copying (r283 attribution: `decode_frame` body + `RefFrameSlot::clone`) |
 | 4 | `Vp8DecoderState::decode_frame` body | 542 | ≈ 5 % | slot bookkeeping around #3 |
 | 5 | `coded_header::parse_token_prob_update` | 522 | ≈ 5 % | per-frame fixed cost; specialised flag-read loop still open |
 
-Encoder — `inter_encode_short_clip` (~10.2k in-process samples):
+Encoder — `inter_encode_short_clip` (~9.3k in-process samples):
 
 | Rank | Symbol | Self-samples | Share | Status |
 |---:|---|---:|---:|---|
-| 1 | `mb_luma_sad_at_mv` + `fetch_luma_mb_halo` | 1992 + 564 | ≈ 25 % | sub-pixel SAD cluster — now decomposed by `subpel_sad_scoring`; fused row-SAD headroom ≈ 10 % of the cluster |
-| 2 | `encoder::group_sad_at_whole_mv` | 2205 | ≈ 22 % | round-281 fused loops (work moved into the caller's own body — tight row SAD, not call churn) |
-| 3 | RD/emit trio (`…_pick` 651 / `encode_mb_block_set_with_neighbors` 569 / `estimate_block_bits` 437) | 1657 | ≈ 16 % | token-emission side, already table-driven (r204/r276) |
+| 1 | `mb_luma_sad_at_mv` + `fetch_luma_mb_halo` | 1992 + 564 | ≈ 28 % | sub-pixel SAD cluster — now decomposed by `subpel_sad_scoring`; fused row-SAD headroom ≈ 10 % of the cluster |
+| 2 | `encoder::group_sad_at_whole_mv` | 2205 | ≈ 24 % | round-281 fused loops (work moved into the caller's own body — tight row SAD, not call churn) |
+| 3 | RD/emit trio (`…_pick` 651 / `encode_mb_block_set_with_neighbors` 569 / `estimate_block_bits` 437) | 1657 | ≈ 18 % | token-emission side, already table-driven (r204/r276) |
 | 4 | `forward_dct_4x4` + `transform_whole_block_luma` | 509 | ≈ 5 % | scalar-dispatch by design (r247) |
 
 **Named next PROFILE-OPT target: `reconstruct_inter_mb` §14.4/§14.5
-residue fusion.** #1 decoder self-time (23 %, and #2 even on
-token-heavy content at 18 %), and the new micro-bench shows ~95 % of
+residue fusion.** #1 decoder self-time (≈ 24 %, and #2 even on
+token-heavy content at ≈ 19 %), and the new micro-bench shows ~95 % of
 its whole-pixel cost is the residue chain, of which ~85 ns/MB is pure
 data movement: each of the 24 sub-blocks runs `extract_4x4` (strided
 raster → `[u8; 16]` scratch), `add_residue_4x4`, `insert_4x4` (scratch
@@ -1474,7 +1474,7 @@ copy-on-write planes), unchanged from the round-283 list.
   committing.
 * **`reconstruct_inter_mb` §14.4/§14.5 residue fusion** — NAMED next
   profile-opt target by the round-285 ranked table (see above): #1
-  decoder self-time (≈ 23 %), with the round-285 micro-bench showing
+  decoder self-time (≈ 24 %), with the round-285 micro-bench showing
   ~95 % of the whole-pixel reconstruct cost in the residue chain and
   ~85 ns/MB of it pure `extract_4x4`/`insert_4x4`/scratch data
   movement. Fuse the §14.4 inverse-DCT output pass with the §14.5

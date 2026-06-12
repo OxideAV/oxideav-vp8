@@ -4,6 +4,38 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Performance — fused whole-pixel SAD scoring in motion search (round 281, 2026-06-12)
+
+Closes the round-279 BENCHMARKS candidate "whole-pixel SAD scoring
+batching". A fresh `sample(1)` profile of the inter-encode bench put
+`motion_comp::fetch_block_whole_pixel` at #1 self-time (2290 of ~9276
+in-process samples) and `encoder::group_sad_at_whole_mv` at #3 (1371):
+the §17 integer-pixel diamond descent (`mb_luma_sad_at_whole_mv`) and
+the SPLITMV group scorer still fetched sixteen (or per-group fewer)
+separate 4×4 patches per whole-pixel candidate. Both scorers now run a
+fused fetch-and-SAD: a whole-pixel candidate's prediction is a direct
+window into the reference plane, so when the 16×16 MB-extent source
+region is strictly in-bounds (the dominant case) the SAD is accumulated
+straight off the reference and source rows — no patch materialisation,
+no source sub-block extraction copy. Border-straddling candidates fall
+back to the batched `fetch_luma_mb_whole_pixel` (non-SPLITMV) or the
+per-member `fetch_block_whole_pixel` path (SPLITMV groups), preserving
+the §20.14 `build_mc_border` edge replication bit-for-bit.
+
+* Measured (Apple M4 / aarch64, `--measurement-time 30`, three
+  interleaved pre/post pairs per config):
+  `inter_encode_short_clip/inter_encode_4f_128x128_qi32` — see
+  `BENCHMARKS.md` round 281 for the full table.
+* Bit-identical output: every candidate SAD is unchanged (new
+  equivalence anchors
+  `whole_mv_sad_matches_per_subblock_fetch_assembly`,
+  `whole_mv_sad_matches_assembly_with_padded_stride`,
+  `group_sad_fused_fast_path_matches_per_subblock_fetch` sweep
+  in-bounds + all four border directions across every §16.4 partition
+  shape), plus a 54-frame FNV-1a byte-hash A/B (3 resolutions × 6
+  frames × 3 quantisers through `Vp8InterStreamEncoder`) identical
+  pre-/post-change on stable and nightly + `simd`.
+
 ### Fuzzing — pixel-exact encode→decode lockstep differential target (round 280, 2026-06-12)
 
 New `cargo-fuzz` target `encode_decode_pixel_lockstep` (the suite's

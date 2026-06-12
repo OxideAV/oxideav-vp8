@@ -964,6 +964,84 @@ interval 3 so each stream carries two K + four P frames, all through
 `Vp8InterStreamEncoder` — FNV-1a `2f655ee6d2a8a303` identical
 pre-/post-change on stable *and* under nightly + `simd`.
 
+## Round 281 — fused whole-pixel SAD scoring (`mb_luma_sad_at_whole_mv` / `group_sad_at_whole_mv`)
+
+Round 281 (2026-06-12) closes the round-279 standing candidate
+"whole-pixel SAD scoring batching". A fresh `sample(1)` PID-attach
+profile (12 s, 1 ms interval, nightly + `simd` build under
+`--measurement-time 60`) reproduced the round-279 finding as the
+current #1 / #3 self-time symbols:
+
+| Self-samples (of ~9276) | Symbol |
+|---:|---|
+| 2290 | `motion_comp::fetch_block_whole_pixel` |
+| 1784 | `motion_search::mb_luma_sad_at_mv` (sub-pixel leg, round-279 shape) |
+| 1371 | `encoder::group_sad_at_whole_mv` |
+| 590 | `encoder::encode_p_frame_multi_ref_inner_with_counts_and_pick` |
+| 458 | `motion_comp::fetch_luma_mb_halo` |
+
+The §17 integer-pixel diamond descent (`mb_luma_sad_at_whole_mv`) and
+the SPLITMV group scorer (`group_sad_at_whole_mv`) still fetched
+sixteen (or per-group fewer) separate 4×4 patches per whole-pixel
+candidate — sixteen `fetch_block_whole_pixel` bounds checks + scratch
+copies per candidate, plus (on the SPLITMV side) a per-member 4×4
+source extraction copy. Both scorers now run a **fused fetch-and-SAD**
+(the round-279 candidate's parenthetical "a fused fetch-and-SAD that
+never materialises the patch"): a whole-pixel candidate's §18.3
+prediction is "simply copied", i.e. a direct window into the reference
+plane at integer offset `(mb_x, mb_y) + (eighth-pixel mv >> 3)`, so
+when the 16×16 MB-extent source region lands strictly in-bounds (the
+dominant case mid-frame — and a conservative gate for every SPLITMV
+group member) the SAD accumulates straight off the reference and
+source rows. No prediction block is built and no source sub-block is
+extracted. Border-straddling candidates fall back to the batched
+`fetch_luma_mb_whole_pixel` (non-SPLITMV) or the original per-member
+`fetch_block_whole_pixel` assembly (SPLITMV groups) — §20.14
+`build_mc_border` edge replication preserved bit-for-bit.
+
+### Measured A/B (`--measurement-time 30 --warm-up-time 3`, three interleaved pre/post pairs per config, Apple M4 / aarch64)
+
+| Config | Pre (3 runs) | Post (3 runs) | Δ (means) |
+|---|---:|---:|---:|
+| stable 1.95 default | 7.403 / 7.183 / 7.130 ms (mean 7.239) | 6.317 / 6.152 / 6.130 ms (mean **6.200**) | **−14.4 %** |
+| nightly 1.97 scalar | 7.347 / 7.242 / 7.153 ms (mean 7.247) | 6.308 / 6.247 / 6.139 ms (mean **6.231**) | **−14.0 %** |
+| nightly 1.97 + `simd` | 6.910 / 6.818 / 6.775 ms (mean 6.834) | 5.876 / 5.815 / 5.758 ms (mean **5.816**) | **−14.9 %** |
+
+Throughput: stable 9.05 → **10.57 Mpx/s**; nightly scalar 9.04 →
+**10.52 Mpx/s**; nightly + `simd` 9.59 → **11.27 Mpx/s**. Every pre
+run sits ≥ 7.119 ms (scalar) / ≥ 6.775 ms (simd) and every post run
+≤ 6.376 ms / ≤ 5.904 ms — the populations don't overlap in any
+config, so the deltas are far outside the measurement envelope. The
+pre columns agree with the round-279 post-change numbers (7.43 /
+7.37 / 6.95 ms) within session drift.
+
+Post-change attribution (same `sample(1)` methodology):
+`fetch_block_whole_pixel` collapses 2290 → **356** self-samples (the
+residue is the SPLITMV border fallback + the per-sub-block reconstruct
+paths); the fused SAD work now shows in its callers' own bodies
+(`group_sad_at_whole_mv` 2007, `mb_luma_sad_at_whole_mv` 179 — tight
+row loops instead of call + copy + re-read), and the new #1 is the
+round-279-shaped sub-pixel `mb_luma_sad_at_mv` leg (2103), which
+already runs the MB-batched §18.3 kernels.
+
+Bit-identity was checked three ways: the full stable suite (38 green
+targets, lib 483 → 486 with the new equivalence anchors
+`whole_mv_sad_matches_per_subblock_fetch_assembly` — every MB of a
+3×2-MB plane × 13 whole-pixel candidates including §17.1-extreme
+border-straddlers in all four directions —
+`whole_mv_sad_matches_assembly_with_padded_stride`, and
+`group_sad_fused_fast_path_matches_per_subblock_fetch` — all four
+§16.4 partition shapes × every group × 11 candidates × 3 MB
+positions); the nightly + `simd` lib suite (485 → 488); and a 54-frame
+byte-hash A/B — 3 resolutions (64×48 / 128×128 / 176×144) × 6 frames
+× 3 quantisers (qi 12 / 32 / 96), keyframe interval 3, all through
+`Vp8InterStreamEncoder` — FNV-1a `1495730e2f66b0a3` (17 273 bytes)
+identical pre-/post-change on stable *and* under nightly + `simd`.
+(The hash differs from the round-279 record because the round-281
+harness drives a different deterministic source — a drifting gradient
+plus a moving high-contrast square so SPLITMV does real work; what
+matters is pre == post within the round, on both toolchains.)
+
 ## What didn't get touched yet (next-round candidates)
 
 * **~~Remaining allocator churn (`malloc` / `free`)~~** — CLOSED in
@@ -997,15 +1075,23 @@ pre-/post-change on stable *and* under nightly + `simd`.
   identical, 54-frame byte-hash proof) measured **−16.6 %** stable /
   **−18.3 %** nightly scalar / **−21.5 %** nightly simd whole-frame,
   and widened the simd-vs-scalar gap to **−5.6 %**.
-* **Whole-pixel SAD scoring batching** — the post-round-279 simd
-  profile's new top-of-stack pair is `fetch_block_whole_pixel` (1824
-  samples) + `group_sad_at_whole_mv` (1120): the §17 integer-pixel
-  descent (`mb_luma_sad_at_whole_mv`) and the SPLITMV group scoring
-  still fetch sixteen (or per-group fewer) separate 4×4 patches per
-  whole-pixel candidate. The non-SPLITMV descent shares one MV per
-  candidate, so `fetch_luma_mb_whole_pixel` (or a fused
-  fetch-and-SAD that never materialises the patch) applies the same
-  way round 279 applied the sub-pixel batch; the SPLITMV group path
-  carries distinct per-group MVs (the round-274 caveat) but each
-  *group* is still single-MV, leaving room for a per-group contiguous
-  fetch. Needs the same byte-hash A/B discipline.
+* **~~Whole-pixel SAD scoring batching~~** — CLOSED in round 281 (see
+  above): both whole-pixel scorers (`mb_luma_sad_at_whole_mv` and the
+  SPLITMV `group_sad_at_whole_mv`) now run a fused fetch-and-SAD
+  straight off the reference rows when the MB-extent source region is
+  in-bounds, with the §20.14 border fallback unchanged. Measured
+  **−14.4 %** stable / **−14.0 %** nightly scalar / **−14.9 %**
+  nightly + `simd` whole-frame on `inter_encode_short_clip`;
+  `fetch_block_whole_pixel` self-time collapsed 2290 → 356 samples;
+  bit-identical (3 new equivalence anchors + 54-frame byte-hash A/B).
+* **Sub-pixel SAD without patch materialisation** — the post-round-281
+  profile's #1 is the sub-pixel `mb_luma_sad_at_mv` leg (2103
+  self-samples) + `fetch_luma_mb_halo` (590): each half-/quarter-pixel
+  candidate still materialises the full 16×16 `sixtap_mb_luma` output
+  before `block_sad_16x16` reads it back. A fused variant could SAD
+  each output row as the vertical pass produces it (the row lives in
+  an `i32` vector already under `simd`), skipping the narrow-to-u8
+  store + reload — but the clamp-to-u8 must stay bit-exact, and the
+  scalar path's auto-vectorisation may already cover most of the
+  margin. Needs a micro-bench first; the round-258 lesson (SIMD leaf
+  inlining regressing the surrounding descent) applies.

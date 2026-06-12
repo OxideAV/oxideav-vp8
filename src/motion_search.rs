@@ -70,8 +70,8 @@
 //!   that walk off the picture.
 
 use crate::motion_comp::{
-    fetch_block_whole_pixel, fetch_luma_mb_halo, fetch_luma_mb_whole_pixel, filter_set_for_version,
-    sixtap_mb_luma, stored_luma_mv,
+    fetch_luma_mb_halo, fetch_luma_mb_whole_pixel, filter_set_for_version, sixtap_mb_luma,
+    stored_luma_mv,
 };
 use crate::motion_vector::Mv;
 
@@ -262,7 +262,27 @@ pub struct SearchResult {
 /// vector (both components multiples of [`WHOLE_PIXEL_STEP`]) and must
 /// already be clamped into `[MV_MIN, MV_MAX]` — debug builds assert
 /// both; release builds silently round/clamp via the underlying
-/// `fetch_block_whole_pixel` call.
+/// batched fetch.
+///
+/// Since all sixteen luma sub-blocks of a non-SPLITMV candidate share
+/// the one MV (§18.1) and a whole-pixel §18.3 prediction is "simply
+/// copied", the candidate's prediction is one contiguous 16×16 source
+/// region at integer offset `(mb_col * 16, mb_row * 16) + (mv >> 2)`.
+/// When that region lands strictly inside the plane (the dominant case
+/// mid-frame) the SAD is accumulated **directly against the reference
+/// rows** — the prediction block is never materialised (the fused
+/// fetch-and-SAD shape the round-279 BENCHMARKS candidate calls for);
+/// this is byte-equivalent to [`block_sad_16x16`] over the
+/// [`fetch_luma_mb_whole_pixel`] fast path because that fetch is a pure
+/// row copy. A border-straddling candidate falls back to one batched
+/// [`fetch_luma_mb_whole_pixel`] (§20.14 `build_mc_border` edge
+/// replication) + [`block_sad_16x16`], itself byte-exact with the
+/// sixteen per-sub-block [`crate::motion_comp::fetch_block_whole_pixel`]
+/// copies the
+/// pre-round-281 listing tiled
+/// (`fetch_luma_mb_whole_pixel_matches_per_subblock_in_bounds` + the
+/// border-clamp tests in [`crate::motion_comp`], plus
+/// `whole_mv_sad_matches_per_subblock_fetch_assembly` below).
 ///
 /// This is the per-candidate SAD evaluator used by
 /// [`small_diamond_search_luma`]; it is exposed publicly so a future
@@ -283,37 +303,48 @@ pub fn mb_luma_sad_at_whole_mv(
     let blk_x0 = mb_col * 16;
     let blk_y0 = mb_row * 16;
     // §18.1 stored_luma_mv doubles the §17 quarter-pixel vector into
-    // the §18 eighth-pixel resolution `fetch_block_whole_pixel`
-    // consumes. For a whole-pixel input the fractional bits stay zero
-    // after doubling so the fetch collapses to the §18.3 page 115
-    // "subblock is simply copied" path.
+    // the §18 eighth-pixel resolution the fetch primitives consume. For
+    // a whole-pixel input the fractional bits stay zero after doubling
+    // so the prediction collapses to the §18.3 page 115 "subblock is
+    // simply copied" path.
     let mv_eighth = stored_luma_mv(mv);
+    // §18.2: integer pixel offset is the eighth-pixel vector shifted
+    // right 3 with sign propagation.
+    let src_x0 = blk_x0 as isize + (mv_eighth.col >> 3) as isize;
+    let src_y0 = blk_y0 as isize + (mv_eighth.row >> 3) as isize;
+    let w_i = reference.width as isize;
+    let h_i = reference.height as isize;
 
-    let mut pred = [0u8; 256];
-    for sub_r in 0..4 {
-        for sub_c in 0..4 {
-            let blk_x = blk_x0 + sub_c * 4;
-            let blk_y = blk_y0 + sub_r * 4;
-            let patch = fetch_block_whole_pixel(
-                reference.plane,
-                reference.stride,
-                reference.width,
-                reference.height,
-                blk_x,
-                blk_y,
-                mv_eighth,
-            );
-            // Place the 4×4 patch at the (sub_r, sub_c) slot of the
-            // 16×16 prediction.
-            for r in 0..4 {
-                let dst_row = sub_r * 4 + r;
-                let dst_col = sub_c * 4;
-                pred[dst_row * 16 + dst_col..dst_row * 16 + dst_col + 4]
-                    .copy_from_slice(&patch[r * 4..r * 4 + 4]);
+    if src_x0 >= 0 && src_y0 >= 0 && src_x0 + 16 <= w_i && src_y0 + 16 <= h_i {
+        // Fused fast path: every source position is strictly in-bounds,
+        // so each prediction row is the contiguous 16-byte reference
+        // run `plane[(src_y0 + r) * stride + src_x0 ..][..16]` — SAD it
+        // against the matching source row without building the block.
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        let mut acc: u32 = 0;
+        for r in 0..16 {
+            let row_start = (y0 + r) * reference.stride + x0;
+            let pred_row = &reference.plane[row_start..row_start + 16];
+            let src_row = &src_y[r * 16..r * 16 + 16];
+            for c in 0..16 {
+                acc += (src_row[c] as i32 - pred_row[c] as i32).unsigned_abs();
             }
         }
+        return acc;
     }
 
+    // Border-straddling candidate: batched §20.14 edge-replicating
+    // fetch (rare — only MBs whose motion walks off the picture).
+    let pred = fetch_luma_mb_whole_pixel(
+        reference.plane,
+        reference.stride,
+        reference.width,
+        reference.height,
+        blk_x0,
+        blk_y0,
+        mv_eighth,
+    );
     block_sad_16x16(src_y, &pred)
 }
 
@@ -757,6 +788,130 @@ mod tests {
             blk[r * 16..r * 16 + 16].copy_from_slice(&plane[src..src + 16]);
         }
         blk
+    }
+
+    /// Pre-round-281 reference shape of [`mb_luma_sad_at_whole_mv`]:
+    /// sixteen per-sub-block
+    /// [`crate::motion_comp::fetch_block_whole_pixel`] copies assembled
+    /// into a 16×16 prediction, then [`block_sad_16x16`]. The round-281
+    /// fused fast path (and its batched border fallback) must match
+    /// this assembly bit-for-bit on every candidate.
+    fn whole_mv_sad_per_subblock_reference(
+        reference: LumaRef<'_>,
+        mb_col: usize,
+        mb_row: usize,
+        src_y: &[u8; 256],
+        mv: Mv,
+    ) -> u32 {
+        let blk_x0 = mb_col * 16;
+        let blk_y0 = mb_row * 16;
+        let mv_eighth = crate::motion_comp::stored_luma_mv(mv);
+        let mut pred = [0u8; 256];
+        for sub_r in 0..4 {
+            for sub_c in 0..4 {
+                let patch = crate::motion_comp::fetch_block_whole_pixel(
+                    reference.plane,
+                    reference.stride,
+                    reference.width,
+                    reference.height,
+                    blk_x0 + sub_c * 4,
+                    blk_y0 + sub_r * 4,
+                    mv_eighth,
+                );
+                for r in 0..4 {
+                    let dst = (sub_r * 4 + r) * 16 + sub_c * 4;
+                    pred[dst..dst + 4].copy_from_slice(&patch[r * 4..r * 4 + 4]);
+                }
+            }
+        }
+        block_sad_16x16(src_y, &pred)
+    }
+
+    #[test]
+    fn whole_mv_sad_matches_per_subblock_fetch_assembly() {
+        // 48×40 plane = 3×2 whole MBs minus nothing; MB(2,1) touches
+        // the bottom-right plane corner so small positive MVs straddle
+        // the border there, and MB(0,0) straddles with negative MVs.
+        let width = 48;
+        let height = 40;
+        let reference = ramp_plane(width, height);
+        // Source = feature plane so SADs are non-trivial at every MV.
+        let src_plane = feature_plane(width, height, 100, 240, 5, 7, 6);
+
+        // Candidate sweep: zero, small in-bounds steps, larger steps,
+        // and §17.1-extreme whole-pixel MVs that push the source region
+        // far past every border (exercising the batched edge-replicate
+        // fallback in all four directions).
+        let candidates: [Mv; 13] = [
+            Mv { row: 0, col: 0 },
+            Mv { row: 4, col: 0 },
+            Mv { row: 0, col: 4 },
+            Mv { row: -4, col: -4 },
+            Mv { row: 8, col: -12 },
+            Mv { row: -16, col: 20 },
+            Mv { row: 64, col: 64 },
+            Mv { row: -64, col: -64 },
+            Mv { row: -1020, col: 0 },
+            Mv { row: 0, col: -1020 },
+            Mv { row: 1020, col: 0 },
+            Mv { row: 0, col: 1020 },
+            Mv {
+                row: 1020,
+                col: -1020,
+            },
+        ];
+
+        for mb_row in 0..(height / 16) {
+            for mb_col in 0..(width / 16) {
+                let src_blk = extract_mb_block(&src_plane, width, mb_col, mb_row);
+                for mv in candidates {
+                    let luma = packed_luma_ref(&reference, width, height);
+                    let expected =
+                        whole_mv_sad_per_subblock_reference(luma, mb_col, mb_row, &src_blk, mv);
+                    let got = mb_luma_sad_at_whole_mv(luma, mb_col, mb_row, &src_blk, mv);
+                    assert_eq!(
+                        got, expected,
+                        "fused whole-pixel SAD diverged at MB({mb_col},{mb_row}) mv={mv:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_mv_sad_matches_assembly_with_padded_stride() {
+        // stride > width: the fused fast path indexes the plane with
+        // the true stride; the per-sub-block reference must agree.
+        let width = 32;
+        let height = 32;
+        let stride = 41; // deliberately non-multiple-of-4 padding
+        let mut plane = vec![0u8; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                plane[y * stride + x] = ((x * 7 + y * 13) % 253) as u8;
+            }
+        }
+        let luma = LumaRef {
+            plane: &plane,
+            stride,
+            width,
+            height,
+        };
+        let mut src_blk = [0u8; 256];
+        for (i, slot) in src_blk.iter_mut().enumerate() {
+            *slot = ((i * 5) % 247) as u8;
+        }
+        for mv in [
+            Mv { row: 0, col: 0 },
+            Mv { row: 4, col: 8 },
+            Mv { row: -4, col: 4 },
+            Mv { row: 40, col: 40 },
+            Mv { row: -40, col: -40 },
+        ] {
+            let expected = whole_mv_sad_per_subblock_reference(luma, 0, 0, &src_blk, mv);
+            let got = mb_luma_sad_at_whole_mv(luma, 0, 0, &src_blk, mv);
+            assert_eq!(got, expected, "padded-stride divergence at mv={mv:?}");
+        }
     }
 
     #[test]

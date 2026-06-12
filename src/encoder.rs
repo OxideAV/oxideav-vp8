@@ -4543,11 +4543,25 @@ fn extract_src_subblock_4x4(src: &[u8; 256], b: usize) -> [u8; 16] {
 }
 
 /// Sum the 4×4 SADs across the partition group `[group_subblocks]` for
-/// a whole-pixel candidate vector `mv`. Uses
-/// [`crate::motion_comp::fetch_block_whole_pixel`] for each member
-/// sub-block (whole-pixel ⇒ the §18.3 sixtap collapses to the copy
-/// path); §18.1 page 114 says no secondary clamp applies to SPLITMV
-/// sub-block MVs.
+/// a whole-pixel candidate vector `mv`.
+///
+/// Every member of one §16.4 partition group shares the one candidate
+/// vector, and a whole-pixel §18.3 prediction is "simply copied", so
+/// each member's 4×4 prediction is a direct window into the reference
+/// plane at integer offset `(mb_x0, mb_y0) + (eighth-pixel mv >> 3)`.
+/// When the whole 16×16 MB-extent source region lands strictly inside
+/// the plane (a conservative gate — every member sub-block lies inside
+/// the MB extent; the dominant case mid-frame) the SAD is accumulated
+/// **directly against the reference and source rows** — no
+/// per-sub-block patch fetch and no source sub-block extraction copy
+/// (the fused fetch-and-SAD shape of the round-279 BENCHMARKS
+/// candidate, SPLITMV-group half). A border-straddling candidate falls
+/// back to the per-member
+/// [`crate::motion_comp::fetch_block_whole_pixel`] path (§20.14
+/// `build_mc_border` edge replication), bit-identical to the
+/// pre-round-281 listing for every candidate
+/// (`group_sad_fused_fast_path_matches_per_subblock_fetch`). §18.1
+/// page 114 says no secondary clamp applies to SPLITMV sub-block MVs.
 fn group_sad_at_whole_mv(
     luma_ref: crate::motion_search::LumaRef<'_>,
     mb_col: usize,
@@ -4562,6 +4576,42 @@ fn group_sad_at_whole_mv(
     let mb_x0 = mb_col * 16;
     let mb_y0 = mb_row * 16;
     let mut sad: u32 = 0;
+
+    // §18.2: integer pixel offset is the eighth-pixel vector shifted
+    // right 3 with sign propagation.
+    let src_x0 = mb_x0 as isize + (mv_eighth.col >> 3) as isize;
+    let src_y0 = mb_y0 as isize + (mv_eighth.row >> 3) as isize;
+    if src_x0 >= 0
+        && src_y0 >= 0
+        && src_x0 + 16 <= luma_ref.width as isize
+        && src_y0 + 16 <= luma_ref.height as isize
+    {
+        // Fused fast path: the whole MB-extent source region is
+        // strictly in-bounds, so each member's prediction row is the
+        // contiguous 4-byte reference run at its sub-block offset — SAD
+        // it against the matching `src_y` run without materialising
+        // either side.
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        for &b in group_subblocks {
+            let sb_row = b >> 2;
+            let sb_col = b & 3;
+            for r in 0..4 {
+                let pred_start = (y0 + sb_row * 4 + r) * luma_ref.stride + x0 + sb_col * 4;
+                let pred_row = &luma_ref.plane[pred_start..pred_start + 4];
+                let src_start = (sb_row * 4 + r) * 16 + sb_col * 4;
+                let src_row = &src_y[src_start..src_start + 4];
+                for c in 0..4 {
+                    sad += (src_row[c] as i32 - pred_row[c] as i32).unsigned_abs();
+                }
+            }
+        }
+        return sad;
+    }
+
+    // Border-straddling candidate: per-member §20.14 edge-replicating
+    // fetch (rare — only candidates whose motion walks off the
+    // picture).
     for &b in group_subblocks {
         let sb_row = b >> 2;
         let sb_col = b & 3;
@@ -8696,6 +8746,100 @@ mod tests {
                 }
             }
             assert!(seen.iter().all(|&s| s), "{p:?} does not cover all 16");
+        }
+    }
+
+    /// Equivalence proof for the round-281 fused
+    /// [`group_sad_at_whole_mv`] fast path: for every §16.4 partition
+    /// shape, every group, and a candidate sweep spanning in-bounds and
+    /// border-straddling whole-pixel MVs (in all four directions), the
+    /// fused row-window SAD must equal the pre-round-281 per-member
+    /// assembly (`fetch_block_whole_pixel` + `extract_src_subblock_4x4`
+    /// + `sub_block_sad_4x4`) bit-for-bit.
+    #[test]
+    fn group_sad_fused_fast_path_matches_per_subblock_fetch() {
+        use crate::motion_vector::Mv;
+        use crate::near_mv::MvPartition;
+
+        // 48×48 plane = 3×3 MBs; MB(0,0) and MB(2,2) reach the plane
+        // corners so the extreme candidates straddle every border.
+        let width = 48usize;
+        let height = 48usize;
+        let mut plane = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                plane[y * width + x] = ((x * 11 + y * 17) % 251) as u8;
+            }
+        }
+        let luma = crate::motion_search::LumaRef {
+            plane: &plane,
+            stride: width,
+            width,
+            height,
+        };
+        let mut src_y = [0u8; 256];
+        for (i, slot) in src_y.iter_mut().enumerate() {
+            *slot = ((i * 3 + 41) % 249) as u8;
+        }
+
+        let per_subblock_reference =
+            |mb_col: usize, mb_row: usize, group_subblocks: &[usize], mv: Mv| -> u32 {
+                let mv_eighth = crate::motion_comp::stored_luma_mv(mv);
+                let mut sad: u32 = 0;
+                for &b in group_subblocks {
+                    let patch = crate::motion_comp::fetch_block_whole_pixel(
+                        luma.plane,
+                        luma.stride,
+                        luma.width,
+                        luma.height,
+                        mb_col * 16 + (b & 3) * 4,
+                        mb_row * 16 + (b >> 2) * 4,
+                        mv_eighth,
+                    );
+                    let src_sb = extract_src_subblock_4x4(&src_y, b);
+                    sad += sub_block_sad_4x4(&src_sb, &patch);
+                }
+                sad
+            };
+
+        let candidates: [Mv; 11] = [
+            Mv { row: 0, col: 0 },
+            Mv { row: 4, col: -4 },
+            Mv { row: -8, col: 12 },
+            Mv { row: 16, col: 16 },
+            Mv { row: -16, col: -16 },
+            Mv { row: 64, col: -64 },
+            Mv { row: -1020, col: 0 },
+            Mv { row: 0, col: -1020 },
+            Mv { row: 1020, col: 0 },
+            Mv { row: 0, col: 1020 },
+            Mv {
+                row: -1020,
+                col: 1020,
+            },
+        ];
+
+        for p in [
+            MvPartition::TopBottom,
+            MvPartition::LeftRight,
+            MvPartition::Quarters,
+            MvPartition::Mv16,
+        ] {
+            let groups = partition_groups(p);
+            for (mb_col, mb_row) in [(0usize, 0usize), (1, 1), (2, 2)] {
+                for g in 0..groups.num_groups {
+                    let members = groups.group(g);
+                    for mv in candidates {
+                        let expected = per_subblock_reference(mb_col, mb_row, members, mv);
+                        let got = group_sad_at_whole_mv(luma, mb_col, mb_row, &src_y, members, mv);
+                        assert_eq!(
+                            got, expected,
+                            "fused group SAD diverged: {p:?} group {g} \
+                             MB({mb_col},{mb_row}) mv={mv:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 

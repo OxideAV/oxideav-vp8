@@ -788,14 +788,22 @@ fn parse_token_prob_update(
     dec: &mut BoolDecoder<'_>,
 ) -> Result<TokenProbUpdates, BoolDecoderError> {
     let mut out: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
-    for (i, plane) in out.iter_mut().enumerate() {
-        for (j, band) in plane.iter_mut().enumerate() {
-            for (k, ctx) in band.iter_mut().enumerate() {
-                for (t, slot) in ctx.iter_mut().enumerate() {
-                    // Each update flag is read at the position-specific
-                    // probability from §13.4's COEFF_UPDATE_PROBS table —
-                    // NOT a flat 128.
-                    let present = dec.read_bool(COEFF_UPDATE_PROBS[i][j][k][t])?;
+    // §13.4: 4×8×3×11 = 1056 update flags, each read at the
+    // position-specific probability from the COEFF_UPDATE_PROBS table
+    // (NOT a flat 128). The walk order is fixed (i outermost over planes,
+    // then bands, then prev-token classes, then positions), so the output
+    // array and the probability table are traversed in exact lockstep:
+    // zip the two leaf `[…; 11]` rows so the inner read indexes neither
+    // array — the per-flag 4-level `COEFF_UPDATE_PROBS[i][j][k][t]`
+    // re-traversal (four bounds checks + index arithmetic per flag) is
+    // replaced by a single forward step over the already-flat probability
+    // row. Output is bit-identical: same flags, same order, same
+    // per-position probabilities.
+    for (out_plane, prob_plane) in out.iter_mut().zip(COEFF_UPDATE_PROBS.iter()) {
+        for (out_band, prob_band) in out_plane.iter_mut().zip(prob_plane.iter()) {
+            for (out_ctx, prob_ctx) in out_band.iter_mut().zip(prob_band.iter()) {
+                for (slot, &prob) in out_ctx.iter_mut().zip(prob_ctx.iter()) {
+                    let present = dec.read_bool(prob)?;
                     *slot = if present {
                         Some(dec.read_literal(8)? as u8)
                     } else {
@@ -806,6 +814,18 @@ fn parse_token_prob_update(
         }
     }
     Ok(out)
+}
+
+/// Bench-only re-export of [`parse_token_prob_update`] (§13.4) so the
+/// `parse_token_prob_update` micro-bench can drive the flag-read loop in
+/// isolation against a pre-encoded header partition. Not part of the
+/// public decode surface — the field is consumed inline by
+/// [`Vp8CodedHeader::parse`] in production.
+#[doc(hidden)]
+pub fn bench_parse_token_prob_update(
+    dec: &mut BoolDecoder<'_>,
+) -> Result<TokenProbUpdates, BoolDecoderError> {
+    parse_token_prob_update(dec)
 }
 
 /// Read a magnitude-`n`-and-sign delta as defined throughout §19.2.
@@ -1654,5 +1674,98 @@ mod tests {
         assert_eq!(MV_UPDATE_PROBS[0][18], 254);
         assert_eq!(MV_UPDATE_PROBS[1][0], 231);
         assert_eq!(MV_UPDATE_PROBS[1][18], 254);
+    }
+
+    /// Round-291 equivalence anchor: the zipped-iterator
+    /// `parse_token_prob_update` must decode byte-identically to a
+    /// verbatim copy of the pre-291 4-level-indexed reference loop, over
+    /// a payload that exercises both the `None` (flag-only) and `Some`
+    /// (flag + `L(8)` literal) branches. Encodes each of the 1056 §13.4
+    /// positions at its `COEFF_UPDATE_PROBS[i][j][k][t]` probability — a
+    /// deterministic minority `Some(prob)` so the literal-read branch
+    /// fires across all four planes — and asserts the production parser
+    /// reproduces both the reference decode and the intended payload.
+    fn reference_parse_token_prob_update_indexed(
+        dec: &mut BoolDecoder<'_>,
+    ) -> Result<TokenProbUpdates, BoolDecoderError> {
+        let mut out: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+        for (i, plane) in out.iter_mut().enumerate() {
+            for (j, band) in plane.iter_mut().enumerate() {
+                for (k, ctx) in band.iter_mut().enumerate() {
+                    for (t, slot) in ctx.iter_mut().enumerate() {
+                        let present = dec.read_bool(COEFF_UPDATE_PROBS[i][j][k][t])?;
+                        *slot = if present {
+                            Some(dec.read_literal(8)? as u8)
+                        } else {
+                            None
+                        };
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn parse_token_prob_update_matches_indexed_reference() {
+        // Build a mixed Some/None payload deterministically.
+        let mut intended: TokenProbUpdates = [[[[None; 11]; 3]; 8]; 4];
+        let mut salt: u32 = 1;
+        for (i, plane) in intended.iter_mut().enumerate() {
+            for (j, band) in plane.iter_mut().enumerate() {
+                for (k, ctx) in band.iter_mut().enumerate() {
+                    for (t, slot) in ctx.iter_mut().enumerate() {
+                        salt = salt.wrapping_mul(1103515245).wrapping_add(12345);
+                        // ~1 in 5 positions carries a replacement.
+                        if (i + j + k + t + (salt >> 16) as usize) % 5 == 0 {
+                            *slot = Some(((salt >> 8) & 0xFF) as u8);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Encode the payload at the §13.4 per-position probabilities.
+        let mut enc = TestEncoder::new();
+        for (i, plane) in intended.iter().enumerate() {
+            for (j, band) in plane.iter().enumerate() {
+                for (k, ctx) in band.iter().enumerate() {
+                    for (t, slot) in ctx.iter().enumerate() {
+                        let p = COEFF_UPDATE_PROBS[i][j][k][t];
+                        match slot {
+                            Some(prob) => {
+                                enc.write_bool(p, true);
+                                enc.write_literal(*prob as u32, 8);
+                            }
+                            None => enc.write_bool(p, false),
+                        }
+                    }
+                }
+            }
+        }
+        // Trailing bit so the final renormalisation has input to pull.
+        enc.write_bool(128, false);
+        let bytes = enc.finish();
+
+        let mut dec_prod = BoolDecoder::init(&bytes).unwrap();
+        let produced = parse_token_prob_update(&mut dec_prod).unwrap();
+
+        let mut dec_ref = BoolDecoder::init(&bytes).unwrap();
+        let reference = reference_parse_token_prob_update_indexed(&mut dec_ref).unwrap();
+
+        assert_eq!(
+            produced, reference,
+            "zipped loop must match the 4-level-indexed reference loop"
+        );
+        assert_eq!(
+            produced, intended,
+            "decode must recover the intended payload"
+        );
+        // Both decoders must have consumed exactly the same input.
+        assert_eq!(
+            dec_prod.remaining_input(),
+            dec_ref.remaining_input(),
+            "both parsers must leave the decoder at the same stream position"
+        );
     }
 }

@@ -178,3 +178,16 @@ harness = false
 [[bench]]
 name = "ref_slot_rotation"
 harness = false
+
+# Round 291 bench. The §13.4 `token_prob_update()` flag-read loop —
+# 1056 update flags (4×8×3×11) parsed at position-specific
+# `COEFF_UPDATE_PROBS` probabilities once per frame in
+# `coded_header::parse_token_prob_update`. The round-288 ranked decoder
+# table named this the standing #5 self-time target (≈ 5 %, the
+# specialised flag-read loop) but it had no isolated A/B instrument: the
+# whole-frame decode benches fold it inside the rest of the §9 header
+# parse. Two payload shapes: the common all-`None` (no updates) frame and
+# a sparse-update frame that exercises the L(8) literal-read branch.
+[[bench]]
+name = "token_prob_update"
+harness = false

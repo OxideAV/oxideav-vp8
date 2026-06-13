@@ -370,6 +370,31 @@ whole-stream on the round-288 `ref_slot_rotation/decode_1k8p_*` benches
 (363 → 404 and 352 → 403 Melem/s; criterion p < 0.05, same-session A/B).
 A/B bench: `cargo bench -p oxideav-vp8 --bench ref_slot_rotation -- 'decode_1k8p'`.
 
+### §13.4 `token_prob_update()` lockstep flag-read loop (round 291)
+
+Round 291 lands the round-288/289 named decoder rank-5 target — the §13.4
+`coded_header::parse_token_prob_update` per-frame flag-read loop (≈ 5 %
+decoder self-time; 1056 update flags = 4×8×3×11, each read at its
+position-specific `COEFF_UPDATE_PROBS` probability). The loop carried a
+4-deep `enumerate()` whose `(i,j,k,t)` indices existed only to re-index
+`COEFF_UPDATE_PROBS[i][j][k][t]` — four bounds checks + index arithmetic
+per flag, re-traversing the table the loop already walked structurally.
+The fixed walk order lets the output array and probability table be zipped
+in exact lockstep, so the inner read indexes neither array.
+
+Output is bit-identical: same flags, same order, same per-position
+probabilities. Anchored by `parse_token_prob_update_matches_indexed_reference`
+(a mixed `Some`/`None` payload exercising the `L(8)` literal branch across
+all four planes, byte-equal + same-stream-position against a verbatim copy
+of the pre-291 4-level-indexed loop) plus the full lib suite (491 stable /
+493 nightly+simd), all 37 roundtrip/decode integration binaries, and the
+`ffmpeg_oracle` validator — decoded bytes unchanged across the corpus.
+Measured **−10.6 %** (`parse_no_updates`, the common no-update frame) /
+**−15.7 %** (`parse_sparse_updates`) on the new `token_prob_update`
+micro-bench (criterion p < 0.05, same-session A/B). A/B bench:
+`cargo bench -p oxideav-vp8 --bench token_prob_update`. See `BENCHMARKS.md`
+round 291.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

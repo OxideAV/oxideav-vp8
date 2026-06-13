@@ -1715,3 +1715,87 @@ follow-on for the residual rotation cost (it would also remove the two
 unavoidable keyframe clones and any genuine fan-out clone the move path
 still pays), but is a public-API change to `RefFrameSlot`'s `Vec<u8>` plane
 fields and so is out of scope for a single bit-identical profile-opt round.
+
+## Round 291 — §13.4 `token_prob_update()` lockstep flag-read loop
+
+Profile-opt round landing the round-288/289 named decoder target: the
+§13.4 `coded_header::parse_token_prob_update` per-frame flag-read loop
+(the standing decoder rank-5 self-time cluster, ≈ 5 %; 1056 update flags
+= 4 planes × 8 bands × 3 prev-token classes × 11 positions read once per
+decoded frame, each at its position-specific `COEFF_UPDATE_PROBS`
+probability — NOT a flat 128).
+
+### The change
+
+The pre-291 loop carried a 4-deep `enumerate()` whose `(i, j, k, t)`
+indices existed only to re-index `COEFF_UPDATE_PROBS[i][j][k][t]` — a
+four-level bounds-checked re-traversal of the probability table on every
+one of the 1056 flags, even though the output array was already being
+walked structurally. The walk order is fixed, so the output and the
+probability table are now traversed in exact lockstep by zipping the two
+leaf `[…; 11]` rows: the inner read indexes neither array, replacing the
+per-flag 4-level index arithmetic + four bounds checks with a single
+forward step over the already-flat probability row. Arithmetic, flag
+order, and per-position probabilities are unchanged.
+
+### New `token_prob_update` micro-bench
+
+The whole-frame decode benches fold this loop inside the rest of the §9
+header parse, so the loop-shape change had no isolated A/B target. The
+new `token_prob_update` binary drives `bench_parse_token_prob_update`
+directly over a header partition pre-encoded by the crate's own §13.4
+writer (`write_no_token_prob_updates` / `write_token_prob_updates`),
+decoded once at setup with a full payload-equality assertion so the
+measured loop is a proven-valid bitstream walk. Two shapes:
+
+* `parse_no_updates` — the all-`None` frame (every flag false): the
+  overwhelmingly common per-frame payload, the loop's hot shape, no
+  `L(8)` literal reads;
+* `parse_sparse_updates` — a scattering of `Some(prob)` replacements
+  exercising the `read_literal(8)` branch on top of the flag walk.
+
+### Measured A/B (criterion stored-baseline, Apple M4 / aarch64, stable 1.95, `--measurement-time 8–10`, same session)
+
+`after` = zipped lockstep loop; `before` = the verbatim pre-291
+4-level-indexed loop, both timed against the same stored `after`
+baseline:
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `token_prob_update/parse_no_updates` | 3.04 µs (348 Melem/s) | **2.73 µs** (385 Melem/s) | **−10.6 %** (p < 0.05) |
+| `token_prob_update/parse_sparse_updates` | 3.17 µs (333 Melem/s) | **2.93 µs** (361 Melem/s) | **−15.7 %** (p < 0.05) |
+
+Criterion's own change estimate reports "Performance has regressed" when
+the old indexed loop is run against the `after` baseline (i.e. the new
+loop is the faster one) at p < 0.05 on both rows; re-running the
+optimised loop against its own baseline shows no change on
+`parse_no_updates` (the low-noise hot shape) and stays within the
+shared-box drift on the sparse row. The `parse_no_updates` row is the
+clean signal and the dominant real-world payload (most frames carry no
+prob updates). On the whole-frame decode this loop is ≈ 5 % of decoder
+self-time, so the −10.6 % loop-level win is a ≈ 0.5 % whole-frame
+decoder floor reduction, layered under the round-283 token descent and
+round-286/289 reconstruct/rotation wins.
+
+### Bit-identity
+
+The loop reads the same flags in the same order at the same per-position
+probabilities, so output is bit-identical by construction. Anchored by
+the new `parse_token_prob_update_matches_indexed_reference` (a mixed
+`Some`/`None` payload — ~1 in 5 of the 1056 positions carrying a
+replacement so the `L(8)` literal branch fires across all four planes —
+encoded at the §13.4 per-position probabilities, decoded through both the
+production parser and a verbatim copy of the pre-291 4-level-indexed
+reference loop, asserting equal payloads *and* equal remaining-input
+stream positions), plus the full stable lib suite (491) and nightly +
+`simd` lib suite (493), every in-tree decode/roundtrip integration test
+(37 green binaries), and the `ffmpeg_oracle` black-box validator —
+decoded bytes unchanged across the entire corpus.
+
+Next profile-opt target: the round-288 deeper follow-on — a copy-on-write
+(`Rc`/`Arc`-backed) plane representation for the residual reference-slot
+rotation cost (also removing the two unavoidable keyframe clones), which
+is a public-API change to `RefFrameSlot`'s `Vec<u8>` plane fields and so
+needs its own round. Decoder ranks 1–2 (`decode_block_core` token
+descent, `reconstruct_inter_mb`) remain the heaviest clusters but were
+each fused in rounds 283 / 286.

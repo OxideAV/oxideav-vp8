@@ -4,6 +4,42 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — §13.4 `token_prob_update()` lockstep flag-read loop (round 291, 2026-06-14)
+
+Profile-opt round landing the round-288/289 named decoder target: the
+§13.4 `coded_header::parse_token_prob_update` per-frame flag-read loop
+(standing decoder rank-5 self-time, ≈ 5 %; 1056 update flags = 4×8×3×11,
+each read at its position-specific `COEFF_UPDATE_PROBS` probability). The
+pre-291 loop carried a 4-deep `enumerate()` whose `(i,j,k,t)` indices
+existed only to re-index `COEFF_UPDATE_PROBS[i][j][k][t]` — four bounds
+checks + index arithmetic per flag, re-traversing the table the loop was
+already walking structurally. The fixed walk order lets the output array
+and probability table be zipped in exact lockstep, so the inner read
+indexes neither array. Arithmetic, flag order, and per-position
+probabilities are unchanged; output is **bit-identical** by construction,
+anchored by the new `parse_token_prob_update_matches_indexed_reference`
+test (mixed `Some`/`None` payload exercising the `L(8)` literal branch
+across all four planes, byte-equal + same-stream-position against a
+verbatim copy of the pre-291 4-level-indexed loop) plus the full lib
+suite (491 stable / 493 nightly+`simd`), every roundtrip/decode
+integration binary (37), and the `ffmpeg_oracle` validator. Measured
+**−10.6 %** (`parse_no_updates`, the common no-update frame) / **−15.7 %**
+(`parse_sparse_updates`) on the new `token_prob_update` micro-bench
+(criterion p < 0.05, same-session A/B). See `BENCHMARKS.md` §"Round 291".
+
+### Added — `token_prob_update` bench: §13.4 flag-read loop (round 291, 2026-06-14)
+
+New `token_prob_update` criterion binary isolating the §13.4
+`parse_token_prob_update` flag-read loop (the whole-frame decode benches
+fold it inside the rest of the §9 header parse). Drives
+`bench_parse_token_prob_update` over a header partition pre-encoded by the
+crate's own §13.4 writer, validated by a full payload-equality assertion
+at setup. Two shapes: `parse_no_updates` (the common all-`None` frame) and
+`parse_sparse_updates` (scattered `Some(prob)` replacements exercising the
+`read_literal(8)` branch). Bench-only `#[doc(hidden)]` re-exports added:
+`coded_header::bench_parse_token_prob_update` and the now-`pub`
+`encoder::COEFF_UPDATE_PROBS_FLAT`.
+
 ### Changed — move-minimising §9 reference-slot rotation (round 289, 2026-06-13)
 
 Profile-opt round landing the round-288 named decoder target: the §9 /

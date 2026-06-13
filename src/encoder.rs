@@ -1163,7 +1163,8 @@ pub fn encode_silent_keyframe(params: SilentKeyframeParams) -> Result<Vec<u8>, E
 /// [`crate::coded_header`] holds the same numbers in its nested-array
 /// form; transcribing them once here avoids cross-module visibility
 /// without re-typing them by hand at call time.
-pub(crate) const COEFF_UPDATE_PROBS_FLAT: [u8; 1056] = {
+#[doc(hidden)]
+pub const COEFF_UPDATE_PROBS_FLAT: [u8; 1056] = {
     let mut out = [0u8; 1056];
     let mut i = 0;
     while i < 4 {

@@ -317,6 +317,31 @@ scratch-then-copy lesson), so the default build is unchanged. A/B bench:
 target: per-frame reference-slot plane-copy churn (see `BENCHMARKS.md`
 round 286).
 
+### `ref_slot_rotation` bench — §9.7/§9.8 reference-slot rotation (round 288)
+
+Round 288 (bench-only, no `src/` change) gives the round-286 runner-up —
+the §9.7/§9.8 reference-frame slot rotation (`RefFrameSlot::clone` churn,
+the `memmove`/`memset` #3 decoder self-time cluster at ≈ 15 %) — its
+first isolated A/B instrument:
+
+```sh
+cargo bench -p oxideav-vp8 --bench ref_slot_rotation -- --quick
+```
+
+* `rotate_*` micro — the §20 page-147 rotation walk in isolation across
+  three flag combinations: even the common `refresh_last`-only ladder
+  costs **~12.2 µs/frame** of slot copying (six populated `Vec` clones);
+  `refresh_all` ~15.2 µs, cross-slot `copy_gf_arf` ~16.2 µs.
+* `decode_1k8p_*` whole-stream — decode through `Vp8DecoderState` under a
+  refresh-last (1.86 ms) vs golden/altref-cadence (1.89 ms) stream; the
+  ~1.3 % gap confirms the rotation is a near-**fixed** per-frame cost
+  driven by the unconditional clones, not refresh frequency.
+* Named next profile-opt target: **copy-on-write / slot-swap planes**
+  (`Rc`/`Arc`-backed slots so `pre_*` capture + GOLDEN/ALTREF
+  pass-through become pointer bumps, or `mem::swap` of the owned current
+  reconstruction into LAST) — byte-identity provable with the existing
+  decode-side byte-hash A/B. See `BENCHMARKS.md` round 288.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

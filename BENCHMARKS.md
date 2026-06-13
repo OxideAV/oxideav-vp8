@@ -1542,3 +1542,105 @@ The new `idct_add_residue_fusion` bench times the unfused vs fused
 Next profile-opt target stays the round-285 runner-up: per-frame
 reference-slot plane-copy churn in `Vp8DecoderState::decode_frame`
 (slot-swap / copy-on-write planes, ≈ 15 % self-time).
+
+## Round 288 — `ref_slot_rotation` micro + whole-stream bench (bench round)
+
+Round 288 (2026-06-13) is a bench-only round: no `src/` change (decoder
+and encoder byte-identical to round 286 — the full stable lib suite
+re-anchors structural bit-identity). It builds the isolated harness for
+the round-285/286 ranked decoder **runner-up** — the §9.7 / §9.8
+reference-frame slot rotation (the `memmove` / `memset` family, #3
+self-time cluster at ≈ 15–16 % on the inter decode profile). Every
+whole-frame decode bench (`keyframe_decode`, `inter_decode_short_clip`,
+`token_decode`) folded this `RefFrameSlot::clone` churn behind header
+parse + token decode + reconstruct + loop filter, so the per-frame copy
+cost had no A/B instrument.
+
+### 1. `rotate_*` — the §20 page-147 rotation walk in isolation
+
+The new `ref_slot_rotation` binary replicates the exact temporaries
+`Vp8DecoderState::decode_frame` stages (`current_slot` +
+`pre_{last,golden,altref}` + `new_{altref,golden,last}`, the
+`copy_arf → copy_gf → refresh_gf → refresh_arf → refresh_last` order),
+driven over public `RefFrameSlot` fields at the 320×240 geometry the
+`keyframe_decode` bench uses (115 200 plane bytes/slot). Three flag
+combinations partition the decoder's per-frame cost (Apple M4 / aarch64,
+rustc 1.95.0 stable, `--measurement-time 12`):
+
+| Bench | Time | Throughput |
+|---|---:|---:|
+| `ref_slot_rotation/rotate_refresh_last_only` | 12.2 µs | 8.76 GiB/s |
+| `ref_slot_rotation/rotate_refresh_all` | 15.2 µs | 7.05 GiB/s |
+| `ref_slot_rotation/rotate_copy_gf_arf` | 16.2 µs | 6.62 GiB/s |
+
+Reading: even the round-149 hardwired P-frame ladder (`refresh_last = 1`,
+everything else 0 — the overwhelmingly common case) costs **12.2 µs of
+pure slot copying per frame**, because the staged sequence still clones
+the three pre-rotation `Option<RefFrameSlot>` slots
+(`pre_{last,golden,altref}`) plus `new_{altref,golden}` plus the
+`current.clone()` into LAST — six populated-slot `Vec` clones where the
+output keeps only one fresh LAST and two pass-through Options. The
+heavier `refresh_all` (+25 %) and cross-slot `copy_gf_arf` (+33 %) shapes
+add at most ~4 µs on top — the rotation cost is dominated by the
+**unconditional** `pre_*` / `current` clones on every frame, not the rare
+golden/altref branches.
+
+### 2. `decode_*` — whole-stream, two refresh cadences
+
+Two whole-stream decodes through `Vp8DecoderState` over the crate's own
+§16 encoder output (1 keyframe + 8 P-frames, 320×240 drifting clip),
+exercising the *shipped* rotation unmodified:
+
+| Bench | Time | Throughput |
+|---|---:|---:|
+| `ref_slot_rotation/decode_1k8p_last_only` | 1.86 ms | 372 Mpx/s |
+| `ref_slot_rotation/decode_1k8p_golden_altref` | 1.89 ms | 367 Mpx/s |
+
+`golden_altref` adds a periodic `refresh_golden_frame` (every 2nd P) /
+`refresh_alternate_frame` (every 3rd P) cadence on top of the default
+refresh-last ladder. It is only **~1.3 % slower** whole-frame than
+`last_only` — confirming the micro's finding from the whole-frame side:
+the rotation is a near-**fixed** per-frame cost driven by `refresh_last`'s
+unconditional current-slot clone, not by refresh frequency. The 12.2 µs
+micro × 9 frames ≈ 110 µs of the 1.86 ms whole-stream number (≈ 6 % of
+this stream's decode wall, scaling with frame area / MB count toward the
+profile's ≈ 15 % at the inter bench's higher P-frame density).
+
+### Ranked hotspot table (carried from round 285/286, re-confirmed)
+
+The round-285 fresh `sample(1)` profiles still stand (no `src/` change
+since round 286 touched only the §14.4/§14.5 residue fold, which moved
+`reconstruct_inter_mb` down, not the rotation). Decoder inter profile,
+post-round-286:
+
+| Rank | Symbol | Share | Status |
+|---:|---|---:|---|
+| 1 | `dct_tokens::decode_block_core` | ≈ 22 % (≈ 47 % token-heavy) | round-283-fused; re-ranks #1 on dense residue |
+| 2 | `motion_comp::reconstruct_inter_mb` | ≈ 20 % | round-286-fused residue pass (−8/−12 % per-MB) |
+| 3 | `memmove`/`memset` — **ref-slot rotation** | ≈ 15 % | **now isolated by `ref_slot_rotation`** — NAMED next PROFILE-OPT target |
+| 4 | `Vp8DecoderState::decode_frame` body | ≈ 5 % | slot bookkeeping around #3 |
+| 5 | `coded_header::parse_token_prob_update` | ≈ 5 % | per-frame fixed cost |
+
+**Named next PROFILE-OPT target: §9 reference-slot rotation copy-on-write
+/ slot-swap.** The micro proves ~12.2 µs/frame of slot copying on the
+common refresh-last path, six populated `Vec` clones where the rotation
+semantically needs only a move of the current reconstruction into LAST
+and pointer-aliasing of the unchanged GOLDEN / ALTREF slots. Candidate
+shapes (any one bit-identical by construction — the rotation only ever
+*selects* and *replaces* whole slots, never mutates plane bytes):
+
+1. **`Rc`/`Arc`-backed planes with copy-on-write** — store
+   `RefFrameSlot` planes behind a refcount so `pre_*` capture and the
+   GOLDEN/ALTREF pass-through become pointer bumps; only the
+   `current.clone()` into LAST stays a real copy (and even that can be a
+   move of the just-decoded planes when `refresh_last` is the only bit).
+2. **Slot-swap when refresh flags allow** — `std::mem::swap` /
+   `Option::take` the current planes into LAST instead of cloning, since
+   `planes` is owned and dropped right after the rotation.
+
+The `ref_slot_rotation` micro is the A/B instrument for that change; the
+two whole-stream rows bound the whole-frame ceiling (≈ 6 % on this
+stream, ≈ 15 % at inter-bench P-frame density). Byte-identity provable
+with the existing decode-side byte-hash A/B (the round-283 / round-286
+55-frame FNV-1a harness). Runner-up after that: the §13.4
+`parse_token_prob_update` per-frame flag-read loop (rank 5).

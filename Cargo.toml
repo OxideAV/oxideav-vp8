@@ -163,3 +163,18 @@ harness = false
 [[bench]]
 name = "subpel_sad_scoring"
 harness = false
+
+# Round 288 bench. The §9.7 / §9.8 reference-frame slot rotation — the
+# per-frame `RefFrameSlot` clone churn `Vp8DecoderState::decode_frame`
+# runs after every decoded frame (`copy_arf → copy_gf → refresh_gf →
+# refresh_arf → refresh_last`). The round-285/286 ranked decoder table
+# named this the standing runner-up profile-opt target (the `memmove` /
+# `memset` family, ≈ 15–16 % decoder self-time, #3 cluster) but it had no
+# isolated bench: every whole-frame decode bench folds the rotation in
+# behind parse + tokens + reconstruct + loop filter. Two layers: the
+# rotation walk in isolation across flag combinations (refresh-last-only
+# / refresh-all / cross-slot-copy) plus whole-stream decodes under a
+# refresh-last vs golden/altref cadence.
+[[bench]]
+name = "ref_slot_rotation"
+harness = false

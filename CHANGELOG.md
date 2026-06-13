@@ -4,6 +4,27 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `ref_slot_rotation` bench: §9.7/§9.8 reference-slot rotation (round 288, 2026-06-13)
+
+Bench-only (measurement) round; decoder and encoder byte-identical (no
+`src/` logic change). Adds the `ref_slot_rotation` criterion binary, the
+isolated harness for the round-285/286 ranked decoder **runner-up** — the
+§9.7/§9.8 reference-frame slot rotation (`RefFrameSlot::clone` churn the
+`memmove`/`memset` family attributes to, the #3 self-time cluster at
+≈ 15–16 % on the inter decode profile). Two layers: a `rotate_*` micro
+that replicates the exact `decode_frame` temporaries (`current_slot` +
+`pre_{last,golden,altref}` + `new_{altref,golden,last}`) over public
+`RefFrameSlot` fields across three flag combinations (refresh-last-only /
+refresh-all / cross-slot-copy), and two `decode_*` whole-stream decodes
+through `Vp8DecoderState` under a refresh-last vs golden/altref cadence.
+The micro measures ~12.2 µs/frame of slot copying even on the common
+refresh-last path (six populated `Vec` clones); the whole-stream rows
+show the golden/altref cadence adds only ~1.3 %, confirming the rotation
+is a near-fixed per-frame cost driven by the unconditional clones, not
+refresh frequency. Names the next profile-opt target: copy-on-write /
+slot-swap planes (`Rc`/`Arc`-backed or `mem::swap` of the owned current
+reconstruction into LAST). See `BENCHMARKS.md` §"Round 288".
+
 ### Added — fuzz target for the §16 inter-MB mode-info decode path (round 287, 2026-06-13)
 
 Fuzz-depth round; decoder and encoder behaviour byte-identical (no `src/`

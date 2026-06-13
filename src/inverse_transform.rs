@@ -389,6 +389,191 @@ pub fn inverse_dct_4x4(input: &[i16; 16], output: &mut [i16; 16]) {
     }
 }
 
+/// Fused §14.4 inverse DCT + §14.5 add-residue clamp, writing the
+/// reconstructed sub-block directly into a strided plane.
+///
+/// `plane` is the prediction raster (row-major, row stride `stride`);
+/// `(sub_row, sub_col)` selects the 4×4 sub-block (top-left pixel at
+/// `(sub_row*4, sub_col*4)`). On entry the sub-block holds the §18
+/// prediction; on return it holds `clamp255(prediction + residue)`.
+///
+/// Output is bit-identical to the unfused
+/// `inverse_dct_4x4` → extract → `add_residue_4x4` → insert sequence:
+/// the §14.4 transform arithmetic is unchanged and the per-pixel
+/// `clamp255(plane[p] + residue)` matches `add_residue_4x4` exactly
+/// (`fused_idct_add_into_matches_unfused_sequence` proves it on both
+/// paths).
+///
+/// Path split: under nightly + `simd` the second IDCT pass is folded
+/// with a lane-wide §14.5 add-clamp store
+/// ([`inverse_dct_4x4_add_into_simd`]), which the round-286 A/B
+/// (`idct_add_residue_fusion`) measured faster than the unfused
+/// sequence. On the scalar (stable / default-CI) path the unfused
+/// sequence already autovectorises the full 16-element add-clamp as one
+/// chunk and a strided fold regressed it, so the scalar path keeps the
+/// proven extract → `add_residue_4x4` → insert shape — same single
+/// helper for callers, no scalar slowdown.
+#[inline]
+pub fn inverse_dct_4x4_add_into(
+    input: &[i16; 16],
+    plane: &mut [u8],
+    stride: usize,
+    sub_row: usize,
+    sub_col: usize,
+) {
+    #[cfg(feature = "simd")]
+    {
+        inverse_dct_4x4_add_into_simd(input, plane, stride, sub_row, sub_col);
+    }
+    #[cfg(not(feature = "simd"))]
+    {
+        // Scalar path: the unfused contiguous-buffer sequence. Building
+        // the full [i16;16] residue then a single 16-wide add-clamp into
+        // a contiguous [u8;16] autovectorises better than a row-at-a-time
+        // strided fold (the round-286 A/B measured the fold ~6 % slower
+        // on the scalar path).
+        let mut residue = [0i16; 16];
+        inverse_dct_4x4_scalar(input, &mut residue);
+        let y0 = sub_row * 4;
+        let x0 = sub_col * 4;
+        let mut pred = [0u8; 16];
+        for r in 0..4 {
+            let src = (y0 + r) * stride + x0;
+            pred[r * 4..r * 4 + 4].copy_from_slice(&plane[src..src + 4]);
+        }
+        let mut summed = [0u8; 16];
+        add_residue_4x4(&pred, &residue, &mut summed);
+        for r in 0..4 {
+            let dst = (y0 + r) * stride + x0;
+            plane[dst..dst + 4].copy_from_slice(&summed[r * 4..r * 4 + 4]);
+        }
+    }
+}
+
+/// SIMD fused §14.4 IDCT + §14.5 add-clamp — the lane layout of
+/// [`inverse_dct_4x4_simd`] with the second-pass rounded outputs added
+/// to the strided predictor and clamped in place.
+#[cfg(feature = "simd")]
+fn inverse_dct_4x4_add_into_simd(
+    input: &[i16; 16],
+    plane: &mut [u8],
+    stride: usize,
+    sub_row: usize,
+    sub_col: usize,
+) {
+    use core::simd::cmp::SimdOrd;
+    use core::simd::Simd;
+
+    let row0 = Simd::<i32, 4>::from_array([
+        input[0] as i32,
+        input[1] as i32,
+        input[2] as i32,
+        input[3] as i32,
+    ]);
+    let row1 = Simd::<i32, 4>::from_array([
+        input[4] as i32,
+        input[5] as i32,
+        input[6] as i32,
+        input[7] as i32,
+    ]);
+    let row2 = Simd::<i32, 4>::from_array([
+        input[8] as i32,
+        input[9] as i32,
+        input[10] as i32,
+        input[11] as i32,
+    ]);
+    let row3 = Simd::<i32, 4>::from_array([
+        input[12] as i32,
+        input[13] as i32,
+        input[14] as i32,
+        input[15] as i32,
+    ]);
+
+    let sin = Simd::<i32, 4>::splat(SINPI8_SQRT2);
+    let cos_m1 = Simd::<i32, 4>::splat(COSPI8_SQRT2_MINUS1);
+    let sh16 = Simd::<i32, 4>::splat(16);
+
+    // First pass — §14.4 column butterfly.
+    let a1 = row0 + row2;
+    let b1 = row0 - row2;
+
+    let t1_c = (row1 * sin) >> sh16;
+    let t2_c = row3 + ((row3 * cos_m1) >> sh16);
+    let c1 = t1_c - t2_c;
+
+    let t1_d = row1 + ((row1 * cos_m1) >> sh16);
+    let t2_d = (row3 * sin) >> sh16;
+    let d1 = t1_d + t2_d;
+
+    let t0 = a1 + d1;
+    let t1 = b1 + c1;
+    let t2 = b1 - c1;
+    let t3 = a1 - d1;
+
+    // Transpose for the second pass.
+    let t0a = t0.to_array();
+    let t1a = t1.to_array();
+    let t2a = t2.to_array();
+    let t3a = t3.to_array();
+
+    let s0 = Simd::<i32, 4>::from_array([t0a[0], t1a[0], t2a[0], t3a[0]]);
+    let s1 = Simd::<i32, 4>::from_array([t0a[1], t1a[1], t2a[1], t3a[1]]);
+    let s2 = Simd::<i32, 4>::from_array([t0a[2], t1a[2], t2a[2], t3a[2]]);
+    let s3 = Simd::<i32, 4>::from_array([t0a[3], t1a[3], t2a[3], t3a[3]]);
+
+    // Second pass — §14.4 row butterfly.
+    let a2 = s0 + s2;
+    let b2 = s0 - s2;
+
+    let t1_c2 = (s1 * sin) >> sh16;
+    let t2_c2 = s3 + ((s3 * cos_m1) >> sh16);
+    let c2 = t1_c2 - t2_c2;
+
+    let t1_d2 = s1 + ((s1 * cos_m1) >> sh16);
+    let t2_d2 = (s3 * sin) >> sh16;
+    let d2 = t1_d2 + t2_d2;
+
+    let four = Simd::<i32, 4>::splat(4);
+    let sh3 = Simd::<i32, 4>::splat(3);
+    // o_k[j] = rounded residue for row j, column k.
+    let o0 = (a2 + d2 + four) >> sh3;
+    let o3 = (a2 - d2 + four) >> sh3;
+    let o1 = (b2 + c2 + four) >> sh3;
+    let o2 = (b2 - c2 + four) >> sh3;
+
+    // Transpose the four column-vectors back into four row-vectors so
+    // each holds one raster row's residue (lane k = column k). This lets
+    // the §14.5 add-clamp run lane-wide against the four predictor bytes
+    // of that row — one SIMD add + lane clamp + narrow per row, rather
+    // than sixteen scalar `clamp255` calls.
+    let o0a = o0.to_array();
+    let o1a = o1.to_array();
+    let o2a = o2.to_array();
+    let o3a = o3.to_array();
+    let res_rows = [
+        Simd::<i32, 4>::from_array([o0a[0], o1a[0], o2a[0], o3a[0]]),
+        Simd::<i32, 4>::from_array([o0a[1], o1a[1], o2a[1], o3a[1]]),
+        Simd::<i32, 4>::from_array([o0a[2], o1a[2], o2a[2], o3a[2]]),
+        Simd::<i32, 4>::from_array([o0a[3], o1a[3], o2a[3], o3a[3]]),
+    ];
+
+    let lo = Simd::<i32, 4>::splat(0);
+    let hi = Simd::<i32, 4>::splat(255);
+    let y0 = sub_row * 4;
+    let x0 = sub_col * 4;
+    for (j, res) in res_rows.iter().enumerate() {
+        let dst = (y0 + j) * stride + x0;
+        let p = &mut plane[dst..dst + 4];
+        let pred = Simd::<i32, 4>::from_array([p[0] as i32, p[1] as i32, p[2] as i32, p[3] as i32]);
+        // clamp255(pred + residue), lane-wide.
+        let summed = (pred + res).simd_clamp(lo, hi).to_array();
+        p[0] = summed[0] as u8;
+        p[1] = summed[1] as u8;
+        p[2] = summed[2] as u8;
+        p[3] = summed[3] as u8;
+    }
+}
+
 /// Scalar §14.4 inverse DCT — the literal RFC 6386 listing.
 ///
 /// Bit-for-bit byte-exact with the spec C source. The public
@@ -975,6 +1160,80 @@ mod tests {
         assert_eq!(out[1], 0);
         assert_eq!(out[2], 230);
         assert_eq!(out[3], 200); // unchanged
+    }
+
+    #[test]
+    fn fused_idct_add_into_matches_unfused_sequence() {
+        // The round-286 fused helper `inverse_dct_4x4_add_into` must be
+        // byte-identical to the prior four-stage sequence
+        //   inverse_dct_4x4 → extract 4×4 → add_residue_4x4 → insert 4×4
+        // over the full §14.2 coefficient envelope, every strided
+        // position, and every predictor byte. Drive a deterministic
+        // mixed-frequency sweep that stresses both clamp saturations.
+        let strides: [(usize, usize); 4] = [(16, 4), (8, 2), (16, 1), (8, 1)];
+        let mut seed: u32 = 0x1357_9bdf;
+        let mut next = || {
+            // xorshift32, deterministic.
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+
+        for &(stride, sub_max) in &strides {
+            let plane_h = sub_max * 4;
+            for sub_row in 0..sub_max {
+                for sub_col in 0..(stride / 4) {
+                    for _ in 0..8 {
+                        // Random predictor plane.
+                        let mut plane_fused = vec![0u8; stride * plane_h];
+                        for p in plane_fused.iter_mut() {
+                            *p = (next() & 0xff) as u8;
+                        }
+                        let mut plane_ref = plane_fused.clone();
+
+                        // Random §14.2-envelope coefficient block: DC up to
+                        // a few thousand, AC skirt, mixed signs.
+                        let mut coeffs = [0i16; 16];
+                        coeffs[0] = ((next() % 4000) as i32 - 2000) as i16;
+                        for c in coeffs.iter_mut().skip(1) {
+                            *c = ((next() % 600) as i32 - 300) as i16;
+                        }
+
+                        // Unfused reference sequence.
+                        let mut residue = [0i16; 16];
+                        inverse_dct_4x4(&coeffs, &mut residue);
+                        let y0 = sub_row * 4;
+                        let x0 = sub_col * 4;
+                        let mut pred = [0u8; 16];
+                        for r in 0..4 {
+                            let src = (y0 + r) * stride + x0;
+                            pred[r * 4..r * 4 + 4].copy_from_slice(&plane_ref[src..src + 4]);
+                        }
+                        let mut summed = [0u8; 16];
+                        add_residue_4x4(&pred, &residue, &mut summed);
+                        for r in 0..4 {
+                            let dst = (y0 + r) * stride + x0;
+                            plane_ref[dst..dst + 4].copy_from_slice(&summed[r * 4..r * 4 + 4]);
+                        }
+
+                        // Fused helper.
+                        inverse_dct_4x4_add_into(
+                            &coeffs,
+                            &mut plane_fused,
+                            stride,
+                            sub_row,
+                            sub_col,
+                        );
+
+                        assert_eq!(
+                            plane_fused, plane_ref,
+                            "fused != unfused for stride={stride} sub=({sub_row},{sub_col})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

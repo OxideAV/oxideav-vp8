@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — fused §14.4 IDCT + §14.5 add-clamp residue pass (round 286, 2026-06-13)
+
+Profile-opt round targeting the round-285 #1 decoder hotspot:
+`reconstruct_inter_mb`'s §14.4/§14.5 residue pass. The per-sub-block
+`inverse_dct_4x4` → `extract_4x4` → `add_residue_4x4` → `insert_4x4`
+four-buffer round-trip is replaced by a single
+`inverse_dct_4x4_add_into` helper that folds the second inverse-DCT pass
+with the §14.5 add-clamp written straight into the strided prediction
+raster. Applied to all three inter-reconstruction entry points
+(`reconstruct_inter_mb`, `reconstruct_inter_mb_whole_pixel`,
+`reconstruct_split_mv_mb`).
+
+Output is bit-identical: every in-tree fixture (`i-frame-then-p-frame`,
+`golden-update-cycle`, `altref-arnr-on`, plus all keyframe fixtures)
+still decodes byte-exact against its `expected.yuv`, and a new
+`fused_idct_add_into_matches_unfused_sequence` unit test proves the
+fused helper equals the prior sequence over a randomized sweep of
+coefficients, strided positions, and predictors on both the scalar and
+SIMD paths.
+
+The SIMD (nightly + `simd`) path — the one the round-283/285 profile
+measured — folds the store lane-wide and is faster on the per-MB
+`reconstruct_inter_mb` bench: sub-pixel full-residue 462 → 426 ns
+(-8 %), whole-pixel full-residue 323 → 285 ns (-12 %), skip unchanged
+(no residue pass). The residue-pass-only delta (full minus skip) drops
+-16 % (sub-pixel) / -58 % (whole-pixel). The scalar (stable / default-CI)
+path keeps the contiguous-buffer sequence behind the same helper because
+a strided fold regressed it ~6 % there (the round-274 scratch-then-copy
+lesson), so the default build is unchanged. New A/B bench
+`benches/idct_add_residue_fusion.rs` times both shapes in one run.
+
 ### Added — hot-path bench harnesses + ranked hotspot table (round 285, 2026-06-12)
 
 Bench-only round; decoder and encoder behaviour byte-identical (no

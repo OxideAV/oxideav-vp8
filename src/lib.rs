@@ -464,8 +464,8 @@ pub use intra_predict::{
 };
 pub use inverse_transform::{
     add_residue, add_residue_4x4, clamp255, clamp_qindex, dequant_block, inverse_dct_4x4,
-    inverse_wht_4x4, inverse_wht_4x4_dc_only, Y1DequantFactors, AC_QLOOKUP, DC_QLOOKUP,
-    QINDEX_RANGE,
+    inverse_dct_4x4_add_into, inverse_wht_4x4, inverse_wht_4x4_dc_only, Y1DequantFactors,
+    AC_QLOOKUP, DC_QLOOKUP, QINDEX_RANGE,
 };
 pub use loop_filter::{
     calculate_mb_filter_level, clamp_s8, common_adjust, filter_frame, mb_filter, s2u,

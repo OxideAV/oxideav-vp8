@@ -76,7 +76,7 @@
 //!   slice.
 
 use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
-use crate::inverse_transform::{add_residue_4x4, clamp255, inverse_dct_4x4, inverse_wht_4x4};
+use crate::inverse_transform::{clamp255, inverse_dct_4x4_add_into, inverse_wht_4x4};
 use crate::motion_vector::Mv;
 use crate::reconstruct::ReconstructedMb;
 
@@ -1615,31 +1615,6 @@ pub fn predict_inter_mb_whole_pixel(
     Ok(out)
 }
 
-/// Extract a 4×4 sub-block at `(sub_row, sub_col)` (4-pixel units) from a
-/// row-major plane of `stride` pixels.
-#[inline]
-fn extract_4x4(plane: &[u8], stride: usize, sub_row: usize, sub_col: usize) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    let y0 = sub_row * 4;
-    let x0 = sub_col * 4;
-    for r in 0..4 {
-        let src = (y0 + r) * stride + x0;
-        out[r * 4..r * 4 + 4].copy_from_slice(&plane[src..src + 4]);
-    }
-    out
-}
-
-/// Splat a 4×4 sub-block back into a row-major plane.
-#[inline]
-fn insert_4x4(plane: &mut [u8], stride: usize, sub_row: usize, sub_col: usize, src: &[u8; 16]) {
-    let y0 = sub_row * 4;
-    let x0 = sub_col * 4;
-    for r in 0..4 {
-        let dst = (y0 + r) * stride + x0;
-        plane[dst..dst + 4].copy_from_slice(&src[r * 4..r * 4 + 4]);
-    }
-}
-
 /// Reconstruct one whole-pixel inter-predicted (non-SPLITMV)
 /// macroblock — RFC 6386 §16.2 / §18 prediction + §14 residue.
 ///
@@ -1687,36 +1662,23 @@ pub fn reconstruct_inter_mb_whole_pixel(
         }
     }
 
-    // Luma: inverse-DCT + add residue per sub-block.
+    // Luma: §14.4 inverse-DCT fused with the §14.5 add-clamp into the
+    // stride-16 prediction raster (round 286), matching the
+    // [`reconstruct_inter_mb`] path. Bit-identical to the prior
+    // inverse_dct_4x4 → extract/add/insert sequence.
     for i in 0..4 {
         for j in 0..4 {
             let idx = i * 4 + j;
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&y_coeffs[idx], &mut residue);
-            let pred = extract_4x4(&out.y, 16, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.y, 16, i, j, &summed);
+            inverse_dct_4x4_add_into(&y_coeffs[idx], &mut out.y, 16, i, j);
         }
     }
 
-    // Chroma: inverse-DCT + add residue per sub-block, U then V.
+    // Chroma: same fused IDCT + add-clamp, U then V, stride 8.
     for i in 0..2 {
         for j in 0..2 {
             let idx = i * 2 + j;
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&u_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.u, 8, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.u, 8, i, j, &summed);
-
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&v_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.v, 8, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.v, 8, i, j, &summed);
+            inverse_dct_4x4_add_into(&u_coeffs_dequant[idx], &mut out.u, 8, i, j);
+            inverse_dct_4x4_add_into(&v_coeffs_dequant[idx], &mut out.v, 8, i, j);
         }
     }
 
@@ -1879,36 +1841,25 @@ pub fn reconstruct_inter_mb(
         }
     }
 
-    // Luma: inverse-DCT + add residue per sub-block.
+    // Luma: §14.4 inverse-DCT fused with the §14.5 add-clamp written
+    // straight into the stride-16 prediction raster (round 286). The
+    // fused helper replaces the prior inverse_dct_4x4 → extract_4x4 →
+    // add_residue_4x4 → insert_4x4 four-buffer round-trip; output is
+    // bit-identical (the transform arithmetic and per-pixel clamp are
+    // unchanged). See `BENCHMARKS.md` round 286.
     for i in 0..4 {
         for j in 0..4 {
             let idx = i * 4 + j;
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&y_coeffs[idx], &mut residue);
-            let pred = extract_4x4(&out.y, 16, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.y, 16, i, j, &summed);
+            inverse_dct_4x4_add_into(&y_coeffs[idx], &mut out.y, 16, i, j);
         }
     }
 
-    // Chroma: inverse-DCT + add residue per sub-block, U then V.
+    // Chroma: same fused IDCT + add-clamp, U then V, stride 8.
     for i in 0..2 {
         for j in 0..2 {
             let idx = i * 2 + j;
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&u_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.u, 8, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.u, 8, i, j, &summed);
-
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&v_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.v, 8, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.v, 8, i, j, &summed);
+            inverse_dct_4x4_add_into(&u_coeffs_dequant[idx], &mut out.u, 8, i, j);
+            inverse_dct_4x4_add_into(&v_coeffs_dequant[idx], &mut out.v, 8, i, j);
         }
     }
 
@@ -2128,36 +2079,22 @@ pub fn reconstruct_split_mv_mb(
         return out;
     }
 
-    // Luma: inverse-DCT + add residue per sub-block (no Y2 for SPLITMV).
+    // Luma: §14.4 inverse-DCT fused with the §14.5 add-clamp into the
+    // stride-16 prediction raster (round 286; no Y2 for SPLITMV).
+    // Bit-identical to the prior extract/add/insert sequence.
     for i in 0..4 {
         for j in 0..4 {
             let idx = i * 4 + j;
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&y_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.y, 16, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.y, 16, i, j, &summed);
+            inverse_dct_4x4_add_into(&y_coeffs_dequant[idx], &mut out.y, 16, i, j);
         }
     }
 
-    // Chroma: inverse-DCT + add residue per sub-block, U then V.
+    // Chroma: same fused IDCT + add-clamp, U then V, stride 8.
     for i in 0..2 {
         for j in 0..2 {
             let idx = i * 2 + j;
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&u_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.u, 8, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.u, 8, i, j, &summed);
-
-            let mut residue = [0i16; 16];
-            inverse_dct_4x4(&v_coeffs_dequant[idx], &mut residue);
-            let pred = extract_4x4(&out.v, 8, i, j);
-            let mut summed = [0u8; 16];
-            add_residue_4x4(&pred, &residue, &mut summed);
-            insert_4x4(&mut out.v, 8, i, j, &summed);
+            inverse_dct_4x4_add_into(&u_coeffs_dequant[idx], &mut out.u, 8, i, j);
+            inverse_dct_4x4_add_into(&v_coeffs_dequant[idx], &mut out.v, 8, i, j);
         }
     }
 
@@ -2167,6 +2104,7 @@ pub fn reconstruct_split_mv_mb(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inverse_transform::inverse_dct_4x4;
 
     /// Minimal test-side VP8 boolean encoder, mirroring the proven
     /// encoder in `motion_vector::tests` / `bool_decoder::tests`. Used to

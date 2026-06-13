@@ -157,5 +157,9 @@ name = "reconstruct_inter_mb"
 harness = false
 
 [[bench]]
+name = "idct_add_residue_fusion"
+harness = false
+
+[[bench]]
 name = "subpel_sad_scoring"
 harness = false

@@ -1482,3 +1482,63 @@ copy-on-write planes), unchanged from the round-283 list.
   unchanged, byte-identity provable with the existing stress-matrix
   pattern. Runner-up: reference-slot copy churn (slot-swap /
   copy-on-write planes, rank 3 at ≈ 15 %).
+
+## Round 286 — fused §14.4 IDCT + §14.5 add-clamp residue pass
+
+Profile-opt round landing the round-285 #1 decoder hotspot. The
+per-sub-block residue chain in the three inter-reconstruction entry
+points (`reconstruct_inter_mb`, `reconstruct_inter_mb_whole_pixel`,
+`reconstruct_split_mv_mb`) was a four-buffer round-trip:
+
+```
+inverse_dct_4x4(coeffs → [i16;16] residue)
+extract_4x4(strided plane → [u8;16] pred)
+add_residue_4x4(pred, residue → [u8;16] summed)
+insert_4x4([u8;16] summed → strided plane)
+```
+
+A single `inverse_dct_4x4_add_into(coeffs, plane, stride, sr, sc)`
+helper now folds the second inverse-DCT pass with the §14.5 add-clamp
+written straight into the strided prediction raster. Arithmetic is
+unchanged; output is bit-identical (proved by
+`fused_idct_add_into_matches_unfused_sequence` over a randomized
+coefficient/position/predictor sweep on both paths, plus every in-tree
+inter fixture still decoding byte-exact against its `expected.yuv`).
+
+### Path split (round-274 lesson)
+
+The §14.4 IDCT structurally emits the second pass one raster row at a
+time, so a naive in-place strided fold stores 4 bytes per row. On the
+**SIMD** path this folds cleanly: each row's predictor is loaded into a
+`Simd<i32,4>`, the residue added lane-wide, `simd_clamp(0,255)` applied,
+and the four bytes narrowed — faster than the unfused store. On the
+**scalar** path the unfused sequence already auto-vectorises the full
+16-element add-clamp as one chunk, and a row-at-a-time fold regressed it
+(same reason the round-274 SPLITMV scratch-then-copy beat a strided
+write ~23 %). So `inverse_dct_4x4_add_into` keeps the contiguous-buffer
+sequence on the scalar path behind the same helper signature — callers
+see one function, the default (stable) build is byte- and
+speed-identical.
+
+### Measured A/B (criterion, Apple M4 / aarch64; shared box)
+
+`reconstruct_inter_mb` per-MB bench, nightly + `simd` (the path the
+round-283/285 profile measured):
+
+| shape                     | before  | after   | Δ      |
+| ------------------------- | ------- | ------- | ------ |
+| `subpel_full_residue`     | 462 ns  | 426 ns  | −8 %   |
+| `whole_pixel_full_residue`| 323 ns  | 285 ns  | −12 %  |
+| `subpel_skip`             | 266 ns  | 261 ns  | ~0 (no residue) |
+
+Residue-pass-only cost (full minus skip): sub-pixel 196 → 165 ns
+(−16 %), whole-pixel 57 → 24 ns (−58 %).
+
+The new `idct_add_residue_fusion` bench times the unfused vs fused
+24-sub-block MB residue pass in one binary (load-immune A/B): fused
+179 ns vs unfused 187 ns under `simd` (−4 %); scalar parity (218 vs
+216 ns, within noise — the scalar path is the unchanged sequence).
+
+Next profile-opt target stays the round-285 runner-up: per-frame
+reference-slot plane-copy churn in `Vp8DecoderState::decode_frame`
+(slot-swap / copy-on-write planes, ≈ 15 % self-time).

@@ -295,6 +295,28 @@ cargo bench -p oxideav-vp8 --bench subpel_sad_scoring -- --quick
   strided prediction raster, dropping the per-sub-block
   `extract_4x4`/`insert_4x4` scratch round-trips).
 
+### Fused §14.4 IDCT + §14.5 add-clamp residue pass (round 286)
+
+Round 286 lands the round-285 named target. The per-sub-block
+`inverse_dct_4x4` → `extract_4x4` → `add_residue_4x4` → `insert_4x4`
+four-buffer round-trip in all three inter-reconstruction entry points
+(`reconstruct_inter_mb`, `reconstruct_inter_mb_whole_pixel`,
+`reconstruct_split_mv_mb`) collapses into one `inverse_dct_4x4_add_into`
+helper that folds the second inverse-DCT pass with the §14.5 add-clamp
+written straight into the strided prediction raster.
+
+Output is bit-identical (every in-tree inter + keyframe fixture still
+decodes byte-exact, plus a randomized fused-vs-unfused equivalence test
+on both paths). On the SIMD path the store folds lane-wide, measuring
+**−8 %** sub-pixel / **−12 %** whole-pixel on the per-MB
+`reconstruct_inter_mb` bench (residue-pass-only delta −16 % / −58 %).
+The scalar (default-CI) path keeps the contiguous-buffer sequence behind
+the same helper — a strided fold regressed it there (the round-274
+scratch-then-copy lesson), so the default build is unchanged. A/B bench:
+`cargo bench -p oxideav-vp8 --bench idct_add_residue_fusion`. Next
+target: per-frame reference-slot plane-copy churn (see `BENCHMARKS.md`
+round 286).
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

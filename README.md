@@ -372,7 +372,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships nineteen `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-one `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -737,6 +737,27 @@ between the paired surfaces):
   dispatch path is fuzzed while the differential keeps the scalar
   kernels covered). Daily scheduled `Fuzz` workflow runs every target
   under ASan since round 284.
+* `panic_free_near_mv_mode_decode` — the §16.2 / §16.3 / §16.4 / §17
+  inter-MB *mode-info decode* surface, landed in round 287. Drives
+  `decode_inter_mb` / `decode_split_mv_mb` (the §18 end-to-end
+  integration entry points), `resolve_inter_mb_mv`, `find_near_mvs`
+  (the §16.3 spatial census), `decode_split_mv` (the §16.4 partition
+  walk), the three bool-tree walks `read_inter_mode` /
+  `read_mv_partition` / `submv_ref`, the §20.11 neighbour-MV lookups
+  `above_block_mv` / `left_block_mv` across all sixteen sub-blocks
+  (SPLITMV `b+12` / `b+3` branches + intra-zero fallback), plus
+  `mv_ref_probs` / `submv_ref_context` / `clamp_mv` — all fed directly
+  from a bool-coder partition with adversarial neighbour `MbInfo`
+  records, sign-bias flags, and attacker-tiled §17 MV probability
+  contexts. This is the bool-decoder-driven §16.3 census → §16.2 tree →
+  §16.4 SPLITMV walk → §17 NEWMV differential that *produces* the
+  vectors the round-263 `panic_free_inter_mb_reconstruct` target feeds
+  in directly — a path the `decode_vp8` targets reach only through
+  self-consistent §9.7 reference state. Asserts the §16.3 census counts
+  stay inside the documented `0..=5` `mv_ref_probs` index envelope on
+  every iteration. Round-287 ASan campaign (nightly, default `simd`):
+  ~11.0 M executions in 181 s (~60.8 K exec/s), peak RSS 572 MB, zero
+  crashes / leaks / OOMs.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

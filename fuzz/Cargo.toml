@@ -453,6 +453,36 @@ cargo-fuzz = true
 #                                     §14.3 / §14.4 / §12.2 / §18.3
 #                                     kernel pairs on attacker-shaped
 #                                     inputs.
+#   * `panic_free_near_mv_mode_decode`
+#                                  — §16.2 / §16.3 / §16.4 / §17 inter-MB
+#                                     *mode-info decode* surface
+#                                     (`decode_inter_mb`,
+#                                     `decode_split_mv_mb`,
+#                                     `resolve_inter_mb_mv`,
+#                                     `find_near_mvs`, `decode_split_mv`,
+#                                     `read_inter_mode`,
+#                                     `read_mv_partition`, `submv_ref`,
+#                                     `above_block_mv` / `left_block_mv`,
+#                                     `mv_ref_probs`, `clamp_mv`). Drives
+#                                     the §16.3 spatial census + §16.2
+#                                     inter-mode tree + §16.4 SPLITMV
+#                                     partition walk + §17 NEWMV
+#                                     differential from a bool-coder
+#                                     partition, with adversarial
+#                                     neighbour `MbInfo` records, sign
+#                                     bias, and attacker-tiled MV
+#                                     probability contexts — the
+#                                     bool-decoder-driven mode/MV decode
+#                                     the round-263
+#                                     `panic_free_inter_mb_reconstruct`
+#                                     target (which feeds vectors in
+#                                     directly) never reaches, and that
+#                                     the `decode_vp8` targets reach only
+#                                     through self-consistent §9.7
+#                                     reference state. Asserts the §16.3
+#                                     census counts stay inside the
+#                                     documented 0..=5 `mv_ref_probs`
+#                                     index envelope on every iteration.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -599,5 +629,11 @@ doc = false
 [[bin]]
 name = "decode_stream_token_descent"
 path = "fuzz_targets/decode_stream_token_descent.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_near_mv_mode_decode"
+path = "fuzz_targets/panic_free_near_mv_mode_decode.rs"
 test = false
 doc = false

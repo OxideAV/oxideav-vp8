@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — fuzz target for the §16 inter-MB mode-info decode path (round 287, 2026-06-13)
+
+Fuzz-depth round; decoder and encoder behaviour byte-identical (no `src/`
+logic change). Adds `fuzz/fuzz_targets/panic_free_near_mv_mode_decode.rs`,
+a panic-freedom harness for the §16.2 / §16.3 / §16.4 / §17 inter-MB
+*mode-info decode* surface that the prior twenty targets leave cold.
+
+Surface driven directly from a bool-coder partition plus adversarial
+neighbour `MbInfo` records, sign-bias flags, and attacker-tiled MV
+probability contexts: `decode_inter_mb` / `decode_split_mv_mb` (the §18
+end-to-end integration entry points), `resolve_inter_mb_mv`,
+`find_near_mvs` (the §16.3 spatial census), `decode_split_mv` (the §16.4
+partition walk), `read_inter_mode` / `read_mv_partition` / `submv_ref`
+(the three bool-tree walks), `above_block_mv` / `left_block_mv` (the
+§20.11 neighbour-MV lookups across all sixteen sub-blocks, including the
+SPLITMV `b+12` / `b+3` branches and the intra-zero fallback),
+`mv_ref_probs`, `submv_ref_context`, and `clamp_mv`. The round-263
+`panic_free_inter_mb_reconstruct` target feeds vectors into the §16
+*reconstruction* orchestrators directly; this new target exercises the
+bool-decoder-driven §16.3 census → §16.2 tree → §16.4 SPLITMV walk → §17
+NEWMV differential that *produces* those vectors — a path the
+`decode_vp8` targets reach only through self-consistent §9.7 reference
+state. The harness asserts the §16.3 census counts stay inside the
+documented `0..=5` `mv_ref_probs` index envelope on every iteration.
+
+ASan campaign (nightly, default `simd` feature, macOS aarch64, cross-
+seeded from the inter-MB-reconstruct and decode-stream corpora): ~11.0 M
+executions in 181 s (~60.8 K exec/s), peak RSS 572 MB, 1316 new corpus
+units, **zero crashes / leaks / OOMs / assertion failures**. The
+scheduled `Fuzz` workflow auto-discovers the new target (now 21).
+
 ### Changed — fused §14.4 IDCT + §14.5 add-clamp residue pass (round 286, 2026-06-13)
 
 Profile-opt round targeting the round-285 #1 decoder hotspot:

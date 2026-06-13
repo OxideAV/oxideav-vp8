@@ -2,7 +2,7 @@ name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Auto-discovers
 # every target in fuzz/fuzz_targets/ and splits the 30-minute budget
-# across them (19 targets as of round 284 → ~94 s each), running under
+# across them (21 targets as of round 287 → ~85 s each), running under
 # ASan on nightly. The committed decode_stream_token_descent seed corpus
 # (fixture-derived keyframe + inter-frame packet streams) ships in the
 # checkout; libFuzzer-discovered corpus entries persist across runs via

@@ -121,23 +121,32 @@ impl MbDequantFactors {
         uvdc_delta: i32,
         uvac_delta: i32,
     ) -> Self {
-        let y1_dc = dc_q(q + ydc_delta);
+        // Every `q + delta` here is formed with `saturating_add`: the
+        // §20.4 index is immediately fed through `clamp_qindex`, which
+        // saturates it into `0..=127`, so an out-of-`i32`-range sum
+        // produced by an extreme base/delta pair clamps to the same table
+        // endpoint a saturated sum would. For a real bitstream `q` is a
+        // §9.6 `u8` (0..=255) and each delta a §9.6 `i8` (-128..=127), so
+        // the sum never leaves `i32` — but the public `i32` API admits
+        // arbitrary callers, and the spec's contract is that the index is
+        // clamped, not that the add wraps or panics.
+        let y1_dc = dc_q(q.saturating_add(ydc_delta));
         let y1_ac = ac_q(q);
 
         // §20.4: dc_q(q + y2_dc_delta_q) * 2.
-        let y2_dc = dc_q(q + y2dc_delta) * 2;
+        let y2_dc = dc_q(q.saturating_add(y2dc_delta)) * 2;
         // §20.4: ac_q(q + y2_ac_delta_q) * 155 / 100, then floor at 8.
-        let mut y2_ac = ac_q(q + y2ac_delta) * 155 / 100;
+        let mut y2_ac = ac_q(q.saturating_add(y2ac_delta)) * 155 / 100;
         if y2_ac < Y2_AC_MIN as i32 {
             y2_ac = Y2_AC_MIN as i32;
         }
 
         // §20.4: dc_q(q + uv_dc_delta_q), then cap at 132.
-        let mut uv_dc = dc_q(q + uvdc_delta);
+        let mut uv_dc = dc_q(q.saturating_add(uvdc_delta));
         if uv_dc > UV_DC_MAX as i32 {
             uv_dc = UV_DC_MAX as i32;
         }
-        let uv_ac = ac_q(q + uvac_delta);
+        let uv_ac = ac_q(q.saturating_add(uvac_delta));
 
         MbDequantFactors {
             y1_dc: y1_dc as i16,
@@ -191,7 +200,12 @@ impl MbDequantFactors {
         let q = if absolute {
             segment_quant
         } else {
-            qi.y_ac_qi as i32 + segment_quant
+            // `saturating_add` for the same reason as `from_base_and_deltas`:
+            // a real §10 `segment_quant` is a small signed value and
+            // `y_ac_qi` a §9.6 `u8`, so the sum stays in `i32`; the public
+            // `i32` API admits extreme callers, and the resulting index is
+            // clamped by `clamp_qindex` rather than wrapped.
+            (qi.y_ac_qi as i32).saturating_add(segment_quant)
         };
         Self::from_base_and_deltas(
             q,
@@ -497,6 +511,40 @@ mod tests {
         // ac index to 127.
         let f_hi = MbDequantFactors::from_base_and_deltas(200, 0, 0, 0, 0, 0);
         assert_eq!(f_hi.y1_ac, AC_QLOOKUP[127]);
+    }
+
+    #[test]
+    fn extreme_base_and_deltas_saturate_without_overflow() {
+        // The public `i32` factor-derivation API admits arbitrary callers.
+        // A base or delta at the `i32` cliff must clamp via `clamp_qindex`,
+        // not panic on the internal `q + delta` add. Sweep every cliff pair
+        // through both the direct and the per-segment derivation paths.
+        let cliffs = [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        for &q in &cliffs {
+            for &d in &cliffs {
+                // Must not panic; the factors must be the clamped-endpoint
+                // table values.
+                let _ = MbDequantFactors::from_base_and_deltas(q, d, d, d, d, d);
+            }
+        }
+
+        // `q = i32::MAX` with a positive Y-DC delta previously overflowed
+        // the `q + ydc_delta` add; it must now saturate to the top of the
+        // table (index 127).
+        let f_hi = MbDequantFactors::from_base_and_deltas(i32::MAX, 1, 1, 1, 1, 1);
+        assert_eq!(f_hi.y1_dc, DC_QLOOKUP[127]);
+        assert_eq!(f_hi.y1_ac, AC_QLOOKUP[127]);
+
+        // `q = i32::MIN` with a negative delta saturates to the bottom
+        // (index 0) rather than overflowing.
+        let f_lo = MbDequantFactors::from_base_and_deltas(i32::MIN, -1, -1, -1, -1, -1);
+        assert_eq!(f_lo.y1_dc, DC_QLOOKUP[0]);
+        assert_eq!(f_lo.y1_ac, AC_QLOOKUP[0]);
+
+        // The §10 per-segment delta-mode base add (`y_ac_qi + segment_quant`)
+        // must also saturate at the `i32::MAX` segment_quant cliff.
+        let f_seg = MbDequantFactors::for_segment(&qi_base(200), i32::MAX, false);
+        assert_eq!(f_seg.y1_ac, AC_QLOOKUP[127]);
     }
 
     #[test]

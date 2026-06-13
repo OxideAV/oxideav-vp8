@@ -450,7 +450,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twenty-one `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-two `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -861,6 +861,34 @@ between the paired surfaces):
   ~2.15 M executions in 151 s, plus a 0.31 M-iteration corpus-replay
   reaching a 687-PC / 2957-feature plateau (303-input corpus); zero
   crashes / leaks / OOMs.
+* `panic_free_dequant_factors_mb` — the §14.1 / §20.4 dequant
+  *factor-derivation* and full-macroblock dequant-apply surface, plus
+  the §13.3 → §14.1 token → dequant wrapper, landed in round 293. The
+  pre-existing transform-primitive target reaches §14.1 only at the
+  single-block leaf (`dequant_block` with the two factors handed in
+  directly) and the token target stops at `decode_mb_coeffs` without
+  ever deriving factors or scaling a block — so the §20.4 `dequant_init`
+  factor construction (`MbDequantFactors::from_base_and_deltas` /
+  `from_quant_indices` / `for_segment`), the whole-MB apply
+  (`dequantize` over the Y2 + 16 Y + 4 U + 4 V block set) and the
+  bitstream → dequant wrapper (`decode_and_dequantize_mb`) were
+  directly under-fuzzed. The harness drives all three from raw bytes,
+  sweeping the base index and the five §9.6 plane deltas across the full
+  `i32` range including the `i32::MIN` / `i32::MAX` cliff endpoints, with
+  every macroblock coefficient seeded at the §14.1 `i16` product cliffs.
+  This target **found a real `attempt to add with overflow` panic**: the
+  internal `q + delta` additions in `from_base_and_deltas` (and the
+  §10 per-segment `y_ac_qi + segment_quant` base add) panicked in a
+  debug build when an out-of-range base/delta pair was supplied through
+  the public `i32` API, even though `clamp_qindex` was meant to saturate
+  the index. Fixed in the same commit by forming every index sum with
+  `saturating_add` so the documented clamp does its job (a real
+  bitstream's §9.6 `u8` base + `i8` deltas never reach the edge, so
+  decode output is unchanged). Round-293 ASan campaign (nightly, default
+  `simd`): 4 055 331 executions in 201 s (cov 338 / ft 602), zero
+  crashes / leaks / OOMs after the fix; a regression test
+  (`extreme_base_and_deltas_saturate_without_overflow`) anchors the
+  saturation at both cliff ends.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

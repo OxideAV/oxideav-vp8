@@ -4,6 +4,36 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Fixed — §14.1 dequant factor-derivation `i32` add overflow + new fuzz target (round 293, 2026-06-14)
+
+New `cargo-fuzz` target `panic_free_dequant_factors_mb` over the §14.1 /
+§20.4 dequant *factor-derivation* and full-macroblock dequant-apply
+surface (`MbDequantFactors::from_base_and_deltas` / `from_quant_indices`
+/ `for_segment` / `dequantize`) plus the §13.3 → §14.1 token → dequant
+wrapper (`decode_and_dequantize_mb`). The pre-existing transform-
+primitive target reached §14.1 only at the single-block leaf
+(`dequant_block` with factors handed in directly) and the token target
+stopped at `decode_mb_coeffs` without deriving factors — so the §20.4
+`dequant_init` factor construction and the whole-MB apply were directly
+under-fuzzed.
+
+The target **found a real `attempt to add with overflow` panic**: the
+internal `q + delta` index additions in `from_base_and_deltas` (and the
+§10 per-segment `y_ac_qi + segment_quant` base add) panicked in a debug
+build when an out-of-range base/delta pair was supplied through the
+public `i32` API, even though `clamp_qindex` was meant to saturate the
+index into `0..=127`. **Fixed** by forming every index sum with
+`saturating_add` so the documented clamp does its job. A real bitstream's
+§9.6 `u8` base index plus `i8` plane deltas never reach the `i32` edge,
+so every decoded byte is unchanged; the fix only hardens the public
+`i32`-typed API against arbitrary callers. New regression test
+`extreme_base_and_deltas_saturate_without_overflow` anchors saturation at
+both cliff ends across both the direct and per-segment derivation paths.
+
+ASan campaign (nightly + default `simd`): 4 055 331 executions in 201 s
+(cov 338 / ft 602); zero crashes / leaks / OOMs after the fix. The
+existing 21 fuzz targets are unaffected.
+
 ### Added — `intra_predict_b4x4` §12.3 sub-block intra bench (round 292, 2026-06-14)
 
 Bench-coverage round (no behaviour change, decoded bytes identical). New

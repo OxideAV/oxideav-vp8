@@ -667,3 +667,9 @@ name = "panic_free_keyframe_reconstruct"
 path = "fuzz_targets/panic_free_keyframe_reconstruct.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "panic_free_dequant_factors_mb"
+path = "fuzz_targets/panic_free_dequant_factors_mb.rs"
+test = false
+doc = false

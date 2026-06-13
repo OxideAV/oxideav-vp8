@@ -4,6 +4,28 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — move-minimising §9 reference-slot rotation (round 289, 2026-06-13)
+
+Profile-opt round landing the round-288 named decoder target: the §9 /
+§20-page-147 reference-frame slot rotation in
+`Vp8DecoderState::decode_frame` (the `memmove`/`memset` #3 self-time
+cluster, ≈ 15 %). The rotation previously cloned every input — the
+just-decoded frame, the three entry slots, and again into each refreshed
+destination (up to six populated `Vec` clones/frame). It now resolves each
+new `LAST`/`GOLDEN`/`ALTREF` to a symbolic source (`rotate_reference_slots`)
+and **moves** each owned source into its destination, cloning only on
+genuine fan-out; the visible-cropped output is built from `planes` first so
+the just-decoded slot consumes `planes` by move. The common
+`refresh_last`-only ladder now does zero plane copies (the keyframe path
+moves `planes` into one of its three slots). Output is bit-identical — the
+rotation only selects and replaces whole slots — anchored by the new
+`rotation_matches_clone_everything_reference` test (every entry-slot
+population × every refresh-control combination, byte-equal against the prior
+clone-everything ladder) plus the full roundtrip/oracle suite. Measured
+**−9.3 %** (refresh-last) / **−10.6 %** (golden+altref cadence) whole-stream
+on the `ref_slot_rotation/decode_1k8p_*` benches (criterion p < 0.05,
+same-session A/B). See `BENCHMARKS.md` §"Round 289".
+
 ### Added — `ref_slot_rotation` bench: §9.7/§9.8 reference-slot rotation (round 288, 2026-06-13)
 
 Bench-only (measurement) round; decoder and encoder byte-identical (no

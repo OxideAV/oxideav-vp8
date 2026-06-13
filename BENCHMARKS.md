@@ -1644,3 +1644,74 @@ stream, ≈ 15 % at inter-bench P-frame density). Byte-identity provable
 with the existing decode-side byte-hash A/B (the round-283 / round-286
 55-frame FNV-1a harness). Runner-up after that: the §13.4
 `parse_token_prob_update` per-frame flag-read loop (rank 5).
+
+## Round 289 — move-minimising reference-slot rotation
+
+Profile-opt round landing the round-288 named target: the §9 / §20-page-147
+reference-frame slot rotation in `Vp8DecoderState::decode_frame` (the
+`memmove` / `memset` #3 decoder self-time cluster, ≈ 15 %; round-288 micro
+proved ~12.2 µs/frame of slot copying on the common refresh-last ladder).
+
+### The change
+
+The pre-289 rotation staged every input as a clone: the just-decoded frame
+(`current_slot = { y: planes.y.clone(), … }`), the three entry slots
+(`pre_last`/`pre_golden`/`pre_altref` = `self.*.clone()`), and again a clone
+into each refreshed destination — up to six populated `Vec` clones per
+frame even when only `refresh_last` is set. The rotation only ever *selects*
+and *replaces* whole slots (it never mutates plane bytes), so it now:
+
+1. **Resolves each destination to a symbolic source first**
+   (`RotationSource ∈ {PreLast, PreGolden, PreAltRef, Current}`) following
+   the §20 ordering (copy_arf → copy_gf → refresh_gf → refresh_arf →
+   refresh_last; both copy cases read the *pre*-rotation slot set).
+2. **Materialises by move**, cloning a source only when it genuinely feeds
+   more than one destination (`is_last_use` test over the resolved source
+   list). On the dominant `refresh_last`-only path this is **zero** plane
+   copies: `Current` moves into `LAST`, `PreGolden`/`PreAltRef` move through.
+3. **Crops the output frame from `planes` before the rotation**, so the
+   just-decoded slot consumes `planes` by move instead of cloning it. The
+   keyframe path applies the same move (one of its three slots takes
+   `planes`; the other two still clone, since a key frame populates all
+   three).
+
+### Measured A/B (`ref_slot_rotation/decode_1k8p_*`, criterion `--measurement-time 8`, same-session, Apple M4 / aarch64, stable 1.95)
+
+| Bench | Before | After | Δ |
+|---|---:|---:|---:|
+| `ref_slot_rotation/decode_1k8p_last_only` | 1.904 ms | **1.710 ms** | **−9.3 %** |
+| `ref_slot_rotation/decode_1k8p_golden_altref` | 1.962 ms | **1.715 ms** | **−10.6 %** |
+
+Throughput: refresh-last 363 → **404 Melem/s**; golden/altref cadence
+352 → **403 Melem/s**. Criterion's own change estimate (stored-baseline,
+same session) reports −9.3 % / −10.6 % at p < 0.05 ("Performance has
+improved") on the post-change run. The `rotate_*` micro rows are
+**unchanged** — that bench keeps a standalone clone-everything replica of
+the old ladder inside the bench file (it does not call the crate's private
+`rotate_reference_slots`), so it stays the documented baseline for the
+copy cost the whole-stream change removes; only the `decode_1k8p_*` rows,
+which drive the real `decode_frame` rotation, move.
+
+### Bit-identity
+
+The rotation only selects and replaces whole slots, so output is
+bit-identical by construction. Anchored by the new
+`rotation_matches_clone_everything_reference` (every entry-slot
+population — each of LAST/GOLDEN/ALTREF populated-or-empty — ×
+every refresh-control combination: `copy_buffer_to_alternate` ∈
+{none, 0, 1, 2} × `copy_buffer_to_golden` ∈ {none, 0, 1, 2} ×
+`refresh_golden`/`refresh_alternate`/`refresh_last` ∈ {none, false, true},
+tagged-plane slots so the assertion checks *which* source landed in each
+destination, `==` against the verbatim pre-289 clone-everything ladder),
+plus the full stable lib suite (490) and nightly + `simd` lib suite (492),
+the `i_frame_then_p_frame_64x64` / `golden_update_cycle` / `altref_arnr`
+bit-exact decode tests, every in-tree decode/roundtrip integration test
+(37 green binaries), and the `ffmpeg_oracle` black-box validator.
+
+Next profile-opt target stays the round-288 runner-up: the §13.4
+`parse_token_prob_update` per-frame flag-read loop (decoder rank 5, ≈ 5 %).
+A copy-on-write (`Rc`/`Arc`-backed) plane representation remains a deeper
+follow-on for the residual rotation cost (it would also remove the two
+unavoidable keyframe clones and any genuine fan-out clone the move path
+still pays), but is a public-API change to `RefFrameSlot`'s `Vec<u8>` plane
+fields and so is out of scope for a single bit-identical profile-opt round.

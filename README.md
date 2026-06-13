@@ -342,6 +342,34 @@ cargo bench -p oxideav-vp8 --bench ref_slot_rotation -- --quick
   reconstruction into LAST) — byte-identity provable with the existing
   decode-side byte-hash A/B. See `BENCHMARKS.md` round 288.
 
+### Move-minimising reference-slot rotation (round 289)
+
+Round 289 lands the round-288 named target. `Vp8DecoderState::decode_frame`
+staged the §9 slot rotation by cloning every input — the just-decoded
+frame (`current_slot = planes.clone()`), the three entry slots (`pre_*`),
+and again into each refreshed destination. The rotation is a pure
+*select-and-replace* over whole slots, so it now resolves each new
+`LAST`/`GOLDEN`/`ALTREF` to a symbolic source (`rotate_reference_slots`)
+and **moves** each owned source into its destination, cloning only when a
+source genuinely feeds more than one slot. The visible-cropped output is
+built from `planes` first so the just-decoded slot consumes `planes` by
+move. The common `refresh_last`-only ladder now does **zero** plane copies
+(the current frame moves into LAST; GOLDEN/ALTREF pass through by move),
+where it previously did six populated `Vec` clones. The keyframe path
+similarly moves `planes` into one of its three slots.
+
+Output is bit-identical: the rotation only selects and replaces whole
+slots. Anchored by `rotation_matches_clone_everything_reference` (every
+entry-slot population × every refresh-control combination, asserting
+byte-equality against the prior clone-everything ladder) plus the full
+roundtrip/oracle suite (490 stable / 492 nightly+simd lib tests, the
+`i_frame_then_p_frame` / `golden_update_cycle` / `altref_arnr` bit-exact
+decode tests, and the `ffmpeg_oracle` black-box validator). Measured
+**−9.3 %** (refresh-last) / **−10.6 %** (golden+altref cadence)
+whole-stream on the round-288 `ref_slot_rotation/decode_1k8p_*` benches
+(363 → 404 and 352 → 403 Melem/s; criterion p < 0.05, same-session A/B).
+A/B bench: `cargo bench -p oxideav-vp8 --bench ref_slot_rotation -- 'decode_1k8p'`.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

@@ -114,6 +114,143 @@ impl RefFrameSlot {
     }
 }
 
+/// Symbolic source of one rotated reference slot.
+///
+/// The §9 slot rotation is a pure *select-and-replace* over whole slots: every
+/// new `LAST` / `GOLDEN` / `ALTREF` value is one of the four pre-rotation
+/// inputs (the three entry slots or the just-decoded frame), never a
+/// byte-level mutation of plane data. Resolving each destination to one of
+/// these tokens first lets the materialisation step move each owned source
+/// into its destination and clone a source only when it genuinely feeds more
+/// than one destination — which collapses the common refresh-last path (one
+/// destination consumes `Current`, the other two pass `Golden` / `AltRef`
+/// through) to zero plane copies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RotationSource {
+    PreLast,
+    PreGolden,
+    PreAltRef,
+    Current,
+}
+
+/// Rotate the three reference slots per the §9 / §20-page-147 refresh ladder,
+/// consuming the entry slots and the just-decoded frame by value and
+/// materialising the next slot-set with the fewest possible plane copies.
+///
+/// `current` is the just-decoded, post-loop-filter frame. `pre_*` are the
+/// entry `self.last` / `golden` / `altref`. The five refresh controls follow
+/// the §20 ordering: `copy_buffer_to_alternate` → `copy_buffer_to_golden` →
+/// `refresh_golden_frame` → `refresh_alternate_frame` → `refresh_last`. Both
+/// copy cases consult the *pre-rotation* slot set (§16), so the resolution
+/// reads only the four input tokens and never a partially-rotated value.
+///
+/// Returns `(new_last, new_golden, new_altref)`. Byte-for-byte identical to a
+/// clone-everything staging of the same ladder (`RotationSource` selection is
+/// the only logic; materialisation reproduces the selected planes exactly),
+/// proved by [`tests::rotation_matches_clone_everything_reference`].
+#[allow(clippy::too_many_arguments)]
+fn rotate_reference_slots(
+    current: RefFrameSlot,
+    pre_last: Option<RefFrameSlot>,
+    pre_golden: Option<RefFrameSlot>,
+    pre_altref: Option<RefFrameSlot>,
+    copy_buffer_to_alternate: Option<u8>,
+    copy_buffer_to_golden: Option<u8>,
+    refresh_golden_frame: Option<bool>,
+    refresh_alternate_frame: Option<bool>,
+    refresh_last: Option<bool>,
+) -> (
+    Option<RefFrameSlot>,
+    Option<RefFrameSlot>,
+    Option<RefFrameSlot>,
+) {
+    use RotationSource::*;
+
+    // --- Resolve each destination to a symbolic source (no plane data yet). ---
+    // ALTREF: copy_buffer_to_alternate (1 = LAST, 2 = GOLDEN) then
+    // refresh_alternate_frame overrides with the current frame.
+    let mut src_altref = match copy_buffer_to_alternate {
+        Some(1) => PreLast,
+        Some(2) => PreGolden,
+        _ => PreAltRef,
+    };
+    // GOLDEN: copy_buffer_to_golden (1 = LAST, 2 = ALTREF — the *pre*-rotation
+    // ALTREF) then refresh_golden_frame overrides with the current frame.
+    let mut src_golden = match copy_buffer_to_golden {
+        Some(1) => PreLast,
+        Some(2) => PreAltRef,
+        _ => PreGolden,
+    };
+    if refresh_golden_frame == Some(true) {
+        src_golden = Current;
+    }
+    if refresh_alternate_frame == Some(true) {
+        src_altref = Current;
+    }
+    let src_last = if refresh_last == Some(true) {
+        Current
+    } else {
+        PreLast
+    };
+
+    // --- Materialise. Move each owned source into the *last* destination that
+    // selects it; every earlier destination that selects the same source takes
+    // a clone. A source that is `None` and selected yields `None` — identical
+    // to cloning a `None` entry slot. ---
+    let sources = [src_last, src_golden, src_altref];
+    let take_for = |which: usize,
+                    pre_last: &mut Option<RefFrameSlot>,
+                    pre_golden: &mut Option<RefFrameSlot>,
+                    pre_altref: &mut Option<RefFrameSlot>,
+                    current: &mut Option<RefFrameSlot>|
+     -> Option<RefFrameSlot> {
+        let tok = sources[which];
+        // Is this the final destination that uses `tok`? If so we may move it
+        // out; otherwise clone so later destinations still see the source.
+        let is_last_use = !sources[which + 1..].contains(&tok);
+        let owned = match tok {
+            PreLast => pre_last,
+            PreGolden => pre_golden,
+            PreAltRef => pre_altref,
+            Current => current,
+        };
+        if is_last_use {
+            owned.take()
+        } else {
+            owned.clone()
+        }
+    };
+
+    let mut pre_last = pre_last;
+    let mut pre_golden = pre_golden;
+    let mut pre_altref = pre_altref;
+    let mut current = Some(current);
+
+    let new_last = take_for(
+        0,
+        &mut pre_last,
+        &mut pre_golden,
+        &mut pre_altref,
+        &mut current,
+    );
+    let new_golden = take_for(
+        1,
+        &mut pre_last,
+        &mut pre_golden,
+        &mut pre_altref,
+        &mut current,
+    );
+    let new_altref = take_for(
+        2,
+        &mut pre_last,
+        &mut pre_golden,
+        &mut pre_altref,
+        &mut current,
+    );
+
+    (new_last, new_golden, new_altref)
+}
+
 /// Persistent across-frame state of a VP8 decoder — the 3-slot
 /// reference-frame buffer (`LAST`, `GOLDEN`, `ALTREF`) plus the §9.10
 /// entropy / intra-mode / motion-vector carry-state and the §9.7
@@ -323,10 +460,22 @@ impl Vp8DecoderState {
         // all three reference slots; entropy / intra-mode / MV tables
         // reset to defaults (with this frame's overlays); sign biases
         // reset to (false, false).
-        let slot = RefFrameSlot::from_keyframe_planes(&planes);
-        self.last = Some(slot.clone());
-        self.golden = Some(slot.clone());
-        self.altref = Some(slot);
+        // Build the visible-cropped output from `planes` first, then MOVE the
+        // planes into one of the three slots; the other two take clones (a key
+        // frame populates all three slots, so two copies are unavoidable, but
+        // the third slot consumes the just-decoded planes without a copy).
+        let output = crate::decoder::crop_to_visible_public(&planes, width, height);
+        self.golden = Some(RefFrameSlot::from_keyframe_planes(&planes));
+        self.altref = Some(RefFrameSlot::from_keyframe_planes(&planes));
+        self.last = Some(RefFrameSlot {
+            y: planes.y,
+            u: planes.u,
+            v: planes.v,
+            y_stride: planes.y_stride,
+            uv_stride: planes.uv_stride,
+            mb_cols: planes.mb_cols,
+            mb_rows: planes.mb_rows,
+        });
         self.coeff_probs = if coded.refresh_entropy_probs {
             frame_coeff_probs
         } else {
@@ -338,9 +487,7 @@ impl Vp8DecoderState {
         self.visible_width = Some(width);
         self.visible_height = Some(height);
 
-        Ok(crate::decoder::crop_to_visible_public(
-            &planes, width, height,
-        ))
+        Ok(output)
     }
 
     /// Interframe decode path — decode the §11 / §16 macroblock layer,
@@ -829,67 +976,37 @@ impl Vp8DecoderState {
         // ---- §9 reference-frame slot rotation -----------------------------
         // §20 page 147 ordering: copy_arf → copy_gf → refresh_gf →
         // refresh_arf → refresh_last. The "copy" cases consult the CURRENT
-        // slot-set (before refresh), so we capture the just-decoded frame
-        // and stage the rotation in temporaries.
+        // slot-set (before refresh), so the entry slots and the just-decoded
+        // frame are passed by value into the move-minimising rotation. Build
+        // the visible-cropped output frame from `planes` first so the
+        // just-decoded slot can MOVE `planes` instead of cloning it.
+        let output = crate::decoder::crop_to_visible_public(&planes, visible_width, visible_height);
         let current_slot = RefFrameSlot {
-            y: planes.y.clone(),
-            u: planes.u.clone(),
-            v: planes.v.clone(),
+            y: planes.y,
+            u: planes.u,
+            v: planes.v,
             y_stride: planes.y_stride,
             uv_stride: planes.uv_stride,
             mb_cols: planes.mb_cols,
             mb_rows: planes.mb_rows,
         };
-        let pre_last = self.last.clone();
-        let pre_golden = self.golden.clone();
-        let pre_altref = self.altref.clone();
-
-        // copy_buffer_to_alternate: 1 = copy LAST, 2 = copy GOLDEN.
-        let mut new_altref = pre_altref.clone();
-        match coded.copy_buffer_to_alternate {
-            Some(1) => {
-                new_altref = pre_last.clone();
-            }
-            Some(2) => {
-                new_altref = pre_golden.clone();
-            }
-            _ => {}
-        }
-        // copy_buffer_to_golden: 1 = copy LAST, 2 = copy ALTREF.
-        let mut new_golden = pre_golden.clone();
-        match coded.copy_buffer_to_golden {
-            Some(1) => {
-                new_golden = pre_last.clone();
-            }
-            Some(2) => {
-                new_golden = pre_altref.clone();
-            }
-            _ => {}
-        }
-        // refresh_golden_frame: replace GOLDEN with current.
-        if coded.refresh_golden_frame == Some(true) {
-            new_golden = Some(current_slot.clone());
-        }
-        // refresh_alternate_frame: replace ALTREF with current.
-        if coded.refresh_alternate_frame == Some(true) {
-            new_altref = Some(current_slot.clone());
-        }
-        // refresh_last: replace LAST with current.
-        let new_last = if coded.refresh_last == Some(true) {
-            Some(current_slot.clone())
-        } else {
-            pre_last
-        };
+        let (new_last, new_golden, new_altref) = rotate_reference_slots(
+            current_slot,
+            self.last.take(),
+            self.golden.take(),
+            self.altref.take(),
+            coded.copy_buffer_to_alternate,
+            coded.copy_buffer_to_golden,
+            coded.refresh_golden_frame,
+            coded.refresh_alternate_frame,
+            coded.refresh_last,
+        );
 
         self.last = new_last;
         self.golden = new_golden;
         self.altref = new_altref;
 
-        Ok(crate::decoder::crop_to_visible_public(
-            &planes,
-            visible_width,
-            visible_height,
-        ))
+        Ok(output)
     }
 
     /// Return the reference-frame slot indexed by `r`. `None` if that slot
@@ -1115,6 +1232,124 @@ mod tests {
             cur = body + size;
         }
         out
+    }
+
+    /// Build a `RefFrameSlot` whose plane bytes uniquely identify it by `tag`
+    /// so the equivalence test can assert *which* source landed in each
+    /// destination, not just that some slot did.
+    fn tagged_slot(tag: u8) -> RefFrameSlot {
+        RefFrameSlot {
+            y: vec![tag; 4],
+            u: vec![tag; 2],
+            v: vec![tag; 2],
+            y_stride: 2,
+            uv_stride: 1,
+            mb_cols: 1,
+            mb_rows: 1,
+        }
+    }
+
+    /// The pre-round-289 clone-everything rotation ladder, verbatim, as the
+    /// byte-exact oracle for [`rotate_reference_slots`].
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_clone_everything_reference(
+        current_slot: &RefFrameSlot,
+        pre_last: Option<RefFrameSlot>,
+        pre_golden: Option<RefFrameSlot>,
+        pre_altref: Option<RefFrameSlot>,
+        copy_buffer_to_alternate: Option<u8>,
+        copy_buffer_to_golden: Option<u8>,
+        refresh_golden_frame: Option<bool>,
+        refresh_alternate_frame: Option<bool>,
+        refresh_last: Option<bool>,
+    ) -> (
+        Option<RefFrameSlot>,
+        Option<RefFrameSlot>,
+        Option<RefFrameSlot>,
+    ) {
+        let mut new_altref = pre_altref.clone();
+        match copy_buffer_to_alternate {
+            Some(1) => new_altref = pre_last.clone(),
+            Some(2) => new_altref = pre_golden.clone(),
+            _ => {}
+        }
+        let mut new_golden = pre_golden.clone();
+        match copy_buffer_to_golden {
+            Some(1) => new_golden = pre_last.clone(),
+            Some(2) => new_golden = pre_altref.clone(),
+            _ => {}
+        }
+        if refresh_golden_frame == Some(true) {
+            new_golden = Some(current_slot.clone());
+        }
+        if refresh_alternate_frame == Some(true) {
+            new_altref = Some(current_slot.clone());
+        }
+        let new_last = if refresh_last == Some(true) {
+            Some(current_slot.clone())
+        } else {
+            pre_last
+        };
+        (new_last, new_golden, new_altref)
+    }
+
+    #[test]
+    fn rotation_matches_clone_everything_reference() {
+        // Distinct tag per input so we can tell sources apart byte-for-byte.
+        let current = tagged_slot(0);
+        let copy_alt_opts = [None, Some(0u8), Some(1), Some(2)];
+        let copy_gld_opts = [None, Some(0u8), Some(1), Some(2)];
+        let bool_opts = [None, Some(false), Some(true)];
+        // Sweep every entry-slot population (each of LAST/GOLDEN/ALTREF either
+        // populated with its own tag or empty) × every refresh-control combo.
+        for last_present in [false, true] {
+            for golden_present in [false, true] {
+                for altref_present in [false, true] {
+                    let pre_last = last_present.then(|| tagged_slot(1));
+                    let pre_golden = golden_present.then(|| tagged_slot(2));
+                    let pre_altref = altref_present.then(|| tagged_slot(3));
+                    for &ca in &copy_alt_opts {
+                        for &cg in &copy_gld_opts {
+                            for &rg in &bool_opts {
+                                for &ra in &bool_opts {
+                                    for &rl in &bool_opts {
+                                        let want = rotate_clone_everything_reference(
+                                            &current,
+                                            pre_last.clone(),
+                                            pre_golden.clone(),
+                                            pre_altref.clone(),
+                                            ca,
+                                            cg,
+                                            rg,
+                                            ra,
+                                            rl,
+                                        );
+                                        let got = rotate_reference_slots(
+                                            current.clone(),
+                                            pre_last.clone(),
+                                            pre_golden.clone(),
+                                            pre_altref.clone(),
+                                            ca,
+                                            cg,
+                                            rg,
+                                            ra,
+                                            rl,
+                                        );
+                                        assert_eq!(
+                                            got, want,
+                                            "rotation mismatch: ca={ca:?} cg={cg:?} \
+                                             rg={rg:?} ra={ra:?} rl={rl:?} \
+                                             last={last_present} golden={golden_present} \
+                                             altref={altref_present}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

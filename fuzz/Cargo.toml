@@ -483,6 +483,30 @@ cargo-fuzz = true
 #                                     census counts stay inside the
 #                                     documented 0..=5 `mv_ref_probs`
 #                                     index envelope on every iteration.
+#   * `panic_free_keyframe_reconstruct`
+#                                  — §12 / §14 key-frame intra
+#                                     reconstruction core driven directly
+#                                     (`frame::decode_keyframe`): an
+#                                     arbitrary `mb_cols × mb_rows` grid
+#                                     of `MacroblockModes` + (already
+#                                     dequantized) `MbCoeffs` synthesised
+#                                     from the fuzz bytes, bypassing the
+#                                     §9.1 / §19.2 parse gates. Forces the
+#                                     full Cartesian product of §12 16×16
+#                                     luma modes, §11.3 B_PRED sub-block
+#                                     mode mixes, §11.4 chroma modes, the
+#                                     `mb_skip_coeff` short-circuit, and
+#                                     hostile post-dequant coefficient
+#                                     magnitudes through the neighbour
+#                                     gather → §14.3 inverse WHT → §14.4
+#                                     inverse DCT → §14.5 add-and-clamp
+#                                     pass — the reconstruction-walker
+#                                     configurations the bitstream-gated
+#                                     `decode_vp8` / token-descent targets
+#                                     seldom reach. Asserts the documented
+#                                     plane geometry and folds every
+#                                     produced plane byte into an FNV-1a
+#                                     accumulator (short-write oracle).
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -635,5 +659,11 @@ doc = false
 [[bin]]
 name = "panic_free_near_mv_mode_decode"
 path = "fuzz_targets/panic_free_near_mv_mode_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_keyframe_reconstruct"
+path = "fuzz_targets/panic_free_keyframe_reconstruct.rs"
 test = false
 doc = false

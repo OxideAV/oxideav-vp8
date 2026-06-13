@@ -811,6 +811,31 @@ between the paired surfaces):
   every iteration. Round-287 ASan campaign (nightly, default `simd`):
   ~11.0 M executions in 181 s (~60.8 K exec/s), peak RSS 572 MB, zero
   crashes / leaks / OOMs.
+* `panic_free_keyframe_reconstruct` — the §12 / §14 key-frame intra
+  *reconstruction core* driven directly via `frame::decode_keyframe`,
+  landed in round 290. The full-stream targets
+  (`panic_free_decode_keyframe`, `decode_stream_token_descent`) reach
+  this reconstruction walker only behind the §9.1 frame-tag and §19.2
+  coded-header validation gates, so a random or fixture-derived
+  bitstream rarely drives it through the full Cartesian product of intra
+  modes, B_PRED sub-block-mode mixes, skip flags, and hostile
+  post-dequant coefficient magnitudes. This target bypasses the parser:
+  it materialises an arbitrary `mb_cols × mb_rows` grid (≤ 16 MBs) of
+  `MacroblockModes` + already-dequantized `MbCoeffs` straight from the
+  fuzz bytes and feeds them to `decode_keyframe`, forcing every §12
+  16×16 luma mode (`DC`/`V`/`H`/`TM_PRED`), the §11.3 `B_PRED` path with
+  all ten §11.2 4×4 sub-block predictors in arbitrary arrangements,
+  every §11.4 chroma mode, the `mb_skip_coeff` short-circuit, and
+  arbitrary `i16` coefficients through the §11/§12 neighbour gather →
+  §14.3 inverse WHT → §14.4 inverse DCT → §14.5 add-and-clamp pass. The
+  oracle is panic-freedom plus full plane materialisation (every output
+  byte folded into an FNV-1a accumulator so ASan reads the entire
+  claimed raster — a short-write / stale-stride bug surfaces here) plus
+  the documented `mb_cols·16 × mb_rows·16` luma / `·8 × ·8` chroma
+  geometry asserts. Round-290 ASan campaign (nightly, default `simd`):
+  ~2.15 M executions in 151 s, plus a 0.31 M-iteration corpus-replay
+  reaching a 687-PC / 2957-feature plateau (303-input corpus); zero
+  crashes / leaks / OOMs.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

@@ -4,6 +4,26 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `intra_predict_b4x4` §12.3 sub-block intra bench (round 292, 2026-06-14)
+
+Bench-coverage round (no behaviour change, decoded bytes identical). New
+`benches/intra_predict_b4x4.rs` isolates the §12.3 4×4 B_PRED sub-block
+intra predictor (`intra_predict::predict_b4x4`) — the per-sub-block
+directional kernel a B_PRED macroblock invokes sixteen times, the
+dominant luma intra mode on detailed keyframe content and previously
+only ever exercised folded inside the whole-frame keyframe-decode bench.
+Covers all ten §12.3 directional modes individually (`b_dc … b_hu`) plus
+a full sixteen-sub-block macroblock loop (`bpred_mb_16_subblocks`), over
+a non-flat ramp neighbour context so the directional arithmetic can't be
+constant-folded. Measured: the ten modes cluster at 4.3–4.7 ns; a full
+B_PRED MB's luma intra prediction is ≈ 84.6 ns — well below its per-MB
+§13 token-decode + reconstruct cost, confirming B_PRED intra prediction
+is a regression-floor target, not a decoder hotspot. `BENCHMARKS.md`
+gains the round-292 section + a refreshed ranked decoder hotspot map
+(token decode #1, reference-slot copy churn #2, `reconstruct_inter_mb`
+sub-pel #3). Pure additive: one bench binary + its registration + docs,
+no `src/`/`tests/` edits, every decode path byte-for-byte unchanged.
+
 ### Changed — §13.4 `token_prob_update()` lockstep flag-read loop (round 291, 2026-06-14)
 
 Profile-opt round landing the round-288/289 named decoder target: the

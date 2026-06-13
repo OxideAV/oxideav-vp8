@@ -191,3 +191,15 @@ harness = false
 [[bench]]
 name = "token_prob_update"
 harness = false
+
+# Round 292 bench. The §12.3 4×4 B_PRED sub-block intra predictor
+# (`intra_predict::predict_b4x4`) — the per-sub-block directional intra
+# path that a B_PRED macroblock invokes sixteen times (once per 4×4 luma
+# sub-block). The 16×16/8×8 whole-block predictors are already isolated
+# (`intra_predict_dc16`), but B_PRED — the dominant luma intra mode on
+# detailed keyframe content — was only ever exercised folded inside the
+# whole-frame keyframe-decode bench. Covers all ten directional modes
+# individually plus a full sixteen-sub-block macroblock loop.
+[[bench]]
+name = "intra_predict_b4x4"
+harness = false

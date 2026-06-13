@@ -1799,3 +1799,118 @@ is a public-API change to `RefFrameSlot`'s `Vec<u8>` plane fields and so
 needs its own round. Decoder ranks 1–2 (`decode_block_core` token
 descent, `reconstruct_inter_mb`) remain the heaviest clusters but were
 each fused in rounds 283 / 286.
+
+## Round 292 — `predict_b4x4` §12.3 sub-block intra coverage + decoder hotspot refresh (bench round)
+
+Round 292 (2026-06-14) is a **bench-coverage** round: no behaviour
+change, decoded bytes identical. The §12 intra predictors had isolated
+A/B instruments for the 16×16 whole-block modes (`intra_predict_dc16`:
+DC/V/H/TM) but **not** for the §12.3 4×4 B_PRED sub-block predictor
+(`intra_predict::predict_b4x4`) — the per-sub-block directional intra
+kernel that a B_PRED macroblock invokes sixteen times (once per 4×4 luma
+sub-block). B_PRED is the dominant luma intra mode on detailed keyframe
+content, so this path is folded into the whole-frame keyframe-decode
+bench on every run, yet had no isolated target for a future per-mode
+optimisation.
+
+### New `intra_predict_b4x4` micro-bench
+
+`benches/intra_predict_b4x4.rs` drives `predict_b4x4` over a non-flat
+ramp neighbour context (an 8-pixel `above` so the right-edge diagonal
+modes exercise their extension pixels, a 4-pixel `left`, and a distinct
+top-left `p`) chosen so no directional kernel collapses to a constant.
+Two layers:
+
+* the ten §12.3 modes individually (`b_dc … b_hu`), giving each
+  directional kernel its own A/B anchor — the diagonal `Vr`/`Vl`/`Hd`/
+  `Hu` modes do ~16 `avg3p`/`avg2p` calls each, `Dc` is the cheap one;
+* `bpred_mb_16_subblocks` — sixteen calls cycling through all ten modes
+  with a per-sub-block rotated context, the realistic per-macroblock
+  B_PRED decode unit (call count and mode spread match a real 16×16
+  luma block).
+
+### Measured (criterion `--quick`, Apple M4 / aarch64, stable 1.95)
+
+| Bench | Time |
+|---|---:|
+| `intra_predict_b4x4/b_dc` | 4.53 ns |
+| `intra_predict_b4x4/b_tm` | 4.32 ns |
+| `intra_predict_b4x4/b_ve` | 4.50 ns |
+| `intra_predict_b4x4/b_he` | 4.50 ns |
+| `intra_predict_b4x4/b_ld` | 4.71 ns |
+| `intra_predict_b4x4/b_rd` | 4.60 ns |
+| `intra_predict_b4x4/b_vr` | 4.50 ns |
+| `intra_predict_b4x4/b_vl` | 4.69 ns |
+| `intra_predict_b4x4/b_hd` | 4.69 ns |
+| `intra_predict_b4x4/b_hu` | 4.73 ns |
+| `intra_predict_b4x4/bpred_mb_16_subblocks` | **84.6 ns** |
+
+The ten modes cluster tightly at 4.3–4.7 ns; the per-mode spread is
+small because every mode terminates in the same 16-byte `copy_from_slice`
+and the directional arithmetic (4–16 `avg3`/`avg2`/`clamp255` ops) is
+cheap relative to call + buffer-fill overhead. The full 16-sub-block
+macroblock is ≈ 84.6 ns — i.e. a B_PRED MB's luma intra prediction is a
+sub-100-ns per-MB cost, well below its §13 token-decode cost (the
+`token_decode` ranked #1 below) and its reconstruct cost. This confirms
+B_PRED intra prediction is **not** a decoder hotspot worth a kernel
+rewrite; the new bench's value is a permanent A/B floor so a future
+regression (or a speculative SIMD per-row rewrite of the diagonal modes)
+is measurable.
+
+### Refreshed ranked decoder hotspot map (post r283–r291, this session)
+
+Whole-frame + targeted decode benches re-measured this round
+(`--quick`, same box):
+
+| Bench | Time | Throughput |
+|---|---:|---:|
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 141.4 µs | 543 Mpx/s |
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` | 165.2 µs | 397 Mpx/s |
+| `token_decode/decode_mb_coeffs_dense_64mb` | 473.7 µs | — |
+| `token_decode/inter_decode_12f_176x144_token_heavy` | 1.206 ms | 252 Mpx/s |
+| `reconstruct_inter_mb/subpel_full_residue` | 571 ns | — |
+| `reconstruct_inter_mb/whole_pixel_full_residue` | 440 ns | — |
+| `reconstruct_inter_mb/subpel_skip` | 274 ns | — |
+| `token_decode/decode_mb_coeffs_sparse_64mb` | 45.6 µs | — |
+| `intra_predict_b4x4/bpred_mb_16_subblocks` | 84.6 ns | — |
+
+Ranked next-round decoder candidates, carried forward from the round-282
+profile and the rounds 283/286/289/291 fuse history:
+
+1. **§13 token decode (`dct_tokens::decode_block` + `decode_mb_coeffs`)**
+   — still the heaviest decoder cluster (`token_decode` dense 64-MB =
+   473.7 µs; the token-heavy 12-frame inter clip = 1.206 ms, the single
+   most expensive bench in the suite). Rounds 283 fused the descent and
+   batched bool-decoder renormalisation; the remaining lever is the
+   §13.2 per-coefficient context-fetch (band / has-coeff state) and the
+   token-tree leaf dispatch. Biggest single decode lever.
+2. **Per-frame reference-slot copy churn (`RefFrameSlot::clone` /
+   `Vp8DecoderState::decode_frame` plane copies)** — the `memmove`
+   family the round-282 profile put at ≈ 11–14 % of inter decode. Round
+   289 cut the rotation cost; the residual is the two unavoidable
+   keyframe clones + the copy-on-write plane representation, which is a
+   public-API change to `RefFrameSlot`'s `Vec<u8>` fields and so needs
+   its own (versioned) round.
+3. **`reconstruct_inter_mb` sub-pel path** — `subpel_full_residue` =
+   571 ns/MB, ≈ 30 % above the whole-pixel path (440 ns); the §18.3
+   six-tap + IDCT-add fusion landed in round 286, so the residual is the
+   sub-pel fetch-halo + filter, already SIMD under the `simd` feature.
+4. **`coded_header::parse_token_prob_update`** — the round-291 zipped
+   lockstep loop took the ≈ 5 % per-frame §13.4 flag-read cost down
+   −10.6 %; now a small fixed floor, de-prioritised below the three
+   above.
+
+B_PRED intra prediction (this round's new bench) is explicitly **not**
+on the candidate list: at 84.6 ns/MB it is two-to-three orders of
+magnitude below the per-MB token-decode + reconstruct cost. The bench
+exists as a regression floor, not a flagged hotspot.
+
+### Bytes-identical
+
+Pure additive change: one new `benches/` binary + its `[[bench]]`
+registration + this document. No `src/` or `tests/` edits, so every
+decode path is byte-for-byte the pre-292 path by construction. The new
+bench synthesises its own inputs in-bench (no fixture files). The full
+stable lib suite (491) and nightly + `simd` lib suite (493), the in-tree
+decode/roundtrip integration tests, and the `ffmpeg_oracle` black-box
+validator are unchanged and green.

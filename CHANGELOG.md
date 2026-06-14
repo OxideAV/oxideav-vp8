@@ -4,6 +4,30 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_kf_mb_mode_decode` fuzz target: §11 key-frame macroblock mode-info tree walk (round 307 fuzz, 2026-06-15)
+
+Fuzz round. New libFuzzer target `panic_free_kf_mb_mode_decode` drives the
+§11 key-frame macroblock *mode-info* tree walk
+(`macroblock::parse_key_frame_macroblock_modes`) directly off a bool-decoder
+partition — the per-macroblock mode-decode side of the key-frame path no
+existing target reached in isolation. It synthesises an attacker-shaped
+`Vp8CodedHeader` (segmentation gate, `mb_segment_tree_probs` with the §9.3
+item-5 255-fallback per entry, `prob_skip_false`) plus an attacker-shaped
+bool partition, then exercises the §10 segment-id 4-leaf tree, the §11.1
+`mb_skip_coeff` read, the §11.2 key-frame Y-mode tree, the §11.3 / §11.5
+sixteen-sub-block `B_PRED` walk (including the cross-macroblock `above` /
+`left` sub-block-mode predictor bookkeeping), and the §11.4 chroma-mode
+tree. The partition uses `BoolDecoder::init_partition` (the §20 short-input
+fallback) so a truncated / empty partition is a first-class input. The
+reconstruction target `panic_free_keyframe_reconstruct` feeds
+`decode_keyframe` *already-decoded* `MacroblockModes` and never walks these
+trees; the bitstream-gated targets reach the walk only behind the §9.1 /
+§19.2 validation gates, so the only mode probabilities they ever feed it
+are a valid header's self-consistent ones. Oracle: panic-freedom plus, on
+the `Ok` path, one decoded entry per macroblock and every decoded
+`segment_id` inside the documented `0..=3` envelope. ~4.7M executions
+clean. No `src/` change.
+
 ### Changed — `read_literal` register-local fixed-prob-128 loop + `bool_decoder_read` literal coverage (round 306 profile, 2026-06-15)
 
 Profile round. `BoolDecoder::read_literal` is now a register-local

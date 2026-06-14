@@ -553,6 +553,44 @@ cargo-fuzz = true
 #                                     bytes essentially never reach because
 #                                     they require a self-consistent size
 #                                     table behind a valid §19.2 header.
+#   * `panic_free_kf_mb_mode_decode` — the §11 key-frame macroblock
+#                                     *mode-info* tree walk driven directly
+#                                     off a bool-decoder partition:
+#                                     `macroblock::parse_key_frame_macroblock_modes`.
+#                                     Drives the §10 segment-id 4-leaf
+#                                     `MB_SEGMENT_TREE` descent (against
+#                                     attacker `mb_segment_tree_probs` with
+#                                     the §9.3-item-5 255 fallback per
+#                                     entry), the §11.1 `mb_skip_coeff`
+#                                     read (attacker `prob_skip_false`), the
+#                                     §11.2 key-frame Y-mode tree, the
+#                                     §11.3 / §11.5 sixteen-sub-block
+#                                     `B_PRED` walk including the
+#                                     cross-macroblock `above`/`left`
+#                                     sub-block-mode predictor bookkeeping,
+#                                     and the §11.4 chroma-mode tree —
+#                                     all from an attacker-shaped
+#                                     `Vp8CodedHeader` (segmentation /
+#                                     skip gates) plus an attacker-shaped
+#                                     bool partition. The reconstruction
+#                                     target `panic_free_keyframe_reconstruct`
+#                                     feeds `decode_keyframe` a grid of
+#                                     *already-decoded* `MacroblockModes`
+#                                     synthesised from the fuzz bytes — it
+#                                     never walks the §11 mode trees; the
+#                                     bitstream-gated targets reach this
+#                                     function only behind the §9.1 / §19.2
+#                                     validation gates, so the only mode
+#                                     probabilities they feed it are the
+#                                     self-consistent ones a valid header
+#                                     carries. The partition is initialised
+#                                     with `BoolDecoder::init_partition`
+#                                     (the §20 short-input fallback) so a
+#                                     truncated / empty partition is a
+#                                     first-class input. Oracle: one
+#                                     decoded entry per macroblock and
+#                                     every decoded `segment_id` inside the
+#                                     documented 0..=3 envelope.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -752,5 +790,11 @@ doc = false
 [[bin]]
 name = "keyframe_stream_encode_decode"
 path = "fuzz_targets/keyframe_stream_encode_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_kf_mb_mode_decode"
+path = "fuzz_targets/panic_free_kf_mb_mode_decode.rs"
 test = false
 doc = false

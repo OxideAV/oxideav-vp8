@@ -4,6 +4,25 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `dequantize_mb` §14.1 dequantization micro-bench (round 298, 2026-06-14)
+
+New criterion bench `dequantize_mb` (the 22nd) isolating the §14.1
+dequantization layer, previously measured only folded inside the
+whole-frame decode benches. Five functions across two layers: the §20.4
+`dequant_init` factor derivation (`MbDequantFactors::from_quant_indices`
+per-frame ≈ 2.32 ns, `for_segment` per-segment delta/absolute ≈ 2.9 ns —
+six `dc_qlookup`/`ac_qlookup` reads through `clamp_qindex` plus the `*2` /
+`*155/100` scalings and `>132` / `<8` clamps) and the per-MB apply
+(`MbDequantFactors::dequantize`, 400 coefficient×factor multiplies over
+all twenty-five 4×4 blocks of a macroblock) at two coefficient densities.
+Headline finding: the apply is occupancy-independent — sparse (183.0 ns)
+and dense (184.1 ns) macroblocks cost within 1 %, because the scalar
+`dequant_block` walks all sixteen lanes of every block unconditionally;
+this fixed-cost shape is exactly what the optional `core::simd`
+`dequant_block` path (round 267) maps onto. Inputs synthesised in-bench
+(no committed fixtures). Bench-only change — no decode/encode-path edit,
+the full lib suite is unchanged.
+
 ### Added — decode profile + §14.4 DC-only fast-path A/B bench cell (round 297, 2026-06-14)
 
 Profiled a whole-keyframe decode (`sample` over a tight `decode_vp8`

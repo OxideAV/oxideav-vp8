@@ -213,3 +213,16 @@ harness = false
 [[bench]]
 name = "bool_decoder_read"
 harness = false
+
+# Round 298 — the §14.1 dequantization layer in isolation. Two layers ran
+# on the decode path with no isolated harness (both folded inside the
+# whole-frame decode benches): the §20.4 `dequant_init` factor derivation
+# (`from_quant_indices` per-frame + `for_segment` per-segment, six
+# `dc_qlookup`/`ac_qlookup` reads + the `*2` / `*155/100` scalings + the
+# `>132` / `<8` clamps) and the per-MB apply (`dequantize`, 400 coeff×factor
+# multiplies over all twenty-five 4×4 blocks of a macroblock). The apply is
+# the SIMD/unroll A/B target — `dequant_block` already carries an optional
+# `core::simd` path. Apply benched at sparse + dense coefficient densities.
+[[bench]]
+name = "dequantize_mb"
+harness = false

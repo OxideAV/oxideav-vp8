@@ -459,6 +459,23 @@ constituent `read_bool` calls. Measurement-only — no decode-path change,
 the full lib suite is unchanged. A/B bench: `cargo bench -p oxideav-vp8
 --bench bool_decoder_read`. See `BENCHMARKS.md` round 295.
 
+Round 298 adds `dequantize_mb`, isolating the §14.1 dequantization layer
+— previously measured only folded inside the whole-frame decode benches.
+Two layers: the §20.4 `dequant_init` factor derivation
+(`MbDequantFactors::from_quant_indices` per-frame ≈ 2.32 ns +
+`for_segment` per-segment ≈ 2.9 ns — six `dc_qlookup`/`ac_qlookup` reads
+through `clamp_qindex` plus the `*2` / `*155/100` scalings and `>132` /
+`<8` clamps) and the per-MB apply (`MbDequantFactors::dequantize`, 400
+coefficient×factor multiplies over all twenty-five 4×4 blocks). Headline
+finding: the apply is **occupancy-independent** — sparse (183.0 ns) and
+dense (184.1 ns) residual macroblocks cost within 1 %, because the scalar
+`dequant_block` walks all sixteen lanes of every block unconditionally
+(`0 * factor` is still a multiply-and-store). That fixed-cost shape is
+exactly what the optional `core::simd` `dequant_block` path (round 267)
+maps onto. Measurement-only — no decode/encode-path change, the full lib
+suite is unchanged. A/B bench: `cargo bench -p oxideav-vp8 --bench
+dequantize_mb`. See `BENCHMARKS.md` round 298.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

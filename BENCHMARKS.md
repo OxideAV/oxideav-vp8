@@ -2080,3 +2080,97 @@ primitive is on the critical path of every decode. The named
 whole-frame PROFILE-OPT target remains the per-frame reference-slot
 plane-copy churn (r294's rank-4, ≈ 11–14 % of inter decode, its own
 round).
+
+## Round 298 — §14.1 dequantization layer in isolation (bench round)
+
+Round 298 (2026-06-14) added `dequantize_mb`, isolating the §14.1
+dequantization layer — the step that turns the raw quantized
+coefficients `decode_mb_coeffs` recovers from the token partition into
+the pre-dequantized `MbCoeffs` the §14.2 inverse transforms consume.
+Two layers run on the decode path and neither had an isolated harness;
+both were only ever measured folded inside the whole-frame decode
+benches (`keyframe_decode`, `inter_decode_short_clip`, `token_decode`):
+
+* **factor derivation** — `MbDequantFactors::from_quant_indices`
+  (per-frame, no segmentation) and `MbDequantFactors::for_segment` (the
+  §10 per-segment override). Both run the §20.4 `dequant_init` body:
+  six `dc_qlookup` / `ac_qlookup` table reads through `clamp_qindex`,
+  the `*2` Y2-DC and `*155/100` Y2-AC scalings, and the `>132`
+  chroma-DC / `<8` Y2-AC clamps. `from_quant_indices` fires once per
+  frame; `for_segment` once per active segment.
+* **the apply** — `MbDequantFactors::dequantize`, the per-MB hot loop.
+  It scales all twenty-five 4×4 blocks of one macroblock (the Y2 block,
+  the sixteen Y sub-blocks, the four U and four V chroma sub-blocks):
+  400 coefficient×factor multiplies per non-skip MB, computed in `i32`
+  and stored back as `i16` (§14.1 page 76). This is the SIMD/unroll A/B
+  target — `dequant_block` already carries an optional `core::simd`
+  path — so a stable per-MB baseline at criterion resolution was
+  overdue.
+
+### The bench
+
+Five functions, inputs synthesised in-bench (no committed fixtures):
+
+* `from_quant_indices` — the per-frame derivation on a mid-range
+  quantiser header (`y_ac_qi = 64`) with **every** per-plane delta
+  present, so all six factors take the full derivation path (none
+  short-circuit a `None` delta to 0).
+* `for_segment_delta` / `for_segment_absolute` — the §10 per-segment
+  override in both modes (delta: `base = yac_qi + segment_quant`;
+  absolute: `base = segment_quant`).
+* `dequantize_sparse_mb` — the per-MB apply over a macroblock whose
+  twenty-five blocks each carry a DC plus three low-frequency AC
+  coefficients (the common post-quantisation residual shape).
+* `dequantize_dense_mb` — the same apply over fully-dense blocks
+  (every lane non-zero, the per-coefficient worst case).
+
+### Measured (`--warm-up-time 1 --measurement-time 3`, Apple M4-class aarch64, macOS 25.1, rustc 1.95.0 stable)
+
+| Bench | Time |
+|---|---:|
+| `dequantize_mb/from_quant_indices` | **2.32 ns** |
+| `dequantize_mb/for_segment_absolute` | 2.86 ns |
+| `dequantize_mb/for_segment_delta` | 2.95 ns |
+| `dequantize_mb/dequantize_sparse_mb` | 183.0 ns |
+| `dequantize_mb/dequantize_dense_mb` | 184.1 ns |
+
+### Findings
+
+The two layers sit three orders of magnitude apart in absolute cost:
+factor derivation is a once-per-frame (or once-per-segment) ≈ 2–3 ns
+table-lookup-and-scale, while the per-MB apply is ≈ 183 ns and fires on
+every coded macroblock — so the apply is where any §14.1 throughput win
+has to come from. `for_segment` costs ≈ 0.5 ns more than
+`from_quant_indices` (the extra base-index add and `absolute` branch);
+delta and absolute mode are within noise of each other.
+
+The headline for the apply: **sparse and dense are within noise** (183.0
+vs 184.1 ns, < 1 %). The scalar `dequant_block` walks all sixteen lanes
+of every block unconditionally — `block[0] * dc_factor` then a
+`skip(1)` loop over lanes 1..=15 — so a block of mostly-zero
+coefficients costs the same as a fully-dense one (`0 * factor` is still
+a multiply-and-store). The per-MB cost is therefore set by the fixed
+400-multiply block count, not by coefficient occupancy. That is exactly
+the shape that maps cleanly onto the 16-wide `core::simd` path
+`dequant_block` already carries (one widen + one lane-wise multiply +
+one truncate per block, no data-dependent branching), which is why the
+SIMD path exists and stays byte-exact against the scalar listing on
+every fixture (`dequant_block_simd_matches_scalar_on_stress_inputs`).
+
+### No behavioural change
+
+This is a measurement-only round: bench harness plus the inputs it
+synthesises, with no edit to any decode or encode path. The full lib
+test suite is unchanged and green. The bench is the isolated A/B target
+for any future change to the §14.1 apply (a wider SIMD lane group, a
+zero-run skip, or a fused dequant→IDCT pass).
+
+### Next-round candidates surfaced
+
+The per-MB apply's occupancy-independent cost is the actionable §14.1
+lever: a fused dequant→inverse-transform pass (the apply currently
+materialises a fully-scaled `MbCoeffs` that the IDCT then re-reads)
+could amortise the block walk, but only behind a bit-exact A/B since
+the layer is on every decoded macroblock. The named whole-frame
+PROFILE-OPT target remains the per-frame reference-slot plane-copy churn
+(r294's rank-4, ≈ 11–14 % of inter decode, its own round).

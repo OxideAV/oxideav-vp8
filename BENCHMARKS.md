@@ -1914,3 +1914,86 @@ bench synthesises its own inputs in-bench (no fixture files). The full
 stable lib suite (491) and nightly + `simd` lib suite (493), the in-tree
 decode/roundtrip integration tests, and the `ffmpeg_oracle` black-box
 validator are unchanged and green.
+
+## Round 294 — §14.4 DC-only IDCT-add fast path (profile-opt round)
+
+Round 294 (2026-06-14) re-profiled the decode hot paths and took the
+result's clearest lever. A fresh `sample(1)` PID-attach profile (12 s @
+1 ms, nightly + `simd`, `--measurement-time 60`):
+
+* **token-heavy inter stream** (`token_decode/inter_decode_12f…`):
+  `decode_block_core` rank-1 at 5466 samples (≈ 53 %),
+  `inverse_dct_4x4_add_into_simd` rank-2 at 1676 (≈ 16 %). The §13
+  token descent is already fully fused (round 283) and resists a
+  bit-identical kernel change.
+* The §14.4 IDCT-add (rank-2) was the next actionable target: it is
+  applied **unconditionally** to every coded residual sub-block — even
+  the very common case where only the DC coefficient is non-zero (a
+  well-predicted inter sub-block).
+
+### The change
+
+A §14.4 **DC-only fast path** at the top of `inverse_dct_4x4_add_into`.
+When every AC coefficient is zero (`input[1..]` all zero), both
+separable passes carry only the DC term, so the full transform reduces
+to a single uniform residue `(input[0] + 4) >> 3` added (clamped) to all
+sixteen predictor pixels — derived directly from the §14.4 listing
+(pass 1 leaves `tmp[0]=tmp[4]=tmp[8]=tmp[12]=input[0]`, pass 2's row
+butterfly then yields the same rounded value for all outputs). The
+butterfly, transpose, and SIMD lane work are skipped entirely; an
+all-zero DC (`(input[0]+4)>>3 == 0`) returns immediately with the
+prediction untouched. The guard sits in the shared dispatcher so both
+the scalar and `simd` paths benefit, and the general path is unchanged
+for any block with a non-zero AC coefficient.
+
+### Measured A/B (`--measurement-time 10 --warm-up-time 2`, four interleaved pre/post pairs per config, Apple M4 / aarch64, nightly + `simd`)
+
+| Bench / config | Pre (4-run mean) | Post (4-run mean) | Δ (means) |
+|---|---:|---:|---:|
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` | 123.73 µs | **106.45 µs** | **−14.0 %** |
+| `token_decode/inter_decode_12f_176x144_token_heavy` | 944.7 µs | 940.7 µs | −0.4 % |
+| `reconstruct_inter_mb/subpel_full_residue` (all-coded) | 411.96 ns | 427.86 ns | +3.9 % |
+| `reconstruct_inter_mb/whole_pixel_full_residue` (all-coded) | 274.1 ns | 288.5 ns | +5.2 % |
+| `reconstruct_inter_mb/subpel_skip` | 253.9 ns | 254.3 ns | +0.2 % |
+
+The headline is the whole-frame inter decode: **−14.0 %**, with every
+one of the four post runs (106.02 / 106.71 / 106.54 / 106.51 µs) below
+every pre run (123.04 / 123.84 / 123.77 / 124.25 µs) — far outside the
+measurement envelope. Throughput **530 → 616 Mpx/s**. The token-heavy
+12-frame stream (textured drifting content, mostly fully-coded blocks
+where the DC-only path rarely fires) is noise-bounded at −0.4 %
+(per-run −1.6 % / −0.6 % / +1.8 % / −2.1 %). The `reconstruct_inter_mb`
+synthetic benches feed **all-coded** blocks (every AC non-zero — the
+fast path never fires) so they show only the one-comparison guard cost
+(+4…5 %); that shape does not occur in real decode where the
+predicted-residue DC-only fraction dominates, which is exactly why the
+whole-frame number swings the other way. `subpel_skip` short-circuits
+before the IDCT and is flat.
+
+### Bytes-identical
+
+The fast path produces bit-identical output to the full transform. New
+equivalence test `dc_only_add_into_matches_general_path` sweeps every
+DC magnitude across the §14.2 envelope (both clamp saturations) at
+every strided sub-block position, asserting the fast path equals an
+independent full-`inverse_dct_4x4` → add-clamp reference. The full
+stable lib suite (492 → 493 with the new anchor) and nightly + `simd`
+lib suite (494 → 495), plus the in-tree decode/roundtrip integration
+tests, are green on both paths. A 10-fixture decode-side byte-hash A/B
+through `Vp8DecoderState` (162 048 Y/U/V plane bytes, FNV-1a
+`cf33bace1d44adff`) is identical pre-/post-change on **stable scalar
+and nightly + `simd`**.
+
+### Refreshed ranked decoder hotspot map (post r294)
+
+| Rank | Symbol | inter-decode share | Notes |
+|---|---|---:|---|
+| 1 | `dct_tokens::decode_block_core` | ≈ 26 % (≈ 53 % on dense streams) | round-283 fused descent; resists a bit-identical change |
+| 2 | `inverse_transform::inverse_dct_4x4_add_into` | ≈ 10 % | **this round's target** — DC-only path now folds out the SIMD butterfly for predicted-residue blocks |
+| 3 | `coded_header::parse_token_prob_update` | ≈ 7 % | round-291 zipped loop; small fixed per-frame floor |
+| 4 | per-frame reference-slot plane copy | ≈ 11–14 % (memmove family) | copy-on-write plane representation — a versioned `RefFrameSlot` API change, own round |
+
+Named next PROFILE-OPT target: the per-frame reference-slot plane-copy
+churn (`memmove` family, ≈ 11–14 % of inter decode) — a copy-on-write
+plane representation gated behind a versioned `RefFrameSlot` change, so
+it carries its own round.

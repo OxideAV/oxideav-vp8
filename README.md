@@ -395,6 +395,30 @@ micro-bench (criterion p < 0.05, same-session A/B). A/B bench:
 `cargo bench -p oxideav-vp8 --bench token_prob_update`. See `BENCHMARKS.md`
 round 291.
 
+Round 294 lands a §14.4 **DC-only IDCT-add fast path** — the round-294
+profile's rank-2 decoder symbol (`inverse_dct_4x4_add_into`, ≈ 16 % of
+inter decode). The §14.4 inverse DCT + §14.5 add-clamp was applied to
+every coded residual sub-block, including the very common case where
+only the DC coefficient is non-zero. For a DC-only block both separable
+passes carry only the DC term, so the full transform collapses to a
+single uniform residue `(input[0] + 4) >> 3` added (clamped) to all
+sixteen predictor pixels — the butterfly, transpose, and SIMD lane work
+are skipped entirely (and an all-zero rounded DC returns with the
+prediction untouched). The guard sits in the shared dispatcher so both
+the scalar and `simd` paths benefit; the general path is unchanged for
+any block with a non-zero AC coefficient. Output is bit-identical:
+`dc_only_add_into_matches_general_path` sweeps every DC magnitude across
+the §14.2 envelope (both clamp saturations) at every strided sub-block
+position against an independent full-`inverse_dct_4x4` → add-clamp
+reference; the full lib suite (493 stable / 495 nightly+simd), the
+roundtrip/decode integration binaries, and a 10-fixture decode-side
+byte-hash A/B (162 048 plane bytes, FNV-1a `cf33bace1d44adff`, identical
+pre/post on both stable scalar and nightly + `simd`) all confirm the
+decoded corpus is unchanged. Measured **−14.0 %** on whole-frame inter
+decode (`inter_decode_4f_128x128_qi32`, 530 → 616 Mpx/s; four
+non-overlapping A/B pairs); the textured token-heavy 12-frame stream is
+noise-bounded at −0.4 %. See `BENCHMARKS.md` round 294.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

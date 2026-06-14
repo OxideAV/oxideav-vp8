@@ -421,6 +421,30 @@ pub fn inverse_dct_4x4_add_into(
     sub_row: usize,
     sub_col: usize,
 ) {
+    // §14.4 DC-only fast path. When every AC coefficient is zero (only
+    // `input[0]` is non-zero — the common case for well-predicted inter
+    // residue), both separable passes carry only the DC term: pass 1
+    // leaves `tmp[0]=tmp[4]=tmp[8]=tmp[12]=input[0]` (the rest zero), and
+    // pass 2's row butterfly then yields `(input[0] + 4) >> 3` for all
+    // sixteen outputs. So the residue is the single uniform value
+    // `(input[0] + 4) >> 3` added to every predictor pixel — identical to
+    // the full transform, with no butterfly. Bit-exact against the
+    // general path (`dc_only_add_into_matches_general_path`).
+    if input[1..].iter().all(|&c| c == 0) {
+        let dc = ((input[0] as i32) + 4) >> 3;
+        if dc != 0 {
+            let y0 = sub_row * 4;
+            let x0 = sub_col * 4;
+            for r in 0..4 {
+                let base = (y0 + r) * stride + x0;
+                for p in &mut plane[base..base + 4] {
+                    *p = (*p as i32 + dc).clamp(0, 255) as u8;
+                }
+            }
+        }
+        // dc == 0: residue is all-zero, prediction is already the output.
+        return;
+    }
     #[cfg(feature = "simd")]
     {
         inverse_dct_4x4_add_into_simd(input, plane, stride, sub_row, sub_col);
@@ -1229,6 +1253,77 @@ mod tests {
                         assert_eq!(
                             plane_fused, plane_ref,
                             "fused != unfused for stride={stride} sub=({sub_row},{sub_col})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_only_add_into_matches_general_path() {
+        // The §14.4 DC-only fast path in `inverse_dct_4x4_add_into` must
+        // be byte-identical to the full-transform unfused reference for
+        // every DC magnitude (both clamp saturations) at every strided
+        // sub-block position. The reference deliberately reconstructs the
+        // residue through the general two-pass `inverse_dct_4x4` so it is
+        // independent of the fast-path arithmetic being validated.
+        let strides: [(usize, usize); 4] = [(16, 4), (8, 2), (16, 1), (8, 1)];
+        // Sweep DCs that round to negative, zero, small, and large
+        // residues, plus the saturating extremes of the §14.2 envelope.
+        let dcs: [i16; 11] = [-2114, -1000, -64, -4, -3, 0, 3, 4, 64, 1000, 2114];
+        let mut seed: u32 = 0x2468_ace0;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+
+        for &(stride, sub_max) in &strides {
+            let plane_h = sub_max * 4;
+            for sub_row in 0..sub_max {
+                for sub_col in 0..(stride / 4) {
+                    for &dc in &dcs {
+                        let mut plane_fast = vec![0u8; stride * plane_h];
+                        for p in plane_fast.iter_mut() {
+                            *p = (next() & 0xff) as u8;
+                        }
+                        let mut plane_ref = plane_fast.clone();
+
+                        let mut coeffs = [0i16; 16];
+                        coeffs[0] = dc;
+
+                        // General-path reference: full IDCT → add-clamp.
+                        let mut residue = [0i16; 16];
+                        inverse_dct_4x4(&coeffs, &mut residue);
+                        let y0 = sub_row * 4;
+                        let x0 = sub_col * 4;
+                        let mut pred = [0u8; 16];
+                        for r in 0..4 {
+                            let src = (y0 + r) * stride + x0;
+                            pred[r * 4..r * 4 + 4].copy_from_slice(&plane_ref[src..src + 4]);
+                        }
+                        let mut summed = [0u8; 16];
+                        add_residue_4x4(&pred, &residue, &mut summed);
+                        for r in 0..4 {
+                            let dst = (y0 + r) * stride + x0;
+                            plane_ref[dst..dst + 4].copy_from_slice(&summed[r * 4..r * 4 + 4]);
+                        }
+
+                        // Fast path under test.
+                        inverse_dct_4x4_add_into(
+                            &coeffs,
+                            &mut plane_fast,
+                            stride,
+                            sub_row,
+                            sub_col,
+                        );
+
+                        assert_eq!(
+                            plane_fast, plane_ref,
+                            "DC-only fast path != general path for dc={dc} \
+                             stride={stride} sub=({sub_row},{sub_col})"
                         );
                     }
                 }

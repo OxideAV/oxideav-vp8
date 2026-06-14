@@ -522,6 +522,11 @@ simd = ["oxideav-vp8/simd"]
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# Needed by `decoder_trait_packet_lifecycle`, which drives the public
+# `oxideav_core::Decoder` trait impl (`Vp8Decoder`) end-to-end:
+# `Packet` in, `Frame` out. Resolves to the same published version the
+# `oxideav-vp8` path dep already pulls in transitively.
+oxideav-core = "0.1"
 
 [dependencies.oxideav-vp8]
 path = ".."
@@ -671,5 +676,11 @@ doc = false
 [[bin]]
 name = "panic_free_dequant_factors_mb"
 path = "fuzz_targets/panic_free_dequant_factors_mb.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decoder_trait_packet_lifecycle"
+path = "fuzz_targets/decoder_trait_packet_lifecycle.rs"
 test = false
 doc = false

@@ -491,7 +491,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twenty-two `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-three `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -930,6 +930,26 @@ between the paired surfaces):
   crashes / leaks / OOMs after the fix; a regression test
   (`extreme_base_and_deltas_saturate_without_overflow`) anchors the
   saturation at both cliff ends.
+* `decoder_trait_packet_lifecycle` — the `oxideav_core::Decoder` trait
+  driver (`Vp8Decoder`), landed in round 296. Every other decode target
+  enters through the direct API (`decode_vp8`, `Vp8DecoderState`); this
+  one walks the *framework* entry point through its full `send_packet`
+  → `receive_frame` → `flush` → `reset` lifecycle. That exercises two
+  surfaces no direct-API target reaches: the packet/frame plumbing (the
+  `Packet` clone into the internal `VecDeque`, the `NeedMore` / `Eof`
+  state transitions across the EOF latch, the queue rebuild on `reset`)
+  and the `From<Vp8DecodedFrame> for VideoFrame` conversion (computed
+  luma / chroma strides, `pts` copy). Two lifecycle oracles beyond
+  panic-freedom: post-`flush` drain must surface `Eof` (never
+  `NeedMore`), and post-`reset` empty receive must surface `NeedMore`
+  (never `Eof`); every produced plane byte is folded into an FNV-1a
+  accumulator so a stride/length mismatch in the conversion surfaces
+  under ASan. Length-prefixed packet input (`split_packets`), seeded
+  from the crate's own fixture-derived IVF streams; per-keyframe §9.1
+  dimension cap, ≤ 16 KiB / ≤ 12 packets per iteration. Round-296 ASan
+  campaign (nightly, default `simd`): ~500 000 executions across two
+  runs (cov 3934 / ft 18688, 2629-input corpus from the 13 fixture
+  seeds), zero crashes / leaks / OOMs; no `src/` change was needed.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

@@ -4,6 +4,32 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `decoder_trait_packet_lifecycle` fuzz target: the `oxideav_core::Decoder` trait driver (round 296, 2026-06-14)
+
+New `cargo-fuzz` target (the 23rd) hardening the public
+`oxideav_core::Decoder` trait impl (`Vp8Decoder`) — the framework
+decode entry point, distinct from the direct API (`decode_vp8`,
+`Vp8DecoderState::decode_frame`) every other target uses. The harness
+walks the full `send_packet` → `receive_frame` → `flush` → `reset`
+lifecycle against a length-prefixed packet stream seeded from the
+crate's own 13 fixture-derived IVF streams, exercising surfaces no
+direct-API target reaches: the `Packet` clone into the internal
+`VecDeque`, the `NeedMore` / `Eof` state transitions across the EOF
+latch, the queue rebuild on `reset`, and the
+`From<Vp8DecodedFrame> for VideoFrame` conversion (computed luma /
+`ceil(w/2)` chroma strides + `pts` copy). Two lifecycle oracles beyond
+panic-freedom: post-`flush` drain must surface `Eof` (never
+`NeedMore`); post-`reset` empty receive must surface `NeedMore` (never
+`Eof`); every produced plane byte is folded into an FNV-1a accumulator
+so a stride / length mismatch surfaces under ASan. Per-keyframe §9.1
+dimension cap, ≤ 16 KiB / ≤ 12 packets per iteration. Round-296 ASan
+campaign (nightly + default `simd`): ~500 000 executions across two
+runs (cov 3934 / ft 18688, 2629-input corpus from the 13 seeds); zero
+crashes / leaks / OOMs — **no `src/` change was needed** (hardening,
+not a bug fix). Fuzz-crate-only change (new target + committed seed
+corpus + an `oxideav-core` dep on the fuzz sub-crate for the trait
+types); no public-surface change.
+
 ### Added — `bool_decoder_read` bench: §7.3 boolean entropy primitive in isolation (round 295, 2026-06-14)
 
 New `criterion` bench `bool_decoder_read` isolates the §7.3

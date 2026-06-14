@@ -3,5 +3,8 @@ corpus/*
 !corpus/decode_stream_token_descent/
 corpus/decode_stream_token_descent/*
 !corpus/decode_stream_token_descent/seeds/
+!corpus/decoder_trait_packet_lifecycle/
+corpus/decoder_trait_packet_lifecycle/*
+!corpus/decoder_trait_packet_lifecycle/seeds/
 artifacts
 coverage

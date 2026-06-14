@@ -4,6 +4,29 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — contiguous-plane fast path in `crop_to_visible` (round 304 profile, 2026-06-14)
+
+Profile round. `decoder::crop_to_visible` (the per-frame visible-crop emit,
+the standing `_platform_memmove` hotspot's #3 caller at 52 / 605 samples)
+now collapses its per-row `extend_from_slice` loop into a single contiguous
+`to_vec()` whenever the visible width equals the macroblock-padded stride
+(`w == y_stride` / `uvw == uv_stride` — the common case for 16-multiple
+dimensions). The strided per-row path is retained byte-for-byte for the
+genuine-crop case (visible < stride). Bit-identical output; a new lib test
+`crop_to_visible_contiguous_matches_strided` sweeps aligned / cropped /
+height-truncated cases against an always-strided reference. Whole-frame A/B
+sits within measurement noise at benched sizes (crop is ≈ 0.7 % of decode
+self-time) but the path is never slower than the prior loop and the benefit
+scales with frame area — kept as a no-regression micro-improvement, no risky
+change forced. The fresh r304 `sample(1)` profile also attributed every
+`_platform_memmove` sample to its `oxideav_vp8` caller (see BENCHMARKS.md
+round 304): the residual memmove headroom is concentrated in
+`state::decode_frame`'s already-move-minimised slot rotation and the
+`decode_mb_coeffs` return-by-value / load-bearing `MbCoeffs` zero-init, with
+the named whole-frame PROFILE-OPT target still the copy-on-write
+reference-slot representation behind a versioned `RefFrameSlot` API change.
+Stable lib 496 (+1), nightly + `simd` lib 498 (+1).
+
 ### Added — `decode_multi_partition_carve` fuzz target for the §9.5 multi-DCT-partition layout walk (round 303 fuzz, 2026-06-14)
 
 Fuzz round. New `cargo-fuzz` target (the crate's 26th) covering the §9.5

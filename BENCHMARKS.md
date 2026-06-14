@@ -2334,3 +2334,75 @@ The named whole-frame PROFILE-OPT target remains the per-frame
 reference-slot plane-copy churn (the `_platform_memmove` rank, a
 copy-on-write plane representation gated behind a versioned `RefFrameSlot`
 API change, so it carries its own round).
+
+## Round 304 — contiguous-plane crop fast path + memmove-caller profile (profile-opt round)
+
+Round 304 (2026-06-14) re-profiled `inter_decode_short_clip` with a fresh
+`sample(1)` PID-attach pass (12 s @ 1 ms, nightly + `simd`) and broke down
+the standing #3 `_platform_memmove` rank by caller. The top-of-stack
+self-time table reconfirmed the r302 ordering (`decode_block_core` 1431,
+`inverse_dct_4x4_add_into` 674, `_platform_memmove` 605,
+`parse_token_prob_update` 342). Attributing every memmove sample to its
+nearest `oxideav_vp8` caller:
+
+| memmove caller | Samples | Note |
+|---|---:|---|
+| `state::decode_frame` | 308 | slot-rotation + per-MB side-band pushes (r289/r300/r302 already move-minimised) |
+| `dct_tokens::decode_mb_coeffs` | 112 | the per-MB `MbCoeffs` return-by-value + `default()` zero-init — **not** dead work: `decode_block_core` leaves coefficients past the §13.3 EOB untouched and relies on the caller pre-zeroing, so the fill is load-bearing |
+| `decoder::crop_to_visible` | 52 | **this round's target** — the per-row visible-crop copy |
+| `motion_comp::reconstruct_inter_mb` | 46 | residue fold (r286 fused) |
+| `state::RefFrameSlot::from_keyframe_planes` | 32 | unavoidable key-frame triple-slot populate (2 clones, r289 move-min) |
+
+### The change
+
+`decoder::crop_to_visible` packed the visible region with `h` (resp. `uvh`)
+separate row-sliced `extend_from_slice` calls regardless of whether a
+per-row stride gap existed. When the visible width already equals the
+macroblock-padded stride (`w == y_stride` / `uvw == uv_stride` — the common
+case for 16-multiple dimensions, e.g. the 128×128 and 320×240 benches), the
+whole leading `w * h` region is already the packed output verbatim, so the
+crop is now one contiguous `to_vec()` instead of a per-row loop. The strided
+path is retained byte-for-byte for the genuine-crop case (visible < stride).
+
+### Measured A/B (interleaved 3× pre/post, Apple M4-class aarch64, nightly + `simd`)
+
+| Bench | Pre (run medians) | Post (run medians) | Δ |
+|---|---:|---:|---:|
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 141.3 / 139.7 / 143.6 µs | 140.7 / 141.3 / 139.9 µs | within noise |
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` | 117.2 µs | 115.4 µs | within noise |
+
+The change is **safe and bit-identical** (a new lib test
+`crop_to_visible_contiguous_matches_strided` sweeps aligned / cropped /
+height-truncated cases against an always-strided reference) but its
+whole-frame benefit sits below the measurement floor at benched sizes:
+`crop_to_visible` is ≈ 0.7 % of decode self-time (31 / ≈ 4500 samples on the
+12 s profile), so collapsing one per-row memcpy loop into a single copy can
+not move the whole-frame number out of noise here. The win scales with frame
+area (one contiguous copy vs `h` row copies + bounds checks) and the path is
+never slower than the prior loop, so it is kept as a no-regression
+micro-improvement rather than reverted. No risky change was forced.
+
+### Bytes-identical
+
+Pure copy-shape refactor of the output emit; decoded planes are byte-for-byte
+what the strided loop produced. Stable lib suite 496 (+1), nightly + `simd`
+lib suite 498 (+1), all in-tree integration test binaries (encode→decode
+pixel lockstep, keyframe / P-frame roundtrips, inter-stream, two-pass
+roundtrip, the `ffmpeg_oracle` black-box validator) green on both toolchains.
+`cargo clippy --all-targets --no-deps -- -D warnings` clean on stable and
+nightly + `simd`.
+
+### Refreshed ranked decoder hotspot map (post r304)
+
+| Rank | Symbol | Note |
+|---|---|---|
+| 1 | `dct_tokens::decode_block_core` | round-283 fused descent; resists a bit-identical change |
+| 2 | `inverse_transform::inverse_dct_4x4_add_into` | r294 DC-only fast path landed |
+| 3 | per-frame reference-slot plane copy (`_platform_memmove`) | the named PROFILE-OPT target — copy-on-write plane representation behind a versioned `RefFrameSlot` change, own round |
+| 4 | `coded_header::parse_token_prob_update` | r291 zipped loop, small fixed floor |
+
+The remaining memmove headroom is concentrated in `state::decode_frame`'s
+slot rotation + the `decode_mb_coeffs` return-by-value, both already
+move-minimised / load-bearing; the named whole-frame PROFILE-OPT target is
+still the copy-on-write reference-slot representation gated behind a
+versioned `RefFrameSlot` API change (its own round).

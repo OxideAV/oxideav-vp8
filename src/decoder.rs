@@ -501,19 +501,38 @@ fn crop_to_visible(planes: &KeyframePlanes, width: u32, height: u32) -> Vp8Decod
     let uvw = w.div_ceil(2);
     let uvh = h.div_ceil(2);
 
-    let mut y = Vec::with_capacity(w * h);
-    for r in 0..h {
-        let src = r * planes.y_stride;
-        y.extend_from_slice(&planes.y[src..src + w]);
-    }
+    // When the visible width equals the macroblock-padded stride there is no
+    // per-row gap to skip, so the whole leading `w * h` region of the source
+    // plane is already the packed output verbatim — one contiguous copy
+    // instead of `h` row-sliced `extend_from_slice` calls. This is the common
+    // case for macroblock-aligned dimensions (e.g. 128×128, 16-multiples). The
+    // strided path below produces the identical packed bytes when a gap exists.
+    let y = if w == planes.y_stride {
+        planes.y[..w * h].to_vec()
+    } else {
+        let mut y = Vec::with_capacity(w * h);
+        for r in 0..h {
+            let src = r * planes.y_stride;
+            y.extend_from_slice(&planes.y[src..src + w]);
+        }
+        y
+    };
 
-    let mut u = Vec::with_capacity(uvw * uvh);
-    let mut v = Vec::with_capacity(uvw * uvh);
-    for r in 0..uvh {
-        let src = r * planes.uv_stride;
-        u.extend_from_slice(&planes.u[src..src + uvw]);
-        v.extend_from_slice(&planes.v[src..src + uvw]);
-    }
+    let (u, v) = if uvw == planes.uv_stride {
+        (
+            planes.u[..uvw * uvh].to_vec(),
+            planes.v[..uvw * uvh].to_vec(),
+        )
+    } else {
+        let mut u = Vec::with_capacity(uvw * uvh);
+        let mut v = Vec::with_capacity(uvw * uvh);
+        for r in 0..uvh {
+            let src = r * planes.uv_stride;
+            u.extend_from_slice(&planes.u[src..src + uvw]);
+            v.extend_from_slice(&planes.v[src..src + uvw]);
+        }
+        (u, v)
+    };
 
     Vp8DecodedFrame {
         width,
@@ -793,6 +812,95 @@ mod tests {
                 declared: 1000,
             })
         ));
+    }
+
+    /// `crop_to_visible`'s contiguous fast path (taken when the visible
+    /// width equals the macroblock-padded stride) must produce byte-for-byte
+    /// the same packed I420 output as the strided per-row copy. Sweeps an
+    /// aligned case (no per-row gap → contiguous path) and a cropped case
+    /// (visible < stride → strided path) against a reference that always
+    /// copies row-by-row, on a deterministically textured plane set.
+    #[test]
+    fn crop_to_visible_contiguous_matches_strided() {
+        // Reference: the unconditional strided per-row crop.
+        fn crop_strided(planes: &KeyframePlanes, width: u32, height: u32) -> Vp8DecodedFrame {
+            let w = width as usize;
+            let h = height as usize;
+            let uvw = w.div_ceil(2);
+            let uvh = h.div_ceil(2);
+            let mut y = Vec::with_capacity(w * h);
+            for r in 0..h {
+                let src = r * planes.y_stride;
+                y.extend_from_slice(&planes.y[src..src + w]);
+            }
+            let mut u = Vec::with_capacity(uvw * uvh);
+            let mut v = Vec::with_capacity(uvw * uvh);
+            for r in 0..uvh {
+                let src = r * planes.uv_stride;
+                u.extend_from_slice(&planes.u[src..src + uvw]);
+                v.extend_from_slice(&planes.v[src..src + uvw]);
+            }
+            Vp8DecodedFrame {
+                width,
+                height,
+                y,
+                u,
+                v,
+            }
+        }
+
+        // Build a 2×2-macroblock padded plane set (32×32 luma, 16×16 chroma)
+        // filled with a position-dependent LCG texture so a stride/offset bug
+        // produces visibly wrong bytes.
+        let mb_cols = 2usize;
+        let mb_rows = 2usize;
+        let y_stride = mb_cols * 16; // 32
+        let uv_stride = mb_cols * 8; // 16
+        let y_rows = mb_rows * 16; // 32
+        let uv_rows = mb_rows * 8; // 16
+        let mut seed: u32 = 0x1234_5678;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        let y: Vec<u8> = (0..y_stride * y_rows).map(|_| next()).collect();
+        let u: Vec<u8> = (0..uv_stride * uv_rows).map(|_| next()).collect();
+        let v: Vec<u8> = (0..uv_stride * uv_rows).map(|_| next()).collect();
+        let planes = KeyframePlanes {
+            y,
+            u,
+            v,
+            y_stride,
+            uv_stride,
+            mb_cols,
+            mb_rows,
+        };
+
+        // Aligned case: visible == padded → contiguous fast path.
+        let got = crop_to_visible(&planes, 32, 32);
+        let want = crop_strided(&planes, 32, 32);
+        assert_eq!(got.y, want.y, "aligned luma");
+        assert_eq!(got.u, want.u, "aligned U");
+        assert_eq!(got.v, want.v, "aligned V");
+
+        // Cropped case: visible < padded on both axes → strided path. Chroma
+        // visible width 17.div_ceil(2)=9 < uv_stride 16 keeps the chroma
+        // strided path active too.
+        let got = crop_to_visible(&planes, 17, 18);
+        let want = crop_strided(&planes, 17, 18);
+        assert_eq!(got.y, want.y, "cropped luma");
+        assert_eq!(got.u, want.u, "cropped U");
+        assert_eq!(got.v, want.v, "cropped V");
+
+        // Mixed case: luma aligned (width==stride) but chroma not. width 32 →
+        // uvw 16 == uv_stride → both contiguous; use width 32 height 30 so the
+        // luma row count differs but width stays aligned (luma contiguous,
+        // height truncation handled by the `w*h` prefix length).
+        let got = crop_to_visible(&planes, 32, 30);
+        let want = crop_strided(&planes, 32, 30);
+        assert_eq!(got.y, want.y, "height-truncated luma");
+        assert_eq!(got.u, want.u, "height-truncated U");
+        assert_eq!(got.v, want.v, "height-truncated V");
     }
 
     #[test]

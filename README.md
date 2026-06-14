@@ -518,6 +518,30 @@ in-tree integration tests green on both toolchains. The named next
 PROFILE-OPT target remains the reference-slot plane-copy churn (above).
 See `BENCHMARKS.md` round 302.
 
+### Contiguous-plane crop fast path + memmove-caller profile (round 304)
+
+Round 304 re-profiled `inter_decode_short_clip` and broke the standing #3
+`_platform_memmove` rank (605 samples) down by `oxideav_vp8` caller:
+`state::decode_frame` 308 (slot rotation + side-band pushes, already
+move-minimised in r289/r300/r302), `decode_mb_coeffs` 112 (the per-MB
+`MbCoeffs` return + its load-bearing zero-init — `decode_block_core` leaves
+post-EOB coefficients untouched and relies on the caller pre-zeroing),
+`crop_to_visible` 52, `reconstruct_inter_mb` 46, `from_keyframe_planes` 32.
+The actionable non-API-gated lever was `crop_to_visible`: it now packs the
+visible region with one contiguous `to_vec()` instead of a per-row
+`extend_from_slice` loop whenever the visible width equals the
+macroblock-padded stride (the common 16-multiple case), keeping the strided
+path byte-for-byte for genuine crops. Bit-identical (new
+`crop_to_visible_contiguous_matches_strided` test sweeps aligned / cropped /
+height-truncated cases). Whole-frame A/B is within measurement noise at
+benched sizes (crop is ≈ 0.7 % of decode self-time) but the path is never
+slower and the benefit scales with frame area — kept as a no-regression
+micro-improvement, no risky change forced. Lib suite 496 stable / 498
+nightly + `simd`; all in-tree integration tests green on both toolchains.
+The named whole-frame PROFILE-OPT target stays the copy-on-write
+reference-slot representation behind a versioned `RefFrameSlot` API change.
+See `BENCHMARKS.md` round 304.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

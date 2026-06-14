@@ -192,11 +192,73 @@ impl<'a> BoolDecoder<'a> {
     /// natural width.
     pub fn read_literal(&mut self, num_bits: u32) -> Result<u32, BoolDecoderError> {
         debug_assert!(num_bits <= 32, "vp8 read_literal: num_bits must be <= 32");
+
+        // Hot-path specialisation of the §7.3 `read_literal` loop. The
+        // generic path calls `read_bool(128)` `num_bits` times; each call
+        // reloads the `range` / `value` / `bit_count` fields, recomputes the
+        // interval split with a 32-bit multiply (`(range - 1) * 128`), and
+        // re-enters `renormalize`. At the fixed probability 128 the split
+        // collapses to a pure shift — `1 + (((range - 1) * 128) >> 8)` is
+        // exactly `1 + ((range - 1) >> 1)`, an algebraic identity (`* 128 >> 8`
+        // == `>> 1`) — and hoisting the three registers into locals lets the
+        // whole accumulator loop run without touching `self` until the end.
+        // Byte-for-byte identical to the generic loop on every input
+        // (`read_literal_fast_matches_generic_loop`).
+        let mut range = self.range;
+        let mut value = self.value;
+        let mut bit_count = self.bit_count;
+        let mut input = self.input;
+
         let mut v: u32 = 0;
         for _ in 0..num_bits {
-            let bit = self.read_bool(128)? as u32;
+            // split = 1 + ((range - 1) >> 1): the prob-128 form of the §7.2
+            // interval split, no multiply.
+            let split = 1 + ((range - 1) >> 1);
+            let big_split = split << 8;
+            let bit = if value >= big_split {
+                value -= big_split;
+                range -= split;
+                1
+            } else {
+                range = split;
+                0
+            };
             v = (v << 1) | bit;
+
+            // Inline of `renormalize` over the local registers — identical
+            // leading-zeros batched shift + single byte pull.
+            let shift = range.leading_zeros() - 24;
+            if shift != 0 {
+                value <<= shift;
+                range <<= shift;
+                let next_bc = bit_count + shift;
+                if next_bc >= 8 {
+                    let (next, rest) = match input.split_first() {
+                        Some(pair) => pair,
+                        None => {
+                            // Commit consumed state before surfacing the
+                            // error so the decoder is left exactly where the
+                            // generic loop would leave it.
+                            self.range = range;
+                            self.value = value;
+                            self.bit_count = bit_count;
+                            self.input = input;
+                            return Err(BoolDecoderError::EndOfStream);
+                        }
+                    };
+                    bit_count = next_bc - 8;
+                    value |= (*next as u32) << bit_count;
+                    input = rest;
+                } else {
+                    bit_count = next_bc;
+                }
+            }
         }
+
+        self.range = range;
+        self.value = value;
+        self.bit_count = bit_count;
+        self.input = input;
         Ok(v)
     }
 
@@ -589,6 +651,86 @@ mod tests {
             );
             assert_eq!(dec.input, dec_ref.input, "input cursor diverged at bit {i}");
         }
+    }
+
+    /// Reference `read_literal`: the generic `num_bits × read_bool(128)`
+    /// loop the production method replaced with a register-local
+    /// specialisation. Used to prove the fast path is state-for-state
+    /// identical (including the mid-literal `EndOfStream` error path).
+    fn read_literal_reference(
+        d: &mut BoolDecoder<'_>,
+        num_bits: u32,
+    ) -> Result<u32, BoolDecoderError> {
+        let mut v: u32 = 0;
+        for _ in 0..num_bits {
+            let bit = d.read_bool(128)? as u32;
+            v = (v << 1) | bit;
+        }
+        Ok(v)
+    }
+
+    #[test]
+    fn read_literal_fast_matches_generic_loop() {
+        // Encode a long run of mixed-width literals, then decode the same
+        // partition with the production `read_literal` and the generic
+        // reference loop in lockstep, asserting both the returned value and
+        // the full decoder state (range / value / bit_count / input cursor)
+        // agree after every literal — across every literal width 1..=16.
+        let mut enc = TestEncoder::new();
+        let mut vals = Vec::new();
+        let mut widths = Vec::new();
+        let mut seed = 0x1357_9bdfu32;
+        for _ in 0..2048 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let w = seed % 16 + 1; // 1..=16
+            let mask = (1u32 << w) - 1;
+            let val = seed & mask;
+            enc.write_literal(val, w);
+            vals.push(val);
+            widths.push(w);
+        }
+        let buf = enc.finish();
+
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        let mut dec_ref = BoolDecoder::init(&buf).unwrap();
+        for (i, (&val, &w)) in vals.iter().zip(widths.iter()).enumerate() {
+            let got = dec.read_literal(w).unwrap();
+            let got_ref = read_literal_reference(&mut dec_ref, w).unwrap();
+            assert_eq!(got, val, "literal {i} (width {w}) wrong value");
+            assert_eq!(got, got_ref, "fast/generic disagreement at literal {i}");
+            assert_eq!(dec.range, dec_ref.range, "range diverged at literal {i}");
+            assert_eq!(dec.value, dec_ref.value, "value diverged at literal {i}");
+            assert_eq!(
+                dec.bit_count, dec_ref.bit_count,
+                "bit_count diverged at literal {i}"
+            );
+            assert_eq!(dec.input, dec_ref.input, "input diverged at literal {i}");
+        }
+    }
+
+    #[test]
+    fn read_literal_fast_matches_generic_on_end_of_stream() {
+        // Drive both paths to the EndOfStream boundary inside a literal and
+        // assert they fail identically and leave the decoder in the same
+        // committed state. A 2-byte all-zero partition exhausts after a few
+        // prob-128 reads (every renorm pulls a bit and there is no input to
+        // refill from).
+        let mut dec = BoolDecoder::init(&[0x00, 0x00]).unwrap();
+        let mut dec_ref = BoolDecoder::init(&[0x00, 0x00]).unwrap();
+        // A wide literal forces the byte-pull past the 2 buffered bytes.
+        let err = dec.read_literal(32).unwrap_err();
+        let err_ref = read_literal_reference(&mut dec_ref, 32).unwrap_err();
+        assert_eq!(err, err_ref);
+        assert_eq!(err, BoolDecoderError::EndOfStream);
+        assert_eq!(dec.range, dec_ref.range, "range diverged on EOS");
+        assert_eq!(dec.value, dec_ref.value, "value diverged on EOS");
+        assert_eq!(
+            dec.bit_count, dec_ref.bit_count,
+            "bit_count diverged on EOS"
+        );
+        assert_eq!(dec.input, dec_ref.input, "input diverged on EOS");
     }
 
     #[test]

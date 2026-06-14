@@ -542,6 +542,27 @@ The named whole-frame PROFILE-OPT target stays the copy-on-write
 reference-slot representation behind a versioned `RefFrameSlot` API change.
 See `BENCHMARKS.md` round 304.
 
+### `read_literal` register-local fixed-prob-128 loop (round 306)
+
+Round 306 specialised `BoolDecoder::read_literal`. The generic path called
+`read_bool(128)` `num_bits` times, reloading the four decoder registers
+(`range` / `value` / `bit_count` / `input`) from `self` and recomputing the
+§7.2 interval split with a 32-bit multiply each bit. The new path hoists the
+registers into locals for the whole accumulator loop and uses the
+fixed-probability-128 split identity (`1 + (((range - 1) * 128) >> 8)` ==
+`1 + ((range - 1) >> 1)` — a shift, no multiply). Byte-for-byte identical to
+the prior loop including the mid-literal `EndOfStream` path, proven by two
+new lib tests (`read_literal_fast_matches_generic_loop` over widths 1..=16
+with full state agreement, and `read_literal_fast_matches_generic_on_end_of_stream`).
+A strict instruction-count reduction that sits below per-run measurement
+noise on a loaded machine — kept as a no-regression micro-improvement, never
+slower than the generic loop. The `bool_decoder_read` bench gained
+`read_literal_mixed_width` (widths 1..=16) and `read_signed_literal_7b_8k`
+(the §17 MV-component idiom) so those register-local loops have width-varied
+A/B targets. The named CoW reference-slot target was deferred as too large /
+risky for a single safe round (the §9 slot rotation is already
+move-minimised). See `BENCHMARKS.md` round 306.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

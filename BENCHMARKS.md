@@ -2406,3 +2406,77 @@ slot rotation + the `decode_mb_coeffs` return-by-value, both already
 move-minimised / load-bearing; the named whole-frame PROFILE-OPT target is
 still the copy-on-write reference-slot representation gated behind a
 versioned `RefFrameSlot` API change (its own round).
+
+## Round 306 — `read_literal` register-local fixed-prob-128 loop + literal A/B coverage (profile-opt round)
+
+Round 306 (2026-06-15) revisited the §7.3 boolean-decoder primitive. The
+named r304 PROFILE-OPT target (copy-on-write reference-slot representation
+behind a versioned `RefFrameSlot` API) was assessed as too large / too
+risky for a single safe round — the §9 slot rotation is already
+move-minimised (r289 `rotate_reference_slots` does zero plane copies on the
+common refresh-last path), so a CoW rewrite would touch the whole
+`RefFrameSlot` ownership model for headroom the r304 profile put at a few
+hundred memmove samples. Per the round's "pick a smaller safe win OR extend
+a benchmark — do not force a risky change" guidance, this round took the
+smaller bool-decoder win plus bench coverage instead.
+
+### The change
+
+`BoolDecoder::read_literal` previously called the generic
+`read_bool(128)` `num_bits` times. Each call reloaded the `range` /
+`value` / `bit_count` / `input` fields from `self`, recomputed the §7.2
+interval split with a 32-bit multiply (`(range - 1) * 128`), and re-entered
+`renormalize`. At the fixed probability 128 the split collapses to a pure
+shift — `1 + (((range - 1) * 128) >> 8)` is exactly `1 + ((range - 1) >> 1)`
+(`* 128 >> 8 == >> 1`, an algebraic identity) — and hoisting the four
+registers into locals lets the whole accumulator loop run without touching
+`self` until it commits the final state. The mid-literal `EndOfStream`
+error path commits the consumed registers exactly where the generic loop
+would leave them.
+
+### Bit-exactness
+
+Two new lib tests pin the fast path state-for-state against the generic
+`num_bits × read_bool(128)` reference loop:
+`read_literal_fast_matches_generic_loop` (2 048 mixed-width literals, full
+`range`/`value`/`bit_count`/`input` agreement after every literal across
+widths 1..=16) and `read_literal_fast_matches_generic_on_end_of_stream`
+(identical failure + committed state at the EOS boundary). Stable + nightly
+lib suite 498 tests, all in-tree integration binaries (including the
+`blackbox_oracle` validator) green.
+
+### Measured A/B (interleaved 3× pre/post, Apple M4-class aarch64, stable)
+
+| Bench | Pre (run min) | Post (run min) | Δ |
+|---|---:|---:|---:|
+| `bool_decoder_read/read_literal_8b_8k` | ≈ 177 µs | ≈ 176 µs | within noise |
+
+The change removes one multiply and three field reloads per coded bit, but
+on a loaded machine the per-run variance (±10–20 %) swamped the difference:
+successive identical-code runs swung 177–217 µs. The improvement is a strict
+instruction-count reduction with zero behavioural change, kept as a
+no-regression micro-improvement (never slower than the generic loop) rather
+than a claimed speedup. `read_literal` is a small share of whole-frame
+decode time (header / partition-size / MV-magnitude reads, not the DCT-token
+hot loop, which uses context-probability `read_bool` not flat-128 literals),
+so no whole-frame bench moves either.
+
+### Bench coverage extended
+
+`bool_decoder_read` gained two cases so the `read_literal` /
+`read_signed_literal` register-local loops have width-varied A/B targets the
+flat width-8 `read_literal_8b_8k` lacked:
+
+* `read_literal_mixed_width` — 8 192 `read_literal` calls of widths spread
+  across 1..=16 (the real §9 header / §13 partition-size width mix).
+* `read_signed_literal_7b_8k` — 8 192 `read_signed_literal(7)` calls (sign
+  bit + six magnitude bits), the §17 MV-component idiom the unsigned bench
+  never touched.
+
+Both partitions are produced by the crate's own §7.3 `BoolEncoder` and
+decoded once at setup with a full value-equality assertion, so each measured
+loop is a proven-valid bitstream walk.
+
+`cargo fmt --check` and `cargo clippy --all-targets --no-deps -- -D
+warnings` clean. No risky change was forced; the CoW reference-slot target
+remains deferred to its own round.

@@ -4,6 +4,30 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — `read_literal` register-local fixed-prob-128 loop + `bool_decoder_read` literal coverage (round 306 profile, 2026-06-15)
+
+Profile round. `BoolDecoder::read_literal` is now a register-local
+specialisation of the generic `num_bits × read_bool(128)` loop: the four
+decoder registers (`range` / `value` / `bit_count` / `input`) are hoisted
+into locals for the whole accumulator loop, and at the fixed probability 128
+the §7.2 interval split collapses from a 32-bit multiply to a single shift
+(`1 + (((range - 1) * 128) >> 8)` == `1 + ((range - 1) >> 1)`). Byte-for-byte
+identical to the prior loop, including the mid-literal `EndOfStream` error
+path, proven by two new lib tests (`read_literal_fast_matches_generic_loop`
+sweeping widths 1..=16 with full state agreement, and
+`read_literal_fast_matches_generic_on_end_of_stream`). Strict
+instruction-count reduction (one fewer multiply + three fewer field reloads
+per coded bit); the win sits below the per-run measurement noise on a loaded
+machine, so it is kept as a no-regression micro-improvement rather than a
+claimed speedup. The named r304 PROFILE-OPT target (copy-on-write
+reference-slot representation behind a versioned `RefFrameSlot` API) was
+deferred as too large / too risky for a single safe round (the §9 slot
+rotation is already move-minimised) per the round's "do not force a risky
+change" guidance. The `bool_decoder_read` bench gained `read_literal_mixed_width`
+(widths 1..=16) and `read_signed_literal_7b_8k` (the §17 MV-component
+`read_signed_literal` idiom) so those register-local loops have width-varied
+A/B targets the flat width-8 case lacked. No bitstream / public-API change.
+
 ### Added — `keyframe_stream_encode_decode` fuzz target for the `Vp8KeyframeStreamEncoder` multi-frame driver (round 305 fuzz, 2026-06-15)
 
 Fuzz round. New `cargo-fuzz` target `keyframe_stream_encode_decode`

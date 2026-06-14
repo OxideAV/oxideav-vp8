@@ -748,3 +748,9 @@ name = "decode_multi_partition_carve"
 path = "fuzz_targets/decode_multi_partition_carve.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "keyframe_stream_encode_decode"
+path = "fuzz_targets/keyframe_stream_encode_decode.rs"
+test = false
+doc = false

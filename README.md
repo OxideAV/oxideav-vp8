@@ -597,7 +597,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twenty-six `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-seven `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -1127,6 +1127,33 @@ between the paired surfaces):
   Round-303 smoke pass (nightly, default `simd`): ~30 000 executions in
   46 s plus a 21 s confirmatory run (cov 3279 / ft 14877, 1008-input
   corpus from empty seed), zero crashes; no `src/` change was needed.
+* `keyframe_stream_encode_decode` — the public `Vp8KeyframeStreamEncoder`
+  multi-frame all-key-frame stream driver, landed in round 305. The
+  three other encode-stream targets stop short of it: the one-shot
+  `panic_free_encode_keyframe` never builds a cross-frame encoder, while
+  `panic_free_two_pass_stream` (`Vp8TwoPassEncoder`) and
+  `inter_stream_encode_decode_sequence` (`Vp8InterStreamEncoder`) are the
+  *inter* stream drivers — none touches the key-frame stream driver nor
+  its §13.4 fitted companion
+  (`encode_frame_with_fitted_token_prob_updates`, the fitter reached
+  through a stream lifetime for the first time). The harness pushes a
+  fuzz-shaped sequence of up to four small (≤ 64 × 64) I420 frames,
+  picking the plain vs fitted entry point per frame from a fuzz bitmap,
+  and probes three surfaces no other target reaches: the
+  dimension-lock state machine (a fuzz-chosen non-first frame is fed
+  altered dimensions and the harness asserts
+  `StreamEncodeError::DimensionsChanged` fired without advancing the
+  frame counter), the §9.7 / §9.8 three-slot keyframe refresh (after
+  every success `last == golden == altref`, exploiting
+  `RefFrameSlot: PartialEq`, plus a counter-advances-by-one and
+  dimensions-locked check), and the fitted fitter's slot/wire
+  consistency. Beyond panic-freedom every emitted frame must self-decode
+  through a fresh `Vp8DecoderState` to the locked visible geometry, with
+  every decoded plane byte folded into an FNV-1a accumulator (short-write
+  oracle). Round-305 smoke pass (nightly, default `simd`): 21 415
+  executions in 31 s plus a 26 s confirmatory run (cov 4784 / ft 24762,
+  940-input corpus from empty seed at ~319 exec/s, peak RSS 421 MB), zero
+  crashes; no `src/` change was needed.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

@@ -4,6 +4,29 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `keyframe_stream_encode_decode` fuzz target for the `Vp8KeyframeStreamEncoder` multi-frame driver (round 305 fuzz, 2026-06-15)
+
+Fuzz round. New `cargo-fuzz` target `keyframe_stream_encode_decode`
+(27th target) drives the public `Vp8KeyframeStreamEncoder` all-key-frame
+stream driver — a cross-frame encoder surface no existing target reached
+(`panic_free_encode_keyframe` is one-shot; `panic_free_two_pass_stream`
+and `inter_stream_encode_decode_sequence` are the *inter* stream
+drivers). Exercises both the plain `encode_frame` path and the §13.4
+fitted companion `encode_frame_with_fitted_token_prob_updates` (the
+round-157 token-prob fitter reached through a stream lifetime for the
+first time), selected per frame by a fuzz bitmap over a sequence of up to
+four ≤ 64 × 64 I420 frames. Three driver-specific oracles beyond
+panic-freedom: the dimension-lock state machine (a non-first frame fed
+altered dimensions must surface `StreamEncodeError::DimensionsChanged`
+without advancing the frame counter), the §9.7 / §9.8 three-slot keyframe
+refresh (`last == golden == altref` after every success, plus
+counter-advances-by-one and dimensions-locked checks), and per-frame
+self-decode through a fresh `Vp8DecoderState` to the locked visible
+geometry (every decoded plane byte folded into FNV-1a as a short-write
+oracle). Round-305 smoke pass (nightly, default `simd`): 21 415
+executions in 31 s plus a 26 s confirmatory run (cov 4784 / ft 24762,
+940-input corpus from empty seed), zero crashes. No `src/` change needed.
+
 ### Changed — contiguous-plane fast path in `crop_to_visible` (round 304 profile, 2026-06-14)
 
 Profile round. `decoder::crop_to_visible` (the per-frame visible-crop emit,

@@ -317,6 +317,29 @@ scratch-then-copy lesson), so the default build is unchanged. A/B bench:
 target: per-frame reference-slot plane-copy churn (see `BENCHMARKS.md`
 round 286).
 
+### Decode profile + §14.4 DC-only fast-path A/B (round 297)
+
+A whole-keyframe decode profile (`sample` over a tight `decode_vp8`
+loop on a 320×240 qi=32 keyframe built by `encode_keyframe`) ranked
+`inverse_dct_4x4_scalar` the **#1** top-of-stack symbol of the decode
+path, ahead of `decode_keyframe_mb_non_bpred`, `decode_block_core`,
+and the `predict_y16x16_tm` intra kernel. The existing
+`inverse_transform_4x4` micro-bench measures only the full high-AC
+transform; on this shared/saturated host the isolated single-call
+micro-bench swings ±20 % run-to-run, so no register-form scalar
+rewrite cleared the noise floor and the §14.4 scalar listing is left
+byte-for-byte unchanged.
+
+Instead, round 297 adds an `idct_dc_only` A/B group to the
+`idct_add_residue_fusion` bench that isolates the residue shape a real
+decode actually produces most: the **DC-only** sub-block (every AC
+coefficient zero), which `inverse_dct_4x4_add_into` short-circuits
+through its §14.4 DC-only fast path (`(input[0]+4)>>3` added uniformly,
+no butterfly). Measured per-MB (24 sub-blocks, same binary, immune to
+cross-run drift): **~110 ns** DC-only vs **~254 ns** full-butterfly —
+the fast path is ~2.3× cheaper, quantifying the win it already buys.
+A/B bench: `cargo bench -p oxideav-vp8 --bench idct_add_residue_fusion`.
+
 ### `ref_slot_rotation` bench — §9.7/§9.8 reference-slot rotation (round 288)
 
 Round 288 (bench-only, no `src/` change) gives the round-286 runner-up —

@@ -4,6 +4,22 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — decode profile + §14.4 DC-only fast-path A/B bench cell (round 297, 2026-06-14)
+
+Profiled a whole-keyframe decode (`sample` over a tight `decode_vp8`
+loop on a 320×240 qi=32 keyframe): `inverse_dct_4x4_scalar` is the #1
+top-of-stack symbol of the decode path. On this shared/saturated host
+the isolated `inverse_transform_4x4` single-call micro-bench swings
+±20 % run-to-run, so no register-form scalar rewrite cleared the noise
+floor — the §14.4 scalar listing is left byte-for-byte unchanged (no
+`src/` change). Added an `idct_dc_only` A/B group to the
+`idct_add_residue_fusion` bench isolating the DC-only residue shape
+(every AC coefficient zero) that `inverse_dct_4x4_add_into`
+short-circuits through its §14.4 DC-only fast path. Per-MB
+(24 sub-blocks, same-binary A/B): ~110 ns DC-only vs ~254 ns
+full-butterfly — the fast path is ~2.3× cheaper, quantifying the win it
+already buys for the common well-predicted sub-block. Bench-only change.
+
 ### Added — `decoder_trait_packet_lifecycle` fuzz target: the `oxideav_core::Decoder` trait driver (round 296, 2026-06-14)
 
 New `cargo-fuzz` target (the 23rd) hardening the public

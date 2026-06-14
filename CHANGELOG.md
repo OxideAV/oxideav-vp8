@@ -4,6 +4,32 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `ivf_demux_decode_walk` IVF container demux-loop fuzz target (round 301, 2026-06-14)
+
+Fuzz round. New `cargo-fuzz` target (the crate's 25th) exercising the
+IVF container demux walk feeding the stateful decoder — the realistic
+`.ivf`-playback path no existing target reaches. `parse_headers` calls
+`ivf::parse_header` / `ivf::parse_frame_header` once each on the raw
+front bytes (no cursor advance, no second record, no payload feed);
+`panic_free_decoder_state` / `decoder_trait_packet_lifecycle` drive
+`Vp8DecoderState::decode_frame` from a synthetic `[u16-LE len][payload]`
+packetiser that inherits no container framing. The new target parses the
+32-byte global header, then walks frame records from offset 32 — carving
+`data[off + 12 .. off + 12 + size]` for each 32-bit attacker-controlled
+payload `size` and advancing the cursor — feeding each carved payload to
+one persistent `Vp8DecoderState` so the §9.7 LAST / GOLDEN / ALTREF
+reference ladder runs as multi-frame `.ivf` playback would drive it. The
+`off + 12 + size` term is the integer-overflow / out-of-range surface a
+hostile `size` field targets; the walk uses checked arithmetic + a
+saturating bounds clamp so a corrupt `size` ends the walk cleanly. Every
+decoded Y / U / V byte is folded into an FNV-1a accumulator (short-write
+oracle). Seeded with two real fixture-derived intact `.ivf` files
+(`i-only-64x64`, `i-frame-then-p-frame`). Hard caps: 8 KiB input,
+≤ 64 records/iteration. ASan campaign (nightly + default `simd`):
+~230 000 executions across two runs (cov 3560 / ft 13091, 831-input
+corpus from the two seeds); zero crashes / leaks / OOMs — no `src/`
+change needed. Library `src/` untouched; only `fuzz/` + READMEs.
+
 ### Changed — drop dead per-frame coefficient/side-band default-fill (round 300, 2026-06-14)
 
 Profile-opt round. A `sample(1)` decode profile flagged a `__bzero` /

@@ -507,6 +507,37 @@ cargo-fuzz = true
 #                                     plane geometry and folds every
 #                                     produced plane byte into an FNV-1a
 #                                     accumulator (short-write oracle).
+#   * `ivf_demux_decode_walk`        — the IVF container demux loop feeding
+#                                     the stateful decoder. `parse_headers`
+#                                     calls `ivf::parse_header` /
+#                                     `ivf::parse_frame_header` once each on
+#                                     the raw front bytes — it never advances
+#                                     a cursor, walks a second record, or
+#                                     feeds an extracted payload anywhere;
+#                                     `panic_free_decoder_state` /
+#                                     `decoder_trait_packet_lifecycle` drive
+#                                     `Vp8DecoderState::decode_frame` from a
+#                                     synthetic `[u16-LE len][payload]`
+#                                     packetiser that inherits NO container
+#                                     framing. This target is the real
+#                                     `.ivf`-playback loop on attacker bytes:
+#                                     `parse_header` → frame-record walk from
+#                                     offset 32, carving
+#                                     `data[off+12 .. off+12+size]` for each
+#                                     32-bit attacker-controlled payload
+#                                     `size` and advancing the cursor. The
+#                                     `off + 12 + size` term is the
+#                                     integer-overflow / out-of-range surface
+#                                     a hostile `size` field targets; the
+#                                     walk uses checked arithmetic + a
+#                                     saturating bounds clamp so a corrupt
+#                                     `size` ends the walk cleanly instead of
+#                                     panicking. Each carved payload is fed
+#                                     to one persistent `Vp8DecoderState`, so
+#                                     the §9.7 LAST / GOLDEN / ALTREF ladder
+#                                     runs exactly as a multi-frame `.ivf`
+#                                     would drive it. Plane-fold FNV-1a oracle
+#                                     over every decoded Y / U / V byte.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -688,5 +719,11 @@ doc = false
 [[bin]]
 name = "inter_stream_encode_decode_sequence"
 path = "fuzz_targets/inter_stream_encode_decode_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ivf_demux_decode_walk"
+path = "fuzz_targets/ivf_demux_decode_walk.rs"
 test = false
 doc = false

@@ -549,7 +549,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twenty-four `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-five `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -1031,6 +1031,30 @@ between the paired surfaces):
   campaign (nightly, default `simd`): ~29 000 executions across two
   runs (cov 4831 / ft 24338, 897-input corpus from empty seed), zero
   crashes / leaks / OOMs; no `src/` change was needed.
+* `ivf_demux_decode_walk` — the IVF container demux loop feeding the
+  stateful decoder, landed in round 301. `parse_headers` calls
+  `ivf::parse_header` / `ivf::parse_frame_header` once each on the raw
+  front bytes — it never advances a cursor, walks a second record, or
+  feeds an extracted payload anywhere; `panic_free_decoder_state` /
+  `decoder_trait_packet_lifecycle` drive `Vp8DecoderState::decode_frame`
+  from a synthetic `[u16-LE len][payload]` packetiser that inherits no
+  container framing. This target is the real `.ivf`-playback loop on
+  attacker bytes: `parse_header` → frame-record walk from offset 32,
+  carving `data[off + 12 .. off + 12 + size]` for each 32-bit
+  attacker-controlled payload `size` and advancing the cursor past it.
+  The `off + 12 + size` term is the integer-overflow / out-of-range
+  surface a hostile `size` field targets — the walk uses checked
+  arithmetic plus a saturating bounds clamp so a corrupt `size` ends the
+  walk cleanly rather than panicking / slicing out of bounds. Each
+  carved payload is fed to one persistent `Vp8DecoderState`, so the §9.7
+  LAST / GOLDEN / ALTREF ladder runs exactly as playing a multi-frame
+  `.ivf` would drive it; every decoded Y / U / V byte is folded into an
+  FNV-1a accumulator (short-write oracle). Seeded with two real
+  fixture-derived IVF files (`i-only-64x64`, `i-frame-then-p-frame`).
+  Round-301 ASan campaign (nightly, default `simd`): ~230 000
+  executions across two runs (cov 3560 / ft 13091, 831-input corpus
+  from the two seeds), zero crashes / leaks / OOMs; no `src/` change was
+  needed.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

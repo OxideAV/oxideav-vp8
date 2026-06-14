@@ -6,5 +6,8 @@ corpus/decode_stream_token_descent/*
 !corpus/decoder_trait_packet_lifecycle/
 corpus/decoder_trait_packet_lifecycle/*
 !corpus/decoder_trait_packet_lifecycle/seeds/
+!corpus/ivf_demux_decode_walk/
+corpus/ivf_demux_decode_walk/*
+!corpus/ivf_demux_decode_walk/seeds/
 artifacts
 coverage

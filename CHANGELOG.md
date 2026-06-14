@@ -4,6 +4,36 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `decode_multi_partition_carve` fuzz target for the §9.5 multi-DCT-partition layout walk (round 303 fuzz, 2026-06-14)
+
+Fuzz round. New `cargo-fuzz` target (the crate's 26th) covering the §9.5
+multi-DCT-partition decode path that the existing raw-bytes decode targets
+essentially never reach: `decoder::carve_dct_partitions`' multi-partition
+truncation / overshoot branches (`TruncatedPartitionSizes`,
+`TruncatedDctPartition`, the `consumed > body.len()` overshoot scan) and
+the §20.4 row-interleaved `r % nbr_of_dct_partitions` token descent.
+Random libFuzzer bytes almost never survive §9.1 / §19.2 header validation
+long enough to set the partition count to 2 / 4 / 8 behind a
+self-consistent size table, so those branches sat almost unfuzzed.
+
+The target builds a structurally valid 2 / 4 / 8-partition key frame with
+`encode_keyframe`, asserts a clean round-trip back to the source geometry
+(every decoded plane byte folded into an FNV-1a accumulator), then applies
+four header-located mutations before re-decoding each mutant: corrupt one
+3-byte LE size word, truncate inside the DCT section, perturb the 19-bit
+`first_partition_size` field, and shrink one declared size to a
+smaller-but-legal value (re-routing the per-partition `BoolDecoder` read
+windows to drive several §7.3 out-of-data renormalisation tails at once).
+Mutation offsets are computed from the freshly parsed `Vp8FrameHeader`
+(`header_bytes_consumed`, `first_partition_size`), so no container framing
+is re-implemented. Dimensions capped at 64 × 64.
+
+Round-303 smoke pass (nightly, default `simd`): ~30 000 executions in 46 s
+plus a 21 s confirmatory run (cov 3279 / ft 14877, 1008-input corpus from
+empty seed) on aarch64-apple-darwin, zero crashes. No `src/` change
+needed; `fuzz/Cargo.toml` registers the new `[[bin]]`. No public-surface
+change.
+
 ### Changed — collapse the per-frame loop-filter coefficient side-band to a per-MB flag (round 302 profile-opt, 2026-06-14)
 
 Profile round. The §15 loop filter's step-2/4 internal-edge decision

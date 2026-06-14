@@ -538,6 +538,21 @@ cargo-fuzz = true
 #                                     runs exactly as a multi-frame `.ivf`
 #                                     would drive it. Plane-fold FNV-1a oracle
 #                                     over every decoded Y / U / V byte.
+#   * `decode_multi_partition_carve` — the §9.5 multi-DCT-partition layout
+#                                     walk: `carve_dct_partitions` (3-byte
+#                                     LE size-table split + per-slice
+#                                     bounds) and the §20.4 row-interleaved
+#                                     `r % N` partition descent. Builds a
+#                                     structurally valid 2/4/8-partition
+#                                     key frame with `encode_keyframe`,
+#                                     asserts a clean round-trip, then
+#                                     mutates the size table, the buffer
+#                                     tail, and the §9.1
+#                                     `first_partition_size` field — the
+#                                     truncation / overshoot branches raw
+#                                     bytes essentially never reach because
+#                                     they require a self-consistent size
+#                                     table behind a valid §19.2 header.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -725,5 +740,11 @@ doc = false
 [[bin]]
 name = "ivf_demux_decode_walk"
 path = "fuzz_targets/ivf_demux_decode_walk.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_multi_partition_carve"
+path = "fuzz_targets/decode_multi_partition_carve.rs"
 test = false
 doc = false

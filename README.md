@@ -573,7 +573,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twenty-five `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-six `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -1079,6 +1079,30 @@ between the paired surfaces):
   executions across two runs (cov 3560 / ft 13091, 831-input corpus
   from the two seeds), zero crashes / leaks / OOMs; no `src/` change was
   needed.
+* `decode_multi_partition_carve` — the §9.5 multi-DCT-partition layout
+  walk on the decode side, landed in round 303. The `panic_free_*`
+  decode targets feed `decode_vp8` raw bytes that essentially never
+  survive the §9.1 start-code / §19.2 bool-coded header validation long
+  enough to set `nbr_of_dct_partitions` to 2 / 4 / 8 behind a
+  self-consistent §9.5 size table, so the multi-partition branches of
+  `carve_dct_partitions` (`TruncatedPartitionSizes`,
+  `TruncatedDctPartition { index, .. }`, the `consumed > body.len()`
+  overshoot scan) and the §20.4 row-interleaved `r % N` partition
+  descent stayed almost unfuzzed. This target builds a structurally
+  valid 2 / 4 / 8-partition key frame with `encode_keyframe`, asserts a
+  clean round-trip back to the source geometry (happy-path oracle, every
+  decoded plane byte folded into FNV-1a), then applies four
+  header-located mutations before re-decoding each mutant: corrupt one
+  3-byte LE size word, truncate the buffer inside the DCT section, perturb
+  the 19-bit `first_partition_size` field, and shrink one declared size
+  to a smaller-but-legal value (re-routing which bytes each per-partition
+  `BoolDecoder` reads, driving several §7.3 out-of-data renormalisation
+  tails at once). Mutation offsets come from the freshly parsed
+  `Vp8FrameHeader` (`header_bytes_consumed`, `first_partition_size`), so
+  no container framing is re-implemented. Dimensions capped at 64 × 64.
+  Round-303 smoke pass (nightly, default `simd`): ~30 000 executions in
+  46 s plus a 21 s confirmatory run (cov 3279 / ft 14877, 1008-input
+  corpus from empty seed), zero crashes; no `src/` change was needed.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

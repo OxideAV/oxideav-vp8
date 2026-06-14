@@ -2264,3 +2264,73 @@ The named whole-frame PROFILE-OPT target remains the per-frame
 reference-slot plane-copy churn (the `_platform_memmove` rank, a
 copy-on-write plane representation gated behind a versioned
 `RefFrameSlot` API change, so it carries its own round).
+
+## Round 302 — collapse the loop-filter coefficient side-band to a per-MB flag (profile-opt round)
+
+Round 302 (2026-06-14) took a non-API-gated lever the §13 → §15 inter
+frame-decode flow surfaced: the stateful interframe decoder kept a
+whole-frame `Vec<MbCoeffs>` (`coeffs_out`) alive past the per-MB decode
+loop solely to feed the §15 loop filter — yet the loop filter reads those
+coefficients only through `mb_has_coeffs`, a **single boolean per MB**.
+Every MB's coefficients are otherwise fully consumed by reconstruction
+inside the per-MB loop (`reconstruct_inter_mb` / `reconstruct_split_mv_mb`
+/ the intra reconstructors), so the frame-length `Vec<MbCoeffs>` was ≈
+800 bytes / MB of pure carry traffic for one boolean reduction per MB.
+
+### The change
+
+The inter decode loop now computes `mb_has_coeffs(&mb_coeffs)` inline —
+while the freshly-decoded bundle is still hot in cache, where the `any()`
+short-circuits on the first non-zero — and pushes only the `bool` into a
+`Vec<bool> has_coeffs_out`. The §15 pass dispatches to a new internal
+`filter_inter_frame_flags` (and its keyframe analogue `filter_frame_flags`)
+that takes a `&[bool]` "has-coeffs" slice instead of `&[MbCoeffs]`. The
+public `filter_frame` / `filter_inter_frame` keep their `&[MbCoeffs]`
+signatures as thin wrappers (`coeffs.iter().map(mb_has_coeffs).collect()`
+→ flag core), so no public API changes. The keyframe path is left on the
+public wrapper because it already materialises the full `Vec<MbCoeffs>`
+for `decode_keyframe` reconstruction — no buffer to remove there.
+
+### Measured A/B (`--warm-up-time 2 --measurement-time 8`, three interleaved pre/post runs each, Apple M4-class aarch64)
+
+| Bench | Pre (run medians) | Post (run medians) | Δ |
+|---|---:|---:|---:|
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` | 116.2 / 116.5 / 118.6 µs | 115.5 / 115.1 / 113.5 µs | **≈ −1…−3 %** |
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 140.0 / 142.0 / 140.8 µs | 140.9 / 139.3 / 139.9 µs | ≈ flat |
+
+Every inter post-run median sits below the baseline band; the keyframe
+path is flat by design (it retains the full coeff vector for
+reconstruction). The win is modest on the small 4-frame 128×128 inter
+clip because the eliminated buffer is `O(mb_count)` — it grows with frame
+size (the removed `Vec<MbCoeffs>` is 800 bytes × every MB plus the
+associated write-then-read memory traffic, replaced by 1 byte × MB
+written at decode time).
+
+### Bytes-identical
+
+The flag path is byte-for-byte the coeffs path: `filter_*_flags` differs
+only in reading `has_coeffs[i]` where the public path computes
+`mb_has_coeffs(&coeffs[i])`. Two new exhaustive equivalence tests
+(`filter_frame_flags_matches_coeffs`, `filter_inter_frame_flags_matches_coeffs`)
+sweep all 2⁶ per-MB occupancy masks × every Y-mode × simple/normal config
+on a textured multi-MB plane set and assert the two paths produce
+identical planes. The full stable lib suite (493 → 495 with the two
+anchors) and nightly + `simd` lib suite (495 → 497), plus all in-tree
+integration test binaries (encode→decode pixel lockstep, keyframe /
+P-frame roundtrips, inter-stream, two-pass roundtrip, the `ffmpeg_oracle`
+black-box validator), are green on both toolchains. `cargo clippy
+--all-targets -D warnings` is clean on stable.
+
+### Refreshed ranked decoder hotspot map (post r302)
+
+| Rank | Symbol | Note |
+|---|---|---|
+| 1 | `dct_tokens::decode_block_core` | round-283 fused descent; resists a bit-identical change |
+| 2 | `inverse_transform::inverse_dct_4x4_add_into` | r294 DC-only fast path landed |
+| 3 | per-frame reference-slot plane copy (`_platform_memmove`) | the named PROFILE-OPT target — copy-on-write plane representation behind a versioned `RefFrameSlot` change, own round |
+| 4 | `coded_header::parse_token_prob_update` | r291 zipped loop, small fixed floor |
+
+The named whole-frame PROFILE-OPT target remains the per-frame
+reference-slot plane-copy churn (the `_platform_memmove` rank, a
+copy-on-write plane representation gated behind a versioned `RefFrameSlot`
+API change, so it carries its own round).

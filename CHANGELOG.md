@@ -4,6 +4,41 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — collapse the per-frame loop-filter coefficient side-band to a per-MB flag (round 302 profile-opt, 2026-06-14)
+
+Profile round. The §15 loop filter's step-2/4 internal-edge decision
+consults the per-MB coefficients only through `mb_has_coeffs` — a single
+boolean per macroblock ("does this MB carry any non-zero DCT
+coefficient"). The stateful interframe decoder
+(`Vp8DecoderState::decode_frame`) previously held a whole-frame
+`Vec<MbCoeffs>` (≈ 800 bytes / MB) alive solely to feed that one boolean
+reduction after the frame finished decoding, even though each MB's
+coefficients are fully consumed by reconstruction inside the per-MB loop.
+
+The decode loop now computes `mb_has_coeffs` inline — while the
+freshly-decoded `mb_coeffs` is still hot in cache — and stores only a
+`bool` per MB, dispatching to new internal `filter_frame_flags` /
+`filter_inter_frame_flags` cores that take a `&[bool]` "has-coeffs" slice.
+The public `filter_frame` / `filter_inter_frame` signatures are unchanged
+(thin wrappers that collapse `&[MbCoeffs]` to the flag slice). This drops
+the per-frame `Vec<MbCoeffs>` allocation + write/read memory traffic on
+the inter path (the win scales with frame size: the eliminated buffer is
+`800 bytes × mb_count`).
+
+A/B (`--warm-up-time 2 --measurement-time 8`, three interleaved runs each,
+Apple M4-class aarch64): `inter_decode_short_clip/inter_decode_4f_128x128_qi32`
+116.2 / 116.5 / 118.6 µs → 115.5 / 115.1 / 113.5 µs (≈ −1…−3 %, every
+post-run median below baseline). `keyframe_decode` is flat (the keyframe
+path retains the full `Vec<MbCoeffs>` for reconstruction, so no change
+there). Bit-exact: two exhaustive equivalence tests
+(`filter_frame_flags_matches_coeffs` / `filter_inter_frame_flags_matches_coeffs`)
+sweep all 2⁶ per-MB occupancy masks × every Y-mode × simple/normal config
+asserting the flag path equals the coeffs path byte-for-byte; the full
+stable lib suite (495), nightly + `simd` lib suite (497), and all in-tree
+integration tests (encode→decode pixel lockstep, P-frame roundtrips,
+inter-stream, two-pass, `ffmpeg_oracle` black-box validator) pass on both
+toolchains.
+
 ### Added — `ivf_demux_decode_walk` IVF container demux-loop fuzz target (round 301, 2026-06-14)
 
 Fuzz round. New `cargo-fuzz` target (the crate's 25th) exercising the

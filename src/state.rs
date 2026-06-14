@@ -43,7 +43,7 @@ use crate::decoder::{DecodeError, Vp8DecodedFrame};
 use crate::dequant::{decode_and_dequantize_mb, MbDequantFactors};
 use crate::frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
 use crate::frame_header::Vp8FrameHeader;
-use crate::loop_filter::{filter_frame, filter_inter_frame, FrameFilterConfig, MAX_MB_SEGMENTS};
+use crate::loop_filter::{filter_frame, FrameFilterConfig, MAX_MB_SEGMENTS};
 use crate::macroblock::{
     parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
     InterFrameIntraProbs, IntraYMode, MacroblockModes,
@@ -597,7 +597,12 @@ impl Vp8DecoderState {
         // raster-ordered contents, no reallocation, and the dead initial
         // fill (the `__bzero` / `memset` the decode profile flags) is gone.
         let mut modes_out: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
-        let mut coeffs_out: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
+        // The §15 loop filter consumes the per-MB coefficients only through
+        // `mb_has_coeffs` (a single boolean per MB). Compute that flag inline
+        // while the freshly-decoded `mb_coeffs` is hot in cache and store only
+        // the `bool` — avoids holding a whole-frame `Vec<MbCoeffs>`
+        // (≈ 800 bytes / MB) alive just to feed one boolean reduction.
+        let mut has_coeffs_out: Vec<bool> = Vec::with_capacity(mb_rows * mb_cols);
         let mut ref_frames_out: Vec<Option<RefFrame>> = Vec::with_capacity(mb_rows * mb_cols);
         let mut inter_modes_out: Vec<Option<InterMode>> = Vec::with_capacity(mb_rows * mb_cols);
 
@@ -931,7 +936,7 @@ impl Vp8DecoderState {
                     "per-MB outputs pushed in raster order"
                 );
                 modes_out.push(mode_record);
-                coeffs_out.push(mb_coeffs);
+                has_coeffs_out.push(crate::loop_filter::mb_has_coeffs(&mb_coeffs));
                 ref_frames_out.push(filter_ref_frame);
                 inter_modes_out.push(filter_inter_mode);
 
@@ -952,10 +957,10 @@ impl Vp8DecoderState {
         self.ref_lf_deltas = lf_config.ref_deltas();
         self.mode_lf_deltas = lf_config.mode_deltas();
         if lf_config.loop_filter_level != 0 {
-            filter_inter_frame(
+            crate::loop_filter::filter_inter_frame_flags(
                 &mut planes,
                 &modes_out,
-                &coeffs_out,
+                &has_coeffs_out,
                 &ref_frames_out,
                 &inter_modes_out,
                 &lf_config,

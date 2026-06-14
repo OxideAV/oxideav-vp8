@@ -494,6 +494,30 @@ The named next PROFILE-OPT target remains the per-frame reference-slot
 plane-copy churn (`_platform_memmove`, a versioned `RefFrameSlot`
 copy-on-write change, its own round). See `BENCHMARKS.md` round 300.
 
+### Collapse the loop-filter coefficient side-band to a per-MB flag (round 302)
+
+Round 302 removes a second per-frame carry buffer the inter decode path
+held only to feed the §15 loop filter. The loop filter's step-2/4
+internal-edge decision reads the per-MB coefficients exclusively through
+`mb_has_coeffs` — one boolean per macroblock — yet
+`Vp8DecoderState::decode_frame` kept a whole-frame `Vec<MbCoeffs>`
+(≈ 800 bytes / MB) alive past the per-MB decode loop just to compute that
+boolean later, even though each MB's coefficients are fully consumed by
+reconstruction inside the loop. The decode loop now computes
+`mb_has_coeffs` inline (while the bundle is hot in cache, where `any()`
+short-circuits on the first non-zero) and stores only a `bool` per MB,
+dispatching to new internal `filter_frame_flags` / `filter_inter_frame_flags`
+cores that take a `&[bool]`; the public `filter_frame` /
+`filter_inter_frame` signatures are unchanged (thin wrappers). Measured
+**≈ −1…−3 % whole-frame inter decode** with every post run below the
+baseline band (the keyframe path is flat — it retains the full coeff
+vector for reconstruction). Bytes-identical: two exhaustive equivalence
+tests sweep all 2⁶ per-MB occupancy masks × every Y-mode × simple/normal
+config; full lib suite (495 stable / 497 nightly + `simd`) and all
+in-tree integration tests green on both toolchains. The named next
+PROFILE-OPT target remains the reference-slot plane-copy churn (above).
+See `BENCHMARKS.md` round 302.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

@@ -771,6 +771,27 @@ pub fn filter_inter_frame(
     inter_modes: &[Option<crate::near_mv::InterMode>],
     config: &FrameFilterConfig,
 ) {
+    // As in `filter_frame`: the §15.1 step-2/4 rule only needs the per-MB
+    // `mb_has_coeffs` boolean. Collapse the bundles and dispatch to the
+    // flag-driven core; the public `&[MbCoeffs]` signature is preserved.
+    let has_coeffs: Vec<bool> = coeffs.iter().map(mb_has_coeffs).collect();
+    filter_inter_frame_flags(planes, modes, &has_coeffs, ref_frames, inter_modes, config);
+}
+
+/// Flag-driven core of [`filter_inter_frame`] — analogue of
+/// [`filter_frame_flags`]. `has_coeffs[index]` must equal `mb_has_coeffs` of
+/// the MB at raster `index`. Byte-for-byte identical to
+/// [`filter_inter_frame`] (proved by
+/// `tests::filter_inter_frame_flags_matches_coeffs`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_inter_frame_flags(
+    planes: &mut KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    ref_frames: &[Option<crate::motion_comp::RefFrame>],
+    inter_modes: &[Option<crate::near_mv::InterMode>],
+    config: &FrameFilterConfig,
+) {
     let mb_cols = planes.mb_cols;
     let mb_rows = planes.mb_rows;
     if mb_cols == 0 || mb_rows == 0 {
@@ -778,7 +799,7 @@ pub fn filter_inter_frame(
     }
     let expected = mb_cols * mb_rows;
     if modes.len() != expected
-        || coeffs.len() != expected
+        || has_coeffs.len() != expected
         || ref_frames.len() != expected
         || inter_modes.len() != expected
     {
@@ -808,7 +829,7 @@ pub fn filter_inter_frame(
             // §15.1 page 86 filter_subblocks rule mirrors the keyframe
             // pass: B_PRED / SPLITMV (we mapped SPLITMV → y_mode B_PRED
             // in the modes record) OR any coded coefficient.
-            let filter_subblocks = mb.y_mode == IntraYMode::B || mb_has_coeffs(&coeffs[index]);
+            let filter_subblocks = mb.y_mode == IntraYMode::B || has_coeffs[index];
 
             let y_x0 = mb_col * 16;
             let y_y0 = mb_row * 16;
@@ -899,7 +920,7 @@ pub fn filter_inter_frame(
 /// skip flag as coded in the bitstream" — so we examine the
 /// dequantized coefficient bundle directly rather than trusting
 /// `mb_skip_coeff`.
-fn mb_has_coeffs(coeffs: &MbCoeffs) -> bool {
+pub(crate) fn mb_has_coeffs(coeffs: &MbCoeffs) -> bool {
     coeffs.y2.iter().any(|&c| c != 0)
         || coeffs.y.iter().any(|b| b.iter().any(|&c| c != 0))
         || coeffs.u.iter().any(|b| b.iter().any(|&c| c != 0))
@@ -1072,13 +1093,34 @@ pub fn filter_frame(
     coeffs: &[MbCoeffs],
     config: &FrameFilterConfig,
 ) {
+    // The §15.1 step-2/4 skip rule consults only `mb_has_coeffs` per MB, a
+    // single boolean. Collapse the full coefficient bundles to that per-MB
+    // flag and dispatch to the flag-driven body; the public `&[MbCoeffs]`
+    // signature is preserved for callers that still hold the full bundles.
+    let has_coeffs: Vec<bool> = coeffs.iter().map(mb_has_coeffs).collect();
+    filter_frame_flags(planes, modes, &has_coeffs, config);
+}
+
+/// Flag-driven core of [`filter_frame`]: the §15.1 step-2/4 decision needs
+/// only one boolean per macroblock (`mb_has_coeffs`), so the decode loop can
+/// compute that flag while the coefficients are still hot in cache and avoid
+/// materialising a whole-frame `Vec<MbCoeffs>` (≈ 800 bytes / MB) solely to
+/// feed the loop filter. `has_coeffs[index]` must equal `mb_has_coeffs` of the
+/// MB at raster `index`; the result is byte-for-byte identical to
+/// [`filter_frame`] (proved by `tests::filter_frame_flags_matches_coeffs`).
+pub(crate) fn filter_frame_flags(
+    planes: &mut KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    config: &FrameFilterConfig,
+) {
     let mb_cols = planes.mb_cols;
     let mb_rows = planes.mb_rows;
     if mb_cols == 0 || mb_rows == 0 {
         return;
     }
     let expected = mb_cols * mb_rows;
-    if modes.len() != expected || coeffs.len() != expected {
+    if modes.len() != expected || has_coeffs.len() != expected {
         return;
     }
 
@@ -1099,7 +1141,7 @@ pub fn filter_frame(
 
             // §15.1 page 86: steps 2 and 4 run when the MB is B_PRED /
             // SPLITMV (no SPLITMV on key frames) OR has any coded coeff.
-            let filter_subblocks = mb.y_mode == IntraYMode::B || mb_has_coeffs(&coeffs[index]);
+            let filter_subblocks = mb.y_mode == IntraYMode::B || has_coeffs[index];
 
             let y_x0 = mb_col * 16;
             let y_y0 = mb_row * 16;
@@ -1830,6 +1872,135 @@ mod tests {
             p, planes,
             "B_PRED MB must filter internal subblock edges even when skip"
         );
+    }
+
+    /// Build a textured `mb_cols × mb_rows` plane set with a value step at
+    /// every internal subblock edge so steps 2/4 visibly move pixels when
+    /// they run.
+    fn textured_planes(mb_cols: usize, mb_rows: usize) -> KeyframePlanes {
+        let mut p = flat_planes(100, mb_cols, mb_rows);
+        let ys = p.y_stride;
+        for r in 0..mb_rows * 16 {
+            for col in 0..mb_cols * 16 {
+                // Saw-tooth on a 4-pixel period — straddles every 4-pixel
+                // subblock edge and the 16-pixel MB edges.
+                p.y[r * ys + col] = 96 + ((col / 4 + r / 4) % 5) as u8 * 8;
+            }
+        }
+        let cs = p.uv_stride;
+        for r in 0..mb_rows * 8 {
+            for col in 0..mb_cols * 8 {
+                p.u[r * cs + col] = 90 + ((col / 4 + r / 4) % 4) as u8 * 10;
+                p.v[r * cs + col] = 130 - ((col / 4 + r / 4) % 4) as u8 * 10;
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn filter_frame_flags_matches_coeffs() {
+        // The flag-driven `filter_frame_flags` must be byte-for-byte
+        // identical to the public `filter_frame` for every combination of
+        // per-MB coeff occupancy × mode × config (simple/normal).
+        let mb_cols = 3;
+        let mb_rows = 2;
+        let n = mb_cols * mb_rows;
+        let y_modes = [
+            IntraYMode::Dc,
+            IntraYMode::V,
+            IntraYMode::H,
+            IntraYMode::Tm,
+            IntraYMode::B,
+            IntraYMode::Dc,
+        ];
+        for &simple in &[false, true] {
+            let mut c = base_config();
+            c.simple = simple;
+            // Sweep every occupancy bitmask over the n MBs.
+            for mask in 0u32..(1 << n) {
+                let modes: Vec<_> = (0..n).map(|i| mode(y_modes[i], None)).collect();
+                let coeffs: Vec<MbCoeffs> = (0..n)
+                    .map(|i| {
+                        let mut mc = MbCoeffs::default();
+                        if (mask >> i) & 1 == 1 {
+                            // A single non-zero AC coefficient flags coded data.
+                            mc.y[0][1] = 9;
+                        }
+                        mc
+                    })
+                    .collect();
+                let flags: Vec<bool> = coeffs.iter().map(mb_has_coeffs).collect();
+
+                let mut p_coeffs = textured_planes(mb_cols, mb_rows);
+                let mut p_flags = p_coeffs.clone();
+                filter_frame(&mut p_coeffs, &modes, &coeffs, &c);
+                filter_frame_flags(&mut p_flags, &modes, &flags, &c);
+                assert_eq!(
+                    p_coeffs, p_flags,
+                    "filter_frame_flags must match filter_frame (simple={simple}, mask={mask:#b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filter_inter_frame_flags_matches_coeffs() {
+        use crate::motion_comp::RefFrame;
+        use crate::near_mv::InterMode;
+        let mb_cols = 3;
+        let mb_rows = 2;
+        let n = mb_cols * mb_rows;
+        let y_modes = [
+            IntraYMode::Dc,
+            IntraYMode::B, // mapped SPLITMV
+            IntraYMode::V,
+            IntraYMode::Dc,
+            IntraYMode::H,
+            IntraYMode::Tm,
+        ];
+        let refs = [
+            Some(RefFrame::Last),
+            Some(RefFrame::Golden),
+            None,
+            Some(RefFrame::AltRef),
+            Some(RefFrame::Last),
+            None,
+        ];
+        let inter = [
+            Some(InterMode::Zero),
+            Some(InterMode::Split),
+            None,
+            Some(InterMode::New),
+            Some(InterMode::Nearest),
+            None,
+        ];
+        let mut c = base_config();
+        c.key_frame = false;
+        for &simple in &[false, true] {
+            c.simple = simple;
+            for mask in 0u32..(1 << n) {
+                let modes: Vec<_> = (0..n).map(|i| mode(y_modes[i], None)).collect();
+                let coeffs: Vec<MbCoeffs> = (0..n)
+                    .map(|i| {
+                        let mut mc = MbCoeffs::default();
+                        if (mask >> i) & 1 == 1 {
+                            mc.u[0][2] = 5;
+                        }
+                        mc
+                    })
+                    .collect();
+                let flags: Vec<bool> = coeffs.iter().map(mb_has_coeffs).collect();
+
+                let mut p_coeffs = textured_planes(mb_cols, mb_rows);
+                let mut p_flags = p_coeffs.clone();
+                filter_inter_frame(&mut p_coeffs, &modes, &coeffs, &refs, &inter, &c);
+                filter_inter_frame_flags(&mut p_flags, &modes, &flags, &refs, &inter, &c);
+                assert_eq!(
+                    p_coeffs, p_flags,
+                    "filter_inter_frame_flags must match filter_inter_frame (simple={simple}, mask={mask:#b})"
+                );
+            }
+        }
     }
 
     #[test]

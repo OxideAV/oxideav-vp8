@@ -203,3 +203,13 @@ harness = false
 [[bench]]
 name = "intra_predict_b4x4"
 harness = false
+
+# Round 295 — the §7.3 boolean entropy decoder primitive in isolation.
+# `read_bool` / `read_literal` and the batched renormalisation step are
+# the most-invoked decode primitive (every coded bit goes through them),
+# but were only ever measured wrapped inside the token descent + whole-
+# frame decode. Three regimes: skewed (renorm fast path), balanced (renorm
+# worst case), and the L(n) literal accumulator.
+[[bench]]
+name = "bool_decoder_read"
+harness = false

@@ -4,6 +4,24 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `bool_decoder_read` bench: §7.3 boolean entropy primitive in isolation (round 295, 2026-06-14)
+
+New `criterion` bench `bool_decoder_read` isolates the §7.3
+`BoolDecoder::read_bool` / `read_literal` primitive and its batched
+renormalisation step — the most-invoked decode primitive (every coded
+bit flows through it), previously measured only folded inside the §13
+token descent and whole-frame decode. Three regimes, each driven by a
+partition produced by the crate's own §7.3 `BoolEncoder` and decoded
+once at setup with a full bit/byte-equality assertion:
+`read_bool_skewed_64k` (prob 248, renorm fast path), `read_bool_balanced_64k`
+(prob 128 fair coin, renorm worst case), and `read_literal_8b_8k`
+(the §9 / §17 `L(n)` idiom). Measured (Apple M4-class aarch64, criterion
+`--quick`): skewed 151.8 µs / balanced 182.3 µs / literal 152.8 µs — the
+fair-coin regime is **≈ 20 % slower per bool** (≈ 2.78 ns vs ≈ 2.32 ns),
+confirming the renormalisation shift + byte-refill as the dominant
+per-bit cost. Measurement-only: bench harness plus the partitions it
+synthesises, no edit to any decode path. See `BENCHMARKS.md` round 295.
+
 ### Fixed — §14.1 dequant factor-derivation `i32` add overflow + new fuzz target (round 293, 2026-06-14)
 
 New `cargo-fuzz` target `panic_free_dequant_factors_mb` over the §14.1 /

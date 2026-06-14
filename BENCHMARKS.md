@@ -1997,3 +1997,86 @@ Named next PROFILE-OPT target: the per-frame reference-slot plane-copy
 churn (`memmove` family, ≈ 11–14 % of inter decode) — a copy-on-write
 plane representation gated behind a versioned `RefFrameSlot` change, so
 it carries its own round.
+
+## Round 295 — §7.3 boolean entropy decoder primitive in isolation (bench round)
+
+Round 295 (2026-06-14) added `bool_decoder_read`, the first bench to
+isolate the §7.3 `bool_decoder` primitive itself. Every coded bit in a
+VP8 frame — header flags, macroblock modes, motion-vector components,
+and the dominant share, DCT-coefficient tokens — flows through
+`BoolDecoder::read_bool` and its inner batched renormalisation step.
+That primitive was previously measured only folded inside the §13 token
+descent (`token_decode`), §12/§16 prediction, §14 transforms, and the
+§15 loop filter, so the renormalisation batching documented in
+`bool_decoder.rs` (the bit-at-a-time §7.3 loop collapsed into a single
+`range.leading_zeros()`-derived shift with at most one byte-pull per
+read) had no isolated A/B target. A future change to the renorm shape
+would only show up diluted inside the whole-frame numbers.
+
+### The bench
+
+Three regimes that bracket the §7.3 cost, each driven by a partition
+produced by the crate's own §7.3 `BoolEncoder` (the exact inverse of
+the decoder under test) and decoded once at setup with a full
+bit/byte-equality assertion, so the measured loop is always a
+proven-valid bitstream walk:
+
+* `read_bool_skewed_64k` — 65 536 booleans at probability 248
+  (≈ 97 % skew). The interval split rarely needs a doubling, so the
+  renormalisation fast-path (`shift == 0` early return) dominates — the
+  well-modelled regime (a confident coefficient context / skip flag).
+* `read_bool_balanced_64k` — 65 536 booleans at probability 128 (a fair
+  coin). The split lands mid-interval, so nearly every read triggers a
+  one/two-bit renormalisation and frequent byte-refills — the §7.3
+  renorm worst case.
+* `read_literal_8b_8k` — 8 192 `read_literal(8)` calls (65 536
+  flat-probability-128 reads assembled MSB-first), the §9 header / §17
+  MV-magnitude `L(n)` idiom, measuring the `read_literal` accumulator
+  loop on top of `read_bool`.
+
+### Measured (`--quick`, Apple M4-class aarch64, macOS 25.1, rustc 1.95.0 stable)
+
+| Bench | Time | Throughput (bits/s) |
+|---|---:|---:|
+| `bool_decoder_read/read_bool_balanced_64k` | **182.28 µs** | 359.5 Melem/s |
+| `bool_decoder_read/read_literal_8b_8k` | 152.79 µs | 428.9 Melem/s |
+| `bool_decoder_read/read_bool_skewed_64k` | 151.81 µs | 431.7 Melem/s |
+
+### Ranked §7.3 hotspot map
+
+| Rank | Regime | Per-bool cost | What dominates |
+|---|---|---:|---|
+| 1 | balanced (prob 128, fair coin) | ≈ 2.78 ns | renormalisation shift + byte-refill on nearly every read — the §7.3 worst case |
+| 2 | literal `L(n)` (flat 128, skewed bits) | ≈ 2.33 ns | the `read_literal` accumulator loop; per-bool cost tracks the skewed `read_bool` (its bits decode through the renorm fast path) |
+| 3 | skewed (prob 248) | ≈ 2.32 ns | the modelled fast path — `shift == 0` early return on most reads, no byte pull |
+
+The headline finding: the **balanced (fair-coin) regime is ≈ 20 %
+slower per bool** than the skewed/literal regimes (2.78 ns vs ≈ 2.32
+ns). The renormalisation shift and its byte-refill — the part the
+in-tree batching already collapses to a single `leading_zeros()` shift
+— is the dominant per-bit cost, and it scales directly with how often
+the interval split forces a doubling. `read_literal` adds no measurable
+overhead beyond its constituent `read_bool` calls: its 2.33 ns/bit is
+within noise of the skewed `read_bool`'s 2.32 ns/bit, confirming the
+accumulator loop (`v = (v << 1) | bit`) is free relative to the entropy
+read it wraps.
+
+### No behavioural change
+
+This is a measurement-only round: bench harness plus the partitions it
+synthesises, with no edit to any decode path. The renormalisation is
+already collapsed to a single leading-zeros shift, so the profile
+surfaces no obvious byte-identical micro-opt; the value of the bench is
+the isolated A/B target it now provides for any future change to the
+§7.3 read or renorm shape (e.g. a multi-bit batched read, or a
+different byte-refill cadence). The full lib test suite is unchanged
+and green.
+
+### Next-round candidates surfaced
+
+The balanced-regime renorm cost is the actionable §7.3 lever a future
+round could target — but only behind a bit-exact A/B, since the
+primitive is on the critical path of every decode. The named
+whole-frame PROFILE-OPT target remains the per-frame reference-slot
+plane-copy churn (r294's rank-4, ≈ 11–14 % of inter decode, its own
+round).

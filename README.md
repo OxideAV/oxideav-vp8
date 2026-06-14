@@ -419,6 +419,23 @@ decode (`inter_decode_4f_128x128_qi32`, 530 → 616 Mpx/s; four
 non-overlapping A/B pairs); the textured token-heavy 12-frame stream is
 noise-bounded at −0.4 %. See `BENCHMARKS.md` round 294.
 
+Round 295 adds `bool_decoder_read`, the first bench to isolate the §7.3
+boolean entropy decoder primitive itself — `BoolDecoder::read_bool` /
+`read_literal` and the batched renormalisation step, the most-invoked
+decode primitive (every coded bit flows through it), previously measured
+only folded inside the §13 token descent and whole-frame decode. Three
+regimes, each driven by a partition produced by the crate's own §7.3
+`BoolEncoder` and decoded once at setup with a full bit/byte-equality
+assertion: `read_bool_skewed_64k` (prob 248, renorm fast path) 151.8 µs,
+`read_bool_balanced_64k` (prob 128 fair coin, renorm worst case) 182.3 µs,
+and `read_literal_8b_8k` (the §9 / §17 `L(n)` idiom) 152.8 µs. Headline
+finding: the fair-coin regime is **≈ 20 % slower per bool** (≈ 2.78 ns vs
+≈ 2.32 ns), so the renormalisation shift + byte-refill is the dominant
+per-bit cost; `read_literal` adds no measurable overhead beyond its
+constituent `read_bool` calls. Measurement-only — no decode-path change,
+the full lib suite is unchanged. A/B bench: `cargo bench -p oxideav-vp8
+--bench bool_decoder_read`. See `BENCHMARKS.md` round 295.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

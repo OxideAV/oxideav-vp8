@@ -1,5 +1,4 @@
-//! Cross-validation of the VP8 codec against `ffmpeg` as a black-box
-//! oracle.
+//! Cross-validation of the VP8 codec as a black-box codec oracle (decoder invoked opaquely).
 //!
 //! The crate's existing `tests/encoder_external_decode.rs` only pipes
 //! the Phase-1 silent keyframe (`encode_silent_keyframe`) through

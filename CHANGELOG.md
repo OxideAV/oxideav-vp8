@@ -89,7 +89,7 @@ sweep all 2⁶ per-MB occupancy masks × every Y-mode × simple/normal config
 asserting the flag path equals the coeffs path byte-for-byte; the full
 stable lib suite (495), nightly + `simd` lib suite (497), and all in-tree
 integration tests (encode→decode pixel lockstep, P-frame roundtrips,
-inter-stream, two-pass, `ffmpeg_oracle` black-box validator) pass on both
+inter-stream, two-pass, `blackbox_oracle` black-box validator) pass on both
 toolchains.
 
 ### Added — `ivf_demux_decode_walk` IVF container demux-loop fuzz target (round 301, 2026-06-14)
@@ -310,7 +310,7 @@ test (mixed `Some`/`None` payload exercising the `L(8)` literal branch
 across all four planes, byte-equal + same-stream-position against a
 verbatim copy of the pre-291 4-level-indexed loop) plus the full lib
 suite (491 stable / 493 nightly+`simd`), every roundtrip/decode
-integration binary (37), and the `ffmpeg_oracle` validator. Measured
+integration binary (37), and the `blackbox_oracle` validator. Measured
 **−10.6 %** (`parse_no_updates`, the common no-update frame) / **−15.7 %**
 (`parse_sparse_updates`) on the new `token_prob_update` micro-bench
 (criterion p < 0.05, same-session A/B). See `BENCHMARKS.md` §"Round 291".
@@ -1749,7 +1749,7 @@ The reference-plane allocation stays under 2 KiB; everything else
 (9×9 halo, 4×4 output, the `temp` buffer inside `sixtap_2d`) is
 stack-allocated. The harness is panic-freedom-only; output
 equivalence against the reference decoder remains the responsibility
-of the `tests/ffmpeg_oracle.rs` round-trip suite.
+of the `tests/blackbox_oracle.rs` round-trip suite.
 
 ### Added — `panic_free_motion_search_descent` fuzz target covering the §17.1 / §18.3 luma MV picker (round 256, 2026-06-08)
 
@@ -2600,7 +2600,7 @@ criterion macro-benches under `cargo bench -p oxideav-vp8 -- --quick`.
 - round 170: criterion benches + sample-profile-driven optimisations + real simd feature
 - remove remaining libwebp-style mentions from src/encoder.rs + tests/public_quality_mapping.rs
 - scrub libwebp-style → WebP-canonical naming
-- add standalone-API + ffmpeg-oracle end-to-end interop suites
+- add standalone-API + blackbox-oracle end-to-end interop suites
 - replace hand-waved imports with real working API examples
 - rewrite as production-ready overview, drop per-round chronology
 - encoder TwoPass r168: real two-pass rate control replaces Tier-3 stub
@@ -2682,7 +2682,7 @@ Two new test files extend the crate's interop coverage:
   under both `--no-default-features` and the default-features build —
   every imported symbol resolves without the `registry` feature.
 
-* **`tests/ffmpeg_oracle.rs`** — 4 tests that cross-validate against
+* **`tests/blackbox_oracle.rs`** — 4 tests that cross-validate against
   `ffmpeg` as a black-box oracle. Direction A drives the real
   `encode_keyframe` (the §11 + §13 + §14 RD encoder, not the Phase-1
   silent path that `encoder_external_decode.rs` already covers) →

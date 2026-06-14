@@ -387,7 +387,7 @@ entry-slot population × every refresh-control combination, asserting
 byte-equality against the prior clone-everything ladder) plus the full
 roundtrip/oracle suite (490 stable / 492 nightly+simd lib tests, the
 `i_frame_then_p_frame` / `golden_update_cycle` / `altref_arnr` bit-exact
-decode tests, and the `ffmpeg_oracle` black-box validator). Measured
+decode tests, and the `blackbox_oracle` black-box validator). Measured
 **−9.3 %** (refresh-last) / **−10.6 %** (golden+altref cadence)
 whole-stream on the round-288 `ref_slot_rotation/decode_1k8p_*` benches
 (363 → 404 and 352 → 403 Melem/s; criterion p < 0.05, same-session A/B).
@@ -411,7 +411,7 @@ probabilities. Anchored by `parse_token_prob_update_matches_indexed_reference`
 all four planes, byte-equal + same-stream-position against a verbatim copy
 of the pre-291 4-level-indexed loop) plus the full lib suite (491 stable /
 493 nightly+simd), all 37 roundtrip/decode integration binaries, and the
-`ffmpeg_oracle` validator — decoded bytes unchanged across the corpus.
+`blackbox_oracle` validator — decoded bytes unchanged across the corpus.
 Measured **−10.6 %** (`parse_no_updates`, the common no-update frame) /
 **−15.7 %** (`parse_sparse_updates`) on the new `token_prob_update`
 micro-bench (criterion p < 0.05, same-session A/B). A/B bench:
@@ -587,7 +587,7 @@ unit tests:
   end-to-end checks against the `default-features = false` standalone
   surface. Every imported symbol must resolve without the `registry`
   feature; passes under both feature configurations.
-* [`tests/ffmpeg_oracle.rs`](./tests/ffmpeg_oracle.rs) — bidirectional
+* [`tests/blackbox_oracle.rs`](./tests/blackbox_oracle.rs) — bidirectional
   cross-validation against `ffmpeg` as a black-box oracle. Direction A
   is *our encode → ffmpeg decode* (PSNR-Y ≥ 30 dB on the recovered
   picture); direction B is *ffmpeg encode → our decode* via the

@@ -1706,7 +1706,7 @@ destination, `==` against the verbatim pre-289 clone-everything ladder),
 plus the full stable lib suite (490) and nightly + `simd` lib suite (492),
 the `i_frame_then_p_frame_64x64` / `golden_update_cycle` / `altref_arnr`
 bit-exact decode tests, every in-tree decode/roundtrip integration test
-(37 green binaries), and the `ffmpeg_oracle` black-box validator.
+(37 green binaries), and the `blackbox_oracle` black-box validator.
 
 Next profile-opt target stays the round-288 runner-up: the §13.4
 `parse_token_prob_update` per-frame flag-read loop (decoder rank 5, ≈ 5 %).
@@ -1789,7 +1789,7 @@ production parser and a verbatim copy of the pre-291 4-level-indexed
 reference loop, asserting equal payloads *and* equal remaining-input
 stream positions), plus the full stable lib suite (491) and nightly +
 `simd` lib suite (493), every in-tree decode/roundtrip integration test
-(37 green binaries), and the `ffmpeg_oracle` black-box validator —
+(37 green binaries), and the `blackbox_oracle` black-box validator —
 decoded bytes unchanged across the entire corpus.
 
 Next profile-opt target: the round-288 deeper follow-on — a copy-on-write
@@ -1912,7 +1912,7 @@ registration + this document. No `src/` or `tests/` edits, so every
 decode path is byte-for-byte the pre-292 path by construction. The new
 bench synthesises its own inputs in-bench (no fixture files). The full
 stable lib suite (491) and nightly + `simd` lib suite (493), the in-tree
-decode/roundtrip integration tests, and the `ffmpeg_oracle` black-box
+decode/roundtrip integration tests, and the `blackbox_oracle` black-box
 validator are unchanged and green.
 
 ## Round 294 — §14.4 DC-only IDCT-add fast path (profile-opt round)
@@ -2247,7 +2247,7 @@ bit-for-bit what the indexed-write path produced (same values, same
 raster order). The full stable lib suite (493) and nightly + `simd` lib
 suite (495), plus all 37 in-tree integration test binaries (encode→
 decode pixel lockstep, keyframe/P-frame roundtrips, inter-stream,
-two-pass roundtrip, the `ffmpeg_oracle` black-box validator), are green
+two-pass roundtrip, the `blackbox_oracle` black-box validator), are green
 on both toolchains. `cargo clippy --all-targets -D warnings` is clean on
 stable and nightly + `simd`.
 
@@ -2317,7 +2317,7 @@ on a textured multi-MB plane set and assert the two paths produce
 identical planes. The full stable lib suite (493 → 495 with the two
 anchors) and nightly + `simd` lib suite (495 → 497), plus all in-tree
 integration test binaries (encode→decode pixel lockstep, keyframe /
-P-frame roundtrips, inter-stream, two-pass roundtrip, the `ffmpeg_oracle`
+P-frame roundtrips, inter-stream, two-pass roundtrip, the `blackbox_oracle`
 black-box validator), are green on both toolchains. `cargo clippy
 --all-targets -D warnings` is clean on stable.
 
@@ -2388,7 +2388,7 @@ Pure copy-shape refactor of the output emit; decoded planes are byte-for-byte
 what the strided loop produced. Stable lib suite 496 (+1), nightly + `simd`
 lib suite 498 (+1), all in-tree integration test binaries (encode→decode
 pixel lockstep, keyframe / P-frame roundtrips, inter-stream, two-pass
-roundtrip, the `ffmpeg_oracle` black-box validator) green on both toolchains.
+roundtrip, the `blackbox_oracle` black-box validator) green on both toolchains.
 `cargo clippy --all-targets --no-deps -- -D warnings` clean on stable and
 nightly + `simd`.
 

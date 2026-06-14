@@ -402,8 +402,12 @@ fn decode_residuals(
     let num_partitions = partitions.len();
     debug_assert!(num_partitions >= 1);
 
+    // §13: every macroblock is decoded exactly once, in raster order
+    // (`mb_row` outer, `mb_col` inner), and its coefficients appended.
+    // Reserve the frame's slots and `push` per MB rather than `resize`-ing
+    // to `default()` first: each slot is overwritten before it is read, so
+    // the bulk default-zeroing (800 bytes per `MbCoeffs`) was dead work.
     let mut coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
-    coeffs.resize(mb_rows * mb_cols, MbCoeffs::default());
 
     // One above-context per macroblock column, lives for the whole frame.
     let mut above: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
@@ -465,7 +469,8 @@ fn decode_residuals(
                 index: raster,
                 source,
             })?;
-            coeffs[raster] = mb_coeffs;
+            debug_assert_eq!(coeffs.len(), raster, "coeffs pushed in raster order");
+            coeffs.push(mb_coeffs);
         }
     }
 

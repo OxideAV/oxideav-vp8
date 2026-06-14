@@ -4,6 +4,28 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — drop dead per-frame coefficient/side-band default-fill (round 300, 2026-06-14)
+
+Profile-opt round. A `sample(1)` decode profile flagged a `__bzero` /
+`memset` cluster (≈ 5 % of self-time) as a doubly-wasted per-frame
+default-fill: both the §13 residual decode (`decoder::decode_residuals`,
+`state::decode_intra_residuals`) and the §16 interframe driver
+(`Vp8DecoderState::decode_frame`) built their per-MB output vectors with
+`vec![default(); mb_count]` (or `with_capacity` + `resize(default())`)
+and then overwrote **every** slot via an indexed write inside the
+raster-order decode loop — so the bulk default-fill (800 bytes × every
+MB on the `Vec<MbCoeffs>` lane, plus a `sentinel_mode` clone per
+`modes_out` slot on the inter path) was never read. Replaced with
+`Vec::with_capacity` + in-loop `push`; decode is exactly raster-ordered
+(`raster = mb_row*mb_cols + mb_col`) so the vector contents are
+bit-for-bit identical with the capacity reserved up front. Measured
+≈ −3 % whole-frame inter decode and ≈ −2 % keyframe decode (every post
+run below every pre run, interleaved A/B, nightly + `simd`,
+Apple M4-class aarch64). Bytes-identical: full lib suite (493 stable /
+495 nightly + `simd`) and all 37 integration test binaries green on both
+toolchains; `cargo clippy --all-targets -D warnings` clean on both. See
+`BENCHMARKS.md` round 300.
+
 ### Added — `inter_stream_encode_decode_sequence` multi-frame stream fuzz target (round 299, 2026-06-14)
 
 New `cargo-fuzz` target (the 24th) covering the previously-unfuzzed

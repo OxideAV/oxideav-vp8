@@ -585,19 +585,21 @@ impl Vp8DecoderState {
         let mut above_mb: Vec<MbInfo> = vec![MbInfo::border(); mb_cols];
 
         // Per-MB recorded mode + coeffs for the §15 loop-filter pass.
-        // Sentinel mode record used to pre-fill `modes_out`; the per-MB
-        // loop overwrites each slot before the loop-filter pass reads it.
-        let sentinel_mode = MacroblockModes {
-            segment_id: None,
-            mb_skip_coeff: true,
-            y_mode: IntraYMode::Dc,
-            subblock_modes: None,
-            uv_mode: crate::macroblock::IntraUvMode::Dc,
-        };
-        let mut modes_out: Vec<MacroblockModes> = vec![sentinel_mode; mb_rows * mb_cols];
-        let mut coeffs_out: Vec<MbCoeffs> = vec![MbCoeffs::default(); mb_rows * mb_cols];
-        let mut ref_frames_out: Vec<Option<RefFrame>> = vec![None; mb_rows * mb_cols];
-        let mut inter_modes_out: Vec<Option<InterMode>> = vec![None; mb_rows * mb_cols];
+        // §16 interframe per-MB outputs. Every macroblock is decoded
+        // exactly once, in raster order (`mb_row` outer, `mb_col` inner),
+        // and its four side-band records are written together at the end of
+        // the iteration before anything reads them back (the §15 loop filter
+        // consumes them only after the whole frame is decoded). The previous
+        // `vec![default(); N]` + indexed assignment paid a full-frame bulk
+        // default-fill (the `MbCoeffs` lane alone is 800 bytes per MB) plus a
+        // `sentinel_mode` clone for every `modes_out` slot, all immediately
+        // overwritten. Reserve the slots and `push` instead: identical
+        // raster-ordered contents, no reallocation, and the dead initial
+        // fill (the `__bzero` / `memset` the decode profile flags) is gone.
+        let mut modes_out: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
+        let mut coeffs_out: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
+        let mut ref_frames_out: Vec<Option<RefFrame>> = Vec::with_capacity(mb_rows * mb_cols);
+        let mut inter_modes_out: Vec<Option<InterMode>> = Vec::with_capacity(mb_rows * mb_cols);
 
         // DCT-partition bool decoders, lazily initialised per the §20.4
         // round-robin row-striping rule (matches the keyframe path).
@@ -923,10 +925,15 @@ impl Vp8DecoderState {
                 // Write the reconstructed MB into the frame buffers.
                 crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
 
-                modes_out[raster] = mode_record;
-                coeffs_out[raster] = mb_coeffs;
-                ref_frames_out[raster] = filter_ref_frame;
-                inter_modes_out[raster] = filter_inter_mode;
+                debug_assert_eq!(
+                    modes_out.len(),
+                    raster,
+                    "per-MB outputs pushed in raster order"
+                );
+                modes_out.push(mode_record);
+                coeffs_out.push(mb_coeffs);
+                ref_frames_out.push(filter_ref_frame);
+                inter_modes_out.push(filter_inter_mode);
 
                 // Advance neighbour records.
                 aboveleft_mb = above_mb[mb_col];
@@ -1107,7 +1114,15 @@ fn decode_intra_residuals(
     let num_partitions = partitions.len();
     debug_assert!(num_partitions >= 1);
 
-    let mut coeffs: Vec<MbCoeffs> = vec![MbCoeffs::default(); mb_rows * mb_cols];
+    // §13: each macroblock's coefficients are decoded exactly once, in
+    // raster order (`mb_row` outer, `mb_col` inner), and appended. Reserve
+    // the full frame's worth of slots up front and `push` each MB's coeffs
+    // as it is decoded, rather than `vec![default(); N]` + indexed write:
+    // every slot is overwritten before it is read, so the bulk
+    // default-zeroing of the whole `Vec<MbCoeffs>` (800 bytes per MB) is
+    // dead work. `push` after `with_capacity` reproduces the identical
+    // raster-ordered contents with no reallocation and no wasted memset.
+    let mut coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
     let mut above: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
 
     let mut partition_decoders: Vec<Option<BoolDecoder<'_>>> =
@@ -1150,7 +1165,8 @@ fn decode_intra_residuals(
                 index: raster,
                 source,
             })?;
-            coeffs[raster] = mb_coeffs;
+            debug_assert_eq!(coeffs.len(), raster, "coeffs pushed in raster order");
+            coeffs.push(mb_coeffs);
         }
     }
 

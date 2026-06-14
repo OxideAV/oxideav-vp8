@@ -476,6 +476,24 @@ maps onto. Measurement-only — no decode/encode-path change, the full lib
 suite is unchanged. A/B bench: `cargo bench -p oxideav-vp8 --bench
 dequantize_mb`. See `BENCHMARKS.md` round 298.
 
+Round 300 drops a **dead per-frame buffer default-fill** the decode
+profile flagged as ≈ 5 % of self-time (`__bzero` / `memset` cluster).
+Both the §13 residual decode and the §16 interframe driver built their
+per-MB output vectors with `vec![default(); mb_count]` (or `resize` to
+default) and then overwrote **every** slot via an indexed write inside
+the raster-order decode loop — so the bulk default-fill (800 bytes ×
+every MB on the `Vec<MbCoeffs>` lane alone, plus a per-slot
+`sentinel_mode` clone on the inter path) was never read. Replacing the
+pattern with `Vec::with_capacity` + in-loop `push` (decode is exactly
+raster-ordered, so contents are bit-for-bit identical, capacity reserved,
+no reallocation) removes the fill. Measured **≈ −3 % whole-frame inter
+decode** and **≈ −2 % keyframe decode** with every post run below every
+pre run. Bytes-identical: full lib suite (493 stable / 495 nightly +
+`simd`) and all 37 integration test binaries green on both toolchains.
+The named next PROFILE-OPT target remains the per-frame reference-slot
+plane-copy churn (`_platform_memmove`, a versioned `RefFrameSlot`
+copy-on-write change, its own round). See `BENCHMARKS.md` round 300.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

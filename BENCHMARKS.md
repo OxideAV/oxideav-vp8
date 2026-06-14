@@ -2174,3 +2174,93 @@ could amortise the block walk, but only behind a bit-exact A/B since
 the layer is on every decoded macroblock. The named whole-frame
 PROFILE-OPT target remains the per-frame reference-slot plane-copy churn
 (r294's rank-4, ≈ 11–14 % of inter decode, its own round).
+
+## Round 300 — drop the dead per-frame coefficient/side-band default-fill (profile-opt round)
+
+Round 300 (2026-06-14) re-profiled the decode hot paths and took the
+clearest non-API-gated lever the §13 → §15 frame-decode flow surfaced.
+
+### Profile evidence
+
+A fresh `sample(1)` PID-attach profile of `inter_decode_short_clip`
+(12 s @ 1 ms, nightly + `simd`), top-of-stack self-time samples:
+
+| Symbol | Samples | Note |
+|---|---:|---|
+| `dct_tokens::decode_block_core` | 2899 | round-283 fused descent; resists a bit-identical change |
+| `inverse_transform::inverse_dct_4x4_add_into` | 1095 | r294 DC-only fast path already landed |
+| `_platform_memmove` | 988 | the named ref-slot plane-copy churn (API-gated, own round) |
+| `coded_header::parse_token_prob_update` | 748 | r291 zipped loop, small fixed floor |
+| **`__bzero` + `_platform_memset`** | **274 + 231 = 505** | **this round's target — buffer default-fills** |
+
+The `__bzero` / `memset` cluster (≈ 5 % of decode self-time) traced to a
+**doubly-wasted** per-frame default-fill. Both the §13 residual decode
+(`decoder::decode_residuals`, `state::decode_intra_residuals`) and the
+§16 interframe driver (`Vp8DecoderState::decode_frame`) built their
+per-MB output vectors with `vec![default(); mb_rows*mb_cols]` (or a
+`with_capacity` + `resize(default())`) and then **overwrote every slot**
+via an indexed write inside the raster-order decode loop. The bulk
+default-fill — for the `Vec<MbCoeffs>` lane that is 800 bytes × every MB,
+plus a `sentinel_mode` clone per `modes_out` slot on the inter path —
+is pure dead work: not one default-initialised slot is ever read (the
+§15 loop filter consumes the vectors only after the whole frame is
+decoded and every slot has been written).
+
+### The change
+
+Replace `vec![default(); N]` / `with_capacity` + `resize` with
+`Vec::with_capacity(N)` followed by `push` inside the decode loop, in all
+three sites:
+
+* `decoder::decode_residuals` — keyframe `Vec<MbCoeffs>` (stateless path);
+* `state::decode_intra_residuals` — keyframe `Vec<MbCoeffs>` (stateful
+  `Vp8DecoderState` path);
+* `Vp8DecoderState::decode_frame` — the four interframe side-band vectors
+  (`modes_out`, `coeffs_out`, `ref_frames_out`, `inter_modes_out`), and
+  the now-unused `sentinel_mode` constant is removed.
+
+Every MB is decoded exactly once in raster order (`mb_row` outer,
+`mb_col` inner, `raster = mb_row*mb_cols + mb_col`), so the `push`
+sequence reproduces the **identical** vector contents the indexed write
+produced, with the capacity reserved up front (no reallocation). A
+`debug_assert_eq!(vec.len(), raster, …)` at each push site pins the
+ordering invariant. On any decode error the `?` propagates and the
+partially-filled vectors are simply dropped, exactly as before.
+
+### Measured A/B (`--warm-up-time 2 --measurement-time 8`, three interleaved pre/post runs each, Apple M4-class aarch64, nightly + `simd`)
+
+| Bench | Pre (run medians) | Post (run medians) | Δ |
+|---|---:|---:|---:|
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` | 109.2 / 113.2 / 108.9 µs | 105.9 / 106.3 / 106.3 µs | **≈ −3 %** |
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 118.3 / 109.5 / 108.7 µs | 106.8 / 107.1 / 106.7 µs | **≈ −2 %** |
+
+Every post run sits below every pre run on both benches — the
+improvement is outside the measurement envelope. The win is the removed
+bulk frame-init memset (the `__bzero` / `memset` cluster the profile
+flagged); it grows with frame size (the fill is `O(mb_count)` and was
+`800 bytes`-per-MB on the coeff lane alone).
+
+### Bytes-identical
+
+Pure allocation-shape refactor: the decoded vector contents are
+bit-for-bit what the indexed-write path produced (same values, same
+raster order). The full stable lib suite (493) and nightly + `simd` lib
+suite (495), plus all 37 in-tree integration test binaries (encode→
+decode pixel lockstep, keyframe/P-frame roundtrips, inter-stream,
+two-pass roundtrip, the `ffmpeg_oracle` black-box validator), are green
+on both toolchains. `cargo clippy --all-targets -D warnings` is clean on
+stable and nightly + `simd`.
+
+### Refreshed ranked decoder hotspot map (post r300)
+
+| Rank | Symbol | Note |
+|---|---|---|
+| 1 | `dct_tokens::decode_block_core` | round-283 fused descent; resists a bit-identical change |
+| 2 | `inverse_transform::inverse_dct_4x4_add_into` | r294 DC-only fast path landed |
+| 3 | per-frame reference-slot plane copy (`_platform_memmove`) | the named PROFILE-OPT target — copy-on-write plane representation behind a versioned `RefFrameSlot` change, own round |
+| 4 | `coded_header::parse_token_prob_update` | r291 zipped loop, small fixed floor |
+
+The named whole-frame PROFILE-OPT target remains the per-frame
+reference-slot plane-copy churn (the `_platform_memmove` rank, a
+copy-on-write plane representation gated behind a versioned
+`RefFrameSlot` API change, so it carries its own round).

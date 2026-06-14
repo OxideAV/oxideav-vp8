@@ -684,3 +684,9 @@ name = "decoder_trait_packet_lifecycle"
 path = "fuzz_targets/decoder_trait_packet_lifecycle.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "inter_stream_encode_decode_sequence"
+path = "fuzz_targets/inter_stream_encode_decode_sequence.rs"
+test = false
+doc = false

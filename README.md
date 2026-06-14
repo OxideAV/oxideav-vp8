@@ -531,7 +531,7 @@ unit tests:
 
 ## Fuzz harnesses
 
-The crate ships twenty-three `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
+The crate ships twenty-four `cargo-fuzz` targets under [`fuzz/`](./fuzz/)
 that exercise the public encode and decode surface for panic-freedom
 (plus, where a target carries an equivalence leg, byte-exact agreement
 between the paired surfaces):
@@ -990,6 +990,29 @@ between the paired surfaces):
   campaign (nightly, default `simd`): ~500 000 executions across two
   runs (cov 3934 / ft 18688, 2629-input corpus from the 13 fixture
   seeds), zero crashes / leaks / OOMs; no `src/` change was needed.
+* `inter_stream_encode_decode_sequence` — the multi-frame
+  `Vp8InterStreamEncoder` driver, landed in round 299. Every other
+  encode target stops at a *single* key frame (`encode_keyframe`,
+  `encode_keyframe_with_reconstruction*`), leaving the cross-frame
+  stream layer — the §9.7 reference-refresh ladder (a key frame
+  replaces all three slots, a ZERO_MV P-frame refreshes LAST only),
+  the keyframe-interval scheduler with its `force_keyframe`
+  re-anchoring, the across-frame §9.4 `ref_frame_delta[]` /
+  `mode_delta[]` carry, and the locked-after-first-frame dimension
+  guard — never driven by a fuzzer. The harness pushes a fuzz-shaped
+  sequence of up to 12 small (≤ 48 × 48) I420 frames at a fuzz-chosen
+  keyframe interval (with per-frame `force_keyframe` overrides) through
+  one encoder and feeds each emitted frame into one long-lived
+  `Vp8DecoderState`, so the decoder carries its own §9 reference slots
+  forward and reconstructs the ZERO_MV P-frames from the LAST it kept —
+  the §16.2 / §18 inter-prediction path no single-frame target reaches.
+  Every parameter is normalised in-range, so an encode `Err`, a decode
+  `Err`, a K/P-classification drift against the scheduler's own verdict,
+  or a visible-dimension drift is itself a finding; decoded plane
+  lengths are asserted against the §9.1 geometry. Round-299 ASan
+  campaign (nightly, default `simd`): ~29 000 executions across two
+  runs (cov 4831 / ft 24338, 897-input corpus from empty seed), zero
+  crashes / leaks / OOMs; no `src/` change was needed.
 
 Initial smoke pass: 800 000 combined iterations on the three decode
 targets + 17 500+ iterations on the encode target (2790 coverage edges,

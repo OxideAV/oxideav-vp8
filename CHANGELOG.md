@@ -4,6 +4,29 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `inter_stream_encode_decode_sequence` multi-frame stream fuzz target (round 299, 2026-06-14)
+
+New `cargo-fuzz` target (the 24th) covering the previously-unfuzzed
+cross-frame stream layer: `Vp8InterStreamEncoder` driven across a
+fuzz-shaped sequence of up to 12 small (≤ 48 × 48) I420 frames at a
+fuzz-chosen keyframe interval with per-frame `force_keyframe`
+overrides, each emitted frame fed into one long-lived
+`Vp8DecoderState`. This is the first fuzz path to reach the §9.7
+reference-refresh ladder across frames, the keyframe scheduler /
+`force_keyframe` re-anchoring, the §9.4 `ref_frame_delta[]` /
+`mode_delta[]` carry, the locked dimension guard, and the §16.2 / §18
+ZERO_MV inter-prediction decode path (every prior encode target stops
+at a single key frame). Oracles beyond panic-freedom: encode must not
+reject an in-range frame, the stateful decoder must accept the
+encoder's own output, the emitted K/P classification must match the
+scheduler's pre-encode verdict (or be Key when forced), and decoded
+visible dimensions + plane lengths must match the §9.1 geometry.
+Round-299 ASan campaign (nightly, default `simd`): ~29 000 executions
+(cov 4831 / ft 24338, 897-input corpus from empty seed), zero crashes /
+leaks / OOMs. No `src/` change was needed — the panic-free decode
+invariant held across the new surface. Test counts unchanged (fuzz-only
+change).
+
 ### Added — `dequantize_mb` §14.1 dequantization micro-bench (round 298, 2026-06-14)
 
 New criterion bench `dequantize_mb` (the 22nd) isolating the §14.1

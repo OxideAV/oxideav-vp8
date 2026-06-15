@@ -2480,3 +2480,58 @@ loop is a proven-valid bitstream walk.
 `cargo fmt --check` and `cargo clippy --all-targets --no-deps -- -D
 warnings` clean. No risky change was forced; the CoW reference-slot target
 remains deferred to its own round.
+
+## Round 308 — shipped vs clone-everything A/B for the §9 slot rotation (profile-opt round)
+
+Round 308 (2026-06-15) closed a measurement gap the prior `ref_slot_rotation`
+harness left. The round-288 bench measured only a **clone-everything**
+stand-in (`rotate_*` rows): a local `rotate()` helper that clones all three
+entry slots plus the current reconstruction, reporting ~12–13 µs/frame as the
+"slot copy cost" and naming copy-on-write as the next target sized against
+that number. That stand-in over-states the cost: the shipped
+`rotate_reference_slots` (r289) is a move-based **minimal-copy** rotation —
+it moves each owned source into the last destination that selects it and
+clones only a genuinely multi-fed source, so on the common refresh-last path
+it performs **zero** plane clones.
+
+This round exposes the shipped rotation to the bench via a `#[doc(hidden)]`
+pass-through shim `bench_rotate_reference_slots` (no logic change to the
+private rotation) and adds three `shipped_*` rows under the same three flag
+combinations as the clone-everything rows.
+
+### A/B (320×240 = 20×15 MB, criterion median, macOS aarch64)
+
+| flags               | `rotate_*` (clone-all) | `shipped_*` (4 input clones) | Δ     |
+| ------------------- | ---------------------- | ---------------------------- | ----- |
+| `refresh_last_only` | 13.19 µs               | 8.71 µs                      | −34 % |
+| `refresh_all`       | 16.21 µs               | 14.31 µs                     | −12 % |
+| `copy_gf_arf`       | 17.20 µs               | 8.40 µs                      | −51 % |
+
+### Interpreting the floor
+
+The `shipped_*` rows are **not** zero because the bench clones the current
+reconstruction plus the three entry slots into owned arguments each iteration
+(the shim consumes by value). `decode_frame` does not pay those four clones —
+it passes `self.{last,golden,altref}.take()`, already-owned values it moves —
+so the decoder's true per-frame rotation cost is *below* the `shipped_*`
+floor. The residual genuine copy work the shipped path still performs:
+
+* `refresh_all` clones the current reconstruction twice (one source → three
+  destinations), hence its smaller Δ.
+* `copy_gf_arf` clones one pre-rotation slot once (LAST feeds both new-LAST
+  and new-GOLDEN), the GOLDEN source moving into ALTREF — far below the six
+  clones the stand-in pays.
+* The key-frame init (not in this micro) clones twice (one reconstruction →
+  three slots).
+
+Only a copy-on-write (`Rc`/`Arc`-backed) slot representation can remove the
+`refresh_all` / `copy_gf_arf` / key-frame clones; the move-based rotation
+already removes the common refresh-last-path clones. The standing
+copy-on-write profile-opt target should be sized against the `shipped_*`
+floor (and below, given the input-clone caveat), **not** the `rotate_*`
+ceiling — the headroom is materially smaller than the round-288 numbers
+suggested.
+
+`cargo fmt --check` and `cargo clippy --all-targets --no-deps -- -D warnings`
+clean; 498 lib tests pass. No decoder/encoder logic change; no risky change
+forced.

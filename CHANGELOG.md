@@ -4,6 +4,42 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — shipped vs clone-everything A/B for the §9 slot rotation in `ref_slot_rotation` (round 308 profile, 2026-06-15)
+
+Profile round. No decoder/encoder logic change — a bench-measurement
+correction. The round-288 `ref_slot_rotation` harness measured only a
+*clone-everything* stand-in (`rotate_*` rows, six populated `Vec` clones
+per frame) and reported ~12–13 µs/frame as the "slot copy cost", naming
+copy-on-write as the next profile-opt target sized against that number.
+But the shipped `rotate_reference_slots` is already a move-based
+*minimal-copy* rotation: it moves each owned source into the last
+destination that selects it and clones only a genuinely multi-fed source,
+so on the common refresh-last path it performs **zero** plane clones.
+
+This round adds a `#[doc(hidden)]` measurement shim
+`bench_rotate_reference_slots` (a thin pass-through to the unchanged
+private rotation) and three `shipped_*` bench rows that drive the shipped
+rotation under the same three flag combinations as the existing
+clone-everything rows. The A/B (320×240, criterion median):
+
+| flags             | clone-everything | shipped (4 input clones) | Δ     |
+| ----------------- | ---------------- | ------------------------ | ----- |
+| `refresh_last_only` | 13.19 µs        | 8.71 µs                  | −34 % |
+| `refresh_all`       | 16.21 µs        | 14.31 µs                 | −12 % |
+| `copy_gf_arf`       | 17.20 µs        | 8.40 µs                  | −51 % |
+
+The residual `shipped_*` cost is dominated by the four by-value input
+clones the bench performs to set up owned arguments each iteration —
+which `decode_frame` does **not** pay (it hands the rotation
+`self.{last,golden,altref}.take()`, already-owned values it moves). The
+genuine remaining copy work is the §16 cross-slot-copy shape (one
+pre-rotation slot feeding two destinations → one clone) and the key-frame
+init (one reconstruction → three slots → two clones), which only a
+copy-on-write (`Rc`/`Arc`-backed) slot representation can remove; the
+move-based rotation already removes the common-path clones. The standing
+copy-on-write profile-opt target should be sized against the `shipped_*`
+floor, not the `rotate_*` ceiling. See `BENCHMARKS.md` §"Round 308".
+
 ### Added — `panic_free_kf_mb_mode_decode` fuzz target: §11 key-frame macroblock mode-info tree walk (round 307 fuzz, 2026-06-15)
 
 Fuzz round. New libFuzzer target `panic_free_kf_mb_mode_decode` drives the

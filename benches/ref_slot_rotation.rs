@@ -42,16 +42,43 @@
 //!      driving the heavy three-clone branches the profile attributes
 //!      the `memmove` cluster to.
 //!
-//! No `src/` change — this is a bench-only (measurement) round. The
-//! micro path reconstructs the rotation from the public `RefFrameSlot`
-//! surface (its fields are `pub`); the whole-stream path exercises the
-//! shipped `decode_frame` rotation unmodified.
+//! 3. **`shipped_*` micro (round 308)** — the SAME three flag
+//!    combinations, but driven through `bench_rotate_reference_slots`,
+//!    the shipped §9 *minimal-copy* rotation `decode_frame` actually
+//!    runs (move each owned source into the last destination that
+//!    selects it; clone only a genuinely multi-fed source). The layer-1
+//!    `rotate_*` harness above is a clone-everything stand-in — it was a
+//!    naive upper bound, not the cost the decoder pays. Pairing the two
+//!    side by side makes the gap measurable: on the common
+//!    refresh-last path the shipped rotation performs **zero** plane
+//!    clones (every source moves into exactly one destination), so its
+//!    cost collapses toward bookkeeping while the clone-everything
+//!    stand-in keeps paying for six populated `Vec` copies. The residual
+//!    real copy cost is concentrated in the §16 cross-slot-copy shape
+//!    (`copy_gf_arf`, where one pre-rotation slot feeds two
+//!    destinations) and the key-frame init (one source → three slots),
+//!    which only a copy-on-write (`Rc`/`Arc`-backed) slot representation
+//!    can remove — the move-based rotation already removes everything
+//!    else.
+//!
+//! The round-308 measurement correction: the `rotate_*` rows are the
+//! clone-everything ceiling; the `shipped_*` rows are the floor the
+//! decoder already operates at. The standing copy-on-write profile-opt
+//! target should be sized against the `shipped_*` numbers, not the
+//! `rotate_*` ceiling.
+//!
+//! No decoder/encoder logic change — this is a bench-only (measurement)
+//! round; the new `shipped_*` rows call the unmodified shipped rotation
+//! through a `#[doc(hidden)]` measurement shim. The layer-1 micro path
+//! reconstructs the clone-everything reference from the public
+//! `RefFrameSlot` surface (its fields are `pub`); the whole-stream path
+//! exercises the shipped `decode_frame` rotation unmodified.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
 use oxideav_vp8::{
-    I420Frame, KeyframeParams, RefFrameSlot, RefreshControls, Vp8DecoderState,
-    Vp8InterStreamEncoder,
+    bench_rotate_reference_slots, I420Frame, KeyframeParams, RefFrameSlot, RefreshControls,
+    Vp8DecoderState, Vp8InterStreamEncoder,
 };
 
 // A mid-size frame: 320×240 = 20×15 MBs — the same resolution the
@@ -194,6 +221,64 @@ fn bench_rotate_micro(c: &mut Criterion) {
     g.finish();
 }
 
+/// The shipped §9 minimal-copy rotation under the same three flag
+/// combinations as `bench_rotate_micro`, driven through the
+/// `bench_rotate_reference_slots` shim so the bench measures what
+/// `decode_frame` actually pays (move-based; clone only a multi-fed
+/// source) rather than the clone-everything ceiling. Each iteration
+/// re-clones the entry slots into owned inputs (the shim consumes by
+/// value, exactly as `decode_frame` passes `self.{last,golden,altref}.take()`),
+/// then runs the rotation; the input clones are charged identically across
+/// all three rows so the row-to-row delta isolates the rotation's own
+/// copy work.
+fn bench_rotate_shipped(c: &mut Criterion) {
+    let current = make_slot(1);
+    let pre_last = make_slot(2);
+    let pre_golden = make_slot(3);
+    let pre_altref = make_slot(4);
+
+    let bytes_per_slot = current.y.len() + current.u.len() + current.v.len();
+
+    // (copy_arf, copy_gf, refresh_gf, refresh_arf, refresh_last)
+    type RefreshFlags = (u8, u8, bool, bool, bool);
+    let cases: [(&str, RefreshFlags); 3] = [
+        // refresh_last only: current moves into LAST, both pre slots move
+        // through untouched — zero clones in the shipped path.
+        ("shipped_refresh_last_only", (0, 0, false, false, true)),
+        // refresh all three: current feeds LAST, GOLDEN and ALTREF, so it
+        // is cloned twice and moved once.
+        ("shipped_refresh_all", (0, 0, true, true, true)),
+        // copy_buffer_to_golden = 1 (LAST → GOLDEN), copy_buffer_to_alternate
+        // = 2 (GOLDEN → ALTREF), refresh_last: pre-LAST feeds both new-LAST
+        // and new-GOLDEN (one clone), pre-GOLDEN feeds new-ALTREF (move).
+        ("shipped_copy_gf_arf", (2, 1, false, false, true)),
+    ];
+
+    let mut g = c.benchmark_group("ref_slot_rotation");
+    g.throughput(Throughput::Bytes(bytes_per_slot as u64));
+
+    for (name, (copy_arf, copy_gf, refresh_gf, refresh_arf, refresh_last)) in cases {
+        g.bench_function(name, |b| {
+            b.iter(|| {
+                let out = bench_rotate_reference_slots(
+                    black_box(current.clone()),
+                    Some(black_box(pre_last.clone())),
+                    Some(black_box(pre_golden.clone())),
+                    Some(black_box(pre_altref.clone())),
+                    black_box(copy_arf),
+                    black_box(copy_gf),
+                    black_box(refresh_gf),
+                    black_box(refresh_arf),
+                    black_box(refresh_last),
+                );
+                black_box(&out).0.as_ref().map(|s| s.y[0])
+            });
+        });
+    }
+
+    g.finish();
+}
+
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 const P_FRAMES: usize = 8;
@@ -304,5 +389,10 @@ fn bench_decode_with_refresh(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_rotate_micro, bench_decode_with_refresh);
+criterion_group!(
+    benches,
+    bench_rotate_micro,
+    bench_rotate_shipped,
+    bench_decode_with_refresh
+);
 criterion_main!(benches);

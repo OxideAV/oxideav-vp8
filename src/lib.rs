@@ -506,7 +506,7 @@ pub use reconstruct::{
     decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
     ReconstructedMb,
 };
-pub use state::{RefFrameSlot, Vp8DecoderState};
+pub use state::{bench_rotate_reference_slots, RefFrameSlot, Vp8DecoderState};
 pub use stream::{
     EncodedStreamFrame, FrameKind, StreamEncodeError, Vp8InterStreamEncoder,
     Vp8KeyframeStreamEncoder,

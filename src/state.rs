@@ -251,6 +251,48 @@ fn rotate_reference_slots(
     (new_last, new_golden, new_altref)
 }
 
+/// Benchmark/measurement shim for the shipped §9 minimal-copy slot
+/// rotation [`rotate_reference_slots`]. Exposes the exact move-based
+/// rotation `decode_frame` runs so a criterion harness can measure its
+/// real per-frame copy cost (zero plane clones on the common refresh-last
+/// path) instead of a clone-everything stand-in. Not part of the decoder
+/// API — hidden from docs and only meaningful to in-tree benches.
+///
+/// The argument order mirrors the coded-header fields exactly:
+/// `(current, pre_last, pre_golden, pre_altref, copy_buffer_to_alternate,
+/// copy_buffer_to_golden, refresh_golden_frame, refresh_alternate_frame,
+/// refresh_last)`. `copy_buffer_to_*` use `0` for "no copy" (mapped to
+/// `None` internally), matching [`RefreshControls`](crate::RefreshControls).
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn bench_rotate_reference_slots(
+    current: RefFrameSlot,
+    pre_last: Option<RefFrameSlot>,
+    pre_golden: Option<RefFrameSlot>,
+    pre_altref: Option<RefFrameSlot>,
+    copy_buffer_to_alternate: u8,
+    copy_buffer_to_golden: u8,
+    refresh_golden_frame: bool,
+    refresh_alternate_frame: bool,
+    refresh_last: bool,
+) -> (
+    Option<RefFrameSlot>,
+    Option<RefFrameSlot>,
+    Option<RefFrameSlot>,
+) {
+    rotate_reference_slots(
+        current,
+        pre_last,
+        pre_golden,
+        pre_altref,
+        (copy_buffer_to_alternate != 0).then_some(copy_buffer_to_alternate),
+        (copy_buffer_to_golden != 0).then_some(copy_buffer_to_golden),
+        Some(refresh_golden_frame),
+        Some(refresh_alternate_frame),
+        Some(refresh_last),
+    )
+}
+
 /// Persistent across-frame state of a VP8 decoder — the 3-slot
 /// reference-frame buffer (`LAST`, `GOLDEN`, `ALTREF`) plus the §9.10
 /// entropy / intra-mode / motion-vector carry-state and the §9.7

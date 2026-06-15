@@ -563,6 +563,30 @@ A/B targets. The named CoW reference-slot target was deferred as too large /
 risky for a single safe round (the §9 slot rotation is already
 move-minimised). See `BENCHMARKS.md` round 306.
 
+### Shipped vs clone-everything A/B for the §9 slot rotation (round 308)
+
+Round 308 (bench-only, no decoder/encoder logic change) corrected a
+measurement gap. The round-288 `ref_slot_rotation` harness measured only a
+*clone-everything* stand-in (`rotate_*` rows: six populated `Vec` clones per
+frame), reporting ~12–13 µs/frame and naming copy-on-write as the next
+target sized against that number. But the shipped `rotate_reference_slots`
+(round 289) is a move-based *minimal-copy* rotation that performs **zero**
+plane clones on the common refresh-last path. This round exposes the shipped
+rotation through a `#[doc(hidden)]` pass-through shim
+(`bench_rotate_reference_slots`) and adds three `shipped_*` rows under the
+same flag combinations. The A/B (320×240, criterion median): `refresh_last_only`
+13.19 → 8.71 µs (−34 %), `refresh_all` 16.21 → 14.31 µs (−12 %),
+`copy_gf_arf` 17.20 → 8.40 µs (−51 %). The `shipped_*` floor still includes
+four per-iteration input clones the bench performs to set up owned arguments
+— costs `decode_frame` does *not* pay (it moves `self.{last,golden,altref}.take()`)
+— so the decoder's true per-frame rotation cost is below the `shipped_*`
+floor. The standing copy-on-write target should be sized against the
+`shipped_*` floor, not the `rotate_*` ceiling; its remaining headroom (the
+§16 cross-slot-copy clone + the key-frame triple-populate) is materially
+smaller than the round-288 numbers implied. A/B bench:
+`cargo bench -p oxideav-vp8 --bench ref_slot_rotation -- 'rotate_|shipped_'`.
+See `BENCHMARKS.md` round 308.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

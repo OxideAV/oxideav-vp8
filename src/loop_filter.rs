@@ -371,6 +371,279 @@ pub fn mb_filter(
 }
 
 // ===================================================================
+// §15.2 / §15.3 SIMD filter kernels (4 segments at once)
+// ===================================================================
+//
+// The §15 per-segment kernels above operate on one edge-straddling
+// pixel run at a time. The frame-geometry pass below fires them once
+// per row (vertical edge) or per column (horizontal edge) of a 16- or
+// 8-pixel edge run. Those rows / columns are fully independent: each
+// gathers its own 8-pixel window from a distinct stride row (vertical
+// edge) or distinct column (horizontal edge), and the §15.2 / §15.3
+// arithmetic on one window never reads another. That independence maps
+// directly onto a 4-lane `core::simd::Simd<i32, 4>` where lane `r`
+// holds segment `r`'s value at a given tap position.
+//
+// To stay byte-exact with the scalar kernels — which early-out per
+// segment when the §15.3 `filter_yes` gate (or the §15.2 edge metric)
+// fails — the SIMD path computes the filtered result for all four lanes
+// unconditionally and then, per lane, selects between the filtered and
+// the original pixel with a `Mask` derived from the same gate. Every
+// lane therefore performs the identical i32 add/clamp/shift sequence
+// the scalar code performs, so the selected output is bit-for-bit the
+// scalar output. No external SIMD layout reference was consulted; the
+// 4-lane layout follows directly from the §15.1 geometry (independent
+// rows / columns) and the §15.2 / §15.3 listings in RFC 6386.
+
+/// Lane-wise §15.2 saturating clamp `c` over a `Simd<i32, 4>` — the
+/// vector form of [`clamp_s8`]: clamp each lane to `-128..=127`.
+#[cfg(feature = "simd")]
+#[inline]
+fn clamp_s8_v(v: core::simd::Simd<i32, 4>) -> core::simd::Simd<i32, 4> {
+    use core::simd::cmp::SimdOrd;
+    use core::simd::Simd;
+    v.simd_clamp(Simd::splat(-128), Simd::splat(127))
+}
+
+/// Lane-wise absolute value over a `Simd<i32, 4>` (the vector form of
+/// [`abs_i`]).
+#[cfg(feature = "simd")]
+#[inline]
+fn abs_v(v: core::simd::Simd<i32, 4>) -> core::simd::Simd<i32, 4> {
+    use core::simd::num::SimdInt;
+    v.abs()
+}
+
+/// Lane-wise §15.2 `common_adjust` shared by both filter types, the
+/// 4-segment vector form of [`common_adjust`].
+///
+/// `p1..q1` are the four inner taps (each lane a distinct segment). The
+/// `q0` / `p0` lanes are updated in place to the filtered values and the
+/// returned `a` matches the scalar return (the subblock filter consumes
+/// it). Bit-for-bit identical to the scalar path on every lane.
+#[cfg(feature = "simd")]
+#[inline]
+fn common_adjust_v(
+    use_outer_taps: bool,
+    p1: core::simd::Simd<i32, 4>,
+    p0: &mut core::simd::Simd<i32, 4>,
+    q0: &mut core::simd::Simd<i32, 4>,
+    q1: core::simd::Simd<i32, 4>,
+) -> core::simd::Simd<i32, 4> {
+    use core::simd::Simd;
+    let outer = if use_outer_taps {
+        clamp_s8_v(p1 - q1)
+    } else {
+        Simd::splat(0)
+    };
+    let a = clamp_s8_v(outer + Simd::splat(3) * (*q0 - *p0));
+    // `b = c(a + 3) >> 3`; `a = c(a + 4) >> 3` — arithmetic right shift,
+    // matching the scalar `>> 3` on i32.
+    let b = clamp_s8_v(a + Simd::splat(3)) >> Simd::splat(3);
+    let a = clamp_s8_v(a + Simd::splat(4)) >> Simd::splat(3);
+    *q0 = clamp_s8_v(*q0 - a);
+    *p0 = clamp_s8_v(*p0 + b);
+    a
+}
+
+/// SIMD §15.3 normal-subblock filter over 4 segments at once — the
+/// 4-lane vector form of [`subblock_filter`].
+///
+/// `seg[k]` holds the four lanes' value at tap `k` (`p3..q3` for
+/// `k = 0..8`), each lane already converted to signed (`u2s`) i32. The
+/// filtered taps are written back into `seg` (still signed); the caller
+/// re-adds 128 (`s2u`) when storing. The §15.3 `filter_yes` gate and the
+/// `hev` test are evaluated per lane and used as `Mask`s to select
+/// between the filtered and the unfiltered value, so each lane is
+/// byte-exact with the scalar kernel.
+#[cfg(feature = "simd")]
+fn subblock_filter_v(
+    hev_threshold: u8,
+    interior_limit: u8,
+    edge_limit: u8,
+    seg: &mut [core::simd::Simd<i32, 4>; 8],
+) {
+    use core::simd::cmp::SimdPartialOrd;
+    use core::simd::Select;
+    use core::simd::Simd;
+
+    let i = Simd::splat(interior_limit as i32);
+    let e = Simd::splat(edge_limit as i32);
+    let t = Simd::splat(hev_threshold as i32);
+
+    let p3 = seg[0];
+    let p2 = seg[1];
+    let p1 = seg[2];
+    let p0 = seg[3];
+    let q0 = seg[4];
+    let q1 = seg[5];
+    let q2 = seg[6];
+    let q3 = seg[7];
+
+    // §15.3 `filter_yes`: edge metric within `e` AND every interior
+    // difference within `i` — evaluated lanewise.
+    let edge_metric = abs_v(p0 - q0) * Simd::splat(2) + abs_v(p1 - q1) / Simd::splat(2);
+    let do_filter = edge_metric.simd_le(e)
+        & abs_v(p3 - p2).simd_le(i)
+        & abs_v(p2 - p1).simd_le(i)
+        & abs_v(p1 - p0).simd_le(i)
+        & abs_v(q3 - q2).simd_le(i)
+        & abs_v(q2 - q1).simd_le(i)
+        & abs_v(q1 - q0).simd_le(i);
+
+    // §15.3 `hev`: |p1 - p0| > t || |q1 - q0| > t, lanewise.
+    let hv = abs_v(p1 - p0).simd_gt(t) | abs_v(q1 - q0).simd_gt(t);
+
+    // Apply `common_adjust` with outer taps gated by the per-lane hev:
+    // compute both the outer-tap and no-outer-tap result, then select.
+    let mut p0_outer = p0;
+    let mut q0_outer = q0;
+    let _ = common_adjust_v(true, p1, &mut p0_outer, &mut q0_outer, q1);
+    let mut p0_inner = p0;
+    let mut q0_inner = q0;
+    let a_inner = common_adjust_v(false, p1, &mut p0_inner, &mut q0_inner, q1);
+
+    let new_p0 = hv.select(p0_outer, p0_inner);
+    let new_q0 = hv.select(q0_outer, q0_inner);
+    // `a = (common_adjust(..) + 1) >> 1` — only the low-hev branch uses
+    // it (no-outer-taps adjust).
+    let a = (a_inner + Simd::splat(1)) >> Simd::splat(1);
+    // When hev is low, p1/q1 are additionally nudged by `a`.
+    let new_p1 = (!hv).select(clamp_s8_v(p1 + a), p1);
+    let new_q1 = (!hv).select(clamp_s8_v(q1 - a), q1);
+
+    // Select between filtered and original per the `filter_yes` gate.
+    seg[2] = do_filter.select(new_p1, p1);
+    seg[3] = do_filter.select(new_p0, p0);
+    seg[4] = do_filter.select(new_q0, q0);
+    seg[5] = do_filter.select(new_q1, q1);
+}
+
+/// SIMD §15.3 normal-macroblock filter over 4 segments at once — the
+/// 4-lane vector form of [`mb_filter`].
+///
+/// Same lane / mask discipline as [`subblock_filter_v`]: byte-exact with
+/// the scalar [`mb_filter`] on every lane.
+#[cfg(feature = "simd")]
+fn mb_filter_v(
+    hev_threshold: u8,
+    interior_limit: u8,
+    edge_limit: u8,
+    seg: &mut [core::simd::Simd<i32, 4>; 8],
+) {
+    use core::simd::cmp::SimdPartialOrd;
+    use core::simd::Select;
+    use core::simd::Simd;
+
+    let i = Simd::splat(interior_limit as i32);
+    let e = Simd::splat(edge_limit as i32);
+    let t = Simd::splat(hev_threshold as i32);
+
+    let p3 = seg[0];
+    let p2 = seg[1];
+    let p1 = seg[2];
+    let p0 = seg[3];
+    let q0 = seg[4];
+    let q1 = seg[5];
+    let q2 = seg[6];
+    let q3 = seg[7];
+
+    let edge_metric = abs_v(p0 - q0) * Simd::splat(2) + abs_v(p1 - q1) / Simd::splat(2);
+    let do_filter = edge_metric.simd_le(e)
+        & abs_v(p3 - p2).simd_le(i)
+        & abs_v(p2 - p1).simd_le(i)
+        & abs_v(p1 - p0).simd_le(i)
+        & abs_v(q3 - q2).simd_le(i)
+        & abs_v(q2 - q1).simd_le(i)
+        & abs_v(q1 - q0).simd_le(i);
+
+    let hv = abs_v(p1 - p0).simd_gt(t) | abs_v(q1 - q0).simd_gt(t);
+
+    // Low-hev wide branch: w = c(c(p1 - q1) + 3*(q0 - p0)).
+    let w = clamp_s8_v(clamp_s8_v(p1 - q1) + Simd::splat(3) * (q0 - p0));
+    // a0 = c((27*w + 63) >> 7): Q0 -= a0; P0 += a0.
+    let a0 = clamp_s8_v((Simd::splat(27) * w + Simd::splat(63)) >> Simd::splat(7));
+    let wide_q0 = s2u_signed_v(q0 - a0);
+    let wide_p0 = s2u_signed_v(p0 + a0);
+    // a1 = c((18*w + 63) >> 7): Q1 -= a1; P1 += a1.
+    let a1 = clamp_s8_v((Simd::splat(18) * w + Simd::splat(63)) >> Simd::splat(7));
+    let wide_q1 = s2u_signed_v(q1 - a1);
+    let wide_p1 = s2u_signed_v(p1 + a1);
+    // a2 = c((9*w + 63) >> 7): Q2 -= a2; P2 += a2.
+    let a2 = clamp_s8_v((Simd::splat(9) * w + Simd::splat(63)) >> Simd::splat(7));
+    let wide_q2 = s2u_signed_v(q2 - a2);
+    let wide_p2 = s2u_signed_v(p2 + a2);
+
+    // High-hev branch: common_adjust(outer taps) on the inner window.
+    let mut p0_hev = p0;
+    let mut q0_hev = q0;
+    common_adjust_v(true, p1, &mut p0_hev, &mut q0_hev, q1);
+
+    // Compose per the per-lane hev, then gate by `filter_yes`.
+    // p2/q2 only move in the low-hev branch.
+    let new_p2 = (!hv).select(wide_p2, p2);
+    let new_q2 = (!hv).select(wide_q2, q2);
+    let new_p1 = (!hv).select(wide_p1, p1);
+    let new_q1 = (!hv).select(wide_q1, q1);
+    let new_p0 = hv.select(p0_hev, wide_p0);
+    let new_q0 = hv.select(q0_hev, wide_q0);
+
+    seg[1] = do_filter.select(new_p2, p2);
+    seg[2] = do_filter.select(new_p1, p1);
+    seg[3] = do_filter.select(new_p0, p0);
+    seg[4] = do_filter.select(new_q0, q0);
+    seg[5] = do_filter.select(new_q1, q1);
+    seg[6] = do_filter.select(new_q2, q2);
+}
+
+/// Lane-wise §15.2 `s2u` that returns the *signed* clamped value
+/// (without the +128) for callers that keep the segment in signed space
+/// and add 128 only when storing — matches `clamp_s8` applied to the
+/// scalar `s2u` argument before its +128.
+#[cfg(feature = "simd")]
+#[inline]
+fn s2u_signed_v(v: core::simd::Simd<i32, 4>) -> core::simd::Simd<i32, 4> {
+    clamp_s8_v(v)
+}
+
+/// SIMD §15.2 simple filter over 4 segments at once — the 4-lane vector
+/// form of [`simple_segment`].
+///
+/// `p1..q1` are the four taps in *unsigned* space (the scalar simple
+/// filter reads the metric on unsigned pixels but adjusts in signed
+/// space via `common_adjust`). Returns the filtered `(p0, q0)` lanes in
+/// unsigned space. Byte-exact with the scalar [`simple_segment`].
+#[cfg(feature = "simd")]
+fn simple_segment_v(
+    edge_limit: u8,
+    p1: core::simd::Simd<i32, 4>,
+    p0: core::simd::Simd<i32, 4>,
+    q0: core::simd::Simd<i32, 4>,
+    q1: core::simd::Simd<i32, 4>,
+) -> (core::simd::Simd<i32, 4>, core::simd::Simd<i32, 4>) {
+    use core::simd::cmp::SimdPartialOrd;
+    use core::simd::Select;
+    use core::simd::Simd;
+
+    let limit = Simd::splat(edge_limit as i32);
+    // §15.2 edge metric on unsigned pixels.
+    let metric = abs_v(p0 - q0) * Simd::splat(2) + abs_v(p1 - q1) / Simd::splat(2);
+    let do_filter = metric.simd_le(limit);
+
+    // common_adjust runs in signed space (u2s = -128).
+    let bias = Simd::splat(128);
+    let p1s = p1 - bias;
+    let q1s = q1 - bias;
+    let mut p0s = p0 - bias;
+    let mut q0s = q0 - bias;
+    common_adjust_v(true, p1s, &mut p0s, &mut q0s, q1s);
+    let new_p0 = p0s + bias;
+    let new_q0 = q0s + bias;
+
+    (do_filter.select(new_p0, p0), do_filter.select(new_q0, q0))
+}
+
+// ===================================================================
 // §15.1 / §15.2 frame loop-filter geometry
 // ===================================================================
 //
@@ -949,6 +1222,19 @@ fn filter_v_edge_normal(
     } else {
         params.sub_bedge_limit
     };
+
+    // SIMD fast path: process 4 independent rows at once. Vertical-edge
+    // rows are fully independent (each gathers its window from a distinct
+    // stride row), so 4 rows map onto one `Simd<i32, 4>` lane each. Both
+    // §15.1 edge lengths (16 luma, 8 chroma) are multiples of 4.
+    #[cfg(feature = "simd")]
+    {
+        if len % 4 == 0 {
+            filter_v_edge_normal_simd(plane, stride, x, y0, len, params, edge_limit, mb_edge);
+            return;
+        }
+    }
+
     let mut seg = [0u8; 8];
     for r in 0..len {
         let row = (y0 + r) * stride;
@@ -980,6 +1266,63 @@ fn filter_v_edge_normal(
     }
 }
 
+/// SIMD vertical-edge normal filter — processes the `len` rows in groups
+/// of 4 through [`subblock_filter_v`] / [`mb_filter_v`]. Byte-exact with
+/// the scalar [`filter_v_edge_normal`] loop body.
+#[cfg(feature = "simd")]
+#[allow(clippy::too_many_arguments)]
+fn filter_v_edge_normal_simd(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y0: usize,
+    len: usize,
+    params: &LoopFilterParams,
+    edge_limit: u8,
+    mb_edge: bool,
+) {
+    use core::simd::Simd;
+    let bias = Simd::splat(128);
+    let mut r = 0;
+    while r < len {
+        // Gather tap `k` across the 4 rows into one lane each, converting
+        // to signed (`u2s` = -128) up front.
+        let mut seg: [Simd<i32, 4>; 8] = [Simd::splat(0); 8];
+        for (k, slot) in seg.iter_mut().enumerate() {
+            let lanes: [i32; 4] = core::array::from_fn(|lane| {
+                let row = (y0 + r + lane) * stride;
+                plane[row + x - 4 + k] as i32 - 128
+            });
+            *slot = Simd::from_array(lanes);
+        }
+        if mb_edge {
+            mb_filter_v(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+            );
+        } else {
+            subblock_filter_v(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+            );
+        }
+        // Scatter back, re-adding 128 (`s2u` reverse of the `u2s` above —
+        // the kernels keep everything clamped within signed range).
+        for (k, slot) in seg.iter().enumerate() {
+            let out = (*slot + bias).to_array();
+            for (lane, &val) in out.iter().enumerate() {
+                let row = (y0 + r + lane) * stride;
+                plane[row + x - 4 + k] = val as u8;
+            }
+        }
+        r += 4;
+    }
+}
+
 /// Apply the normal §15.3 filter to one horizontal edge of a plane.
 ///
 /// `y` is the row at the edge (`p`-side is `y - 1`, `q`-side is `y`);
@@ -999,6 +1342,18 @@ fn filter_h_edge_normal(
     } else {
         params.sub_bedge_limit
     };
+
+    // SIMD fast path: 4 independent columns at once (each gathers its
+    // window from a distinct column). Both edge lengths are multiples
+    // of 4.
+    #[cfg(feature = "simd")]
+    {
+        if len % 4 == 0 {
+            filter_h_edge_normal_simd(plane, stride, y, x0, len, params, edge_limit, mb_edge);
+            return;
+        }
+    }
+
     let mut seg = [0u8; 8];
     for c in 0..len {
         let col = x0 + c;
@@ -1030,36 +1385,147 @@ fn filter_h_edge_normal(
     }
 }
 
+/// SIMD horizontal-edge normal filter — processes the `len` columns in
+/// groups of 4. Byte-exact with the scalar [`filter_h_edge_normal`]
+/// loop body.
+#[cfg(feature = "simd")]
+#[allow(clippy::too_many_arguments)]
+fn filter_h_edge_normal_simd(
+    plane: &mut [u8],
+    stride: usize,
+    y: usize,
+    x0: usize,
+    len: usize,
+    params: &LoopFilterParams,
+    edge_limit: u8,
+    mb_edge: bool,
+) {
+    use core::simd::Simd;
+    let bias = Simd::splat(128);
+    let mut c = 0;
+    while c < len {
+        let mut seg: [Simd<i32, 4>; 8] = [Simd::splat(0); 8];
+        for (k, slot) in seg.iter_mut().enumerate() {
+            let base = (y - 4 + k) * stride + x0 + c;
+            let lanes: [i32; 4] = core::array::from_fn(|lane| plane[base + lane] as i32 - 128);
+            *slot = Simd::from_array(lanes);
+        }
+        if mb_edge {
+            mb_filter_v(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+            );
+        } else {
+            subblock_filter_v(
+                params.hev_threshold,
+                params.interior_limit,
+                edge_limit,
+                &mut seg,
+            );
+        }
+        for (k, slot) in seg.iter().enumerate() {
+            let base = (y - 4 + k) * stride + x0 + c;
+            let out = (*slot + bias).to_array();
+            for (lane, &val) in out.iter().enumerate() {
+                plane[base + lane] = val as u8;
+            }
+        }
+        c += 4;
+    }
+}
+
 /// Apply the §15.2 simple filter to one vertical edge (luma only).
 ///
 /// The simple filter examines a 4-pixel window `p1 p0 | q0 q1`; the
 /// `edge_limit` is the precomputed `mbedge_limit` / `sub_bedge_limit`.
 fn filter_v_edge_simple(plane: &mut [u8], stride: usize, x: usize, y0: usize, edge_limit: u8) {
-    let mut seg = [0u8; 4];
-    for r in 0..16 {
-        let row = (y0 + r) * stride;
-        for (k, slot) in seg.iter_mut().enumerate() {
-            *slot = plane[row + x - 2 + k];
+    // SIMD fast path: 4 independent rows at once (16 rows = 4 groups).
+    #[cfg(feature = "simd")]
+    filter_v_edge_simple_simd(plane, stride, x, y0, edge_limit);
+    #[cfg(not(feature = "simd"))]
+    {
+        let mut seg = [0u8; 4];
+        for r in 0..16 {
+            let row = (y0 + r) * stride;
+            for (k, slot) in seg.iter_mut().enumerate() {
+                *slot = plane[row + x - 2 + k];
+            }
+            simple_segment(edge_limit, &mut seg, 0);
+            for (k, &val) in seg.iter().enumerate() {
+                plane[row + x - 2 + k] = val;
+            }
         }
-        simple_segment(edge_limit, &mut seg, 0);
-        for (k, &val) in seg.iter().enumerate() {
-            plane[row + x - 2 + k] = val;
+    }
+}
+
+/// SIMD vertical-edge simple filter — 4 rows per group through
+/// [`simple_segment_v`]. Byte-exact with the scalar loop body.
+#[cfg(feature = "simd")]
+fn filter_v_edge_simple_simd(plane: &mut [u8], stride: usize, x: usize, y0: usize, edge_limit: u8) {
+    use core::simd::Simd;
+    let mut r = 0;
+    while r < 16 {
+        let gather = |off: usize| -> Simd<i32, 4> {
+            Simd::from_array(core::array::from_fn(|lane| {
+                plane[(y0 + r + lane) * stride + x - 2 + off] as i32
+            }))
+        };
+        let (np0, nq0) = simple_segment_v(edge_limit, gather(0), gather(1), gather(2), gather(3));
+        let np0 = np0.to_array();
+        let nq0 = nq0.to_array();
+        for lane in 0..4 {
+            let row = (y0 + r + lane) * stride;
+            plane[row + x - 1] = np0[lane] as u8;
+            plane[row + x] = nq0[lane] as u8;
         }
+        r += 4;
     }
 }
 
 /// Apply the §15.2 simple filter to one horizontal edge (luma only).
 fn filter_h_edge_simple(plane: &mut [u8], stride: usize, y: usize, x0: usize, edge_limit: u8) {
-    let mut seg = [0u8; 4];
-    for c in 0..16 {
-        let col = x0 + c;
-        for (k, slot) in seg.iter_mut().enumerate() {
-            *slot = plane[(y - 2 + k) * stride + col];
+    // SIMD fast path: 4 independent columns at once (16 cols = 4 groups).
+    #[cfg(feature = "simd")]
+    filter_h_edge_simple_simd(plane, stride, y, x0, edge_limit);
+    #[cfg(not(feature = "simd"))]
+    {
+        let mut seg = [0u8; 4];
+        for c in 0..16 {
+            let col = x0 + c;
+            for (k, slot) in seg.iter_mut().enumerate() {
+                *slot = plane[(y - 2 + k) * stride + col];
+            }
+            simple_segment(edge_limit, &mut seg, 0);
+            for (k, &val) in seg.iter().enumerate() {
+                plane[(y - 2 + k) * stride + col] = val;
+            }
         }
-        simple_segment(edge_limit, &mut seg, 0);
-        for (k, &val) in seg.iter().enumerate() {
-            plane[(y - 2 + k) * stride + col] = val;
+    }
+}
+
+/// SIMD horizontal-edge simple filter — 4 columns per group through
+/// [`simple_segment_v`]. Byte-exact with the scalar loop body.
+#[cfg(feature = "simd")]
+fn filter_h_edge_simple_simd(plane: &mut [u8], stride: usize, y: usize, x0: usize, edge_limit: u8) {
+    use core::simd::Simd;
+    let mut c = 0;
+    while c < 16 {
+        let gather = |off: usize| -> Simd<i32, 4> {
+            let base = (y - 2 + off) * stride + x0 + c;
+            Simd::from_array(core::array::from_fn(|lane| plane[base + lane] as i32))
+        };
+        let (np0, nq0) = simple_segment_v(edge_limit, gather(0), gather(1), gather(2), gather(3));
+        let np0 = np0.to_array();
+        let nq0 = nq0.to_array();
+        let p0_base = (y - 1) * stride + x0 + c;
+        let q0_base = y * stride + x0 + c;
+        for lane in 0..4 {
+            plane[p0_base + lane] = np0[lane] as u8;
+            plane[q0_base + lane] = nq0[lane] as u8;
         }
+        c += 4;
     }
 }
 
@@ -2099,6 +2565,166 @@ mod tests {
             intra_y_mode_prob_update: None,
             intra_uv_mode_prob_update: None,
             mv_prob_update: None,
+        }
+    }
+
+    // ----- §15 SIMD kernel byte-exactness ------------------------------
+    //
+    // The SIMD kernels must reproduce the scalar per-segment kernels
+    // bit-for-bit on every lane. These tests run only under `--features
+    // simd`; they drive a deterministic stress matrix of pixel windows
+    // and filter parameters through both the vector kernel and the
+    // always-compiled scalar per-segment reference, asserting equality.
+
+    #[cfg(feature = "simd")]
+    fn stress_windows() -> Vec<[u8; 8]> {
+        // A spread of ramps, flats, spikes and pseudo-random windows that
+        // exercise both the `filter_yes`/metric-pass and -fail branches
+        // and both hev polarities.
+        let mut v = vec![
+            [120, 122, 124, 126, 130, 132, 134, 136], // gentle ramp (filters)
+            [10, 12, 14, 16, 240, 242, 244, 246],     // hard step (gate fails)
+            [128; 8],                                 // flat (filters, no-op)
+            [126, 127, 128, 129, 130, 131, 132, 133], // tiny ramp
+            [100, 140, 100, 140, 100, 140, 100, 140], // high interior diff
+            [0, 0, 0, 255, 255, 255, 255, 255],       // edge spike
+        ];
+        let mut s: u32 = 0x1234_5678;
+        for _ in 0..64 {
+            let mut w = [0u8; 8];
+            for slot in w.iter_mut() {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *slot = (s >> 16) as u8;
+            }
+            v.push(w);
+        }
+        v
+    }
+
+    #[cfg(feature = "simd")]
+    #[test]
+    fn subblock_filter_simd_matches_scalar() {
+        use core::simd::Simd;
+        let windows = stress_windows();
+        for &(hev_t, ilim, elim) in &[
+            (0u8, 1u8, 1u8),
+            (4, 4, 4),
+            (2, 8, 16),
+            (10, 30, 60),
+            (0, 63, 127),
+        ] {
+            // Pack 4 windows per vector group; pad with the first window.
+            let mut idx = 0;
+            while idx < windows.len() {
+                let group: [[u8; 8]; 4] =
+                    core::array::from_fn(|l| windows[(idx + l) % windows.len()]);
+
+                // Scalar reference, per segment.
+                let mut expected = group;
+                for w in expected.iter_mut() {
+                    subblock_filter(hev_t, ilim, elim, w, 0);
+                }
+
+                // SIMD: gather as signed lanes, run, scatter back.
+                let mut seg: [Simd<i32, 4>; 8] = [Simd::splat(0); 8];
+                for (k, slot) in seg.iter_mut().enumerate() {
+                    *slot = Simd::from_array(core::array::from_fn(|l| group[l][k] as i32 - 128));
+                }
+                subblock_filter_v(hev_t, ilim, elim, &mut seg);
+                let mut got = group;
+                for (k, slot) in seg.iter().enumerate() {
+                    let out = (*slot + Simd::splat(128)).to_array();
+                    for (l, &val) in out.iter().enumerate() {
+                        got[l][k] = val as u8;
+                    }
+                }
+
+                assert_eq!(
+                    got, expected,
+                    "subblock hev={hev_t} i={ilim} e={elim} idx={idx}"
+                );
+                idx += 4;
+            }
+        }
+    }
+
+    #[cfg(feature = "simd")]
+    #[test]
+    fn mb_filter_simd_matches_scalar() {
+        use core::simd::Simd;
+        let windows = stress_windows();
+        for &(hev_t, ilim, elim) in &[
+            (0u8, 1u8, 1u8),
+            (4, 4, 4),
+            (2, 8, 16),
+            (10, 30, 60),
+            (0, 63, 127),
+        ] {
+            let mut idx = 0;
+            while idx < windows.len() {
+                let group: [[u8; 8]; 4] =
+                    core::array::from_fn(|l| windows[(idx + l) % windows.len()]);
+
+                let mut expected = group;
+                for w in expected.iter_mut() {
+                    mb_filter(hev_t, ilim, elim, w, 0);
+                }
+
+                let mut seg: [Simd<i32, 4>; 8] = [Simd::splat(0); 8];
+                for (k, slot) in seg.iter_mut().enumerate() {
+                    *slot = Simd::from_array(core::array::from_fn(|l| group[l][k] as i32 - 128));
+                }
+                mb_filter_v(hev_t, ilim, elim, &mut seg);
+                let mut got = group;
+                for (k, slot) in seg.iter().enumerate() {
+                    let out = (*slot + Simd::splat(128)).to_array();
+                    for (l, &val) in out.iter().enumerate() {
+                        got[l][k] = val as u8;
+                    }
+                }
+
+                assert_eq!(got, expected, "mb hev={hev_t} i={ilim} e={elim} idx={idx}");
+                idx += 4;
+            }
+        }
+    }
+
+    #[cfg(feature = "simd")]
+    #[test]
+    fn simple_segment_simd_matches_scalar() {
+        use core::simd::Simd;
+        let windows = stress_windows();
+        for &elim in &[1u8, 4, 16, 60, 127] {
+            let mut idx = 0;
+            while idx < windows.len() {
+                // Simple filter operates on the inner 4 pixels p1 p0 q0 q1.
+                let group: [[u8; 4]; 4] = core::array::from_fn(|l| {
+                    let w = windows[(idx + l) % windows.len()];
+                    [w[2], w[3], w[4], w[5]]
+                });
+
+                let mut expected = group;
+                for w in expected.iter_mut() {
+                    simple_segment(elim, w, 0);
+                }
+
+                let p1 = Simd::from_array(core::array::from_fn(|l| group[l][0] as i32));
+                let p0 = Simd::from_array(core::array::from_fn(|l| group[l][1] as i32));
+                let q0 = Simd::from_array(core::array::from_fn(|l| group[l][2] as i32));
+                let q1 = Simd::from_array(core::array::from_fn(|l| group[l][3] as i32));
+                let (np0, nq0) = simple_segment_v(elim, p1, p0, q0, q1);
+                let np0 = np0.to_array();
+                let nq0 = nq0.to_array();
+
+                for l in 0..4 {
+                    assert_eq!(
+                        [np0[l] as u8, nq0[l] as u8],
+                        [expected[l][1], expected[l][2]],
+                        "simple e={elim} idx={idx} lane={l}"
+                    );
+                }
+                idx += 4;
+            }
         }
     }
 }

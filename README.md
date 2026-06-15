@@ -39,7 +39,7 @@ oxideav-vp8 = { version = "0.2", default-features = false }
 | Feature | Default | What it does |
 |---|---|---|
 | `registry` | on | Pulls `oxideav-core` and the framework-trait factories (`make_encoder` / `make_decoder` returning `Box<dyn Encoder>` / `Box<dyn Decoder>`), the `Vp8Decoder` (`oxideav_core::Decoder`) impl, and the `register*` entry points. |
-| `simd` | — | **Nightly-only.** Routes selected §14 transform, §14.1 dequantize, §12 intra, and §18.3 sub-pixel-interpolation kernels through `core::simd` rewrites. Every SIMD primitive is byte-exact against its scalar partner on a stress matrix. Default (stable) builds use the scalar paths unchanged. See `BENCHMARKS.md` for the A/B numbers. |
+| `simd` | — | **Nightly-only.** Routes selected §14 transform, §14.1 dequantize, §12 intra, §15 loop-filter, and §18.3 sub-pixel-interpolation kernels through `core::simd` rewrites. Every SIMD primitive is byte-exact against its scalar partner on a stress matrix. Default (stable) builds use the scalar paths unchanged. See `BENCHMARKS.md` for the A/B numbers. |
 
 ## Standalone use (no `oxideav-core`)
 

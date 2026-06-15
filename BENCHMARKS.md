@@ -2535,3 +2535,60 @@ suggested.
 `cargo fmt --check` and `cargo clippy --all-targets --no-deps -- -D warnings`
 clean; 498 lib tests pass. No decoder/encoder logic change; no risky change
 forced.
+
+## Round 314 — §15 loop-filter SIMD (`core::simd::Simd<i32, 4>`, simd feature)
+
+Round 314 (2026-06-15) closes the standing round-170 / round-269 candidate
+"SIMD the deblock path". Before this round the `simd` feature accelerated the
+§14 transforms, §14.1 dequant, §12 intra and §18.3 sub-pixel interpolation —
+but the §15 loop filter, the single heaviest decode-side stage on a fully
+coded frame, stayed scalar on every build. This round adds 4-lane vector
+kernels for the §15.2 simple filter and the §15.3 normal subblock / MB
+filters and routes the frame-geometry edge loops through them in groups of
+4 rows (vertical edge) / columns (horizontal edge).
+
+### Why 4-lane works here
+
+The §15.1 geometry fires the per-segment kernel once per row of a vertical
+edge and once per column of a horizontal edge. Those rows / columns are fully
+independent — each gathers its own 8-pixel window from a distinct stride row
+(vertical) or distinct column (horizontal), and the §15.2 / §15.3 arithmetic
+on one window never reads another. That independence maps directly onto a
+`Simd<i32, 4>` where lane `r` holds segment `r`'s value at a given tap. Both
+§15.1 edge lengths (16 luma, 8 chroma) are multiples of 4, so the whole edge
+vectorises with no scalar tail.
+
+### Byte-exactness discipline
+
+The scalar kernels early-out per segment when the §15.3 `filter_yes` gate (or
+the §15.2 edge metric) fails. The vector path computes the filtered result
+for all four lanes unconditionally and then, per lane, selects between the
+filtered and the original pixel with a `Mask` derived from the same gate.
+Every lane therefore performs the identical i32 add / `clamp_s8` / shift
+sequence the scalar code performs, so the selected output is bit-for-bit the
+scalar output. Three parity tests
+(`subblock_filter_simd_matches_scalar`, `mb_filter_simd_matches_scalar`,
+`simple_segment_simd_matches_scalar`) drive a 70-window stress matrix (ramps,
+flats, spikes, an LCG pseudo-random fill) across five `(hev, interior,
+edge)`-limit combinations through both the vector kernel and the
+always-compiled scalar per-segment reference, asserting equality on every
+lane.
+
+### A/B (`loop_filter_frame`, 320×240 = 20×15 MB, criterion median, M4-class aarch64)
+
+| Bench | Scalar (stable) | SIMD (nightly) | Δ |
+|---|---:|---:|---:|
+| `filter_frame_keyframe_320x240_normal` | 352.7 µs | **196.5 µs** | **−44 %** |
+| `filter_frame_keyframe_320x240_simple` | 81.0 µs | **49.3 µs** | **−39 %** |
+| `filter_inter_frame_320x240_normal` | 342.6 µs | **205.6 µs** | **−40 %** |
+
+The micro-benches in `loop_filter_normal.rs` / `loop_filter_mb_edge.rs` call
+the per-segment scalar kernels directly and so are unchanged; the SIMD path
+is only reachable through the `filter_frame` / `filter_inter_frame` geometry
+loops, which `loop_filter_frame.rs` exercises — the correct A/B target.
+
+`cargo fmt --check` clean on stable; `clippy --all-targets --no-deps -D
+warnings` clean on both the stable scalar build and the nightly `simd` build;
+691 tests pass under `--features simd` (686 under the stable scalar build —
+the 5 extra are the simd-gated parity tests). No decoder/encoder logic change
+on the stable path; the stable build is byte-identical to before this round.

@@ -4,6 +4,28 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §15 loop-filter SIMD kernels (round 314, 2026-06-15)
+
+The nightly-only `simd` feature now accelerates the §15 loop filter, the
+heaviest decode-side stage on a fully coded frame. New
+`core::simd::Simd<i32, 4>` kernels for the §15.2 simple filter and the
+§15.3 normal subblock / MB filters process 4 independent edge segments
+(rows of a vertical edge, columns of a horizontal edge) per group; the
+frame-geometry edge loops dispatch to them under the `simd` feature.
+
+* Byte-exact with the scalar per-segment kernels: the vector path
+  computes all four lanes unconditionally and selects between the
+  filtered and original pixel per lane with a `Mask` derived from the
+  same §15.3 `filter_yes` / §15.2 edge-metric gate, so each lane runs the
+  identical i32 add / `clamp_s8` / shift sequence. Three parity tests
+  drive a 70-window stress matrix across five limit combinations.
+* `loop_filter_frame` A/B (320×240, criterion median): keyframe normal
+  352.7 → 196.5 µs (−44 %), keyframe simple 81.0 → 49.3 µs (−39 %), inter
+  normal 342.6 → 205.6 µs (−40 %). See `BENCHMARKS.md`.
+* The default (stable) scalar build is byte-identical to before this
+  round; only the `simd` feature changes behaviour (and only in timing,
+  not output).
+
 ### Added — automatic §9.7 golden-frame refresh cadence on the streaming encoder (round 309, 2026-06-15)
 
 `Vp8InterStreamEncoder` gains an automatic §9.7 `refresh_golden_frame`

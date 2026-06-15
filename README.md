@@ -587,6 +587,38 @@ smaller than the round-288 numbers implied. A/B bench:
 `cargo bench -p oxideav-vp8 --bench ref_slot_rotation -- 'rotate_|shipped_'`.
 See `BENCHMARKS.md` round 308.
 
+### Automatic §9.7 golden-frame refresh cadence (round 309)
+
+Round 309 closes the documented streaming-encoder gap where
+`Vp8InterStreamEncoder`'s scheduler-driven `encode_frame` path only ever
+refreshed LAST on P-frames, leaving GOLDEN frozen at the most-recent key
+frame's reconstruction until the next key frame. A new builder
+`with_golden_interval(n)` (plus getter `golden_interval()` and the
+encode-free predicate `next_p_frame_refreshes_golden()`) makes every
+`n`-th P-frame after a key frame also emit §9.7 `refresh_golden_frame = 1`,
+so GOLDEN tracks recent content for the §16.2 inter MBs that match it
+better than LAST:
+
+```rust
+use oxideav_vp8::{KeyframeParams, stream::Vp8InterStreamEncoder};
+
+let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 60)
+    .expect("non-zero keyframe interval")
+    .with_golden_interval(10);   // refresh GOLDEN every 10th P-frame
+```
+
+`n = 0` (the default after `new`) keeps the historical `refresh_last`-only
+auto path byte-for-byte. The cadence is counted in P-frames since the last
+key frame and resets on every key frame (automatic or forced), so the
+golden boundary re-anchors after a scene-cut keyframe override. The auto
+schedule routes through `encode_p_frame_multi_ref_with_refresh` and leaves
+ALTREF + the §20 `copy_buffer_*` paths untouched (full manual control of
+the §9.7 / §9.8 ladder stays available via the `encode_p_frame_with_refresh*`
+family). Five new lib tests anchor the schedule (scheduled GOLDEN update,
+frozen-otherwise, keyframe cadence reset, `golden_interval = 0`
+byte-identity, and a scheduled-golden stream decoding cleanly through
+`Vp8DecoderState`); lib tests 498 → 503 stable.
+
 ## With the OxideAV runtime (`registry` feature on, the default)
 
 ```rust

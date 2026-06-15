@@ -4,6 +4,39 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — automatic §9.7 golden-frame refresh cadence on the streaming encoder (round 309, 2026-06-15)
+
+`Vp8InterStreamEncoder` gains an automatic §9.7 `refresh_golden_frame`
+schedule, closing the documented gap where the scheduler-driven
+`encode_frame` / `encode_frame_with_force` path only ever refreshed LAST
+on P-frames — leaving GOLDEN frozen at the most-recent key frame's
+reconstruction until the next key frame.
+
+* New builder `with_golden_interval(n)` + getter `golden_interval()`.
+  `n = 0` (the default after `new`) keeps the historical
+  `refresh_last`-only auto path **byte-for-byte**; `n > 0` makes every
+  `n`-th P-frame after a key frame also emit `refresh_golden_frame = 1`,
+  writing the current reconstruction into the encoder's GOLDEN slot in
+  lockstep with what the decoder writes from the wire.
+* New predicate `next_p_frame_refreshes_golden()` reports — without
+  encoding — whether the next scheduler-driven P-frame is a golden
+  boundary (false for a disabled cadence or when the next frame is a key
+  frame, since key frames already refresh every slot per §9.7).
+* The cadence is counted in P-frames since the last key frame and resets
+  on every key frame (automatic or forced), so the golden boundary
+  re-anchors after a scene-cut keyframe override.
+
+Routes through the existing `encode_p_frame_multi_ref_with_refresh`
+primitive with `RefreshControls { refresh_golden_frame: true,
+refresh_last: true, .. }`; ALTREF and the §20 `copy_buffer_*` paths are
+untouched on the auto schedule (full manual control stays available via
+the `encode_p_frame_with_refresh*` family). Five new lib tests: scheduled
+GOLDEN update + frozen-otherwise, cadence reset on keyframe,
+`golden_interval = 0` byte-identity against the plain auto path, a 1K+4P
+scheduled-golden stream decoding cleanly through `Vp8DecoderState`, and the
+disabled-by-default predicate. Lib tests 498 → 503 stable. No public
+breakage; `new` is unchanged.
+
 ## [0.2.4](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.3...v0.2.4) - 2026-06-15
 
 ### Other

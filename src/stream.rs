@@ -66,7 +66,8 @@ use crate::encoder::{
     encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
-    encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh_and_intra_pick,
+    encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,
+    encode_p_frame_multi_ref_with_refresh_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
     EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
@@ -492,6 +493,19 @@ pub struct Vp8InterStreamEncoder {
     /// ZERO_MV, OTHER_MV, SPLIT_MV}` order. Same lifecycle as
     /// `carried_ref_deltas`.
     carried_mode_deltas: [i16; 4],
+    /// Automatic §9.7 `refresh_golden_frame` cadence for the
+    /// scheduler-driven [`Self::encode_frame`] path. `0` disables the
+    /// automatic golden refresh (the historical behaviour — GOLDEN
+    /// stays frozen at the most-recent keyframe's reconstruction until
+    /// the next key frame). `N > 0` makes every `N`-th P-frame **after a
+    /// key frame** also set `refresh_golden_frame = 1`, so GOLDEN tracks
+    /// recent content for the inter MBs that match it better than LAST.
+    /// Counted in P-frames since the last key frame (a key frame already
+    /// refreshes every slot per §9.7, so it resets the count).
+    golden_interval: u64,
+    /// Number of P-frames emitted since the last key frame, used to
+    /// drive [`Self::golden_interval`]. Reset to `0` on every key frame.
+    p_frames_since_keyframe: u64,
 }
 
 impl Vp8InterStreamEncoder {
@@ -523,7 +537,60 @@ impl Vp8InterStreamEncoder {
             altref: None,
             carried_ref_deltas: [0; 4],
             carried_mode_deltas: [0; 4],
+            golden_interval: 0,
+            p_frames_since_keyframe: 0,
         })
+    }
+
+    /// Set the automatic §9.7 `refresh_golden_frame` cadence (builder
+    /// style) and return the modified encoder.
+    ///
+    /// With `golden_interval = N > 0`, the scheduler-driven
+    /// [`Self::encode_frame`] / [`Self::encode_frame_with_force`] path
+    /// sets `refresh_golden_frame = 1` on every `N`-th P-frame measured
+    /// from the most-recent key frame (i.e. the `N`-th, `2N`-th, …
+    /// P-frame after each key frame). On those frames the current
+    /// reconstruction is written into the encoder's GOLDEN slot exactly
+    /// as the decoder will write its own — the §16.2 inter MBs of later
+    /// P-frames can then predict off a recent GOLDEN instead of one
+    /// frozen at the last key frame.
+    ///
+    /// `golden_interval = 0` (the default after [`Self::new`]) disables
+    /// the automatic refresh and reproduces the historical
+    /// `refresh_last`-only auto path byte-for-byte. Callers that want
+    /// full manual control over the §9.7 / §9.8 ladder keep using the
+    /// `encode_p_frame_with_refresh*` family, which is unaffected.
+    #[must_use]
+    pub fn with_golden_interval(mut self, golden_interval: u64) -> Self {
+        self.golden_interval = golden_interval;
+        self
+    }
+
+    /// The configured automatic §9.7 golden-refresh cadence (`0` =
+    /// disabled). See [`Self::with_golden_interval`].
+    pub fn golden_interval(&self) -> u64 {
+        self.golden_interval
+    }
+
+    /// Whether the next scheduler-driven P-frame would set
+    /// `refresh_golden_frame = 1` under the configured
+    /// [`Self::golden_interval`], **without** encoding anything.
+    ///
+    /// Always `false` when the automatic cadence is disabled
+    /// (`golden_interval == 0`) or when the next frame is a key frame
+    /// (key frames refresh every slot regardless). Otherwise `true`
+    /// exactly when this would be the `N`-th, `2N`-th, … P-frame after
+    /// the last key frame.
+    pub fn next_p_frame_refreshes_golden(&self) -> bool {
+        if self.golden_interval == 0 {
+            return false;
+        }
+        if self.next_frame_is_keyframe() == FrameKind::Key {
+            return false;
+        }
+        // This call would emit P-frame number `p_frames_since_keyframe
+        // + 1` since the last key frame.
+        (self.p_frames_since_keyframe + 1) % self.golden_interval == 0
     }
 
     /// Decide whether the next [`Self::encode_frame`] call would emit
@@ -611,6 +678,17 @@ impl Vp8InterStreamEncoder {
         // the caller drop the slots externally.)
         let emit_key = must_be_key || self.last.is_none();
 
+        // §9.7 automatic golden-refresh schedule: when a non-zero
+        // `golden_interval` is configured, the `N`-th P-frame after the
+        // last key frame also sets `refresh_golden_frame = 1` so GOLDEN
+        // tracks recent content rather than staying frozen at the most-
+        // recent key frame. The first scheduled refresh therefore lands
+        // when `p_frames_since_keyframe + 1` (this P-frame's index since
+        // the key frame) is a multiple of the interval.
+        let refresh_golden = !emit_key
+            && self.golden_interval != 0
+            && (self.p_frames_since_keyframe + 1) % self.golden_interval == 0;
+
         let (bytes, planes, kind) = if emit_key {
             let (b, p) = encode_keyframe_with_reconstruction(frame, &self.params)?;
             (b, p, FrameKind::Key)
@@ -620,25 +698,43 @@ impl Vp8InterStreamEncoder {
             // (`LAST` required, `GOLDEN` / `ALTREF` optional) to the
             // multi-ref encoder so it can score each MB against every
             // available reference and emit the §16.2 `ref_frame_tree`
-            // selector bits per MB. Until a future round wires up the
-            // §9.7 `refresh_golden_frame` / `refresh_alternate_frame`
-            // ladder, GOLDEN / ALTREF stay frozen at the most-recent
-            // keyframe's reconstruction — they still beat LAST for
-            // MBs whose source content matches the keyframe (e.g.
-            // after a brief disturbance returns to the original
-            // frame).
+            // selector bits per MB.
+            //
+            // When `refresh_golden` is set the §9.7 wire ladder is
+            // `refresh_golden_frame = 1, refresh_last = 1` (everything
+            // else 0); otherwise it is the default `refresh_last = 1`
+            // only — byte-identical to the historical auto path. The
+            // matching `RefreshControls` is reproduced on the slot side
+            // below so the encoder's GOLDEN slot stays in lockstep with
+            // what the decoder writes from the wire.
             let last_planes = ref_slot_to_keyframe_planes(
                 self.last.as_ref().expect("LAST slot present for P-frame"),
             );
             let golden_planes = self.golden.as_ref().map(ref_slot_to_keyframe_planes);
             let altref_planes = self.altref.as_ref().map(ref_slot_to_keyframe_planes);
-            let (b, p) = encode_p_frame_multi_ref(
-                frame,
-                &last_planes,
-                golden_planes.as_ref(),
-                altref_planes.as_ref(),
-                &self.params,
-            )?;
+            let (b, p) = if refresh_golden {
+                let refresh = RefreshControls {
+                    refresh_golden_frame: true,
+                    refresh_last: true,
+                    ..RefreshControls::default()
+                };
+                encode_p_frame_multi_ref_with_refresh(
+                    frame,
+                    &last_planes,
+                    golden_planes.as_ref(),
+                    altref_planes.as_ref(),
+                    &self.params,
+                    &refresh,
+                )?
+            } else {
+                encode_p_frame_multi_ref(
+                    frame,
+                    &last_planes,
+                    golden_planes.as_ref(),
+                    altref_planes.as_ref(),
+                    &self.params,
+                )?
+            };
             (b, p, FrameKind::InterZeroMv)
         };
 
@@ -660,16 +756,28 @@ impl Vp8InterStreamEncoder {
                 // after a key frame).
                 self.carried_ref_deltas = [0; 4];
                 self.carried_mode_deltas = [0; 4];
+                // §9.7 key frames reset the automatic golden-refresh
+                // cadence: every slot was just refreshed, so the count
+                // of P-frames since the last key frame restarts at 0.
+                self.p_frames_since_keyframe = 0;
             }
             FrameKind::InterZeroMv => {
-                // §9.7 inter refresh ladder used by encode_p_frame_zero_mv:
-                // refresh_last = 1, refresh_golden_frame = 0,
-                // refresh_alternate_frame = 0, copy_buffer_to_* = 0.
-                // Only LAST changes. The §9.4 carried-delta state stays
-                // unchanged (the scheduler-driven path emits
-                // `loop_filter_adj_enable = 0`, so this frame's effective
-                // deltas are all 0 and we have no fresh values to carry).
+                // §9.7 inter refresh ladder. By default only LAST
+                // changes (refresh_last = 1, everything else 0). When
+                // the automatic golden-refresh schedule fired for this
+                // frame the wire carried `refresh_golden_frame = 1` as
+                // well, so GOLDEN takes the same current reconstruction
+                // — keeping the encoder slot in lockstep with the
+                // decoder's §9.7 write. ALTREF and the §20 copy_buffer_*
+                // paths stay untouched on this auto schedule. The §9.4
+                // carried-delta state stays unchanged (this path emits
+                // `loop_filter_adj_enable = 0`, so the effective deltas
+                // are all 0 and there is nothing fresh to carry).
+                if refresh_golden {
+                    self.golden = Some(new_slot.clone());
+                }
                 self.last = Some(new_slot);
+                self.p_frames_since_keyframe += 1;
             }
         }
 
@@ -2174,6 +2282,137 @@ mod tests {
             last_after_p.y, golden_after_k.y,
             "LAST must change after a P-frame, GOLDEN must not"
         );
+    }
+
+    #[test]
+    fn golden_interval_zero_is_default_and_disables_auto_refresh() {
+        let enc =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 100).expect("non-zero interval");
+        assert_eq!(enc.golden_interval(), 0, "default cadence is disabled");
+        assert!(
+            !enc.next_p_frame_refreshes_golden(),
+            "first frame is a key frame, never an auto golden refresh"
+        );
+    }
+
+    #[test]
+    fn auto_golden_refresh_updates_golden_on_scheduled_p_frame() {
+        // keyframe_interval large so frames 1.. are all P; golden every
+        // 2nd P-frame after the key frame.
+        let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("non-zero interval")
+            .with_golden_interval(2);
+        assert_eq!(enc.golden_interval(), 2);
+
+        // Frame 0: key — refreshes every slot, resets the cadence.
+        let (y0, u0, v0) = flat_frame(32, 32, 60, 130, 200);
+        let f0 = I420Frame::packed(32, 32, &y0, &u0, &v0);
+        assert!(!enc.next_p_frame_refreshes_golden(), "next is a key frame");
+        enc.encode_frame(&f0).expect("frame 0 K");
+        let golden_after_k = enc.golden().expect("golden after K").y.clone();
+
+        // Frame 1: 1st P after K (1 % 2 != 0) — golden NOT refreshed.
+        assert!(
+            !enc.next_p_frame_refreshes_golden(),
+            "1st P-frame is not a golden boundary"
+        );
+        let (y1, u1, v1) = flat_frame(32, 32, 200, 50, 90);
+        let f1 = I420Frame::packed(32, 32, &y1, &u1, &v1);
+        enc.encode_frame(&f1).expect("frame 1 P");
+        assert_eq!(
+            enc.golden().expect("golden present").y,
+            golden_after_k,
+            "GOLDEN must stay frozen on the 1st P-frame"
+        );
+
+        // Frame 2: 2nd P after K (2 % 2 == 0) — golden refreshed to this
+        // frame's reconstruction.
+        assert!(
+            enc.next_p_frame_refreshes_golden(),
+            "2nd P-frame is a golden boundary"
+        );
+        let (y2, u2, v2) = flat_frame(32, 32, 30, 220, 40);
+        let f2 = I420Frame::packed(32, 32, &y2, &u2, &v2);
+        enc.encode_frame(&f2).expect("frame 2 P");
+        let golden_after_p2 = enc.golden().expect("golden present").y.clone();
+        assert_ne!(
+            golden_after_p2, golden_after_k,
+            "GOLDEN must change on the 2nd P-frame (auto refresh)"
+        );
+        // GOLDEN now equals LAST: both took this frame's reconstruction.
+        assert_eq!(
+            golden_after_p2,
+            enc.last().expect("last present").y,
+            "scheduled golden refresh writes the same reconstruction as LAST"
+        );
+    }
+
+    #[test]
+    fn auto_golden_refresh_cadence_resets_on_keyframe() {
+        // interval 3 keyframes, golden every 2nd P-frame. The forced
+        // key frame mid-stream must restart the P-frame counter so the
+        // golden boundary re-anchors to the new key frame.
+        let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("non-zero interval")
+            .with_golden_interval(2);
+        let (y, u, v) = flat_frame(32, 32, 128, 128, 128);
+        let f = I420Frame::packed(32, 32, &y, &u, &v);
+
+        // Key frame, then one P-frame (P#1 — not a golden boundary).
+        enc.encode_frame(&f).expect("f0 K");
+        enc.encode_frame(&f).expect("f1 P");
+        // Force a key frame; cadence resets.
+        enc.encode_frame_with_force(&f, true).expect("f2 forced K");
+        // Now P#1 after the new key frame — must NOT be a golden boundary.
+        assert!(
+            !enc.next_p_frame_refreshes_golden(),
+            "cadence must re-anchor after a key frame"
+        );
+        enc.encode_frame(&f).expect("f3 P#1"); // no golden
+        assert!(
+            enc.next_p_frame_refreshes_golden(),
+            "P#2 after the re-anchored key frame is a golden boundary"
+        );
+    }
+
+    #[test]
+    fn auto_golden_refresh_stream_decodes_through_state_driver() {
+        // The encoder writes refresh_golden_frame = 1 on scheduled
+        // P-frames; the decoder must read it back and keep its own GOLDEN
+        // slot in lockstep. A 1K + 4P stream with golden every 2nd P
+        // exercises one scheduled refresh; all frames must decode.
+        let mut enc = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("non-zero interval")
+            .with_golden_interval(2);
+        let mut dec = Vp8DecoderState::new();
+        for i in 0..5u8 {
+            let (yp, up, vp) = flat_frame(32, 32, 40 + i * 30, 120, 110 + i * 20);
+            let frame = I420Frame::packed(32, 32, &yp, &up, &vp);
+            let out = enc.encode_frame(&frame).expect("encode");
+            let decoded = dec.decode_frame(&out.bytes).expect("decode");
+            assert_eq!(decoded.width, 32);
+            assert_eq!(decoded.height, 32);
+        }
+    }
+
+    #[test]
+    fn auto_golden_refresh_disabled_matches_plain_auto_path_byte_for_byte() {
+        // golden_interval = 0 must reproduce the historical
+        // refresh_last-only auto path exactly. Encode the same stream
+        // with the default encoder and confirm every emitted frame is
+        // byte-identical.
+        let mut plain =
+            Vp8InterStreamEncoder::new(KeyframeParams::default(), 100).expect("interval");
+        let mut also_disabled = Vp8InterStreamEncoder::new(KeyframeParams::default(), 100)
+            .expect("interval")
+            .with_golden_interval(0);
+        for i in 0..4u8 {
+            let (yp, up, vp) = flat_frame(32, 32, 50 + i * 25, 130, 90 + i * 15);
+            let frame = I420Frame::packed(32, 32, &yp, &up, &vp);
+            let a = plain.encode_frame(&frame).expect("plain");
+            let b = also_disabled.encode_frame(&frame).expect("disabled");
+            assert_eq!(a.bytes, b.bytes, "golden_interval=0 must be byte-identical");
+        }
     }
 
     #[test]

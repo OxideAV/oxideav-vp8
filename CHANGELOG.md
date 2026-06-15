@@ -4,6 +4,32 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — `panic_free_split_mv_predict` fuzz target (round 318)
+
+New `cargo fuzz` target driving the §16.4 / §18 whole-MB SPLITMV
+prediction synthesiser `motion_comp::predict_split_mv` directly under an
+attacker-shaped MV envelope — a surface no existing harness reached:
+stream-decode fuzzers reach it only through §16.4 mode decode whose
+sixteen vectors are bounded by the sub-MV-mode prediction tree, and the
+single-sub-block fuzzers never run the whole-MB chroma-MV §18.1 averaging
+/ per-sub-block doubling / raster pack.
+
+* Drives an arbitrary `(MB grid ≤ 4×4, target MB position, sixteen luma
+  vectors, version / full-pixel flag)` across four MV-shaping classes
+  (verbatim full-`i16`, small-signed mid-plane, whole-pixel copy branch,
+  degenerate all-equal SPLITMV). Per §18.1 page 114 SPLITMV applies no
+  secondary clamp, so the §20.14 edge-replication inside `filter_block_4x4`
+  is exercised densely by the adversarial vectors.
+* Equivalence oracle on every iteration: each of the sixteen luma + four
+  U + four V sub-blocks must equal, byte for byte, the `filter_block_4x4`
+  block recomputed independently from `stored_luma_mv` (luma) or the
+  `split_chroma_mvs` §18.1 average (chroma), with `apply_full_pixel`
+  applied when the version-3 flag is set — a panic on any drift.
+* Round-318 ASan run (nightly + default `simd`): ~2.85 M executions in
+  61 s (cov 283 / ft 912, ~48 K exec/s, peak RSS 415 MB) from an empty
+  seed; zero crashes / leaks / OOMs. No `src/` change was needed — the
+  synthesiser is panic-free and byte-exact across the full envelope.
+
 ### Added — §15 loop-filter SIMD kernels (round 314, 2026-06-15)
 
 The nightly-only `simd` feature now accelerates the §15 loop filter, the

@@ -798,3 +798,9 @@ name = "panic_free_kf_mb_mode_decode"
 path = "fuzz_targets/panic_free_kf_mb_mode_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "panic_free_split_mv_predict"
+path = "fuzz_targets/panic_free_split_mv_predict.rs"
+test = false
+doc = false

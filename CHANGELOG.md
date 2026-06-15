@@ -4,6 +4,87 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.3...v0.2.4) - 2026-06-15
+
+### Other
+
+- *(vp8)* shipped vs clone-everything A/B for §9 slot rotation (round 308 profile)
+- §11 key-frame MB mode-info tree walk target (round 307)
+- register-local read_literal fixed-prob-128 loop + literal A/B coverage (round 306 profile)
+- add keyframe_stream_encode_decode target for Vp8KeyframeStreamEncoder (round 305)
+- rename ffmpeg_oracle → blackbox_oracle (validator-name neutralization)
+- *(decoder)* contiguous-plane fast path in crop_to_visible (round 304 profile)
+- add decode_multi_partition_carve for §9.5 multi-DCT-partition layout walk
+- collapse loop-filter coeff side-band to per-MB flag (round 302 profile-opt)
+- add ivf_demux_decode_walk IVF container demux-loop target (round 301)
+- drop dead per-frame coeff/side-band default-fill (round 300 profile-opt)
+- add inter_stream_encode_decode_sequence multi-frame stream target (round 299)
+- add dequantize_mb §14.1 dequantization micro-bench (round 298)
+- r297 decode profile + §14.4 DC-only fast-path A/B cell
+- add decoder_trait_packet_lifecycle target for the oxideav_core::Decoder trait driver (round 296)
+- §7.3 bool-decoder primitive in isolation (round 295)
+- §14.4 DC-only IDCT-add fast path — −14% whole-frame inter decode
+- §14.1 dequant factor-derivation target + fix i32 add-overflow panic
+- *(r292)* isolate §12.3 predict_b4x4 sub-block intra path + refresh decoder hotspot map
+- lockstep §13.4 token_prob_update flag-read loop (round 291 profile-opt)
+- §12/§14 keyframe-reconstruct decode-core target (round 290)
+- move-minimising §9 reference-slot rotation (round 289 profile-opt)
+- §9.7/§9.8 reference-slot rotation harness + ranked-table refresh (round 288)
+- §16 inter-MB mode-info decode target (round 287)
+- fuse §14.4 IDCT + §14.5 add-clamp residue pass (round 286 profile-opt)
+- round-285 ranked-table shares recomputed against the exact profile sample totals
+- r283/r284 hot-path harnesses + ranked hotspot table (round 285)
+- move committed seed corpus into corpus/decode_stream_token_descent/seeds/ (round 284 follow-up)
+- decode_stream_token_descent target + scalar/SIMD parity probes; fix decode_vp8 short-DCT-partition reject (round 284)
+- fused §13 token descent + batched bool renormalisation (round 283)
+- decoder-side whole-frame coverage + full-suite refresh (round 282)
+- fused whole-pixel SAD scoring (round 281)
+- pixel-exact encode→decode lockstep differential target (round 280)
+- MB-batched sub-pixel SAD scoring (round 279)
+- round-278 whole-frame keyframe path measured under nightly + simd
+- compile-time SPLITMV partition-group table (round 277)
+- MV-cost log2 table + allocation-free tree walks (round 276)
+- document panic_free_filter_block_into in fuzz/README target table (r275)
+- panic_free_filter_block_into r275 — §16.4 SPLITMV strided-write filter_block_4x4_into (RFC 6386 §16.4 / §18.3 / §20.14)
+- filter_block_4x4_into strided-write primitive + round-274 SPLITMV write-strategy A/B (negative result)
+- add panic_free_mb_batch_motion_comp target for round-270/271/272 MB-batched motion-comp primitives
+- batch whole-pixel non-SPLITMV MB fetch (r272 depth)
+- MB-scale §18.3 chroma batching (sixtap_mb_chroma) — round 271
+- MB-scale §18.3 luma batching (sixtap_mb_luma) + SIMD partner (round 270)
+- SIMD §18.3 sixtap_2d sub-pixel kernel under the `simd` feature (round 269)
+- SIMD §12.2 TM_PRED intra kernel under the `simd` feature (round 268)
+- SIMD §14.1 dequantize kernel under the `simd` feature (round 267)
+- panic_free_encode_decode_e2e r266 — per-frame symmetric encode→decode round-trip (RFC 6386 §7 / §9 / §11 / §13 / §14 / §15)
+- panic_free_inter_mb_reconstruct r265 — §16 inter-MB reconstruction surface (RFC 6386 §16 / §16.2 / §16.4 / §18)
+- panic_free_loop_filter_writeback r263 — §9.4 / §19.2 loop-filter parameter writeback (RFC 6386 §9.4 / §19.2 / §15.4)
+- panic_free_transform_4x4_roundtrip r262 — §14 transform / dequant / residue-summation primitives (RFC 6386 §14)
+- panic_free_bool_codec r261 — §7 boolean range coder primitives (RFC 6386 §7)
+- loop_filter_mb_edge r260 — §15.3 `MBfilter` wide deblock partner (RFC 6386 §15.3 / §15.4)
+- panic_free_intra_predict_kernels r259 — §12 intra-prediction pixel kernels (RFC 6386 §12)
+- block_sad_16x16 SIMD partner + leaf bench r258: §17 SAD primitive (RFC 6386 §17 / §18.3)
+- panic_free_sixtap_subpel r257 — §18.3 / §20.14 sub-pixel synthesis primitives (RFC 6386 §18.3 / §20.14)
+- panic_free_motion_search_descent r256 — §17.1 / §18.3 luma MV picker (RFC 6386 §17 / §18.3 / §20.14)
+- motion_search_descent r255 — wall-time A/B target for the §17.1 / §18.3 luma MV picker (RFC 6386 §17 / §18.3)
+- §13.2 walk-order anchor r254: byte-equal ENC_PCAT1..6 + ENC_CAT_BASE against the RFC 6386 §13.2 spec listing
+- §17.2 walk-order anchor r253: byte-equal MV_UPDATE_PROBS_FLAT against the spec MV_UPDATE_PROBS table (RFC 6386 §17.2)
+- §13.4 walk-order anchor r252: in-crate byte-equivalence against the actual COEFF_UPDATE_PROBS_FLAT (RFC 6386 §13.4)
+- forward_wht_4x4 scalar+SIMD r251: rewrite listings into canonical (a1,b1,c1,d1) butterfly shape mirroring §14.3 inverse_wht_4x4 (RFC 6386 §14.3)
+- forward_dct_4x4_simd r250: rewrite listing into canonical (a1,b1,c1,d1) butterfly shape, matching the round-249 scalar listing (RFC 6386 §14.4)
+- forward_dct_4x4_scalar r249: rewrite listing into canonical (a1,b1,c1,d1) butterfly shape mirroring §14.4 inverse (RFC 6386 §14.4)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- forward_dct_4x4 SIMD dispatch split r247: route public dispatcher to scalar even under `simd` feature (RFC 6386 §14.4)
+- scrub artefacts to positive-only language
+- tokens fuzz r237: panic_free_token_block target (RFC 6386 §13.2 / §13.3)
+- loopfilter fuzz r232: panic_free_loopfilter_segment target (RFC 6386 §15)
+- BENCHMARKS r226: soften whole-frame extrapolation, leave verification to a future profile-depth round
+- forward_transform SIMD r226: §14.3 + §14.4 forward `core::simd<i32,4>` rewrites (RFC 6386 §14)
+- encoder bench r220: forward_transform_4x4 micro-bench (RFC 6386 §14.3 / §14.4)
+- encoder fuzz r213: panic_free_two_pass_stream multi-frame target (RFC 6386 §9.7)
+- encoder fuzz r207: panic_free_encode_keyframe target (RFC 6386 §11/§13/§14/§15)
+- encoder r204: precompute §13.2 token bit paths (RFC 6386 §13.2)
+- round 200: cargo-fuzz harness suite + nested fuzz crate
+- round 194: rate_control_qi_sweep bench + published 10-row trade-off curve
+
 ### Added — shipped vs clone-everything A/B for the §9 slot rotation in `ref_slot_rotation` (round 308 profile, 2026-06-15)
 
 Profile round. No decoder/encoder logic change — a bench-measurement

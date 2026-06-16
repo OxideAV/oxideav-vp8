@@ -533,7 +533,7 @@ pub fn decode_keyframe_mb_bpred(
     }
 
     // ----- Chroma (§12.2): identical to the non-B_PRED path --------
-    let topleft_u = neighbors.u_topleft.unwrap_or(0);
+    let topleft_u = neighbors.u_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_uv8x8(
         &mut out.u,
         uv_mode,
@@ -541,7 +541,7 @@ pub fn decode_keyframe_mb_bpred(
         neighbors.u_left.as_ref(),
         topleft_u,
     );
-    let topleft_v = neighbors.v_topleft.unwrap_or(0);
+    let topleft_v = neighbors.v_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_uv8x8(
         &mut out.v,
         uv_mode,

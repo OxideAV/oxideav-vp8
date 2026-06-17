@@ -4,6 +4,33 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §12.2 DC-prediction edge-sum SIMD kernel (round 329)
+
+The nightly-only `simd` feature now accelerates the averaging numerator
+of the §12.2 DC intra predictor — the mode selected on the majority of
+flat-region macroblocks (both 16×16 luma and 8×8 chroma). The per-edge
+horizontal byte sum is rewritten as a single widening
+`core::simd::Simd<u16, N>::reduce_sum` for the two §12.2 widths
+(N = 16 luma, N = 8 chroma); the `predict_dc_with_optional_edges` two- /
+one-edge averaging paths dispatch to it under the `simd` feature and fall
+back to the scalar accumulate on every stable build.
+
+* A `u16` lane cannot overflow: the widest edge holds 16 bytes of value
+  255, summing to 4080, well inside `u16::MAX`. Integer addition is
+  associative, so the tree reduction yields the identical total as the
+  scalar left-fold — the rounding shift that follows is byte-identical.
+* `dc_edge_sum_simd_matches_scalar_on_stress_inputs` proves the SIMD and
+  scalar sums agree bit-for-bit across all-zero, all-255 (the maximum),
+  the §12.2 off-frame defaults (127 / 129), ramps, alternating extremes,
+  and 16 pseudo-random edges per width.
+  `dc_edge_sum_drives_predict_dc_public_entry_points` confirms the public
+  `predict_y16x16_dc` / `predict_uv8x8_dc` surface still emits the
+  expected fill against an independent scalar average.
+* New `dc_edge_sum_parity_pair` doc-hidden probe wired into the
+  `decode_stream_token_descent` fuzz target so any scalar/SIMD divergence
+  on attacker-shaped neighbour bytes becomes a finding. No behaviour
+  change on the default (scalar) build.
+
 ### Added — `panic_free_split_mv_predict` fuzz target (round 318)
 
 New `cargo fuzz` target driving the §16.4 / §18 whole-MB SPLITMV

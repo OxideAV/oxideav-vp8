@@ -167,6 +167,12 @@ fn simd_parity_leg(data: &[u8]) {
         oxideav_vp8::intra_predict::predict_tm_parity_pair(8, &above16[..8], &left16[..8], p);
     assert_eq!(s, v, "§12.2 TM_PRED 8×8 scalar/SIMD divergence");
 
+    // §12.2 DC edge sum: both averaging widths, raw neighbour bytes.
+    let (s, v) = oxideav_vp8::intra_predict::dc_edge_sum_parity_pair(16, &above16);
+    assert_eq!(s, v, "§12.2 DC edge-sum 16-wide scalar/SIMD divergence");
+    let (s, v) = oxideav_vp8::intra_predict::dc_edge_sum_parity_pair(8, &left16[..8]);
+    assert_eq!(s, v, "§12.2 DC edge-sum 8-wide scalar/SIMD divergence");
+
     // §18.3 / §20.14 six-tap synthesis: every kernel scale, both filter
     // sets, fractional offsets masked into the {0..7}² tap-table range.
     let mx = usize::from(at(83)) & 7;

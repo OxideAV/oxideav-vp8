@@ -265,6 +265,93 @@ pub fn predict_tm_parity_pair(n: usize, above: &[u8], left: &[u8], p: u8) -> (Ve
     (scalar, simd)
 }
 
+/// Horizontal sum of an `n`-pixel DC neighbour edge (the §12.2 averaging
+/// numerator before rounding). The two §12.2 block widths (16 luma, 8
+/// chroma) take the SIMD reduction on nightly + `simd`; everything else
+/// (and every stable build) the scalar accumulate. The SIMD path is
+/// byte-exact against the scalar listing on every fixture
+/// (`dc_edge_sum_simd_matches_scalar_on_stress_inputs`).
+#[inline]
+fn dc_edge_sum(edge: &[u8]) -> u32 {
+    #[cfg(feature = "simd")]
+    {
+        match edge.len() {
+            16 => return dc_edge_sum_simd::<16>(edge),
+            8 => return dc_edge_sum_simd::<8>(edge),
+            _ => {}
+        }
+    }
+    dc_edge_sum_scalar(edge)
+}
+
+/// Scalar §12.2 DC edge sum — the averaging numerator written out
+/// longhand: a widening accumulate of every byte in `edge`.
+///
+/// The public [`dc_edge_sum`] dispatches here on stable builds (and on
+/// nightly without the `simd` feature); the `simd` feature swaps in
+/// [`dc_edge_sum_simd`] for the §12.2 block widths (16 and 8), which is
+/// itself byte-exact against this implementation
+/// (`dc_edge_sum_simd_matches_scalar_on_stress_inputs`).
+#[allow(dead_code)] // Used by `dc_edge_sum` only on the !simd path.
+#[inline]
+fn dc_edge_sum_scalar(edge: &[u8]) -> u32 {
+    let mut sum: u32 = 0;
+    for &v in edge {
+        sum += v as u32;
+    }
+    sum
+}
+
+/// SIMD §12.2 DC edge sum — `core::simd::Simd<u16, N>` reduction of
+/// [`dc_edge_sum_scalar`] for the two §12.2 edge widths (N = 16 luma,
+/// N = 8 chroma).
+///
+/// The averaging numerator is a pure horizontal sum with no cross-lane
+/// dependency, so it maps directly onto one widening reduction: load the
+/// `N` neighbour bytes, widen lane-wise to `u16`, and `reduce_sum`. A
+/// `u16` lane cannot overflow — the largest single edge holds `N = 16`
+/// bytes of value 255, summing to `4080`, well inside `u16::MAX`. Integer
+/// addition is associative, so the tree reduction yields the identical
+/// total as the scalar left-fold; the byte-exactness is enforced on every
+/// fixture by `dc_edge_sum_simd_matches_scalar_on_stress_inputs`.
+#[cfg(feature = "simd")]
+#[inline]
+fn dc_edge_sum_simd<const N: usize>(edge: &[u8]) -> u32 {
+    use core::simd::num::SimdUint;
+    use core::simd::Simd;
+
+    debug_assert_eq!(edge.len(), N);
+    let widened: Simd<u16, N> = Simd::<u8, N>::from_slice(edge).cast::<u16>();
+    widened.reduce_sum() as u32
+}
+
+/// Differential probe for the fuzz harness: run the §12.2 DC edge sum for
+/// one of the two §12.2 widths (`n` = 16 luma or 8 chroma) through BOTH
+/// [`dc_edge_sum_scalar`] and [`dc_edge_sum_simd`] and return
+/// `(scalar, simd)` so the caller can assert equality. `edge` must hold
+/// `n` pixels.
+///
+/// Only compiled under the `simd` feature (without it there is exactly one
+/// implementation and nothing to compare). Behaviour-neutral: nothing in
+/// the decode or encode pipeline calls this — it exists so the
+/// `decode_stream_token_descent` fuzz target can turn any scalar/SIMD
+/// divergence on attacker-shaped inputs into a finding.
+///
+/// # Panics
+///
+/// Panics if `n` is not 16 or 8 (the only widths the SIMD kernel serves).
+#[cfg(feature = "simd")]
+#[doc(hidden)]
+pub fn dc_edge_sum_parity_pair(n: usize, edge: &[u8]) -> (u32, u32) {
+    let scalar = dc_edge_sum_scalar(edge);
+    let simd = match n {
+        16 => dc_edge_sum_simd::<16>(edge),
+        8 => dc_edge_sum_simd::<8>(edge),
+        other => panic!("dc_edge_sum_parity_pair: unsupported §12.2 width {other}"),
+    };
+    (scalar, simd)
+}
+
 /// Generic DC-prediction helper for the §12.2 / §12.3 rules.
 ///
 /// * If both `above` and `left` are present, the DC value is the
@@ -290,29 +377,17 @@ fn predict_dc_with_optional_edges(
     let dc = match (above, left) {
         (Some(a), Some(l)) => {
             // 2n summands, shf = log2(2n).
-            let mut sum: u32 = 0;
-            for &v in a {
-                sum += v as u32;
-            }
-            for &v in l {
-                sum += v as u32;
-            }
+            let sum = dc_edge_sum(a) + dc_edge_sum(l);
             let shf = (2 * n).trailing_zeros();
             ((sum + (1 << (shf - 1))) >> shf) as u8
         }
         (Some(a), None) => {
-            let mut sum: u32 = 0;
-            for &v in a {
-                sum += v as u32;
-            }
+            let sum = dc_edge_sum(a);
             let shf = n.trailing_zeros();
             ((sum + (1 << (shf - 1))) >> shf) as u8
         }
         (None, Some(l)) => {
-            let mut sum: u32 = 0;
-            for &v in l {
-                sum += v as u32;
-            }
+            let sum = dc_edge_sum(l);
             let shf = n.trailing_zeros();
             ((sum + (1 << (shf - 1))) >> shf) as u8
         }
@@ -1226,5 +1301,80 @@ mod tests {
         let mut via_scalar = [0u8; 64];
         super::predict_tm_scalar(&mut via_scalar, 8, &above8, &left8, p);
         assert_eq!(via_public.as_slice(), via_scalar.as_slice());
+    }
+
+    // ---------------------------------------------------------------
+    // SIMD vs scalar byte-exact equivalence for the §12.2 DC edge sum.
+    // Mirrors the §12.2 TM and §14 dequant
+    // `*_simd_matches_scalar_on_stress_inputs` pairs. On stable / no
+    // `simd` feature this exercises the scalar path twice (the public
+    // `dc_edge_sum` dispatch and the directly-named `_scalar` fn) —
+    // harmless; keeps CI green. On nightly + `simd` it's the primary
+    // safety net: `dc_edge_sum` dispatches to the SIMD reduction for
+    // the §12.2 widths (16 / 8) while `dc_edge_sum_scalar` stays
+    // reachable as the fallback, so the assertion compares the two
+    // bit-for-bit, including the all-255 saturating sum (16 × 255 =
+    // 4080) that the rounding shift then divides.
+    // ---------------------------------------------------------------
+
+    /// `edge` stress fixtures for one §12.2 width `n` (16 luma / 8
+    /// chroma): all-zero, all-255 (the reduction's maximum), the
+    /// §12.2 off-frame defaults (127 above, 129 left), an ascending
+    /// ramp, an alternating-extremes pattern, and deterministic
+    /// pseudo-random rows reusing the §12.2 TM LCG.
+    fn dc_edge_stress_inputs(n: usize) -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        v.push(vec![0u8; n]);
+        v.push(vec![255u8; n]);
+        v.push(vec![DEFAULT_ABOVE_PIXEL; n]);
+        v.push(vec![DEFAULT_LEFT_PIXEL; n]);
+        v.push((0..n).map(|i| (i * 255 / (n - 1)) as u8).collect());
+        v.push((0..n).map(|i| if i % 2 == 0 { 0 } else { 255 }).collect());
+        let mut seed = 0xDC00_0000u32 ^ (n as u32);
+        for _ in 0..16 {
+            v.push(lcg_bytes(&mut seed, n));
+        }
+        v
+    }
+
+    #[test]
+    fn dc_edge_sum_simd_matches_scalar_on_stress_inputs() {
+        for n in [16usize, 8] {
+            for (idx, edge) in dc_edge_stress_inputs(n).iter().enumerate() {
+                // `dc_edge_sum` is the dispatcher: SIMD on nightly +
+                // `simd` (for n = 16 / 8), scalar otherwise. Compare it
+                // against the directly-named scalar fallback on the
+                // identical edge.
+                let via_dispatch = super::dc_edge_sum(edge);
+                let via_scalar = super::dc_edge_sum_scalar(edge);
+                assert_eq!(
+                    via_dispatch, via_scalar,
+                    "dc_edge_sum (dispatch) diverged from scalar on stress \
+                     input #{idx} (n {n})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dc_edge_sum_drives_predict_dc_public_entry_points() {
+        // The two §12.2 DC kernels must agree with an independent
+        // scalar average on a non-flat edge — proving the SIMD sum
+        // rewrite didn't change the public surface's bytes.
+        let above16: [u8; 16] = core::array::from_fn(|i| (i * 17) as u8);
+        let left16: [u8; 16] = core::array::from_fn(|i| 255 - (i * 13) as u8);
+        let sum: u32 = above16.iter().chain(left16.iter()).map(|&b| b as u32).sum();
+        let want = ((sum + 16) >> 5) as u8;
+        let mut out = [0u8; 256];
+        predict_y16x16_dc(&mut out, Some(&above16), Some(&left16));
+        assert!(out.iter().all(|&p| p == want));
+
+        let above8: [u8; 8] = core::array::from_fn(|i| (i * 31) as u8);
+        let left8: [u8; 8] = core::array::from_fn(|i| 255 - (i * 29) as u8);
+        let sum: u32 = above8.iter().chain(left8.iter()).map(|&b| b as u32).sum();
+        let want = ((sum + 8) >> 4) as u8;
+        let mut out = [0u8; 64];
+        predict_uv8x8_dc(&mut out, Some(&above8), Some(&left8));
+        assert!(out.iter().all(|&p| p == want));
     }
 }

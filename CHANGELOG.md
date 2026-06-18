@@ -4,6 +4,34 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed — §12.3 B_TM_PRED routed through the shared SIMD TM kernel (round 334)
+
+The §12.3 4×4 sub-block `B_TM_PRED` arm of `predict_b4x4` previously ran
+its own inline scalar `4×4` double loop with a per-pixel `clamp255`. It
+now routes through the shared §12.2 TM dispatcher (`predict_tm`), so on
+the nightly-only `simd` feature it takes the existing
+`core::simd::Simd<i16, N>` row kernel at width N = 4 alongside the §12.2
+16/8 block sizes; stable builds take the byte-identical scalar fill.
+`B_TM_PRED` is one of the most-selected sub-block intra modes on detailed
+keyframe content, so this widens SIMD coverage onto a hot intra path with
+no new kernel code (the kernel was already generic over N).
+
+* The SIMD TM kernel's `i16` arithmetic reproduces the scalar `i32`
+  `clamp255(L_r + A_c - P)` exactly at every width: each intermediate
+  lies in `-255..=510`, far inside `i16`, so no lane wraps before the
+  `simd_clamp(0, 255)`. `predict_tm_simd_matches_scalar_on_stress_inputs`
+  now sweeps width 4 in addition to 16 / 8, asserting the SIMD and scalar
+  fills agree bit-for-bit across the clamp-floor / clamp-ceiling
+  endpoints, opposing ramps, alternating extremes, and pseudo-random
+  triples.
+* New `predict_b4x4_tm_matches_independent_scalar_formula` locks the
+  public `predict_b4x4` Tm arm to an independent inline scalar reference
+  across a clamp-straddling fixture and 64 deterministic random triples,
+  proving the routing did not change the emitted bytes.
+* `predict_tm_parity_pair` (the doc-hidden fuzz probe feeding
+  `decode_stream_token_descent`) now accepts width 4 so any scalar/SIMD
+  divergence on the §12.3 sub-block TM surfaces as a fuzz finding.
+
 ### Added — §12.2 DC-prediction edge-sum SIMD kernel (round 329)
 
 The nightly-only `simd` feature now accelerates the averaging numerator

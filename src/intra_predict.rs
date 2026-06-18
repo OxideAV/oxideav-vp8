@@ -165,6 +165,11 @@ fn predict_tm(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8) {
         match n {
             16 => return predict_tm_simd::<16>(out, above, left, p),
             8 => return predict_tm_simd::<8>(out, above, left, p),
+            // §12.3 B_TM_PRED: the 4×4 sub-block TM is the identical
+            // §12.2 `clamp255(L_r + A_c - P)` fill at width 4. The SIMD
+            // kernel is generic over N, so the §12.3 sub-block arm
+            // routes here alongside the §12.2 16/8 block sizes.
+            4 => return predict_tm_simd::<4>(out, above, left, p),
             _ => {}
         }
     }
@@ -176,9 +181,9 @@ fn predict_tm(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8) {
 ///
 /// The public [`predict_tm`] dispatches here on stable builds (and on
 /// nightly without the `simd` feature); the `simd` feature swaps in
-/// [`predict_tm_simd`] for the §12.2 block sizes (16 and 8), which is
-/// itself byte-exact against this implementation
-/// (`predict_tm_simd_matches_scalar_on_stress_inputs`).
+/// [`predict_tm_simd`] for the §12.2 block sizes (16 and 8) and the
+/// §12.3 sub-block size (4), which is itself byte-exact against this
+/// implementation (`predict_tm_simd_matches_scalar_on_stress_inputs`).
 fn predict_tm_scalar(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8) {
     debug_assert_eq!(out.len(), n * n);
     debug_assert_eq!(above.len(), n);
@@ -192,9 +197,9 @@ fn predict_tm_scalar(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8)
     }
 }
 
-/// SIMD §12.2 TM_PRED — `core::simd::Simd<i16, N>` row rewrite of
-/// [`predict_tm_scalar`] for the two §12.2 block widths (N = 16 luma,
-/// N = 8 chroma).
+/// SIMD TM_PRED — `core::simd::Simd<i16, N>` row rewrite of
+/// [`predict_tm_scalar`] for the three TM block widths (N = 16 §12.2
+/// luma, N = 8 §12.2 chroma, N = 4 §12.3 sub-block).
 ///
 /// §12.2 computes `X_{rc} = clamp255(L_r + A_c - P)`. The column term
 /// `A_c - P` is row-invariant, so it is formed once as an `i16` vector
@@ -236,11 +241,12 @@ fn predict_tm_simd<const N: usize>(out: &mut [u8], above: &[u8], left: &[u8], p:
     }
 }
 
-/// Differential probe for the fuzz harness: run the §12.2 TM_PRED fill for
-/// one of the two §12.2 block widths (`n` = 16 luma or 8 chroma) through
-/// BOTH [`predict_tm_scalar`] and [`predict_tm_simd`] and return
-/// `(scalar, simd)` as `n*n`-byte rasters so the caller can assert
-/// byte-equality. `above` and `left` must each hold `n` pixels.
+/// Differential probe for the fuzz harness: run the TM_PRED fill for one
+/// of the three TM block widths (`n` = 16 §12.2 luma, 8 §12.2 chroma, or
+/// 4 §12.3 sub-block) through BOTH [`predict_tm_scalar`] and
+/// [`predict_tm_simd`] and return `(scalar, simd)` as `n*n`-byte rasters
+/// so the caller can assert byte-equality. `above` and `left` must each
+/// hold `n` pixels.
 ///
 /// Only compiled under the `simd` feature (without it there is exactly one
 /// implementation and nothing to compare). Behaviour-neutral: nothing in
@@ -250,7 +256,7 @@ fn predict_tm_simd<const N: usize>(out: &mut [u8], above: &[u8], left: &[u8], p:
 ///
 /// # Panics
 ///
-/// Panics if `n` is not 16 or 8 (the only widths the SIMD kernel serves).
+/// Panics if `n` is not 16, 8, or 4 (the only widths the SIMD kernel serves).
 #[cfg(feature = "simd")]
 #[doc(hidden)]
 pub fn predict_tm_parity_pair(n: usize, above: &[u8], left: &[u8], p: u8) -> (Vec<u8>, Vec<u8>) {
@@ -260,7 +266,8 @@ pub fn predict_tm_parity_pair(n: usize, above: &[u8], left: &[u8], p: u8) -> (Ve
     match n {
         16 => predict_tm_simd::<16>(&mut simd, above, left, p),
         8 => predict_tm_simd::<8>(&mut simd, above, left, p),
-        other => panic!("predict_tm_parity_pair: unsupported §12.2 width {other}"),
+        4 => predict_tm_simd::<4>(&mut simd, above, left, p),
+        other => panic!("predict_tm_parity_pair: unsupported §12.2/§12.3 width {other}"),
     }
     (scalar, simd)
 }
@@ -573,12 +580,15 @@ pub fn predict_b4x4(out: &mut [u8; 16], mode: IntraBmode, above: &[u8; 8], left:
             }
         }
         IntraBmode::Tm => {
-            // §12.3 B_TM_PRED: same shape as the 16×16 TM at 4×4.
-            for r in 0..4 {
-                for c in 0..4 {
-                    buf[b(r, c)] = clamp255(left[r] as i32 + above[c] as i32 - p as i32);
-                }
-            }
+            // §12.3 B_TM_PRED: same shape as the 16×16 TM at 4×4,
+            // `X_{rc} = clamp255(L_r + A_c - P)`. Route through the
+            // shared §12.2 TM dispatcher so the SIMD path (nightly +
+            // `simd`) serves the 4×4 sub-block alongside the 16/8 block
+            // sizes; stable builds take the byte-identical scalar fill.
+            // Only the four directly-above pixels `above[0..4]` are read
+            // (the diagonal-mode right-extension `above[4..8]` is
+            // irrelevant to TM).
+            predict_tm(&mut buf, 4, &above[0..4], &left[..], p);
         }
         IntraBmode::Ve => {
             // §12.3 B_VE_PRED: each column c gets avg3p(A + c) i.e.
@@ -1259,7 +1269,9 @@ mod tests {
 
     #[test]
     fn predict_tm_simd_matches_scalar_on_stress_inputs() {
-        for n in [16usize, 8] {
+        // 16 / 8 are the §12.2 block sizes; 4 is the §12.3 B_TM_PRED
+        // sub-block, which now shares the SIMD TM dispatcher.
+        for n in [16usize, 8, 4] {
             for (idx, (above, left, p)) in tm_stress_inputs(n).iter().enumerate() {
                 // `predict_tm` is the dispatcher: SIMD on nightly +
                 // `simd` (for n = 16 / 8), scalar otherwise. Compare
@@ -1301,6 +1313,58 @@ mod tests {
         let mut via_scalar = [0u8; 64];
         super::predict_tm_scalar(&mut via_scalar, 8, &above8, &left8, p);
         assert_eq!(via_public.as_slice(), via_scalar.as_slice());
+    }
+
+    #[test]
+    fn predict_b4x4_tm_matches_independent_scalar_formula() {
+        // §12.3 B_TM_PRED now routes through the shared §12.2 TM
+        // dispatcher (SIMD on nightly + `simd`, scalar otherwise). Lock
+        // in that the public `predict_b4x4` Tm arm still produces the
+        // exact §12.3 `clamp255(L_r + A_c - P)` fill, byte-for-byte,
+        // against an independent inline scalar reference — across a
+        // clamp-straddling triple and the deterministic LCG triples.
+        let independent = |above: &[u8; 8], left: &[u8; 4], p: u8| -> [u8; 16] {
+            let mut want = [0u8; 16];
+            for r in 0..4 {
+                for c in 0..4 {
+                    let v = left[r] as i32 + above[c] as i32 - p as i32;
+                    want[r * 4 + c] = v.clamp(0, 255) as u8;
+                }
+            }
+            want
+        };
+
+        // Clamp-straddling fixture: opposing ramps + mid-range P.
+        let above: [u8; 8] = core::array::from_fn(|i| (i * 36) as u8);
+        let left: [u8; 4] = [255, 170, 85, 0];
+        for &p in &[0u8, 64, 127, 200, 255] {
+            let mut got = [0u8; 16];
+            predict_b4x4(&mut got, IntraBmode::Tm, &above, &left, p);
+            assert_eq!(
+                got,
+                independent(&above, &left, p),
+                "B_TM_PRED diverged from independent scalar formula (p {p})"
+            );
+        }
+
+        // Deterministic pseudo-random triples (independent LCG seed).
+        let mut seed = 0xB471_0000u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        for _ in 0..64 {
+            let above: [u8; 8] = core::array::from_fn(|_| next());
+            let left: [u8; 4] = core::array::from_fn(|_| next());
+            let p = next();
+            let mut got = [0u8; 16];
+            predict_b4x4(&mut got, IntraBmode::Tm, &above, &left, p);
+            assert_eq!(
+                got,
+                independent(&above, &left, p),
+                "B_TM_PRED diverged from independent scalar formula on random triple (p {p})"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

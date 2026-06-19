@@ -804,3 +804,9 @@ name = "panic_free_split_mv_predict"
 path = "fuzz_targets/panic_free_split_mv_predict.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "adaptive_quant_encode_decode_lockstep"
+path = "fuzz_targets/adaptive_quant_encode_decode_lockstep.rs"
+test = false
+doc = false

@@ -420,8 +420,9 @@ pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_M
 pub use encoder::{
     classify_coeff_token, count_block_branches, count_inter_frame_branches,
     count_keyframe_branches, count_mb_branches, empty_branch_counts, encode_coeff_block,
-    encode_keyframe, encode_keyframe_with_fitted_token_prob_updates,
-    encode_keyframe_with_reconstruction,
+    encode_keyframe, encode_keyframe_adaptive_quant,
+    encode_keyframe_adaptive_quant_with_reconstruction,
+    encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors, encode_p_frame_multi_ref,
@@ -437,11 +438,11 @@ pub use encoder::{
     fit_token_prob_updates, make_silent_keyframe_encoder, patch_first_partition_size,
     quality_to_qindex, write_frame_tag, write_loop_filter, write_loop_filter_with_deltas,
     write_mb_no_skip_coeff, write_no_token_prob_updates, write_quant_indices,
-    write_segment_update_flags, write_token_partition_count, write_token_prob_updates, BoolEncoder,
-    BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, KeyframeParams,
-    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
-    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
-    TokenEncoder,
+    write_segment_update_flags, write_token_partition_count, write_token_prob_updates,
+    write_update_segmentation, AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector,
+    EncodeError, EncodedMb, I420Frame, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas,
+    MbPixels, RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder,
+    SilentKeyframeParams, TokenEncodeError, TokenEncoder, UpdateSegmentationLayer,
 };
 
 /// Framework `make_encoder` / `make_encoder_with_qindex` /

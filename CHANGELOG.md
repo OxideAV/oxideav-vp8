@@ -30,6 +30,32 @@ encoder side of segmentation.
   does (full layer with mixed Some/None deltas, absolute-mode with no map
   update, map-update with no feature data).
 
+### Added — §9.3 / §10 segment-based adaptive-quant key-frame encoder (round 346)
+
+`encode_keyframe_adaptive_quant` (+ `_with_reconstruction`) is the first
+encoder path to emit `segmentation_enabled = true`. Each macroblock is
+sorted into one of four §10 segments by its luma variance and quantised
+at that segment's effective qindex (`clamp(base_y_ac_qi +
+quant_delta[seg], 0, 127)`); the frame header carries the §9.3
+delta-mode per-segment `quantizer_update` values + `mb_segment_tree_probs`,
+and the §11 mode layer carries each MB's §10 `segment_id`.
+
+* `AdaptiveQuantConfig` exposes the base qindex, three luma-variance
+  classification boundaries, the four signed per-segment quant deltas, and
+  the §15 loop-filter knobs. The default applies the classic
+  activity-masking gradient (flat → coarser `+8`, busiest → finer `−12`).
+* The decoder's long-standing `resolve_segment_dequant_factors` rebuilds
+  the identical four `MbDequantFactors` from the emitted quantizer deltas
+  and routes each MB by its decoded `segment_id`, so the path satisfies
+  the encoder/decoder pixel-lockstep contract: the encoder quantises and
+  dequantises each MB with the *same* per-segment factor, predicting from
+  the exact pixels the decoder reconstructs.
+* `tests/encoder_keyframe_adaptive_quant.rs` (11 tests) pins byte-exact
+  encode→decode lockstep across the default gradient, partial macroblocks,
+  both §15 filter arms, a steeper gradient at a different base, and the
+  all-zero-delta no-op; plus a PSNR bar, range-validation rejections, and a
+  "gradient ≠ uniform" differentiation check.
+
 ### Changed — §12.3 B_TM_PRED routed through the shared SIMD TM kernel (round 334)
 
 The §12.3 4×4 sub-block `B_TM_PRED` arm of `predict_b4x4` previously ran

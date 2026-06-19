@@ -4412,6 +4412,375 @@ fn encode_keyframe_inner(
     Ok((out, planes))
 }
 
+/// Configuration for the §9.3 / §10 segment-based adaptive-quant key-frame
+/// encoder ([`encode_keyframe_adaptive_quant`]).
+///
+/// The encoder sorts each macroblock into one of four segments by its
+/// luma activity (variance), then applies a per-segment quantizer feature
+/// so detailed macroblocks can be coded at a finer quantizer than flat
+/// ones (or vice-versa). All segmentation machinery — the §9.3
+/// `update_segmentation()` block, the per-MB §10 `segment_id`, the
+/// per-segment §14.1 dequant factors — is driven from this config. The
+/// segmentation is **delta-mode** (`segment_feature_mode = 0`): each
+/// segment's `quant_delta` is added to the §9.6 `base_y_ac_qi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdaptiveQuantConfig {
+    /// §9.6 baseline `y_ac_qi` (0..=127). Each segment's effective qindex
+    /// is `clamp(base_y_ac_qi + quant_delta[seg], 0, 127)`.
+    pub base_y_ac_qi: u8,
+    /// Three ascending luma-variance boundaries splitting macroblocks into
+    /// the four segments: segment `s` is the count of boundaries the MB's
+    /// variance meets-or-exceeds (so a flat MB → segment 0, the busiest →
+    /// segment 3). Values need not be sorted by the caller; the classifier
+    /// uses them as independent "≥" tests, but ascending order gives the
+    /// intended monotone mapping.
+    pub variance_boundaries: [u32; 3],
+    /// Per-segment §10 `quantizer_update_value` deltas (signed, magnitude
+    /// ≤ 127), added to `base_y_ac_qi` in delta mode. The natural AQ
+    /// choice raises the quantizer on flat segments (`+`) and lowers it on
+    /// detailed segments (`-`); the default does exactly that.
+    pub quant_delta: [i8; 4],
+    /// §9.4 baseline loop-filter level (0..=63); `0` skips the §15 filter.
+    pub loop_filter_level: u8,
+    /// §9.4 sharpness (0..=7).
+    pub sharpness_level: u8,
+    /// §9.4 `filter_type`: false = §15.3 normal, true = §15.2 simple.
+    pub filter_type: bool,
+}
+
+impl Default for AdaptiveQuantConfig {
+    fn default() -> Self {
+        AdaptiveQuantConfig {
+            base_y_ac_qi: 32,
+            variance_boundaries: [
+                SEGMENT_VARIANCE_THRESHOLDS[1],
+                SEGMENT_VARIANCE_THRESHOLDS[2],
+                SEGMENT_VARIANCE_THRESHOLDS[3],
+            ],
+            // Flat → coarser (+), detailed → finer (−): the classic
+            // activity-masking AQ gradient.
+            quant_delta: [8, 0, -6, -12],
+            loop_filter_level: 0,
+            sharpness_level: 0,
+            filter_type: false,
+        }
+    }
+}
+
+/// Population variance of a 16×16 luma macroblock (×1, integer), the §10
+/// activity metric the [`AdaptiveQuantConfig`] classifier sorts on.
+///
+/// One-pass `E[X²] − E[X]²` in `u64` (256 `u8` samples sum to at most
+/// `256·255² ≈ 1.66e7`, far inside `u64`). The `saturating_sub` guards the
+/// rare case where integer rounding of the two terms inverts their order.
+fn mb_luma_variance(y: &[u8; 256]) -> u32 {
+    let mut sum: u64 = 0;
+    let mut sumsq: u64 = 0;
+    for &px in y.iter() {
+        sum += px as u64;
+        sumsq += (px as u64) * (px as u64);
+    }
+    let n = 256u64;
+    let mean_sq = (sum * sum) / (n * n);
+    let e_sq = sumsq / n;
+    e_sq.saturating_sub(mean_sq) as u32
+}
+
+/// Classify a macroblock variance into a 0..=3 segment id: the number of
+/// `variance_boundaries` the variance meets-or-exceeds, capped at 3.
+fn classify_segment(variance: u32, boundaries: &[u32; 3]) -> u8 {
+    boundaries.iter().filter(|&&b| variance >= b).count().min(3) as u8
+}
+
+/// Encode a key frame with §9.3 / §10 segment-based adaptive quantisation.
+///
+/// Each macroblock is sorted into one of four segments by its §10 luma
+/// variance ([`mb_luma_variance`] vs the config's `variance_boundaries`),
+/// and quantised at that segment's effective qindex
+/// (`clamp(base_y_ac_qi + quant_delta[seg], 0, 127)`). The frame header
+/// carries the §9.3 `update_segmentation()` block (delta-mode per-segment
+/// `quantizer_update` values + the `mb_segment_tree_probs`), and the §11
+/// mode layer carries each MB's §10 `segment_id`. The decoder's
+/// `resolve_segment_dequant_factors` rebuilds the same four
+/// [`crate::dequant::MbDequantFactors`] and applies the matching one per
+/// MB, so the emitted bytes self-decode to the encoder's own
+/// reconstruction within the per-segment quantiser's distortion.
+///
+/// The quantiser used to *quantise* each MB's residual is the same one
+/// used to *dequantise* it for the running reconstruction buffer, so the
+/// encoder predicts from the exact pixels the decoder will reconstruct
+/// (the standard encoder/decoder pixel-lockstep contract). The §15 loop
+/// filter (when `loop_filter_level != 0`) runs as a post-reconstruction
+/// stage with segmentation-aware levels left at the frame base (the §10
+/// per-segment loop-filter feature is not emitted by this path).
+pub fn encode_keyframe_adaptive_quant(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    let (bytes, _planes) = encode_keyframe_adaptive_quant_with_reconstruction(frame, config)?;
+    Ok(bytes)
+}
+
+/// As [`encode_keyframe_adaptive_quant`], but also returns the
+/// macroblock-aligned post-§15 reconstruction planes (the LAST/GOLDEN/
+/// ALTREF candidate a multi-frame driver would install) so callers avoid
+/// re-decoding the bytes just emitted.
+pub fn encode_keyframe_adaptive_quant_with_reconstruction(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let width = frame.width;
+    let height = frame.height;
+    if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
+        return Err(EncodeError::InvalidDimensions { width, height });
+    }
+    if config.base_y_ac_qi > 127 {
+        return Err(EncodeError::QuantIndexOutOfRange {
+            value: config.base_y_ac_qi,
+        });
+    }
+    if config.loop_filter_level > 63 {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: config.loop_filter_level,
+        });
+    }
+    if config.sharpness_level > 7 {
+        return Err(EncodeError::SharpnessLevelOutOfRange {
+            value: config.sharpness_level,
+        });
+    }
+
+    let mb_cols = width.div_ceil(16) as usize;
+    let mb_rows = height.div_ceil(16) as usize;
+
+    let coeff_probs = crate::dct_tokens::DEFAULT_COEFF_PROBS;
+
+    // §10 per-segment effective qindex + the matching §14.1 dequant
+    // factors. Delta mode: q_seg = clamp(base + delta, 0, 127). The
+    // decoder rebuilds the identical factors from the §9.3 quantizer
+    // deltas via `resolve_segment_dequant_factors`.
+    let base = config.base_y_ac_qi as i32;
+    let mut seg_qindex = [0u8; crate::loop_filter::MAX_MB_SEGMENTS];
+    let mut seg_factors =
+        [crate::dequant::MbDequantFactors::from_base_and_deltas(base, 0, 0, 0, 0, 0);
+            crate::loop_filter::MAX_MB_SEGMENTS];
+    for s in 0..crate::loop_filter::MAX_MB_SEGMENTS {
+        let q = (base + config.quant_delta[s] as i32).clamp(0, 127) as u8;
+        seg_qindex[s] = q;
+        seg_factors[s] =
+            crate::dequant::MbDequantFactors::from_base_and_deltas(q as i32, 0, 0, 0, 0, 0);
+    }
+
+    let mut planes = crate::frame::KeyframePlanes {
+        y: vec![0u8; mb_cols * 16 * mb_rows * 16],
+        u: vec![0u8; mb_cols * 8 * mb_rows * 8],
+        v: vec![0u8; mb_cols * 8 * mb_rows * 8],
+        y_stride: mb_cols * 16,
+        uv_stride: mb_cols * 8,
+        mb_cols,
+        mb_rows,
+    };
+
+    let mut modes: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
+    let mut all_coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
+
+    for mb_row in 0..mb_rows {
+        for mb_col in 0..mb_cols {
+            let pixels = frame.extract_mb(mb_row, mb_col);
+            let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
+
+            // §10 classify by luma activity, then quantise at the
+            // segment's qindex.
+            let variance = mb_luma_variance(&pixels.y);
+            let seg = classify_segment(variance, &config.variance_boundaries);
+            let q = seg_qindex[seg as usize];
+
+            let encoded = encode_mb_block_set_with_neighbors(&pixels, &neighbors, q, &coeff_probs)
+                .map_err(EncodeError::Token)?;
+
+            let mb_skip_coeff = encoded.nonzero_block_count == 0;
+
+            // Dequantise with the SAME segment factors used to quantise,
+            // so the encoder's reconstruction matches the decoder's.
+            let mut dq = encoded.coeffs;
+            seg_factors[seg as usize].dequantize(&mut dq);
+            let use_bpred = encoded.y_mode == IntraYMode::B;
+            let recon = if use_bpred {
+                crate::reconstruct::decode_keyframe_mb_bpred(
+                    encoded.b_subblock_modes.as_ref(),
+                    encoded.uv_mode,
+                    mb_skip_coeff,
+                    &neighbors,
+                    &dq.y,
+                    &dq.u,
+                    &dq.v,
+                )
+            } else {
+                crate::reconstruct::decode_keyframe_mb_non_bpred(
+                    encoded.y_mode,
+                    encoded.uv_mode,
+                    mb_skip_coeff,
+                    &neighbors,
+                    &dq.y2,
+                    &dq.y,
+                    &dq.u,
+                    &dq.v,
+                )
+            }
+            .map_err(EncodeError::Reconstruct)?;
+            crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
+
+            modes.push(MacroblockModes {
+                segment_id: Some(seg),
+                mb_skip_coeff,
+                y_mode: encoded.y_mode,
+                subblock_modes: encoded.b_subblock_modes,
+                uv_mode: encoded.uv_mode,
+            });
+            all_coeffs.push(encoded.coeffs);
+        }
+    }
+
+    // ---- §15 loop-filter post-pass (segment LF feature not emitted) ------
+    if config.loop_filter_level != 0 {
+        let lf_config = crate::loop_filter::FrameFilterConfig {
+            simple: config.filter_type,
+            key_frame: true,
+            loop_filter_level: config.loop_filter_level,
+            sharpness_level: config.sharpness_level,
+            // We emit per-segment *quantizer* deltas but no per-segment
+            // loop-filter deltas, so the §15 level is the frame base for
+            // every segment.
+            segmentation_enabled: false,
+            segment_abs: false,
+            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+            delta_enabled: false,
+            ref_delta_current: 0,
+            bpred_mode_delta: 0,
+            ref_delta_last: 0,
+            ref_delta_golden: 0,
+            ref_delta_altref: 0,
+            zero_mv_mode_delta: 0,
+            other_mv_mode_delta: 0,
+            split_mv_mode_delta: 0,
+        };
+        crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
+    }
+
+    // ---- §19.2 first (control) partition --------------------------------
+    let mut hdr = BoolEncoder::new();
+
+    // §9.2 — color_space + clamping_type both 0.
+    hdr.write_bool(128, false);
+    hdr.write_bool(128, false);
+
+    // §9.3 — segmentation ON: delta-mode per-segment quantizer features +
+    // the map update with explicit tree probabilities. We emit a fixed,
+    // mid-range `mb_segment_tree_probs` (170 ≈ "leans toward 0") for all
+    // three nodes; the per-MB `segment_id` codes below use the same probs.
+    const SEG_TREE_PROB: u8 = 170;
+    let seg_probs: [u8; 3] = [SEG_TREE_PROB; 3];
+    let layer = UpdateSegmentationLayer {
+        update_mb_segmentation_map: true,
+        feature_mode_absolute: false,
+        // Each segment carries its quant delta. A 0 delta is still emitted
+        // (Some(0)) so the decoder's segment base for that slot is exactly
+        // `base + 0`, matching `seg_qindex` above.
+        quantizer: [
+            Some(config.quant_delta[0] as i16),
+            Some(config.quant_delta[1] as i16),
+            Some(config.quant_delta[2] as i16),
+            Some(config.quant_delta[3] as i16),
+        ],
+        loop_filter: [None; 4],
+        segment_prob: [Some(seg_probs[0]), Some(seg_probs[1]), Some(seg_probs[2])],
+    };
+    write_update_segmentation(&mut hdr, &layer);
+
+    // §9.4 — loop filter; mode_ref_lf_delta disabled.
+    write_loop_filter(
+        &mut hdr,
+        config.filter_type,
+        config.loop_filter_level,
+        config.sharpness_level,
+        false,
+    )?;
+    // §9.5 — single DCT partition.
+    write_token_partition_count(&mut hdr, 1)?;
+    // §9.6 — quant indices: the §9.6 baseline. The per-segment override
+    // rides on top of this base via the §9.3 quantizer deltas above.
+    write_quant_indices(&mut hdr, config.base_y_ac_qi, None, None, None, None, None)?;
+    // §9.7 (key frame) — refresh_entropy_probs.
+    hdr.write_bool(128, true);
+    // §13 / §9.9 — no token-prob updates.
+    write_no_token_prob_updates(&mut hdr, &COEFF_UPDATE_PROBS_FLAT);
+    // §9.11 — mb_no_skip_coeff enabled, balanced prob.
+    let prob_skip_false = 128u8;
+    write_mb_no_skip_coeff(&mut hdr, true, prob_skip_false);
+
+    // §11 mode layer WITH the §10 per-MB segment_id prefix.
+    write_mode_layer_segmented(
+        &mut hdr,
+        &modes,
+        mb_rows,
+        mb_cols,
+        prob_skip_false,
+        Some(&seg_probs),
+    );
+
+    let first_partition = hdr.finish();
+    let first_partition_size = first_partition.len();
+    if first_partition_size > 0x7_FFFF {
+        return Err(EncodeError::FirstPartitionTooLarge {
+            bytes: first_partition_size,
+        });
+    }
+
+    // ---- §19.2 DCT partition: per-MB §13.3 token data (single part) ------
+    let mut tok = BoolEncoder::new();
+    let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
+    for mb_row in 0..mb_rows {
+        let mut left_ctx = MbEntropyCtx::default();
+        for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
+            let raster = mb_row * mb_cols + mb_col;
+            let mb = &modes[raster];
+            let use_bpred = mb.y_mode == IntraYMode::B;
+            if mb.mb_skip_coeff {
+                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
+                continue;
+            }
+            encode_mb_tokens(
+                &mut tok,
+                &all_coeffs[raster],
+                use_bpred,
+                &coeff_probs,
+                above_col,
+                &mut left_ctx,
+            )
+            .map_err(EncodeError::Token)?;
+        }
+    }
+    let dct_partition = tok.finish();
+
+    // ---- §9.1 frame tag + assembly --------------------------------------
+    let mut out: Vec<u8> = Vec::with_capacity(10 + first_partition_size + dct_partition.len());
+    write_frame_tag(
+        &mut out,
+        true,
+        0,
+        true,
+        first_partition_size as u32,
+        width,
+        height,
+        ScaleCode::None,
+        ScaleCode::None,
+    )?;
+    out.extend_from_slice(&first_partition);
+    out.extend_from_slice(&dct_partition);
+
+    Ok((out, planes))
+}
+
 /// Clear the §13.3 non-zero predictor slots a skip macroblock touches.
 ///
 /// §13.1: a skipped macroblock writes no token data, so all of its

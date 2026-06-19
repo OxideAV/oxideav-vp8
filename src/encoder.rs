@@ -527,20 +527,129 @@ pub fn patch_first_partition_size(buf: &mut [u8], size: u32) -> Result<(), Encod
     Ok(())
 }
 
-/// §9.3 segment-update flags writer.
+/// §9.3 segment-update flags writer (disabled path).
 ///
-/// Phase 1 only supports the disabled path (`enabled = false`), which
-/// emits the single `L(1) = 0` toggle. The `update_mb_segmentation_map`
-/// / `update_segment_feature_data` / per-segment quantizer / per-segment
-/// loop-filter / `mb_segment_tree_probs` sub-blocks of §9.3 are not
-/// written. When a later round needs them, this signature will grow a
-/// richer parameter struct.
+/// Emits the single `segmentation_enabled = L(1) = 0` toggle. The richer
+/// enabled path — `update_mb_segmentation_map`, the per-segment quantizer
+/// / loop-filter feature data, and the `mb_segment_tree_probs` block — is
+/// written by [`write_update_segmentation`] when the encoder turns
+/// segmentation on. `debug_assert` guards against a caller passing
+/// `enabled = true` here (it would emit the toggle but none of the
+/// dependent §9.3 sub-blocks the decoder then expects to read).
 pub fn write_segment_update_flags(enc: &mut BoolEncoder, enabled: bool) {
     debug_assert!(
         !enabled,
-        "Phase 1 encoder only supports segmentation_enabled = false"
+        "use write_update_segmentation for the segmentation_enabled = true path"
     );
     enc.write_bool(128, enabled);
+}
+
+/// Encoder-side mirror of [`crate::coded_header::UpdateSegmentation`] —
+/// the §9.3 `update_segmentation()` sub-block emitted when
+/// `segmentation_enabled = true`.
+///
+/// The four `quantizer` / `loop_filter` slots carry the per-segment
+/// feature deltas (or absolute values, when `feature_mode_absolute`).
+/// `None` means "this segment's feature is not updated this frame" — the
+/// decoder leaves it at its persisted value (0 on a key frame). The three
+/// `segment_prob` slots are the `mb_segment_tree_probs[3]` branch
+/// probabilities used to code each MB's `segment_id`; `None` means the
+/// decoder uses the default 255 ("always read a zero branch") for that
+/// node.
+///
+/// The writer ([`write_update_segmentation`]) lays the bits out exactly as
+/// [`crate::coded_header::parse_update_segmentation`] reads them, so the
+/// decoder recovers this struct field-for-field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UpdateSegmentationLayer {
+    /// `update_mb_segmentation_map` (§9.3). When `true`, the per-MB
+    /// `segment_id` codes follow in the §11 mode layer (against
+    /// `segment_prob`) and the `segment_prob` sub-block is written here.
+    pub update_mb_segmentation_map: bool,
+    /// `segment_feature_mode`: `false` = delta mode (the segment value is
+    /// added to the §9.6 baseline), `true` = absolute mode (the segment
+    /// value replaces the baseline). Only meaningful when at least one
+    /// `quantizer` / `loop_filter` slot is `Some`.
+    pub feature_mode_absolute: bool,
+    /// Per-segment §10 quantizer feature (`quantizer_update_value` +
+    /// `quantizer_update_sign`, 7-bit magnitude). `None` skips the
+    /// segment's `quantizer_update` flag (codes a 0).
+    pub quantizer: [Option<i16>; 4],
+    /// Per-segment §10 loop-filter feature (`lf_update_value` +
+    /// `lf_update_sign`, 6-bit magnitude). `None` skips the segment's
+    /// `loop_filter_update` flag (codes a 0).
+    pub loop_filter: [Option<i16>; 4],
+    /// `mb_segment_tree_probs[3]` (§10). `None` codes a 0
+    /// `segment_prob_update` flag for that node (decoder uses 255).
+    pub segment_prob: [Option<u8>; 3],
+}
+
+/// Write the §9.3 `update_segmentation()` sub-block for the
+/// `segmentation_enabled = true` path.
+///
+/// Emits, in §19.2 `update_segmentation()` order:
+///
+/// 1. `segmentation_enabled = L(1) = 1`;
+/// 2. `update_mb_segmentation_map` (L1);
+/// 3. `update_segment_feature_data` (L1), set iff any `quantizer` /
+///    `loop_filter` slot is `Some`; when set: `segment_feature_mode`
+///    (L1), then four `quantizer_update` flags (each followed by a signed
+///    7-bit magnitude when present), then four `loop_filter_update` flags
+///    (each followed by a signed 6-bit magnitude when present);
+/// 4. when `update_mb_segmentation_map`, three `segment_prob_update`
+///    flags, each followed by an 8-bit `segment_prob` when present.
+///
+/// This is the exact byte layout
+/// [`crate::coded_header::parse_update_segmentation`] reads (which is
+/// itself the §19.2 table verbatim), so the decoder reconstructs the
+/// [`crate::coded_header::UpdateSegmentation`] this layer describes.
+pub fn write_update_segmentation(enc: &mut BoolEncoder, layer: &UpdateSegmentationLayer) {
+    // §19.2 row 3: segmentation_enabled = 1 introduces the sub-block.
+    enc.write_bool(128, true);
+    enc.write_bool(128, layer.update_mb_segmentation_map);
+
+    // update_segment_feature_data: only when some feature is actually
+    // carried. Matching the decoder, the four quantizer + four loop-filter
+    // flags are only present when this bit is set.
+    let update_feature_data = layer.quantizer.iter().any(Option::is_some)
+        || layer.loop_filter.iter().any(Option::is_some);
+    enc.write_bool(128, update_feature_data);
+    if update_feature_data {
+        enc.write_bool(128, layer.feature_mode_absolute);
+        for slot in &layer.quantizer {
+            match slot {
+                Some(v) => {
+                    enc.write_bool(128, true);
+                    // §9.3: 7-bit magnitude + sign. write_signed_literal
+                    // pairs with the decoder's read_signed_delta(_, 7).
+                    enc.write_signed_literal(*v as i32, 7);
+                }
+                None => enc.write_bool(128, false),
+            }
+        }
+        for slot in &layer.loop_filter {
+            match slot {
+                Some(v) => {
+                    enc.write_bool(128, true);
+                    // §9.3: 6-bit magnitude + sign.
+                    enc.write_signed_literal(*v as i32, 6);
+                }
+                None => enc.write_bool(128, false),
+            }
+        }
+    }
+
+    if layer.update_mb_segmentation_map {
+        for slot in &layer.segment_prob {
+            match slot {
+                Some(p) => {
+                    enc.write_bool(128, true);
+                    enc.write_literal(*p as u32, 8);
+                }
+                None => enc.write_bool(128, false),
+            }
+        }
+    }
 }
 
 /// §9.4 loop-filter type / level / sharpness + `mb_lf_adjustments`
@@ -4346,6 +4455,25 @@ fn write_mode_layer(
     mb_cols: usize,
     prob_skip_false: u8,
 ) {
+    write_mode_layer_segmented(hdr, modes, mb_rows, mb_cols, prob_skip_false, None);
+}
+
+/// As [`write_mode_layer`], but with the optional §10 per-MB `segment_id`
+/// prefix. When `segment_probs` is `Some(probs)` — meaning the frame set
+/// `segmentation_enabled && update_mb_segmentation_map` — each macroblock
+/// emits its `segment_id` (via the §10 `mb_segment_tree` against the
+/// effective `probs`, defaults-of-255 already folded in) *before* the
+/// §11.1 `mb_skip_coeff` bit, matching the decoder's read order in
+/// [`crate::macroblock`] `parse_key_frame_macroblock_modes`. When `None`
+/// the layer is identical to the non-segmented wire.
+fn write_mode_layer_segmented(
+    hdr: &mut BoolEncoder,
+    modes: &[MacroblockModes],
+    mb_rows: usize,
+    mb_cols: usize,
+    prob_skip_false: u8,
+    segment_probs: Option<&[u8; 3]>,
+) {
     // §11.3 item 3: the "above" sub-block context spans the whole frame
     // width (4 sub-blocks per MB column), initialised to B_DC_PRED.
     let mut above_subblock = vec![IntraBmode::Dc; mb_cols * 4];
@@ -4357,6 +4485,14 @@ fn write_mode_layer(
 
         for mb_col in 0..mb_cols {
             let mb = &modes[mb_row * mb_cols + mb_col];
+
+            // 0. segment_id (§10), only when the frame updates the
+            //    segmentation map. Coded before mb_skip_coeff via the
+            //    §10 mb_segment_tree.
+            if let Some(probs) = segment_probs {
+                let sid = mb.segment_id.unwrap_or(0);
+                hdr.write_treed(&crate::macroblock::MB_SEGMENT_TREE, |i| probs[i], sid);
+            }
 
             // 1. mb_skip_coeff (§11.1) — mb_no_skip_coeff is enabled.
             hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
@@ -8707,6 +8843,141 @@ mod tests {
     use crate::coded_header::Vp8CodedHeader;
     use crate::decode_vp8;
     use crate::frame_header::Vp8FrameHeader;
+
+    /// Re-read a §9.3 `update_segmentation()` block from raw bits the
+    /// same way the decoder's `parse_update_segmentation` does, so a
+    /// `write_update_segmentation` round-trip can be asserted without
+    /// reaching the private parser. Mirrors the §19.2 table layout
+    /// verbatim (the writer is the only thing under test).
+    #[derive(Debug, PartialEq, Eq)]
+    struct DecodedSegLayer {
+        feature_absolute: bool,
+        update_map: bool,
+        quant: [Option<i16>; 4],
+        lf: [Option<i16>; 4],
+        probs: [Option<u8>; 3],
+    }
+
+    fn read_update_segmentation_for_test(dec: &mut BoolDecoder<'_>) -> DecodedSegLayer {
+        // The caller has already consumed segmentation_enabled = 1.
+        let update_map = dec.read_bool(128).unwrap();
+        let update_feature = dec.read_bool(128).unwrap();
+        let mut feature_absolute = false;
+        let mut quant: [Option<i16>; 4] = [None; 4];
+        let mut lf: [Option<i16>; 4] = [None; 4];
+        if update_feature {
+            feature_absolute = dec.read_bool(128).unwrap();
+            for slot in &mut quant {
+                if dec.read_bool(128).unwrap() {
+                    let mag = dec.read_literal(7).unwrap() as i16;
+                    let sign = dec.read_bool(128).unwrap();
+                    *slot = Some(if sign { -mag } else { mag });
+                }
+            }
+            for slot in &mut lf {
+                if dec.read_bool(128).unwrap() {
+                    let mag = dec.read_literal(6).unwrap() as i16;
+                    let sign = dec.read_bool(128).unwrap();
+                    *slot = Some(if sign { -mag } else { mag });
+                }
+            }
+        }
+        let mut probs: [Option<u8>; 3] = [None; 3];
+        if update_map {
+            for slot in &mut probs {
+                if dec.read_bool(128).unwrap() {
+                    *slot = Some(dec.read_literal(8).unwrap() as u8);
+                }
+            }
+        }
+        DecodedSegLayer {
+            feature_absolute,
+            update_map,
+            quant,
+            lf,
+            probs,
+        }
+    }
+
+    /// `write_update_segmentation` lays the §9.3 sub-block out so the
+    /// decoder's reader recovers every field: the map-update flag, the
+    /// delta/absolute feature mode, the four signed quantizer deltas, the
+    /// four signed loop-filter deltas, and the three tree probabilities,
+    /// including the `None` (flag-not-set) slots.
+    #[test]
+    fn update_segmentation_writer_round_trips_full_layer() {
+        let layer = UpdateSegmentationLayer {
+            update_mb_segmentation_map: true,
+            feature_mode_absolute: false,
+            quantizer: [Some(-12), None, Some(40), Some(-1)],
+            loop_filter: [None, Some(7), None, Some(-3)],
+            segment_prob: [Some(200), None, Some(31)],
+        };
+        let mut enc = BoolEncoder::new();
+        write_update_segmentation(&mut enc, &layer);
+        let buf = enc.finish();
+
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        // segmentation_enabled = 1 written first.
+        assert!(dec.read_bool(128).unwrap());
+        let got = read_update_segmentation_for_test(&mut dec);
+        assert_eq!(got.feature_absolute, layer.feature_mode_absolute);
+        assert_eq!(got.update_map, layer.update_mb_segmentation_map);
+        assert_eq!(got.quant, layer.quantizer);
+        assert_eq!(got.lf, layer.loop_filter);
+        assert_eq!(got.probs, layer.segment_prob);
+    }
+
+    /// Absolute feature mode + no map update: `update_segment_feature_data`
+    /// is still set (a feature is carried), but the `segment_prob` block is
+    /// absent. Exercises the absolute-mode flag and the map-off branch.
+    #[test]
+    fn update_segmentation_writer_absolute_no_map_update() {
+        let layer = UpdateSegmentationLayer {
+            update_mb_segmentation_map: false,
+            feature_mode_absolute: true,
+            quantizer: [Some(20), Some(35), Some(60), Some(90)],
+            loop_filter: [None; 4],
+            segment_prob: [None; 3],
+        };
+        let mut enc = BoolEncoder::new();
+        write_update_segmentation(&mut enc, &layer);
+        let buf = enc.finish();
+
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        assert!(dec.read_bool(128).unwrap());
+        let got = read_update_segmentation_for_test(&mut dec);
+        assert!(got.feature_absolute);
+        assert!(!got.update_map);
+        assert_eq!(got.quant, layer.quantizer);
+        assert_eq!(got.lf, [None; 4]);
+        assert_eq!(got.probs, [None; 3]);
+    }
+
+    /// Map-update with no feature data: `update_segment_feature_data` codes
+    /// 0 (no quantizer / loop-filter deltas), but the three tree
+    /// probabilities are still written.
+    #[test]
+    fn update_segmentation_writer_map_only_no_features() {
+        let layer = UpdateSegmentationLayer {
+            update_mb_segmentation_map: true,
+            feature_mode_absolute: false,
+            quantizer: [None; 4],
+            loop_filter: [None; 4],
+            segment_prob: [Some(255), Some(128), Some(1)],
+        };
+        let mut enc = BoolEncoder::new();
+        write_update_segmentation(&mut enc, &layer);
+        let buf = enc.finish();
+
+        let mut dec = BoolDecoder::init(&buf).unwrap();
+        assert!(dec.read_bool(128).unwrap());
+        let got = read_update_segmentation_for_test(&mut dec);
+        assert!(got.update_map);
+        assert_eq!(got.quant, [None; 4]);
+        assert_eq!(got.lf, [None; 4]);
+        assert_eq!(got.probs, layer.segment_prob);
+    }
 
     /// Equivalence proof for the round-277 compile-time
     /// `PARTITION_GROUP_TABLE`: for each of the four §16.4 partitions,

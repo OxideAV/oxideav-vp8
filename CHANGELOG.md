@@ -4,6 +4,32 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §9.3 `update_segmentation()` writer + per-MB `segment_id` emission (round 346)
+
+The encoder gained a real §9.3 `update_segmentation()` block writer
+(`write_update_segmentation` + the `UpdateSegmentationLayer` struct) and
+the optional §10 per-MB `segment_id` prefix in the §11 mode layer. Until
+now the encoder could only emit `segmentation_enabled = false`; the
+decoder has long parsed the full enabled path (per-segment quantizer /
+loop-filter feature deltas + `mb_segment_tree_probs`), so this closes the
+encoder side of segmentation.
+
+* `write_update_segmentation` lays the sub-block out byte-for-byte as the
+  decoder's `parse_update_segmentation` reads it: `update_mb_segmentation_map`,
+  the `update_segment_feature_data` gate (auto-set iff any quantizer /
+  loop-filter slot is present), `segment_feature_mode`, the four signed
+  7-bit quantizer deltas, the four signed 6-bit loop-filter deltas, and
+  the three 8-bit `mb_segment_tree_probs` entries — each behind its
+  presence flag, with `None` slots coding the not-updated branch.
+* The §11 mode-layer writer now takes an optional `segment_probs` and, when
+  set, emits each MB's `segment_id` via the §10 `mb_segment_tree`
+  (`MB_SEGMENT_TREE`, now `pub(crate)`) before the §11.1 `mb_skip_coeff`
+  bit — matching the decoder's read order in
+  `parse_key_frame_macroblock_modes`. With `None` the wire is unchanged.
+* Three writer round-trip tests re-read the block exactly as the decoder
+  does (full layer with mixed Some/None deltas, absolute-mode with no map
+  update, map-update with no feature data).
+
 ### Changed — §12.3 B_TM_PRED routed through the shared SIMD TM kernel (round 334)
 
 The §12.3 4×4 sub-block `B_TM_PRED` arm of `predict_b4x4` previously ran

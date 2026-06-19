@@ -307,7 +307,12 @@ pub(crate) const BMODE_TREE: [i8; 18] = [
 
 /// `mb_segment_tree` from RFC 6386 §10. Six entries — the segment
 /// id is two bits walked through a balanced tree.
-const MB_SEGMENT_TREE: [i8; 6] = [
+///
+/// `pub(crate)` so the encoder's §11 mode-layer writer can drive
+/// [`crate::encoder::BoolEncoder::write_treed`] against the same tree the
+/// decoder walks in [`read_segment_id`], guaranteeing the per-MB
+/// `segment_id` round-trips bit-for-bit.
+pub(crate) const MB_SEGMENT_TREE: [i8; 6] = [
     // 2, 4
     2, 4, // -0, -1
     0, -1, // -2, -3

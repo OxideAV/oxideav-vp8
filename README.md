@@ -11,8 +11,9 @@ Decoder and encoder are both at production status.
   (mid-GOP golden refresh, multi-frame auto-alt-ref, ARNR).
 * **Encode** — full encoder with SPLITMV, GOLDEN / ALTREF,
   multi-partition output, refresh controls, loop-filter deltas, the
-  §11 intra mode picker, the §13.4 token-probability fitter, and a
-  complexity-aware two-pass rate-control family. The per-coefficient
+  §11 intra mode picker, the §13.4 token-probability fitter, §9.3 / §10
+  segment-based adaptive quantisation (`encode_keyframe_adaptive_quant`),
+  and a complexity-aware two-pass rate-control family. The per-coefficient
   token emission hot path is allocation-free (§13.2 token bit paths
   precomputed into a static table).
 * The full public surface is reachable both with the default
@@ -105,6 +106,24 @@ The algorithm distributes per-frame qindex around `config.base.qindex`
 so heavier-than-mean frames get lower qindex (better quality) and
 lighter frames get higher qindex (smaller bytes), with scene-cut
 detection forcing extra-quality keyframes.
+
+### Segment-based adaptive-quant keyframe encode
+
+```rust
+use oxideav_vp8::{encode_keyframe_adaptive_quant, AdaptiveQuantConfig, I420Frame};
+
+let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+let config = AdaptiveQuantConfig::default();   // base qi 32, flat→coarser / busy→finer
+let vp8_bytes = encode_keyframe_adaptive_quant(&frame, &config)?;
+```
+
+`encode_keyframe_adaptive_quant` sorts each macroblock into one of four
+§10 segments by luma variance and quantises it at that segment's effective
+qindex (`clamp(base_y_ac_qi + quant_delta[seg], 0, 127)`), emitting the
+§9.3 `update_segmentation()` block + per-MB §10 `segment_id`. The default
+gradient raises the quantiser on flat regions and lowers it on detailed
+ones (activity masking). All knobs — base qindex, variance boundaries,
+per-segment deltas, loop-filter — are on `AdaptiveQuantConfig`.
 
 ### Container helpers
 

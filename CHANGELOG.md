@@ -4,6 +4,19 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — closed-loop bitrate-targeting rate control (round 354)
+
+The two-pass rate controller gained a real bit-budget loop so
+`Vp8TwoPassConfig::target_bitrate_bps` is no longer advisory-only.
+
+* **Bit-cost model** (`encoder::estimate_bits_per_mb` /
+  `estimate_frame_bytes`): predicts a frame's encoded size at a candidate
+  qindex from the in-tree first-pass complexity surrogate and the §20.4
+  AC quantiser ladder. Bits fall as the quantiser coarsens; a per-MB
+  floor keeps header / mode bits from vanishing. Calibrated so the
+  surrogate value reads as predicted bits/MB at the default qindex. The
+  model is clean-room — RFC 6386 is silent on rate control by design.
+
 ### Added — §9.3 `update_segmentation()` writer + per-MB `segment_id` emission (round 346)
 
 The encoder gained a real §9.3 `update_segmentation()` block writer

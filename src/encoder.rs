@@ -9007,6 +9007,83 @@ fn mean_complexity_cost(stats: &[FrameComplexity]) -> f32 {
     }
 }
 
+// ─────────────────── bit-cost model (clean-room) ───────────────────
+//
+// RFC 6386 is silent on rate control by design (§9.6 only fixes the
+// quantiser ladder; the encoder chooses how to spend bits). The
+// closed-loop bitrate target below needs a way to predict, *before*
+// entropy-coding a frame, roughly how many bits it will cost at a
+// candidate qindex. The model is built only from the in-tree
+// complexity surrogate plus the §20.4 AC quantiser ladder; no
+// reference encoder is consulted.
+//
+// Shape: encoded frame bits fall as the quantiser step grows (coarser
+// quant → more coefficients quantise to zero → fewer tokens). The
+// §20.4 `ac_qlookup` step at qindex 0 is 4 and at qindex 127 is 284 —
+// a ~71× span. We model the per-MB bit cost as the first-pass
+// `bits_per_mb` surrogate divided by a power of the AC step, so a
+// flat frame stays cheap at every qindex and a busy frame's cost
+// collapses as the quantiser coarsens.
+
+/// Exponent γ on the AC quantiser step in the bit-cost model
+/// (fixed-point ×256). A γ near 1.0 makes predicted bits roughly
+/// inversely proportional to the quantiser step. `RATE_MODEL_GAMMA_X256
+/// / 256.0` is the effective exponent.
+pub const RATE_MODEL_GAMMA_X256: i32 = 200;
+
+/// Per-MB additive floor (in bits) the bit-cost model charges every
+/// macroblock regardless of quantiser — mode bits, the always-present
+/// per-MB header tokens, and the residual the quantiser can never
+/// drive fully to zero. Keeps the model from predicting a literally
+/// zero-bit frame at the coarsest quantiser.
+pub const RATE_MODEL_MB_FLOOR_BITS: f32 = 6.0;
+
+/// Reference AC quantiser step the surrogate was calibrated against.
+/// `first_pass_analyze`'s `bits_per_mb` is tuned (§ its rustdoc) so a
+/// `mad=10, var=200` frame lands near 100 — read as "≈100 bits/MB at
+/// the default qindex". The §20.4 AC step at [`DEFAULT_QINDEX`] (50)
+/// is the divisor that makes the model reproduce that reading, so the
+/// surrogate value *is* the predicted bits/MB at the reference step.
+const RATE_MODEL_REF_QINDEX: usize = DEFAULT_QINDEX as usize;
+
+/// The §20.4 AC quantiser step for a clamped qindex.
+#[inline]
+fn ac_step_for_qindex(qindex: i32) -> f32 {
+    crate::inverse_transform::AC_QLOOKUP[crate::inverse_transform::clamp_qindex(qindex)] as f32
+}
+
+/// Predict the encoded **bits per macroblock** for a frame of the
+/// given complexity at a candidate `qindex`.
+///
+/// Clean-room model (see the module comment above): the first-pass
+/// `bits_per_mb` surrogate is the predicted cost at
+/// [`RATE_MODEL_REF_QINDEX`]; scaling to another qindex multiplies by
+/// `(ref_step / step) ^ γ`, then a per-MB floor is added so the
+/// coarsest quantiser still charges header / mode bits.
+pub fn estimate_bits_per_mb(complexity: f32, qindex: i32) -> f32 {
+    let gamma = RATE_MODEL_GAMMA_X256 as f32 / 256.0;
+    let ref_step = ac_step_for_qindex(RATE_MODEL_REF_QINDEX as i32);
+    let step = ac_step_for_qindex(qindex);
+    // `complexity` is the surrogate's reading at the reference step;
+    // a coarser (larger) step than the reference scales the cost down.
+    let scaled = complexity.max(0.0) * (ref_step / step).powf(gamma);
+    scaled + RATE_MODEL_MB_FLOOR_BITS
+}
+
+/// Predict the encoded **byte** count for one whole frame at `qindex`.
+///
+/// Multiplies [`estimate_bits_per_mb`] by the macroblock count implied
+/// by `width × height` (16×16 MBs, partial MBs rounded up per §2), then
+/// converts to bytes (÷8, rounded up).
+pub fn estimate_frame_bytes(complexity: f32, qindex: i32, width: u32, height: u32) -> u64 {
+    let mb_cols = (width as u64).div_ceil(16);
+    let mb_rows = (height as u64).div_ceil(16);
+    let mb_count = mb_cols.saturating_mul(mb_rows);
+    let bits_per_mb = estimate_bits_per_mb(complexity, qindex);
+    let total_bits = (bits_per_mb.max(0.0) as f64) * (mb_count as f64);
+    (total_bits / 8.0).ceil() as u64
+}
+
 /// Mean luma value and variance for one frame.  Single linear pass
 /// over `frame.y` honouring `frame.y_stride`.
 fn luma_mean_and_variance(frame: &I420Frame<'_>) -> (f32, f32) {
@@ -11515,5 +11592,87 @@ mod tests {
             IntraUvMode::Dc,
             "flat-grey source should pick DC_PRED for UV"
         );
+    }
+
+    // ─────────────── bit-cost model (rate control) ───────────────
+
+    #[test]
+    fn estimate_bits_per_mb_falls_as_qindex_rises() {
+        // The whole point of the model: at a fixed complexity, raising
+        // the qindex (coarser quantiser) must lower the predicted bits.
+        let complexity = 200.0;
+        let lo = estimate_bits_per_mb(complexity, 10);
+        let mid = estimate_bits_per_mb(complexity, 50);
+        let hi = estimate_bits_per_mb(complexity, 110);
+        assert!(
+            lo > mid && mid > hi,
+            "bits/MB must fall as qindex rises: qi10={lo} qi50={mid} qi110={hi}"
+        );
+    }
+
+    #[test]
+    fn estimate_bits_per_mb_rises_with_complexity() {
+        // At a fixed qindex, a busier frame must cost more bits.
+        let qi = 40;
+        let flat = estimate_bits_per_mb(10.0, qi);
+        let busy = estimate_bits_per_mb(800.0, qi);
+        assert!(
+            busy > flat,
+            "busier frame must cost more bits at the same qindex: flat={flat} busy={busy}"
+        );
+    }
+
+    #[test]
+    fn estimate_bits_per_mb_reproduces_surrogate_at_reference_qindex() {
+        // By construction the surrogate value is the predicted bits/MB
+        // at the reference qindex (plus the per-MB floor): the scaling
+        // factor collapses to 1.0 when step == ref_step.
+        let complexity = 137.0;
+        let predicted = estimate_bits_per_mb(complexity, RATE_MODEL_REF_QINDEX as i32);
+        assert!(
+            (predicted - (complexity + RATE_MODEL_MB_FLOOR_BITS)).abs() < 1e-3,
+            "at the reference qindex the model must reproduce the surrogate + floor, got {predicted}"
+        );
+    }
+
+    #[test]
+    fn estimate_bits_per_mb_keeps_the_floor_at_coarsest_quant() {
+        // Even at qindex 127 a zero-complexity frame still charges the
+        // per-MB floor (header / mode bits never vanish).
+        let predicted = estimate_bits_per_mb(0.0, 127);
+        assert!(
+            (predicted - RATE_MODEL_MB_FLOOR_BITS).abs() < 1e-3,
+            "zero-complexity frame at qi127 must charge exactly the floor, got {predicted}"
+        );
+    }
+
+    #[test]
+    fn estimate_frame_bytes_scales_with_macroblock_count() {
+        // A 4× larger frame (2× each dimension) has 4× the MBs and so
+        // ≈4× the predicted bytes at the same complexity / qindex.
+        let small = estimate_frame_bytes(150.0, 40, 32, 32); // 2×2 MBs
+        let big = estimate_frame_bytes(150.0, 40, 64, 64); // 4×4 MBs
+        assert!(
+            big >= small.saturating_mul(3),
+            "4× the MBs must predict roughly 4× the bytes: small={small} big={big}"
+        );
+    }
+
+    #[test]
+    fn estimate_frame_bytes_rounds_partial_macroblocks_up() {
+        // A 17×17 frame spans 2×2 MBs (one full + partials) — same MB
+        // count as 32×32, so the predicted byte count must match.
+        let partial = estimate_frame_bytes(100.0, 40, 17, 17);
+        let full = estimate_frame_bytes(100.0, 40, 32, 32);
+        assert_eq!(
+            partial, full,
+            "17×17 and 32×32 both span 2×2 MBs — byte estimate must match"
+        );
+    }
+
+    #[test]
+    fn estimate_frame_bytes_zero_dimensions_is_zero() {
+        assert_eq!(estimate_frame_bytes(500.0, 40, 0, 64), 0);
+        assert_eq!(estimate_frame_bytes(500.0, 40, 64, 0), 0);
     }
 }

@@ -13,7 +13,10 @@ Decoder and encoder are both at production status.
   multi-partition output, refresh controls, loop-filter deltas, the
   §11 intra mode picker, the §13.4 token-probability fitter, §9.3 / §10
   segment-based adaptive quantisation (`encode_keyframe_adaptive_quant`),
-  and a complexity-aware two-pass rate-control family. The per-coefficient
+  and a two-pass rate-control family offering both a complexity-aware
+  constant-quality schedule and a closed-loop **bitrate-targeting** mode
+  (solve a per-GOP base qindex to a byte budget, then correct
+  frame-by-frame from the running rate debt). The per-coefficient
   token emission hot path is allocation-free (§13.2 token bit paths
   precomputed into a static table).
 * The full public surface is reachable both with the default
@@ -90,22 +93,52 @@ as needed. For multi-frame inter encoding use `Vp8Encoder` +
 ### Two-pass rate-control encode
 
 ```rust
-use oxideav_vp8::encoder::{
-    first_pass_analyze, two_pass_qindices,
-    Vp8TwoPassConfig, Vp8TwoPassEncoder,
-};
+use oxideav_vp8::encoder::{two_pass_qindices, Vp8TwoPassConfig, Vp8TwoPassEncoder};
 
-let stats = first_pass_analyze(&i420_frames);          // cheap per-frame stats
 let config = Vp8TwoPassConfig::default();              // wraps a base Vp8EncoderConfig
-let qindices = two_pass_qindices(&stats, &config)?;
-let encoder = Vp8TwoPassEncoder::new(config);
-let packets = encoder.encode(&i420_frames, &stats)?;
+let mut encoder = Vp8TwoPassEncoder::new(config);
+
+// First pass: cheap per-frame complexity stats (cached on the encoder).
+let stats = encoder.first_pass_analyze(&i420_frames)?;
+// (Optional) inspect the planned schedule without encoding:
+let qindices = two_pass_qindices(&config, &stats)?;
+
+// Second pass: encode each frame against its complexity record.
+let mut packets = Vec::new();
+for (frame, stat) in i420_frames.iter().zip(stats.iter()) {
+    packets.push(encoder.encode_frame(frame, *stat)?);   // first frame is a keyframe
+}
 ```
 
-The algorithm distributes per-frame qindex around `config.base.qindex`
-so heavier-than-mean frames get lower qindex (better quality) and
-lighter frames get higher qindex (smaller bytes), with scene-cut
-detection forcing extra-quality keyframes.
+In **constant-quality** mode (the default — no bitrate target) the
+algorithm distributes per-frame qindex around `config.base.qindex` so
+heavier-than-mean frames get lower qindex (better quality) and lighter
+frames get higher qindex (smaller bytes), with scene-cut detection
+forcing extra-quality keyframes.
+
+#### Bitrate-targeting mode (closed loop)
+
+Set `target_bitrate_bps` **and** a frame rate (`fps_num` / `fps_den`) and
+the second pass becomes a closed-loop bitrate controller:
+
+```rust
+let config = Vp8TwoPassConfig {
+    target_bitrate_bps: 600_000,   // 600 kbps
+    fps_num: 30, fps_den: 1,
+    ..Vp8TwoPassConfig::default()
+};
+```
+
+`first_pass_analyze` converts the bits/sec target into a per-GOP byte
+budget (`gop_byte_budget`) and bisects the §9.6 qindex range for the
+lowest base qindex whose predicted byte total — via the in-tree bit-cost
+model (`estimate_bits_per_mb` / `estimate_frame_bytes`) — fits
+`target_bitrate_bps × overshoot_ratio` (`solve_base_qindex_for_budget`).
+Each `encode_frame` then re-centres the complexity delta on that solved
+base and adds a feedback correction proportional to the running rate
+debt (`rate_debt_bytes()`), so an over-budget stream coarsens later
+frames and an under-budget one spends quality. The whole rate-control
+family is clean-room — RFC 6386 is silent on rate control by design.
 
 ### Segment-based adaptive-quant keyframe encode
 

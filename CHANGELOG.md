@@ -27,6 +27,16 @@ The two-pass rate controller gained a real bit-budget loop so
   re-centres the complexity-aware per-frame schedule on that solved base.
   When no bitrate target is set the schedule is identical to the prior
   constant-quality `two_pass_qindices`.
+* **Closed-loop feedback in `Vp8TwoPassEncoder`**: when the config is
+  bitrate-targeted, `first_pass_analyze` caches the solved base qindex +
+  a per-frame byte allotment, and each `encode_frame` re-centres the
+  complexity delta on the solved base then adds a feedback correction
+  proportional to the running rate debt (bytes emitted − bytes allotted,
+  exposed via `rate_debt_bytes()`). An over-budget stream nudges later
+  frames' qindex up (coarser / cheaper), an under-budget one nudges it
+  down — gain / clamp are `RATE_FEEDBACK_QSTEP_PER_FRAME` /
+  `RATE_FEEDBACK_MAX_QSTEP`. With no bitrate target the encode path is
+  byte-for-byte unchanged.
 
 ### Added — §9.3 `update_segmentation()` writer + per-MB `segment_id` emission (round 346)
 

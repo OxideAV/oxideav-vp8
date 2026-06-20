@@ -8723,9 +8723,23 @@ impl Vp8TwoPassConfig {
 /// # Algorithm (clean-room, RFC 6386 §9.6 + in-tree primitives only)
 ///
 /// RFC 6386 is intentionally silent on rate-control — the algorithm is
-/// the encoder's choice. This implementation is a **complexity-aware
-/// constant-quality scheduler** built from a single linear pass over the
-/// luma plane:
+/// the encoder's choice. This implementation runs in one of two modes,
+/// selected by [`Vp8TwoPassConfig::bitrate_targeted`]:
+///
+/// * **Constant-quality** (no bitrate target): a complexity-aware
+///   scheduler centred on `config.base.qindex` (steps 1–3 below).
+/// * **Bitrate-targeted** (`target_bitrate_bps > 0` **and** a frame
+///   rate set): [`Self::first_pass_analyze`] solves the GOP base qindex
+///   that fits the budget ([`solve_base_qindex_for_budget`]) and caches
+///   a per-frame byte allotment. Each [`Self::encode_frame`] then
+///   re-centres the complexity delta on the solved base and adds a
+///   closed-loop feedback term proportional to the accumulated rate
+///   debt (bytes emitted so far minus bytes allotted), so the stream
+///   self-corrects toward the target. The feedback gain /clamp are
+///   [`RATE_FEEDBACK_QSTEP_PER_FRAME`] / [`RATE_FEEDBACK_MAX_QSTEP`].
+///
+/// The complexity-aware scheduler (both modes share it) is built from a
+/// single linear pass over the luma plane:
 ///
 /// 1. **First pass** ([`first_pass_analyze`] / the free fn of the same
 ///    name): for each input frame, compute a lightweight cost surrogate
@@ -8785,6 +8799,23 @@ pub struct Vp8TwoPassEncoder {
     /// Frame index of the most recent emitted key frame.  Anchors the
     /// `golden_interval` / scene-cut keyframe scheduler.
     last_keyframe_index: Option<u64>,
+    /// Base qindex the [`solve_base_qindex_for_budget`] solver chose for
+    /// this GOP, cached during [`Self::first_pass_analyze`] when the
+    /// config is bitrate-targeted.  `None` keeps the encoder on the
+    /// constant-quality schedule centred on `config.base.qindex`.
+    solved_base_qindex: Option<u8>,
+    /// Per-frame byte allotment under the bitrate target (= GOP byte
+    /// budget ÷ frame count), cached alongside `solved_base_qindex`.
+    /// Drives the closed-loop feedback term: a frame that overspends
+    /// this allotment pushes subsequent frames' qindex up, and vice
+    /// versa.
+    frame_byte_budget: Option<u64>,
+    /// Running rate debt in bytes: `Σ(emitted − allotment)` across the
+    /// frames coded so far.  Positive ⇒ the stream is over budget so
+    /// later frames must use a coarser quantiser; negative ⇒ under
+    /// budget so quality can be spent.  Only updated on the
+    /// bitrate-targeted path.
+    rate_debt_bytes: i64,
 }
 
 impl Vp8TwoPassEncoder {
@@ -8800,6 +8831,9 @@ impl Vp8TwoPassEncoder {
             last_reconstruction: None,
             frame_count: 0,
             last_keyframe_index: None,
+            solved_base_qindex: None,
+            frame_byte_budget: None,
+            rate_debt_bytes: 0,
         }
     }
 
@@ -8823,6 +8857,24 @@ impl Vp8TwoPassEncoder {
     ) -> crate::error::Result<Vec<FrameComplexity>> {
         let stats = first_pass_analyze(frames, &self.config)?;
         self.global_mean_cost = Some(mean_complexity_cost(&stats));
+        // If a bitrate target is set, solve the GOP base qindex now and
+        // cache the per-frame byte allotment so the second-pass encode
+        // loop can correct over/undershoot frame-by-frame.  Reset any
+        // debt carried from a previous analysis.
+        self.rate_debt_bytes = 0;
+        if self.config.bitrate_targeted() && !stats.is_empty() {
+            let (w, h) = frames
+                .first()
+                .map(|f| (f.width, f.height))
+                .unwrap_or((0, 0));
+            self.solved_base_qindex =
+                Some(solve_base_qindex_for_budget(&self.config, &stats, w, h));
+            self.frame_byte_budget =
+                gop_byte_budget(&self.config, stats.len()).map(|b| b / stats.len() as u64);
+        } else {
+            self.solved_base_qindex = None;
+            self.frame_byte_budget = None;
+        }
         Ok(stats)
     }
 
@@ -8878,8 +8930,24 @@ impl Vp8TwoPassEncoder {
         if force_key {
             self.last_keyframe_index = Some(self.frame_count);
         }
+        // Closed-loop accounting: fold this frame's over/undershoot vs
+        // its allotment into the running debt so the next frame's
+        // `qindex_for` can correct it.  Only meaningful on the
+        // bitrate-targeted path (frame_byte_budget is `None` otherwise).
+        if let Some(budget) = self.frame_byte_budget {
+            let spent = bytes.len() as i64;
+            self.rate_debt_bytes = self.rate_debt_bytes.saturating_add(spent - budget as i64);
+        }
         self.frame_count += 1;
         Ok(bytes)
+    }
+
+    /// Current accumulated rate debt in bytes (positive ⇒ over budget).
+    /// Exposed so a streaming caller can observe how the closed-loop
+    /// bitrate controller is tracking the target.  Always `0` on the
+    /// constant-quality (no bitrate target) path.
+    pub fn rate_debt_bytes(&self) -> i64 {
+        self.rate_debt_bytes
     }
 
     /// Resolve the per-frame qindex from the cached first-pass mean
@@ -8887,11 +8955,50 @@ impl Vp8TwoPassEncoder {
     /// hasn't been called).  Centralised so the [`Self::encode_frame`]
     /// path and the public [`two_pass_qindex_for_frame`] free function
     /// agree on the formula.
+    ///
+    /// On the bitrate-targeted path the base qindex is the solver's
+    /// choice (cached during [`Self::first_pass_analyze`]) plus a
+    /// closed-loop feedback term proportional to the accumulated
+    /// [`Self::rate_debt_bytes`]: a stream that has overspent its
+    /// allotment so far nudges this frame's qindex up (coarser, cheaper)
+    /// and an under-budget stream nudges it down (finer, higher
+    /// quality).  Without a bitrate target the behaviour is unchanged.
     fn qindex_for(&self, complexity: FrameComplexity) -> u8 {
-        match self.global_mean_cost {
-            Some(mean) => qindex_from_complexity(&self.config, complexity, mean),
-            None => qindex_from_complexity(&self.config, complexity, complexity.bits_per_mb),
+        // Constant-quality (no bitrate target): unchanged historical path.
+        let Some(solved_base) = self.solved_base_qindex else {
+            return match self.global_mean_cost {
+                Some(mean) => qindex_from_complexity(&self.config, complexity, mean),
+                None => qindex_from_complexity(&self.config, complexity, complexity.bits_per_mb),
+            };
+        };
+        // Bitrate-targeted: re-centre the complexity delta on the solved
+        // base, then add the feedback correction.
+        let mut cfg = self.config;
+        cfg.base.qindex = solved_base;
+        let mean = self.global_mean_cost.unwrap_or(complexity.bits_per_mb);
+        let centred = qindex_from_complexity(&cfg, complexity, mean) as i32;
+        let correction = self.rate_feedback_delta();
+        (centred + correction).clamp(0, 127) as u8
+    }
+
+    /// Closed-loop feedback delta (in qindex units) from the running
+    /// rate debt.  Scales the accumulated over/undershoot by the
+    /// per-frame byte allotment: roughly one qindex step per
+    /// [`RATE_FEEDBACK_BYTES_PER_QSTEP`] fraction of an allotment of
+    /// debt, clamped to ±[`RATE_FEEDBACK_MAX_QSTEP`] so a single noisy
+    /// frame can't slam the quantiser to an extreme.  Returns `0` when
+    /// no per-frame budget is known.
+    fn rate_feedback_delta(&self) -> i32 {
+        let Some(budget) = self.frame_byte_budget else {
+            return 0;
+        };
+        if budget == 0 {
+            return 0;
         }
+        // debt as a multiple of one frame's allotment.
+        let debt_frames = self.rate_debt_bytes as f32 / budget as f32;
+        let raw = (debt_frames * RATE_FEEDBACK_QSTEP_PER_FRAME as f32).round() as i32;
+        raw.clamp(-RATE_FEEDBACK_MAX_QSTEP, RATE_FEEDBACK_MAX_QSTEP)
     }
 }
 
@@ -9219,6 +9326,18 @@ fn mean_complexity_cost(stats: &[FrameComplexity]) -> f32 {
 /// inversely proportional to the quantiser step. `RATE_MODEL_GAMMA_X256
 /// / 256.0` is the effective exponent.
 pub const RATE_MODEL_GAMMA_X256: i32 = 200;
+
+/// Closed-loop feedback gain: qindex steps applied per one full
+/// frame-allotment of accumulated rate debt. A gain of 4 means a
+/// stream that is one whole frame's worth of bytes over budget nudges
+/// the next frame's qindex up by 4 (coarser / cheaper). Kept modest so
+/// the loop settles rather than oscillates.
+pub const RATE_FEEDBACK_QSTEP_PER_FRAME: i32 = 4;
+
+/// Clamp on the per-frame closed-loop feedback correction (qindex
+/// units), so a single pathological frame's debt can't slam the
+/// quantiser to an extreme in one step.
+pub const RATE_FEEDBACK_MAX_QSTEP: i32 = 24;
 
 /// Per-MB additive floor (in bits) the bit-cost model charges every
 /// macroblock regardless of quantiser — mode bits, the always-present
@@ -12043,6 +12162,32 @@ mod tests {
             cq, br,
             "untargeted bitrate schedule must equal the CQ schedule"
         );
+    }
+
+    #[test]
+    fn rate_feedback_delta_sign_and_clamp() {
+        let config = Vp8TwoPassConfig {
+            target_bitrate_bps: 100_000,
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        let mut enc = Vp8TwoPassEncoder::new(config);
+        // No budget cached yet ⇒ no feedback.
+        assert_eq!(enc.rate_feedback_delta(), 0);
+
+        enc.frame_byte_budget = Some(1000);
+        // Over budget by one full frame allotment ⇒ +gain.
+        enc.rate_debt_bytes = 1000;
+        assert_eq!(enc.rate_feedback_delta(), RATE_FEEDBACK_QSTEP_PER_FRAME);
+        // Under budget by one allotment ⇒ −gain.
+        enc.rate_debt_bytes = -1000;
+        assert_eq!(enc.rate_feedback_delta(), -RATE_FEEDBACK_QSTEP_PER_FRAME);
+        // Huge debt ⇒ clamped at the max step.
+        enc.rate_debt_bytes = 1_000_000;
+        assert_eq!(enc.rate_feedback_delta(), RATE_FEEDBACK_MAX_QSTEP);
+        enc.rate_debt_bytes = -1_000_000;
+        assert_eq!(enc.rate_feedback_delta(), -RATE_FEEDBACK_MAX_QSTEP);
     }
 
     #[test]

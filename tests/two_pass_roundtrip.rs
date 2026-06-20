@@ -299,6 +299,95 @@ fn two_pass_qindices_empty_input_yields_empty_schedule() {
     assert!(schedule.is_empty());
 }
 
+/// Encode the four-frame clip under the closed-loop bitrate controller
+/// at a tight vs a generous target, and confirm: (1) the tight target
+/// never emits more bytes than the generous one (the solver picks a
+/// coarser quantiser under pressure), and (2) every frame still decodes
+/// through the stateful decoder under both targets.
+#[test]
+fn closed_loop_bitrate_target_is_monotone_and_decodable() {
+    let frames = [
+        solid_frame(),
+        gradient_frame(),
+        checker_frame(),
+        noise_frame(),
+    ];
+    let i420: Vec<I420Frame<'_>> = frames
+        .iter()
+        .map(|(y, u, v)| I420Frame::packed(32, 32, y, u, v))
+        .collect();
+
+    // Encode the clip at a given bitrate; return the emitted byte total.
+    // Every frame is decoded so the test fails loudly on a bad stream.
+    let encode_at = |bps: u32| -> usize {
+        let config = Vp8TwoPassConfig {
+            target_bitrate_bps: bps,
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        assert!(config.bitrate_targeted(), "config must be bitrate-targeted");
+        let mut enc = Vp8TwoPassEncoder::new(config);
+        let stats = enc.first_pass_analyze(&i420).unwrap();
+        let mut decoder = Vp8DecoderState::new();
+        let mut total = 0usize;
+        for (i, (f, s)) in i420.iter().zip(stats.iter()).enumerate() {
+            let bytes = enc.encode_frame(f, *s).unwrap();
+            total += bytes.len();
+            let decoded = decoder
+                .decode_frame(&bytes)
+                .unwrap_or_else(|e| panic!("frame {i} @ {bps}bps must decode: {e:?}"));
+            assert_eq!(decoded.width, 32);
+            assert_eq!(decoded.height, 32);
+        }
+        total
+    };
+
+    // A starved target must not emit more than a generous one. (For a
+    // tiny 32×32 clip the per-frame VP8 header dominates, so equality is
+    // permitted; the load-bearing invariant is monotonicity.)
+    let tight = encode_at(2_000); // 250 B/s — very tight
+    let generous = encode_at(2_000_000); // 250 kB/s — effectively unconstrained
+    assert!(
+        tight <= generous,
+        "tight bitrate target ({tight} B) must not emit more than the generous \
+         target ({generous} B)"
+    );
+}
+
+/// A bitrate target absent a frame rate must NOT engage the solver —
+/// `bitrate_targeted()` is false, so the schedule equals the plain
+/// constant-quality encode (the rate is undefined without an fps).
+#[test]
+fn bitrate_without_frame_rate_stays_constant_quality() {
+    let frames = [solid_frame(), gradient_frame()];
+    let i420: Vec<I420Frame<'_>> = frames
+        .iter()
+        .map(|(y, u, v)| I420Frame::packed(32, 32, y, u, v))
+        .collect();
+
+    let config = Vp8TwoPassConfig {
+        target_bitrate_bps: 50_000,
+        fps_num: 0, // no rate → solver disabled
+        ..Vp8TwoPassConfig::default()
+    };
+    assert!(!config.bitrate_targeted());
+
+    let mut enc = Vp8TwoPassEncoder::new(config);
+    let stats = enc.first_pass_analyze(&i420).unwrap();
+    // No bitrate solving ⇒ zero accumulated debt throughout.
+    let mut decoder = Vp8DecoderState::new();
+    for (f, s) in i420.iter().zip(stats.iter()) {
+        let bytes = enc.encode_frame(f, *s).unwrap();
+        decoder.decode_frame(&bytes).expect("frame must decode");
+    }
+    assert_eq!(
+        enc.rate_debt_bytes(),
+        0,
+        "untargeted encode must accumulate no rate debt"
+    );
+}
+
 #[test]
 fn encoder_fallback_without_first_pass_uses_base_qindex() {
     // If a caller skips first_pass_analyze, encode_frame must still

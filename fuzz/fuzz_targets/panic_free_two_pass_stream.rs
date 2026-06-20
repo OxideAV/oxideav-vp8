@@ -89,6 +89,8 @@ fuzz_target!(|data: &[u8]| {
         },
         target_bitrate_bps: 0,
         overshoot_ratio: 1.2,
+        fps_num: 0,
+        fps_den: 1,
     };
 
     // I420 plane sizes for tightly-packed strides at the chosen

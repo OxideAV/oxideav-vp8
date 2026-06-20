@@ -16,6 +16,17 @@ The two-pass rate controller gained a real bit-budget loop so
   floor keeps header / mode bits from vanishing. Calibrated so the
   surrogate value reads as predicted bits/MB at the default qindex. The
   model is clean-room — RFC 6386 is silent on rate control by design.
+* **Frame rate on `Vp8TwoPassConfig`** (`fps_num` / `fps_den` +
+  `fps()` / `bitrate_targeted()` helpers): needed to turn a bits/sec
+  target into a per-GOP byte budget.
+* **Bitrate-budget solver** (`encoder::gop_byte_budget`,
+  `solve_base_qindex_for_budget`, `two_pass_qindices_for_bitrate`):
+  converts the bitrate target into a per-GOP byte budget and bisects the
+  §9.6 qindex range for the lowest base qindex (best quality) whose
+  predicted byte total fits `target_bitrate_bps × overshoot_ratio`, then
+  re-centres the complexity-aware per-frame schedule on that solved base.
+  When no bitrate target is set the schedule is identical to the prior
+  constant-quality `two_pass_qindices`.
 
 ### Added — §9.3 `update_segmentation()` writer + per-MB `segment_id` emission (round 346)
 

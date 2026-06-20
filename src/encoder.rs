@@ -8667,10 +8667,23 @@ impl Vp8Encoder {
 pub struct Vp8TwoPassConfig {
     /// Underlying single-pass config used as the second-pass baseline.
     pub base: Vp8EncoderConfig,
-    /// Target average bitrate in bits/sec. Advisory — see struct docs.
+    /// Target average bitrate in bits/sec. When non-zero **and** a frame
+    /// rate is set, the second pass solves for a per-GOP base qindex that
+    /// makes the predicted byte total meet this budget (see struct docs).
+    /// `0` keeps the historical complexity-aware constant-quality
+    /// scheduler centred on `base.qindex`.
     pub target_bitrate_bps: u32,
-    /// Maximum permitted bitrate-overshoot ratio (e.g. `1.2`). Advisory.
+    /// Maximum permitted bitrate-overshoot ratio (e.g. `1.2`). The
+    /// bitrate solver treats `target_bitrate_bps × overshoot_ratio` as
+    /// the hard per-GOP byte ceiling it must not exceed.
     pub overshoot_ratio: f32,
+    /// Frame-rate numerator (frames per `fps_den` seconds). Used with
+    /// [`target_bitrate_bps`](Self::target_bitrate_bps) to convert the
+    /// bits/sec budget into a per-GOP byte budget. `0` disables the
+    /// bitrate solver (the bitrate budget is undefined without a rate).
+    pub fps_num: u32,
+    /// Frame-rate denominator. `0` is treated as `1`.
+    pub fps_den: u32,
 }
 
 impl Default for Vp8TwoPassConfig {
@@ -8679,7 +8692,29 @@ impl Default for Vp8TwoPassConfig {
             base: Vp8EncoderConfig::default(),
             target_bitrate_bps: 0,
             overshoot_ratio: 1.2,
+            fps_num: 0,
+            fps_den: 1,
         }
+    }
+}
+
+impl Vp8TwoPassConfig {
+    /// Frames-per-second as an `f32`, or `None` when no rate is set
+    /// (`fps_num == 0`). `fps_den == 0` is read as `1`.
+    pub fn fps(&self) -> Option<f32> {
+        if self.fps_num == 0 {
+            None
+        } else {
+            Some(self.fps_num as f32 / self.fps_den.max(1) as f32)
+        }
+    }
+
+    /// True when the bitrate solver is active: a positive target bitrate
+    /// **and** a usable frame rate are both present. When `false` the
+    /// second pass stays on the complexity-aware constant-quality
+    /// schedule centred on [`base.qindex`](Vp8EncoderConfig::qindex).
+    pub fn bitrate_targeted(&self) -> bool {
+        self.target_bitrate_bps > 0 && self.fps().is_some()
     }
 }
 
@@ -8991,6 +9026,160 @@ pub fn two_pass_qindices(
 /// [`Vp8TwoPassEncoder::new`].
 pub fn make_two_pass_encoder(config: Vp8TwoPassConfig) -> Vp8TwoPassEncoder {
     Vp8TwoPassEncoder::new(config)
+}
+
+// ─────────────── bitrate-budget solver (clean-room) ───────────────
+//
+// RFC 6386 fixes the §9.6 qindex ladder but is silent on how an
+// encoder hits a bitrate. The solver below turns a bits/sec target
+// into a per-GOP byte budget and bisects the §9.6 qindex range for
+// the *lowest* base qindex (= highest quality) whose predicted byte
+// total still fits the budget. Prediction is the in-tree bit-cost
+// model ([`estimate_frame_bytes`]); no reference encoder is read.
+
+/// The per-GOP byte budget implied by a bitrate target and frame rate.
+///
+/// `bytes = (target_bitrate_bps / 8) × (frame_count / fps)`. Returns
+/// `None` when the config has no usable bitrate / frame-rate pair
+/// (i.e. [`Vp8TwoPassConfig::bitrate_targeted`] is `false`) or when
+/// `frame_count == 0`.
+pub fn gop_byte_budget(config: &Vp8TwoPassConfig, frame_count: usize) -> Option<u64> {
+    if frame_count == 0 {
+        return None;
+    }
+    // `fps()` only yields `Some` when `fps_num != 0`, so the rate is
+    // always strictly positive and finite here.
+    let fps = config.fps()?;
+    if config.target_bitrate_bps == 0 {
+        return None;
+    }
+    let bytes_per_sec = config.target_bitrate_bps as f64 / 8.0;
+    let gop_seconds = frame_count as f64 / fps as f64;
+    Some((bytes_per_sec * gop_seconds).floor() as u64)
+}
+
+/// Predicted total encoded bytes for a GOP if every frame were coded
+/// at the same `base_qindex` (before per-frame AQ redistribution).
+///
+/// Sums [`estimate_frame_bytes`] over each frame's complexity at
+/// `base_qindex`. All frames are assumed to share `width × height`.
+fn predict_gop_bytes_at_qindex(
+    complexities: &[FrameComplexity],
+    width: u32,
+    height: u32,
+    base_qindex: i32,
+) -> u64 {
+    complexities.iter().fold(0u64, |acc, c| {
+        acc.saturating_add(estimate_frame_bytes(
+            c.bits_per_mb,
+            base_qindex,
+            width,
+            height,
+        ))
+    })
+}
+
+/// Solve for the GOP base qindex that meets `config`'s bitrate budget.
+///
+/// Returns the **lowest** §9.6 qindex (best quality) whose predicted
+/// byte total — summed over `complexities` at that single qindex via
+/// the in-tree bit-cost model — stays within
+/// `target_bitrate_bps × overshoot_ratio`. If even qindex 127 (the
+/// coarsest quantiser) overshoots, returns 127; if even qindex 0 fits,
+/// returns 0.
+///
+/// Returns `config.base.qindex` unchanged when
+/// [`Vp8TwoPassConfig::bitrate_targeted`] is `false` (no bitrate
+/// solving requested) or the GOP is empty.
+///
+/// The search is a monotone bisection: predicted bytes decrease as the
+/// qindex rises (coarser quantiser ⇒ fewer tokens), so the smallest
+/// qindex meeting the ceiling is found in `log2(128) ≤ 7` model
+/// evaluations of the GOP.
+pub fn solve_base_qindex_for_budget(
+    config: &Vp8TwoPassConfig,
+    complexities: &[FrameComplexity],
+    width: u32,
+    height: u32,
+) -> u8 {
+    if !config.bitrate_targeted() || complexities.is_empty() {
+        return config.base.qindex.min(127);
+    }
+    let budget = match gop_byte_budget(config, complexities.len()) {
+        Some(b) => b,
+        None => return config.base.qindex.min(127),
+    };
+    // Hard ceiling = budget × overshoot. overshoot_ratio < 1.0 is
+    // nonsensical (would forbid even hitting the target); clamp to 1.0.
+    let ceiling = {
+        let r = config.overshoot_ratio.max(1.0) as f64;
+        (budget as f64 * r) as u64
+    };
+    // predicted(qindex) is monotone non-increasing in qindex. Find the
+    // smallest qindex whose predicted total ≤ ceiling.
+    let fits = |qi: i32| predict_gop_bytes_at_qindex(complexities, width, height, qi) <= ceiling;
+    // Coarsest quantiser still overshoots ⇒ nothing we can do, cap at 127.
+    if !fits(127) {
+        return 127;
+    }
+    // Finest quantiser already fits ⇒ spend all the quality.
+    if fits(0) {
+        return 0;
+    }
+    // Bisect for the boundary: lo never fits, hi always fits.
+    let mut lo = 0i32; // !fits(lo) holds (fits(0) was false above)
+    let mut hi = 127i32; // fits(hi) holds
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if fits(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi as u8
+}
+
+/// Full second-pass qindex schedule under a bitrate target.
+///
+/// First solves the GOP base qindex via
+/// [`solve_base_qindex_for_budget`], then redistributes per-frame
+/// qindex around *that* solved base using the same complexity-aware
+/// delta as [`two_pass_qindices`] (heavier frames → lower qindex). The
+/// result is a schedule whose **mean** tracks the bitrate budget while
+/// individual frames still flex with complexity.
+///
+/// When the config is not bitrate-targeted this is identical to
+/// [`two_pass_qindices`] (the base qindex stays `config.base.qindex`).
+///
+/// Returns `Err(Vp8Error::InvalidData)` if `config.base.qindex` is
+/// outside `0..=127`.
+pub fn two_pass_qindices_for_bitrate(
+    config: &Vp8TwoPassConfig,
+    complexities: &[FrameComplexity],
+    width: u32,
+    height: u32,
+) -> crate::error::Result<Vec<u8>> {
+    if config.base.qindex > 127 {
+        return Err(crate::error::Vp8Error::invalid(format!(
+            "vp8 two-pass: config.base.qindex={} out of RFC 6386 §9.6 range 0..=127",
+            config.base.qindex
+        )));
+    }
+    if complexities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let solved_base = solve_base_qindex_for_budget(config, complexities, width, height);
+    // Re-centre the delta math on the solved base by cloning the config
+    // with base.qindex replaced. The per-frame delta + scene-cut boost
+    // are unchanged.
+    let mut solved_config = *config;
+    solved_config.base.qindex = solved_base;
+    let mean = mean_complexity_cost(complexities);
+    Ok(complexities
+        .iter()
+        .map(|c| qindex_from_complexity(&solved_config, *c, mean))
+        .collect())
 }
 
 // ──────────────────── two-pass helpers (private) ────────────────────
@@ -11674,5 +11863,201 @@ mod tests {
     fn estimate_frame_bytes_zero_dimensions_is_zero() {
         assert_eq!(estimate_frame_bytes(500.0, 40, 0, 64), 0);
         assert_eq!(estimate_frame_bytes(500.0, 40, 64, 0), 0);
+    }
+
+    // ─────────────── bitrate-budget solver ───────────────
+
+    fn busy_clip(n: usize) -> Vec<FrameComplexity> {
+        (0..n)
+            .map(|i| FrameComplexity {
+                frame_index: i as u32,
+                bits_per_mb: 600.0,
+                scene_cut: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gop_byte_budget_tracks_bitrate_and_rate() {
+        let mut config = Vp8TwoPassConfig {
+            target_bitrate_bps: 8_000_000, // 1 MB/s
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        // 30 frames at 30fps == 1 second == 1 MB.
+        let b = gop_byte_budget(&config, 30).expect("budget defined");
+        assert_eq!(b, 1_000_000);
+        // Half the frames ⇒ half the budget.
+        let b2 = gop_byte_budget(&config, 15).expect("budget defined");
+        assert_eq!(b2, 500_000);
+        // No rate ⇒ no budget.
+        config.fps_num = 0;
+        assert!(gop_byte_budget(&config, 30).is_none());
+    }
+
+    #[test]
+    fn solver_returns_base_when_not_bitrate_targeted() {
+        // No target bitrate ⇒ solver is a no-op, returns base qindex.
+        let config = Vp8TwoPassConfig {
+            base: Vp8EncoderConfig {
+                qindex: 44,
+                ..Vp8EncoderConfig::default()
+            },
+            ..Vp8TwoPassConfig::default()
+        };
+        let qi = solve_base_qindex_for_budget(&config, &busy_clip(10), 176, 144);
+        assert_eq!(qi, 44);
+    }
+
+    #[test]
+    fn solver_raises_qindex_under_a_tight_budget() {
+        // A deliberately starved bitrate must drive the solved base
+        // qindex high (coarse quantiser) to fit the budget.
+        let config = Vp8TwoPassConfig {
+            target_bitrate_bps: 8_000, // 1 kB/s — very tight for QCIF busy
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        let qi = solve_base_qindex_for_budget(&config, &busy_clip(30), 176, 144);
+        assert!(
+            qi > Vp8EncoderConfig::default().qindex,
+            "tight budget must raise the base qindex above the default, got {qi}"
+        );
+    }
+
+    #[test]
+    fn solver_lowers_qindex_under_a_generous_budget() {
+        // A very generous bitrate must drive the solved base qindex to
+        // the finest quantiser (best quality).
+        let config = Vp8TwoPassConfig {
+            target_bitrate_bps: 800_000_000, // absurdly high
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        let qi = solve_base_qindex_for_budget(&config, &busy_clip(30), 176, 144);
+        assert_eq!(qi, 0, "generous budget must spend all quality (qindex 0)");
+    }
+
+    #[test]
+    fn solver_is_monotone_in_budget() {
+        // Loosening the budget must never raise the solved qindex.
+        let base = Vp8TwoPassConfig {
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        let clip = busy_clip(30);
+        let mut prev = 128i32;
+        for &bps in &[8_000u32, 40_000, 200_000, 1_000_000, 5_000_000] {
+            let config = Vp8TwoPassConfig {
+                target_bitrate_bps: bps,
+                ..base
+            };
+            let qi = solve_base_qindex_for_budget(&config, &clip, 176, 144) as i32;
+            assert!(
+                qi <= prev,
+                "a larger budget ({bps} bps) must not raise the solved qindex: {qi} > {prev}"
+            );
+            prev = qi;
+        }
+    }
+
+    #[test]
+    fn solver_respects_predicted_ceiling() {
+        // The predicted byte total at the solved qindex must stay under
+        // the budget × overshoot ceiling (the solver's contract).
+        let config = Vp8TwoPassConfig {
+            target_bitrate_bps: 100_000,
+            overshoot_ratio: 1.2,
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        let clip = busy_clip(30);
+        let qi = solve_base_qindex_for_budget(&config, &clip, 176, 144) as i32;
+        let budget = gop_byte_budget(&config, clip.len()).unwrap();
+        let ceiling = (budget as f64 * 1.2) as u64;
+        let predicted = predict_gop_bytes_at_qindex(&clip, 176, 144, qi);
+        // Either we fit the ceiling, or we are already pinned at the
+        // coarsest quantiser (127) and physically cannot do better.
+        assert!(
+            predicted <= ceiling || qi == 127,
+            "predicted {predicted} must fit ceiling {ceiling} unless pinned at qi127 (qi={qi})"
+        );
+    }
+
+    #[test]
+    fn two_pass_qindices_for_bitrate_recenters_schedule() {
+        // Under a tight budget the per-frame schedule must re-centre on
+        // the solved (higher) base, not on config.base.qindex.
+        let config = Vp8TwoPassConfig {
+            base: Vp8EncoderConfig {
+                qindex: 30,
+                ..Vp8EncoderConfig::default()
+            },
+            target_bitrate_bps: 8_000,
+            fps_num: 30,
+            fps_den: 1,
+            ..Vp8TwoPassConfig::default()
+        };
+        // Vary complexity so the schedule isn't flat.
+        let clip: Vec<_> = (0..6)
+            .map(|i| FrameComplexity {
+                frame_index: i,
+                bits_per_mb: 200.0 + i as f32 * 200.0,
+                scene_cut: false,
+            })
+            .collect();
+        let sched = two_pass_qindices_for_bitrate(&config, &clip, 176, 144).unwrap();
+        assert_eq!(sched.len(), clip.len());
+        let mean_qi: f32 = sched.iter().map(|&q| q as f32).sum::<f32>() / sched.len() as f32;
+        assert!(
+            mean_qi > config.base.qindex as f32,
+            "tight budget must raise the schedule mean above the configured base: \
+             mean={mean_qi} base={}",
+            config.base.qindex
+        );
+        for &q in &sched {
+            assert!(q <= 127);
+        }
+    }
+
+    #[test]
+    fn two_pass_qindices_for_bitrate_matches_cq_when_untargeted() {
+        // With no bitrate target the bitrate schedule must equal the
+        // plain complexity-aware schedule.
+        let config = Vp8TwoPassConfig::default();
+        let clip: Vec<_> = (0..5)
+            .map(|i| FrameComplexity {
+                frame_index: i,
+                bits_per_mb: 100.0 + i as f32 * 50.0,
+                scene_cut: false,
+            })
+            .collect();
+        let cq = two_pass_qindices(&config, &clip).unwrap();
+        let br = two_pass_qindices_for_bitrate(&config, &clip, 176, 144).unwrap();
+        assert_eq!(
+            cq, br,
+            "untargeted bitrate schedule must equal the CQ schedule"
+        );
+    }
+
+    #[test]
+    fn two_pass_qindices_for_bitrate_empty_and_bad_base() {
+        let config = Vp8TwoPassConfig::default();
+        assert!(two_pass_qindices_for_bitrate(&config, &[], 176, 144)
+            .unwrap()
+            .is_empty());
+        let bad = Vp8TwoPassConfig {
+            base: Vp8EncoderConfig {
+                qindex: 200,
+                ..Vp8EncoderConfig::default()
+            },
+            ..Vp8TwoPassConfig::default()
+        };
+        assert!(two_pass_qindices_for_bitrate(&bad, &busy_clip(3), 176, 144).is_err());
     }
 }

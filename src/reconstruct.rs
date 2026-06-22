@@ -1584,7 +1584,13 @@ mod tests {
 
         // ... and must NOT match the prior corner-0 behaviour (locks the fix).
         let mut bug_u = [0u8; 64];
-        predict_uv8x8(&mut bug_u, IntraUvMode::Tm, Some(&u_above), Some(&u_left), 0);
+        predict_uv8x8(
+            &mut bug_u,
+            IntraUvMode::Tm,
+            Some(&u_above),
+            Some(&u_left),
+            0,
+        );
         assert_ne!(out.u, bug_u);
     }
 }

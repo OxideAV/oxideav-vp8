@@ -533,7 +533,11 @@ pub fn decode_keyframe_mb_bpred(
     }
 
     // ----- Chroma (§12.2): identical to the non-B_PRED path --------
-    let topleft_u = neighbors.u_topleft.unwrap_or(0);
+    // Off-frame chroma top-left defaults to DEFAULT_ABOVE_PIXEL (127), the
+    // RFC 6386 §12.2 above-row default — matching the non-B_PRED path above
+    // and the encoder. Only TM_PRED reads this corner; defaulting to 0 here
+    // diverged U/V on top-row B_PRED MBs while luma stayed byte-identical.
+    let topleft_u = neighbors.u_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_uv8x8(
         &mut out.u,
         uv_mode,
@@ -541,7 +545,7 @@ pub fn decode_keyframe_mb_bpred(
         neighbors.u_left.as_ref(),
         topleft_u,
     );
-    let topleft_v = neighbors.v_topleft.unwrap_or(0);
+    let topleft_v = neighbors.v_topleft.unwrap_or(DEFAULT_ABOVE_PIXEL);
     predict_uv8x8(
         &mut out.v,
         uv_mode,
@@ -1519,5 +1523,68 @@ mod tests {
         predict_uv8x8(&mut want_v, IntraUvMode::V, Some(&v_above), None, 0);
         assert_eq!(out.u, want_u);
         assert_eq!(out.v, want_v);
+    }
+
+    #[test]
+    fn bpred_top_row_chroma_topleft_defaults_to_127() {
+        // Regression (issue #23): on a top-row B_PRED MB the off-frame
+        // chroma top-left must default to DEFAULT_ABOVE_PIXEL (127), the
+        // RFC 6386 §12.2 above-row default — the same value the non-B_PRED
+        // path and the encoder use. TM_PRED is the only 8×8 chroma mode that
+        // reads the corner, so it exposes the divergence: defaulting to 0
+        // (the prior bug) silently corrupted U/V on top-row MBs while luma
+        // stayed byte-identical (pink/green smearing).
+        let u_above = [55u8; 8];
+        let u_left = [70u8; 8];
+        let v_above = [66u8; 8];
+        let v_left = [80u8; 8];
+        let neighbors = MbNeighbors {
+            y_above: Some([100u8; 16]),
+            y_left: Some([100u8; 16]),
+            y_topleft: Some(100),
+            y_above_right: Some([100u8; 4]),
+            u_above: Some(u_above),
+            u_left: Some(u_left),
+            v_above: Some(v_above),
+            v_left: Some(v_left),
+            // u_topleft / v_topleft deliberately None: this is the top row.
+            ..MbNeighbors::default()
+        };
+        let (y, u, v) = zero_bpred_coeffs();
+        let out = decode_keyframe_mb_bpred(
+            Some(&all_modes(IntraBmode::Dc)),
+            IntraUvMode::Tm,
+            true,
+            &neighbors,
+            &y,
+            &u,
+            &v,
+        )
+        .unwrap();
+
+        // Must match a standalone TM_PRED with corner = 127 ...
+        let mut want_u = [0u8; 64];
+        predict_uv8x8(
+            &mut want_u,
+            IntraUvMode::Tm,
+            Some(&u_above),
+            Some(&u_left),
+            DEFAULT_ABOVE_PIXEL,
+        );
+        let mut want_v = [0u8; 64];
+        predict_uv8x8(
+            &mut want_v,
+            IntraUvMode::Tm,
+            Some(&v_above),
+            Some(&v_left),
+            DEFAULT_ABOVE_PIXEL,
+        );
+        assert_eq!(out.u, want_u);
+        assert_eq!(out.v, want_v);
+
+        // ... and must NOT match the prior corner-0 behaviour (locks the fix).
+        let mut bug_u = [0u8; 64];
+        predict_uv8x8(&mut bug_u, IntraUvMode::Tm, Some(&u_above), Some(&u_left), 0);
+        assert_ne!(out.u, bug_u);
     }
 }

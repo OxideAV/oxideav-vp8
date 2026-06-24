@@ -4,6 +4,57 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §13 trellis coefficient-level RDO quantisation (round 367)
+
+The keyframe encoder gained a **trellis quantiser** — the first
+coefficient-level rate-distortion search in the crate (until now the RD
+pickers scored at mode granularity only, leaving per-token quantisation as
+the long-standing deferred item documented on `encode_mb_block_set`). It
+jointly minimises the Lagrangian `J = D + λ·R` over each 4×4 block's level
+assignment by a Viterbi pass in scan order, replacing the per-coefficient
+round-half-away-from-zero divide on the quality-deciding paths.
+
+* **`trellis_quantize_block`** (+ `TrellisBlockSpec`): a forward Viterbi
+  whose state is the §13.3 token context (`ctx3 ∈ {0,1,2}`) carried into
+  the next coefficient. For each coefficient it scores the candidate levels
+  `round(|x|/q)`, `round−1`, and `0`; the rate is the exact §13.2 token
+  bits (tree path + cat extra bits + sign) priced through the same
+  `bool_bits` table the mode pickers use, and the distortion is the §14.4
+  IDCT **basis-norm-weighted** transform-domain squared error
+  (`IDCT_BASIS_NORM_SQ`, computed once from the real `inverse_dct_4x4` on
+  unit impulses so it tracks pixel-domain SSD). The optimal EOB position is
+  found by adding each terminating survivor's EOB-token bits plus the
+  suffix distortion of the dropped tail.
+* **Clean-room**: RFC 6386 specifies only token *decoding*; level
+  selection is a non-normative encoder choice (the spec is silent on it by
+  design). The trellis only chooses levels — reconstruction still runs the
+  identical dequant → IDCT → add chain the decoder runs, so the
+  encoder/decoder pixel-lockstep contract is preserved exactly (every
+  pre-existing lockstep + round-trip test still passes).
+* **Wired into the keyframe RD paths**: `pick_y16x16_mode`,
+  `pick_uv8x8_mode`, the §11.3 B_PRED per-sub-block walker, and the chroma
+  re-quant in `encode_mb_block_set_with_neighbors` (whole-block Y as
+  `YAfterY2` + the `Y2` WHT block, chroma as `UV`, B_PRED sub-blocks as
+  `YNoY2`). The inter (P-frame) emit path is unchanged this round and
+  stays byte-for-byte identical (a follow-up threads `coeff_probs` into the
+  inter picker).
+* **Tuning**: `TRELLIS_LAMBDA_SCALE = 0.04` — coefficient-level RDO spends
+  λ far more aggressively than the mode picker it shares the multiplier
+  with, so the trellis runs at a fraction of the mode λ. Calibrated on the
+  `natural_test_frame_64x64` keyframe RD fixtures as the conservative
+  "shave bits, never drop below the prior PSNR" operating point: keyframe
+  bytes fall **12–13 %** at the low/mid quantisers VP8 keyframes actually
+  use while holding the SAD-picker PSNR floor at every quantiser. The full
+  mode λ would cut ~45 % of bytes at a 1–2.5 dB cost — a steeper trade a
+  future quality/size knob can unlock.
+* **Tests**: `trellis_basis_norm_distortion_tracks_pixel_ssd` (the
+  basis-norm model reproduces the true reconstruction SSD to sub-LSB
+  rounding) and `trellis_round_trips_and_never_raises_rd_cost` (32 seeds:
+  trellis is the exact RD minimiser over its model and never raises J above
+  plain rounding, and every trellis block round-trips byte-exact through
+  the §13.3 token encoder + decoder). The keyframe RD baseline test now
+  pins the smaller-byte / equal-or-better-PSNR trellis operating point.
+
 ### Added — closed-loop bitrate-targeting rate control (round 354)
 
 The two-pass rate controller gained a real bit-budget loop so

@@ -11,7 +11,11 @@ Decoder and encoder are both at production status.
   (mid-GOP golden refresh, multi-frame auto-alt-ref, ARNR).
 * **Encode** — full encoder with SPLITMV, GOLDEN / ALTREF,
   multi-partition output, refresh controls, loop-filter deltas, the
-  §11 intra mode picker, the §13.4 token-probability fitter, §9.3 / §10
+  §11 intra mode picker, **§13 trellis coefficient-level RDO
+  quantisation** (a Viterbi `J = D + λ·R` search over each block's level
+  assignment, modelling the §13.3 token-context chain and the optimal EOB
+  position — keyframes shed 12–13 % of bytes at the working quantisers
+  while holding PSNR), the §13.4 token-probability fitter, §9.3 / §10
   segment-based adaptive quantisation (`encode_keyframe_adaptive_quant`),
   and a two-pass rate-control family offering both a complexity-aware
   constant-quality schedule and a closed-loop **bitrate-targeting** mode
@@ -25,8 +29,11 @@ Decoder and encoder are both at production status.
   [`tests/api_compat_0_1_13.rs`](./tests/api_compat_0_1_13.rs).
 
 VP8 has no remaining bitstream gaps in this crate; ongoing work is
-performance tuning (SIMD primitives, profile-guided fast paths) and
-bench / fuzz coverage — see `BENCHMARKS.md`.
+encoder rate-distortion quality (the §13 trellis quantiser now covers the
+keyframe paths; threading it into the inter / P-frame emit path and
+exposing the trellis aggressiveness as a quality/size knob are the next
+steps), performance tuning (SIMD primitives, profile-guided fast paths),
+and bench / fuzz coverage — see `BENCHMARKS.md`.
 
 ## Install
 

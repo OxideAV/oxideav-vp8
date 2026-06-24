@@ -2707,21 +2707,13 @@ struct WholeBlockLuma {
 /// WHT collecting the sub-block DCs into Y2), returning the quantised
 /// Y / Y2 coefficients. Shared by the RD scorer and never recomputed for
 /// the winner.
-fn transform_whole_block_luma(
-    src: &[u8; 256],
-    pred: &[u8; 256],
-    factors: &crate::dequant::MbDequantFactors,
-) -> ([[i16; 16]; 16], [i16; 16]) {
-    transform_whole_block_luma_rd(src, pred, factors, None)
-}
-
-/// As [`transform_whole_block_luma`], but when `trellis` is `Some` the
-/// sixteen `YAfterY2` sub-blocks and the `Y2` (WHT) block are quantised by
-/// the §13 [`trellis_quantize_block`] RD search rather than plain rounding.
-/// The Y2 block is trellised against `BlockType::Y2` (plane 1, full 0..15
-/// scan), each Y sub-block against `BlockType::YAfterY2` (plane 0,
-/// `firstCoeff = 1` — the DC now lives in Y2 and is excluded). `None`
-/// preserves the plain-rounding bytes exactly.
+///
+/// When `trellis` is `Some` the sixteen `YAfterY2` sub-blocks and the `Y2`
+/// (WHT) block are quantised by the §13 [`trellis_quantize_block`] RD
+/// search rather than plain rounding. The Y2 block is trellised against
+/// `BlockType::Y2` (plane 1, full 0..15 scan), each Y sub-block against
+/// `BlockType::YAfterY2` (plane 0, `firstCoeff = 1` — the DC now lives in
+/// Y2 and is excluded). `None` preserves the plain-rounding bytes exactly.
 fn transform_whole_block_luma_rd(
     src: &[u8; 256],
     pred: &[u8; 256],
@@ -2976,17 +2968,10 @@ struct ChromaPlane<'a> {
 /// Transform + quantise one 8×8 chroma plane's residual into its four
 /// §13.3 `UV` sub-blocks (each carrying its own DC — chroma has no Y2),
 /// returning the quantised blocks in raster sub-block order (`i*2 + j`).
-fn transform_chroma_plane(
-    src: &[u8; 64],
-    pred: &[u8; 64],
-    factors: &crate::dequant::MbDequantFactors,
-) -> [[i16; 16]; 4] {
-    transform_chroma_plane_rd(src, pred, factors, None)
-}
-
-/// As [`transform_chroma_plane`], but when `trellis` is `Some` each `UV`
-/// sub-block is quantised by the §13 [`trellis_quantize_block`] RD search
-/// (plane 2, `firstCoeff = 0`). `None` preserves plain-rounding bytes.
+///
+/// When `trellis` is `Some` each `UV` sub-block is quantised by the §13
+/// [`trellis_quantize_block`] RD search (plane 2, `firstCoeff = 0`);
+/// `None` preserves plain-rounding bytes.
 fn transform_chroma_plane_rd(
     src: &[u8; 64],
     pred: &[u8; 64],
@@ -6031,7 +6016,12 @@ fn score_split_partition(
 /// plane). Mirrors the `B_PRED` luma transform path (`transform_b_pred_luma`
 /// would, if it existed; we inline it here since the SPLITMV picker is
 /// the only inter caller that needs no-Y2 luma).
-fn transform_split_mv_mb(
+///
+/// When `trellis` is `Some` each `YNoY2` luma sub-block and each `UV`
+/// chroma sub-block is quantised by the §13 [`trellis_quantize_block`] RD
+/// search; `None` preserves the plain-rounding SPLITMV wire byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn transform_split_mv_mb_rd(
     src: &[u8; 256],
     pred: &[u8; 256],
     chroma_src_u: &[u8; 64],
@@ -6039,6 +6029,7 @@ fn transform_split_mv_mb(
     chroma_src_v: &[u8; 64],
     chroma_pred_v: &[u8; 64],
     factors: &crate::dequant::MbDequantFactors,
+    trellis: Option<&MbRdCtx>,
 ) -> MbCoeffs {
     // Per-sub-block luma forward DCT + Y1 quantisation. SPLITMV codes
     // every coefficient (0..=15) of each Y sub-block — no Y2, so the
@@ -6058,14 +6049,28 @@ fn transform_split_mv_mb(
             // No DC extraction — every coefficient is quantised in
             // place under the Y1 (dc, ac) factors. The decoder's
             // `BlockType::YNoY2` path reads them the same way.
-            enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac);
+            match trellis {
+                Some(rd) if rd.lambda > 0.0 => trellis_quantize_block(
+                    &mut coeffs,
+                    TrellisBlockSpec {
+                        dc: factors.y1_dc,
+                        ac: factors.y1_ac,
+                        first_coeff: BlockType::YNoY2.first_coeff(),
+                        entry_ctx3: 0,
+                        plane: BlockType::YNoY2.plane_index(),
+                    },
+                    rd.coeff_probs,
+                    rd.lambda,
+                ),
+                _ => enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac),
+            }
             y[i * 4 + j] = coeffs;
         }
     }
 
     // Chroma uses the same path the whole-MB encoder uses.
-    let u = transform_chroma_plane(chroma_src_u, chroma_pred_u, factors);
-    let v = transform_chroma_plane(chroma_src_v, chroma_pred_v, factors);
+    let u = transform_chroma_plane_rd(chroma_src_u, chroma_pred_u, factors, trellis);
+    let v = transform_chroma_plane_rd(chroma_src_v, chroma_pred_v, factors, trellis);
 
     MbCoeffs {
         y,
@@ -6288,7 +6293,16 @@ fn pick_mb_for_ref(
     lambda: f64,
     filters: &[[i32; 6]; 8],
     factors: &crate::dequant::MbDequantFactors,
+    coeff_probs: Option<&CoeffProbs>,
 ) -> PickedMbForRef {
+    // §13 trellis RD context for the inter residual emit, available once
+    // the caller resolves this frame's coefficient probs. `None` keeps the
+    // pre-trellis inter wire byte-for-byte.
+    let trellis_rd = coeff_probs.map(|cp| MbRdCtx {
+        factors,
+        coeff_probs: cp,
+        lambda,
+    });
     // ---- §16.3 census + §17 motion search ------------------------
     //
     // The §16.3 `find_near_mvs[CNT_BEST]` slot is the "best"
@@ -6458,8 +6472,15 @@ fn pick_mb_for_ref(
             false,
             filters,
         );
-        let raw_coeffs = transform_split_mv_mb(
-            &pixels.y, &pred.y, &pixels.u, &pred.u, &pixels.v, &pred.v, factors,
+        let raw_coeffs = transform_split_mv_mb_rd(
+            &pixels.y,
+            &pred.y,
+            &pixels.u,
+            &pred.u,
+            &pixels.v,
+            &pred.v,
+            factors,
+            trellis_rd.as_ref(),
         );
         (raw_coeffs, true)
     } else {
@@ -6471,9 +6492,10 @@ fn pick_mb_for_ref(
             false,
             filters,
         );
-        let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &pred.y, factors);
-        let u_quant = transform_chroma_plane(&pixels.u, &pred.u, factors);
-        let v_quant = transform_chroma_plane(&pixels.v, &pred.v, factors);
+        let (y_quant, y2_quant) =
+            transform_whole_block_luma_rd(&pixels.y, &pred.y, factors, trellis_rd.as_ref());
+        let u_quant = transform_chroma_plane_rd(&pixels.u, &pred.u, factors, trellis_rd.as_ref());
+        let v_quant = transform_chroma_plane_rd(&pixels.v, &pred.v, factors, trellis_rd.as_ref());
         let raw_coeffs = MbCoeffs {
             y: y_quant,
             y2: y2_quant,
@@ -8051,6 +8073,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                     lambda,
                     filters,
                     &factors,
+                    Some(&coeff_probs),
                 );
                 let ref_bits = ref_frame_tree_bits(*ref_frame, prob_last_pick, prob_gf_pick);
                 let total = pick.j + lambda * ref_bits;

@@ -35,16 +35,20 @@ round-half-away-from-zero divide on the quality-deciding paths.
   `pick_uv8x8_mode`, the §11.3 B_PRED per-sub-block walker, and the chroma
   re-quant in `encode_mb_block_set_with_neighbors` (whole-block Y as
   `YAfterY2` + the `Y2` WHT block, chroma as `UV`, B_PRED sub-blocks as
-  `YNoY2`), **and the intra-within-P-frame whole-block path**
-  (`pick_intra_mb_all` / `score_intra_mb_candidate`, which threads this
-  frame's resolved `coeff_probs` into an `MbRdCtx` and routes the Y / Y2 /
-  chroma transforms through the same trellis). Because the intra-in-inter
-  picker both scores and emits the winning coefficients, the trellis levels
-  the decoder reconstructs are exactly the ones the encoder predicted from
-  — every P-frame intra-pick + pixel-lockstep test stays green. The
-  purely-inter (motion-compensated) `pick_mb_for_ref` emit path is still
-  byte-for-byte unchanged (it has 16 positional args already; bundling them
-  to thread `coeff_probs` is the remaining follow-up).
+  `YNoY2`), the **intra-within-P-frame whole-block path**
+  (`pick_intra_mb_all` / `score_intra_mb_candidate`), **and the
+  purely-inter (motion-compensated) emit path** (`pick_mb_for_ref` — both
+  the whole-block inter MB as `YAfterY2`/`Y2`/`UV` and the SPLITMV MB as
+  `YNoY2`/`UV` via `transform_split_mv_mb_rd`). All three thread this
+  frame's resolved `coeff_probs` into an `MbRdCtx` at the inter mode lambda
+  (`rd_lambda(factors)`) and route the transforms through the same trellis.
+  Every emit site that uses the trellis also reconstructs from the *same*
+  trellis-quantised coefficients (the encoder's `recon` is built from a
+  dequantised copy of the emitted `raw_coeffs`), so the encoder/decoder
+  pixel-lockstep contract holds — every P-frame round-trip, SPLITMV,
+  golden-ref, sub-pel, refresh-ladder, multi-partition, intra-pick, and
+  pixel-lockstep test stays green. The three plain `transform_*` wrappers
+  folded into their `_rd` variants (`None` = the prior plain-rounding wire).
 * **Tuning**: `TRELLIS_LAMBDA_SCALE = 0.04` — coefficient-level RDO spends
   λ far more aggressively than the mode picker it shares the multiplier
   with, so the trellis runs at a fraction of the mode λ. Calibrated on the

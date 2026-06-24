@@ -6638,11 +6638,19 @@ fn score_intra_mb_candidate(
     neighbors: &crate::reconstruct::MbNeighbors,
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
+    coeff_probs: Option<&CoeffProbs>,
 ) -> IntraMbPick {
     debug_assert!(
         y_mode != IntraYMode::B,
         "score_intra_mb_candidate is whole-block only; B_PRED is routed via the per-sub-block walker",
     );
+    // §13 trellis RD context for the intra-in-P-frame whole-block paths,
+    // available once the caller resolves this frame's coefficient probs.
+    let trellis_rd = coeff_probs.map(|cp| MbRdCtx {
+        factors,
+        coeff_probs: cp,
+        lambda,
+    });
 
     // ---- §12 prediction. Each `predict_y16x16` / `predict_uv8x8`
     //      dispatcher applies the §12 default-fill rules when the
@@ -6698,10 +6706,13 @@ fn score_intra_mb_candidate(
         sad += (*a as i32 - *b as i32).unsigned_abs();
     }
 
-    // ---- §14 forward transform + quantise ----
-    let (y_quant, y2_quant) = transform_whole_block_luma(&pixels.y, &y_pred, factors);
-    let u_quant = transform_chroma_plane(&pixels.u, &u_pred, factors);
-    let v_quant = transform_chroma_plane(&pixels.v, &v_pred, factors);
+    // ---- §14 forward transform + quantise (§13 trellis when this frame's
+    //      coeff_probs are resolved; plain rounding otherwise — keeps the
+    //      pre-trellis inter wire byte-for-byte for callers that pass None).
+    let (y_quant, y2_quant) =
+        transform_whole_block_luma_rd(&pixels.y, &y_pred, factors, trellis_rd.as_ref());
+    let u_quant = transform_chroma_plane_rd(&pixels.u, &u_pred, factors, trellis_rd.as_ref());
+    let v_quant = transform_chroma_plane_rd(&pixels.v, &v_pred, factors, trellis_rd.as_ref());
     let raw_coeffs = MbCoeffs {
         y: y_quant,
         y2: y2_quant,
@@ -6783,6 +6794,7 @@ fn pick_intra_mb_all(
     neighbors: &crate::reconstruct::MbNeighbors,
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
+    coeff_probs: Option<&CoeffProbs>,
 ) -> IntraMbPick {
     const Y_MODES: [IntraYMode; 4] = [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
     const UV_MODES: [IntraUvMode; 4] = [
@@ -6794,8 +6806,15 @@ fn pick_intra_mb_all(
     let mut best: Option<IntraMbPick> = None;
     for &y_mode in Y_MODES.iter() {
         for &uv_mode in UV_MODES.iter() {
-            let cand =
-                score_intra_mb_candidate(y_mode, uv_mode, pixels, neighbors, factors, lambda);
+            let cand = score_intra_mb_candidate(
+                y_mode,
+                uv_mode,
+                pixels,
+                neighbors,
+                factors,
+                lambda,
+                coeff_probs,
+            );
             match best.as_ref() {
                 None => best = Some(cand),
                 Some(b) if cand.j < b.j => best = Some(cand),
@@ -8078,7 +8097,8 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             let mut chose_intra = false;
             if pick_intra {
                 let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
-                let intra_pick = pick_intra_mb_all(&pixels, &neighbors, &factors, lambda);
+                let intra_pick =
+                    pick_intra_mb_all(&pixels, &neighbors, &factors, lambda, Some(&coeff_probs));
                 let prob_intra_pick: u8 = 128;
                 let inter_total = chosen.j
                     + lambda * ref_frame_tree_bits(chosen_ref_frame, prob_last_pick, prob_gf_pick)
@@ -12447,7 +12467,7 @@ mod tests {
             u: uv_vstripe,
             v: uv_vstripe,
         };
-        let pick_v = pick_intra_mb_all(&pixels_v, &make_neighbors(), &factors, lambda);
+        let pick_v = pick_intra_mb_all(&pixels_v, &make_neighbors(), &factors, lambda, None);
         assert_eq!(
             pick_v.y_mode,
             IntraYMode::V,
@@ -12486,7 +12506,7 @@ mod tests {
             u: uv_hstripe,
             v: uv_hstripe,
         };
-        let pick_h = pick_intra_mb_all(&pixels_h, &make_neighbors(), &factors, lambda);
+        let pick_h = pick_intra_mb_all(&pixels_h, &make_neighbors(), &factors, lambda, None);
         assert_eq!(
             pick_h.y_mode,
             IntraYMode::H,
@@ -12532,7 +12552,7 @@ mod tests {
             u: uv_tm,
             v: uv_tm,
         };
-        let pick_tm = pick_intra_mb_all(&pixels_tm, &make_neighbors(), &factors, lambda);
+        let pick_tm = pick_intra_mb_all(&pixels_tm, &make_neighbors(), &factors, lambda, None);
         assert_eq!(
             pick_tm.y_mode,
             IntraYMode::Tm,
@@ -12560,7 +12580,13 @@ mod tests {
             u: flat_uv,
             v: flat_uv,
         };
-        let pick_flat = pick_intra_mb_all(&pixels_flat, &MbNeighbors::default(), &factors, lambda);
+        let pick_flat = pick_intra_mb_all(
+            &pixels_flat,
+            &MbNeighbors::default(),
+            &factors,
+            lambda,
+            None,
+        );
         assert_eq!(
             pick_flat.y_mode,
             IntraYMode::Dc,

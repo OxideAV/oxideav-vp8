@@ -53,6 +53,13 @@ decoder runs the identical filter.
   (key and P frames alike) end-to-end. Defaults to `false` (the historical
   fixed-`base.lf_level` behaviour). The auto-LF stream decodes through the
   stateful decoder unchanged (`tests/two_pass_roundtrip.rs`).
+* **`Vp8EncoderConfig::auto_loop_filter`** — the same switch on the
+  single-pass config, honoured by the typed direct-API handle
+  (`Vp8Encoder::encode_keyframe`, which now also honours `config.lf_level`)
+  and the framework factory (`make_encoder_with_config`, which now threads
+  `lf_level` + the auto switch through the registry adapter rather than
+  forwarding qindex alone). Defaults to `false`
+  (`tests/encoder_config_auto_loop_filter.rs`).
 * **Measured**: on a coarse-quantised (qi 100) blocky 64×48 source the
   auto path lifts reconstruction PSNR (Y+U+V) from 40.29 dB (unfiltered) to
   40.48 dB (+0.19 dB) while staying in byte-exact encoder↔decoder lockstep

@@ -9037,7 +9037,7 @@ mod factory {
         VideoFrame,
     };
 
-    use super::{encode_keyframe, I420Frame, KeyframeParams};
+    use super::{encode_keyframe, encode_keyframe_auto_loop_filter, I420Frame, KeyframeParams};
     use crate::decoder::VP8_CODEC_ID;
 
     /// Build a framework-side VP8 encoder bound to `params` with all
@@ -9099,7 +9099,76 @@ mod factory {
             y_ac_qi: qindex,
             ..KeyframeParams::default()
         };
+        build_frame_encoder(params, width, height, pixel_format, keyframe, false)
+    }
 
+    /// Build a framework-side VP8 encoder from a full
+    /// [`super::Vp8EncoderConfig`]: honours `qindex`, the §9.4 `lf_level`,
+    /// and the `auto_loop_filter` RD-selection switch (when set,
+    /// `lf_level` is ignored and the §9.4 level / sharpness are chosen per
+    /// frame).
+    pub(crate) fn make_encoder_from_config(
+        params: &CodecParameters,
+        config: super::Vp8EncoderConfig,
+    ) -> Result<Box<dyn Encoder>> {
+        let width = params
+            .width
+            .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
+        let height = params
+            .height
+            .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
+        if width == 0 || height == 0 {
+            return Err(Error::invalid(
+                "vp8 encoder: width and height must be positive",
+            ));
+        }
+        if width > 0x3FFF || height > 0x3FFF {
+            return Err(Error::invalid(
+                "vp8 encoder: width/height exceed VP8 14-bit field (max 16383)",
+            ));
+        }
+        let pixel_format = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
+        if pixel_format != PixelFormat::Yuv420P {
+            return Err(Error::unsupported(
+                "vp8 encoder: only PixelFormat::Yuv420P is supported",
+            ));
+        }
+        if config.qindex > 127 {
+            return Err(Error::invalid(
+                "vp8 encoder: qindex out of range (must be 0..=127)",
+            ));
+        }
+        if config.lf_level > 63 {
+            return Err(Error::invalid(
+                "vp8 encoder: lf_level out of range (must be 0..=63)",
+            ));
+        }
+        let keyframe = KeyframeParams {
+            y_ac_qi: config.qindex,
+            loop_filter_level: config.lf_level,
+            ..KeyframeParams::default()
+        };
+        build_frame_encoder(
+            params,
+            width,
+            height,
+            pixel_format,
+            keyframe,
+            config.auto_loop_filter,
+        )
+    }
+
+    /// Shared constructor for the framework-side keyframe encoder adapter.
+    /// `auto_lf` routes each frame through the §9.4 RD loop-filter selector
+    /// ([`encode_keyframe_auto_loop_filter`]) when set.
+    pub(crate) fn build_frame_encoder(
+        params: &CodecParameters,
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        keyframe: KeyframeParams,
+        auto_lf: bool,
+    ) -> Result<Box<dyn Encoder>> {
         let mut output_params = params.clone();
         output_params.media_type = MediaType::Video;
         output_params.codec_id = CodecId::new(VP8_CODEC_ID);
@@ -9116,6 +9185,7 @@ mod factory {
             width,
             height,
             keyframe,
+            auto_lf,
             time_base,
             pending: VecDeque::new(),
             eof: false,
@@ -9132,6 +9202,9 @@ mod factory {
         width: u32,
         height: u32,
         keyframe: KeyframeParams,
+        /// §9.4 RD loop-filter auto-selection (per
+        /// [`Vp8EncoderConfig::auto_loop_filter`]).
+        auto_lf: bool,
         time_base: TimeBase,
         pending: VecDeque<Packet>,
         eof: bool,
@@ -9163,7 +9236,8 @@ mod factory {
                 Frame::Video(v) => v,
                 _ => return Err(Error::invalid("vp8 encoder: video frames only")),
             };
-            let bytes = encode_video_frame(v, self.width, self.height, &self.keyframe)?;
+            let bytes =
+                encode_video_frame(v, self.width, self.height, &self.keyframe, self.auto_lf)?;
             let mut pkt = Packet::new(0, self.time_base, bytes);
             pkt.pts = v.pts;
             pkt.dts = v.pts;
@@ -9195,6 +9269,7 @@ mod factory {
         width: u32,
         height: u32,
         keyframe: &KeyframeParams,
+        auto_lf: bool,
     ) -> Result<Vec<u8>> {
         if frame.planes.len() < 3 {
             return Err(Error::invalid(
@@ -9228,7 +9303,12 @@ mod factory {
         let v_packed = repack_plane(&v_plane.data, v_plane.stride, uvw, uvh);
 
         let src = I420Frame::packed(width, height, &y_packed, &u_packed, &v_packed);
-        let bytes = encode_keyframe(&src, keyframe).map_err(|e| Error::invalid(e.to_string()))?;
+        let bytes = if auto_lf {
+            encode_keyframe_auto_loop_filter(&src, keyframe)
+        } else {
+            encode_keyframe(&src, keyframe)
+        }
+        .map_err(|e| Error::invalid(e.to_string()))?;
         Ok(bytes)
     }
 
@@ -9325,6 +9405,14 @@ pub struct Vp8EncoderConfig {
     pub lookahead_window: u32,
     /// Per-frame target bitrate in bits, or 0 for CQ mode.
     pub target_bitrate_bps: u32,
+    /// When `true`, the §9.4 `loop_filter_level` / `sharpness_level` are
+    /// chosen per frame by the RD selector
+    /// ([`select_filter_params`]) rather than taken from
+    /// [`lf_level`](Self::lf_level): the encoder picks the pair minimising
+    /// post-§15 reconstruction SSD against the source. Defaults to `false`
+    /// (the historical fixed-`lf_level` behaviour). RFC 6386 is silent on
+    /// the choice, so this is a clean-room encoder-quality knob.
+    pub auto_loop_filter: bool,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -9337,6 +9425,7 @@ impl Default for Vp8EncoderConfig {
             alt_ref_interval: DEFAULT_ALT_REF_INTERVAL,
             lookahead_window: DEFAULT_LOOKAHEAD_WINDOW,
             target_bitrate_bps: 0,
+            auto_loop_filter: false,
         }
     }
 }
@@ -9373,15 +9462,24 @@ impl Vp8Encoder {
 
     /// Encode `frame` as a VP8 key frame; returns the on-the-wire
     /// bytes. Delegates to the current crate's [`encode_keyframe`]
-    /// driver using the encoder's [`Vp8EncoderConfig`] as the §9.6
-    /// quant-index source.
+    /// driver using the encoder's [`Vp8EncoderConfig`] for the §9.6
+    /// quant index and the §9.4 loop-filter level. When
+    /// [`auto_loop_filter`](Vp8EncoderConfig::auto_loop_filter) is set the
+    /// §9.4 level / sharpness are RD-selected per frame
+    /// ([`encode_keyframe_auto_loop_filter`]) and `config.lf_level` is
+    /// ignored.
     pub fn encode_keyframe(&mut self, frame: &I420Frame<'_>) -> crate::error::Result<Vec<u8>> {
         let params = KeyframeParams {
             y_ac_qi: self.config.qindex,
+            loop_filter_level: self.config.lf_level,
             ..KeyframeParams::default()
         };
-        let bytes = encode_keyframe(frame, &params)
-            .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
+        let bytes = if self.config.auto_loop_filter {
+            encode_keyframe_auto_loop_filter(frame, &params)
+        } else {
+            encode_keyframe(frame, &params)
+        }
+        .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
         self.stats.frames_encoded += 1;
         self.stats.keyframes_emitted += 1;
         self.stats.bytes_emitted += bytes.len() as u64;
@@ -10255,15 +10353,16 @@ fn qindex_from_complexity(
 }
 
 /// Framework-side factory that takes a full [`Vp8EncoderConfig`]
-/// (rather than just a qindex). Routes through
-/// [`make_encoder_with_qindex`] for now; the additional knobs are
-/// persisted on the returned encoder for future use.
+/// (rather than just a qindex). Honours `qindex`, the §9.4 `lf_level`,
+/// and the [`auto_loop_filter`](Vp8EncoderConfig::auto_loop_filter)
+/// RD-selection switch; when the latter is set the §9.4 level / sharpness
+/// are chosen per frame and `lf_level` is ignored.
 #[cfg(feature = "registry")]
 pub fn make_encoder_with_config(
     params: &oxideav_core::CodecParameters,
     config: Vp8EncoderConfig,
 ) -> oxideav_core::Result<Box<dyn oxideav_core::Encoder>> {
-    make_encoder_with_qindex(params, config.qindex)
+    factory::make_encoder_from_config(params, config)
 }
 
 /// Build a [`Vp8Encoder`] (the typed direct-API handle) from a

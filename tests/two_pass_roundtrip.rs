@@ -240,6 +240,55 @@ fn every_emitted_frame_decodes_via_stateful_decoder() {
     }
 }
 
+/// The §9.4 6-bit `loop_filter_level` a key-frame bitstream carries. The
+/// first partition begins at byte 10 (3-byte tag + 7-byte key-frame
+/// extension); the leading §19.2 bool fields up to the level are
+/// color_space, clamping_type, update_mb_segmentation, filter_type.
+fn keyframe_filter_level(bytes: &[u8]) -> u8 {
+    use oxideav_vp8::bool_decoder::BoolDecoder;
+    let mut bd = BoolDecoder::init(&bytes[10..]).expect("init first partition");
+    let _ = bd.read_bool(128).unwrap();
+    let _ = bd.read_bool(128).unwrap();
+    let _ = bd.read_bool(128).unwrap();
+    let _ = bd.read_bool(128).unwrap();
+    bd.read_literal(6).unwrap() as u8
+}
+
+#[test]
+fn two_pass_auto_loop_filter_decodes_end_to_end() {
+    use oxideav_vp8::Vp8EncoderConfig;
+
+    // A coarse base qindex so the busier frames (checker / noise) carry
+    // real block-edge error the RD selector can act on.
+    let base = Vp8EncoderConfig {
+        qindex: 96,
+        lf_level: 0,
+        ..Vp8EncoderConfig::default()
+    };
+    let auto_cfg = Vp8TwoPassConfig {
+        base,
+        auto_loop_filter: true,
+        ..Vp8TwoPassConfig::default()
+    };
+
+    // run_four_frame_clip already decodes every frame through the stateful
+    // decoder, so a successful return proves the whole auto-LF stream
+    // (key + P frames, each with its own RD-selected §9.4 level) is
+    // bitstream-valid. Re-confirm here for a discrete CI signal.
+    let (_stats, _schedule, auto_bytes) = run_four_frame_clip(auto_cfg);
+    assert_eq!(auto_bytes.len(), 4);
+    let mut dec = Vp8DecoderState::new();
+    for (i, b) in auto_bytes.iter().enumerate() {
+        let f = dec.decode_frame(b).expect("auto-LF frame decodes");
+        assert_eq!(f.width, 32, "frame {i}");
+        assert_eq!(f.height, 32, "frame {i}");
+    }
+    // The first frame is a key frame; its §9.4 level is whatever the
+    // selector chose (>= 0 — a flat-grey keyframe legitimately wants 0).
+    let lvl = keyframe_filter_level(&auto_bytes[0]);
+    assert!(lvl <= 63, "selected level {lvl} in §9.4 range");
+}
+
 #[test]
 fn two_pass_qindex_for_frame_handles_baseline_complexity() {
     let config = Vp8TwoPassConfig::default();

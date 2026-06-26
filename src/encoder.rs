@@ -9422,6 +9422,15 @@ pub struct Vp8TwoPassConfig {
     pub fps_num: u32,
     /// Frame-rate denominator. `0` is treated as `1`.
     pub fps_den: u32,
+    /// When `true`, each second-pass frame's §9.4 `loop_filter_level` is
+    /// chosen by the RD selector ([`select_filter_level`]) rather than
+    /// taken from `base.lf_level`: the encoder picks, per frame, the level
+    /// that minimises post-§15 reconstruction SSD against the source. The
+    /// chosen level reaches the wire, so decoder lockstep holds. Defaults
+    /// to `false` (the historical fixed-`base.lf_level` behaviour). RFC
+    /// 6386 is silent on the level choice, so this is a clean-room
+    /// encoder-quality knob.
+    pub auto_loop_filter: bool,
 }
 
 impl Default for Vp8TwoPassConfig {
@@ -9432,6 +9441,7 @@ impl Default for Vp8TwoPassConfig {
             overshoot_ratio: 1.2,
             fps_num: 0,
             fps_den: 1,
+            auto_loop_filter: false,
         }
     }
 }
@@ -9652,16 +9662,29 @@ impl Vp8TwoPassEncoder {
                 })
                 .unwrap_or(false);
 
+        // §9.4 auto loop-filter: when enabled, the per-frame
+        // `loop_filter_level` is the RD selector's choice rather than
+        // `base.lf_level`. The auto entry points write the chosen level to
+        // the wire so decoder lockstep holds either way.
+        let auto_lf = self.config.auto_loop_filter;
         let (bytes, planes) = if force_key {
-            encode_keyframe_with_reconstruction(frame, &params)
-                .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
+            if auto_lf {
+                encode_keyframe_auto_loop_filter_with_reconstruction(frame, &params)
+            } else {
+                encode_keyframe_with_reconstruction(frame, &params)
+            }
+            .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
         } else {
             let reference = self
                 .last_reconstruction
                 .as_ref()
                 .expect("force_key=false implies a reference exists");
-            encode_p_frame_multi_ref(frame, reference, None, None, &params)
-                .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
+            if auto_lf {
+                encode_p_frame_multi_ref_auto_loop_filter(frame, reference, None, None, &params)
+            } else {
+                encode_p_frame_multi_ref(frame, reference, None, None, &params)
+            }
+            .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
         };
 
         self.last_reconstruction = Some(planes);

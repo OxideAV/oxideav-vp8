@@ -39,6 +39,12 @@ level to the §9.4 header so a compliant decoder runs the identical filter.
   per-MB §9.4 reference / mode deltas — for each candidate, so the chosen
   level reaches the wire and inter encoder↔decoder lockstep holds (verified
   through a stateful I-then-P self-decode).
+* **`Vp8TwoPassConfig::auto_loop_filter`** — a config flag that switches
+  the multi-frame [`Vp8TwoPassEncoder::encode_frame`] driver onto the auto
+  entry points, so a whole stream gets per-frame RD-selected §9.4 levels
+  (key and P frames alike) end-to-end. Defaults to `false` (the historical
+  fixed-`base.lf_level` behaviour). The auto-LF stream decodes through the
+  stateful decoder unchanged (`tests/two_pass_roundtrip.rs`).
 * **Measured**: on a coarse-quantised (qi 100) blocky 64×48 source the
   auto path lifts reconstruction PSNR (Y+U+V) from 40.29 dB (unfiltered) to
   40.48 dB (+0.19 dB) while staying in byte-exact encoder↔decoder lockstep

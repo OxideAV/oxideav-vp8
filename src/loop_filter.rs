@@ -1688,19 +1688,50 @@ pub fn select_filter_level(
     src: &SourcePlanes<'_>,
     inter: Option<&InterFilterInfo<'_>>,
 ) -> u8 {
+    select_filter_params(planes, modes, has_coeffs, base, src, inter).0
+}
+
+/// Joint RD-driven §9.4 `(loop_filter_level, sharpness_level)` selection
+/// (clean-room; RFC 6386 is silent on the encoder's choice — §15 only
+/// *defines* the filter).
+///
+/// Extends [`select_filter_level`] with the §15.4 `sharpness_level`
+/// (`0..=7`), which scales down the interior-edge limit (a higher
+/// sharpness filters interior sub-block edges less, preserving real
+/// detail). The search is a **coordinate descent**: first pick the best
+/// level at the base sharpness (coarse grid `step = 4` + `±3` refine — the
+/// level dominates the distortion), then sweep all 8 sharpness values at
+/// that level. Returns `(level, sharpness)`; when the chosen level is `0`
+/// the sharpness is irrelevant (the §15 whole-frame skip runs) and the
+/// base sharpness is returned unchanged.
+///
+/// Each candidate clones the unfiltered planes and runs the real §15 pass,
+/// so the returned pair is exactly reproducible by [`filter_frame`] /
+/// [`filter_inter_frame`]. `inter` is `Some` for a P-frame, `None` for a
+/// key frame. Level `0` is always a candidate, so the selector never
+/// *adds* distortion.
+pub fn select_filter_params(
+    planes: &KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    base: &FrameFilterConfig,
+    src: &SourcePlanes<'_>,
+    inter: Option<&InterFilterInfo<'_>>,
+) -> (u8, u8) {
     const STEP: u8 = 4;
 
-    // Score one candidate level against the source by cloning the
-    // unfiltered planes, running the real §15 pass at that level, and
-    // measuring visible-window SSD. Level 0 short-circuits the §15
-    // whole-frame skip (no clone, no filter) per §15 page 84.
-    let score = |level: u8| -> u64 {
+    // Score a candidate (level, sharpness) against the source by cloning
+    // the unfiltered planes, running the real §15 pass, and measuring
+    // visible-window SSD. Level 0 short-circuits the §15 whole-frame skip
+    // (no clone, no filter) per §15 page 84 — sharpness is then a no-op.
+    let score = |level: u8, sharpness: u8| -> u64 {
         if level == 0 {
             return reconstruction_ssd(planes, src);
         }
         let mut cand = planes.clone();
         let cfg = FrameFilterConfig {
             loop_filter_level: level,
+            sharpness_level: sharpness,
             ..*base
         };
         match inter {
@@ -1717,43 +1748,61 @@ pub fn select_filter_level(
         reconstruction_ssd(&cand, src)
     };
 
-    // Coarse grid: 0, STEP, 2·STEP, … 63, plus the endpoint 63.
+    let base_sharp = base.sharpness_level.min(7);
+
+    // ---- Stage 1: pick the level at the base sharpness -----------------
+    // Coarse grid: 0, STEP, 2·STEP, … plus the endpoint 63.
     let mut best_level = 0u8;
-    let mut best_ssd = score(0);
+    let mut best_ssd = score(0, base_sharp);
     let mut l = STEP;
     while l <= 63 {
-        let s = score(l);
+        let s = score(l, base_sharp);
         if s < best_ssd {
             best_ssd = s;
             best_level = l;
         }
         l = l.saturating_add(STEP);
     }
-    // Always consider the top of the range so a frame that genuinely wants
-    // the maximum filter is reachable even if 63 is not on the grid.
     {
-        let s = score(63);
+        let s = score(63, base_sharp);
         if s < best_ssd {
             best_ssd = s;
             best_level = 63;
         }
     }
-
-    // Local refine: sweep the ±(STEP-1) neighbourhood of the grid winner.
+    // Local refine: ±(STEP-1) around the grid winner.
     let lo = best_level.saturating_sub(STEP - 1);
     let hi = best_level.saturating_add(STEP - 1).min(63);
     for cand in lo..=hi {
         if cand == best_level {
             continue;
         }
-        let s = score(cand);
+        let s = score(cand, base_sharp);
         if s < best_ssd {
             best_ssd = s;
             best_level = cand;
         }
     }
 
-    best_level
+    // Level 0 wins: sharpness is irrelevant (the §15 skip runs).
+    if best_level == 0 {
+        return (0, base_sharp);
+    }
+
+    // ---- Stage 2: sweep sharpness at the chosen level ------------------
+    let mut best_sharp = base_sharp;
+    for sharp in 0u8..=7 {
+        if sharp == base_sharp {
+            continue;
+        }
+        let s = score(best_level, sharp);
+        if s < best_ssd {
+            best_ssd = s;
+            best_sharp = sharp;
+        }
+    }
+
+    (best_level, best_sharp)
 }
 
 /// Flag-driven core of [`filter_frame`]: the §15.1 step-2/4 decision needs
@@ -2847,6 +2896,51 @@ mod tests {
             after < unfiltered,
             "chosen level {level} SSD {after} must beat unfiltered {unfiltered}"
         );
+
+        // The joint (level, sharpness) selector must agree with the
+        // level-only one on its level and return an in-range sharpness, and
+        // its chosen pair must score no worse than the level-only result.
+        let (jl, js) = select_filter_params(&planes, &modes, &has_coeffs, &cfg, &src, None);
+        assert_eq!(
+            jl, level,
+            "joint selector level agrees with select_filter_level"
+        );
+        assert!(js <= 7, "sharpness {js} in §9.4 range");
+        let mut jf = planes.clone();
+        let mut jc = cfg;
+        jc.loop_filter_level = jl;
+        jc.sharpness_level = js;
+        filter_frame_flags(&mut jf, &modes, &has_coeffs, &jc);
+        let joint_ssd = reconstruction_ssd(&jf, &src);
+        assert!(
+            joint_ssd <= after,
+            "joint (level={jl}, sharp={js}) SSD {joint_ssd} must not exceed level-only {after}"
+        );
+    }
+
+    #[test]
+    fn select_filter_params_flat_source_picks_zero_level() {
+        let mb_cols = 2;
+        let mb_rows = 2;
+        let n = mb_cols * mb_rows;
+        let planes = flat_planes(120, mb_cols, mb_rows);
+        let modes: Vec<_> = (0..n).map(|_| mode(IntraYMode::Dc, None)).collect();
+        let has_coeffs = vec![true; n];
+        let mut cfg = base_config();
+        cfg.sharpness_level = 3; // non-default base sharpness
+        let src = SourcePlanes {
+            width: mb_cols * 16,
+            height: mb_rows * 16,
+            y: &planes.y,
+            u: &planes.u,
+            v: &planes.v,
+            y_stride: planes.y_stride,
+            uv_stride: planes.uv_stride,
+        };
+        let (level, sharp) = select_filter_params(&planes, &modes, &has_coeffs, &cfg, &src, None);
+        assert_eq!(level, 0, "lossless flat reconstruction wants no filtering");
+        // Level 0 ⇒ sharpness irrelevant; the base sharpness is returned.
+        assert_eq!(sharp, 3, "base sharpness returned when level is 0");
     }
 
     // ----- §15 SIMD kernel byte-exactness ------------------------------

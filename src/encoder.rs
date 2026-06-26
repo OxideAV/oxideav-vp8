@@ -4821,12 +4821,13 @@ fn encode_keyframe_inner_lf(
         other_mv_mode_delta: 0,
         split_mv_mode_delta: 0,
     };
-    // §9.4 effective loop-filter level. When `auto_lf` is set the RD
-    // selector replaces `params.loop_filter_level` with the
-    // distortion-minimising level (clean-room; RFC 6386 is silent on the
-    // encoder's level choice). The chosen value is written to the header
-    // below so the decoder runs the identical §15 pass.
-    let eff_lf_level = if auto_lf {
+    // §9.4 effective loop-filter level + sharpness. When `auto_lf` is set
+    // the RD selector jointly replaces `params.loop_filter_level` /
+    // `params.sharpness_level` with the distortion-minimising pair
+    // (clean-room; RFC 6386 is silent on the encoder's choice). Both
+    // chosen values are written to the header below so the decoder runs
+    // the identical §15 pass.
+    let (eff_lf_level, eff_sharpness) = if auto_lf {
         let has_coeffs: Vec<bool> = all_coeffs
             .iter()
             .map(crate::loop_filter::mb_has_coeffs)
@@ -4840,7 +4841,7 @@ fn encode_keyframe_inner_lf(
             y_stride: frame.y_stride,
             uv_stride: frame.uv_stride,
         };
-        crate::loop_filter::select_filter_level(
+        crate::loop_filter::select_filter_params(
             &planes,
             &modes,
             &has_coeffs,
@@ -4849,9 +4850,10 @@ fn encode_keyframe_inner_lf(
             None,
         )
     } else {
-        params.loop_filter_level
+        (params.loop_filter_level, params.sharpness_level)
     };
     lf_config.loop_filter_level = eff_lf_level;
+    lf_config.sharpness_level = eff_sharpness;
     if eff_lf_level != 0 {
         crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
     }
@@ -4880,7 +4882,7 @@ fn encode_keyframe_inner_lf(
         &mut hdr,
         params.filter_type,
         eff_lf_level,
-        params.sharpness_level,
+        eff_sharpness,
         false,
     )?;
     // §9.5 — DCT partition count.
@@ -8419,14 +8421,14 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
         other_mv_mode_delta: effective_mode_deltas[2],
         split_mv_mode_delta: effective_mode_deltas[3],
     };
-    // §9.4 effective loop-filter level. With `auto_lf` the RD selector
-    // replaces `params.loop_filter_level` with the level that minimises
-    // post-§15 reconstruction SSD against the source (clean-room; RFC 6386
-    // is silent on the encoder's choice). The selector runs the SAME §15
-    // inter pass — including the per-MB ref/mode deltas above — for each
-    // candidate, so the chosen level reaches the wire and decoder lockstep
-    // holds.
-    let eff_lf_level = if auto_lf {
+    // §9.4 effective loop-filter level + sharpness. With `auto_lf` the RD
+    // selector jointly replaces `params.loop_filter_level` /
+    // `params.sharpness_level` with the pair that minimises post-§15
+    // reconstruction SSD against the source (clean-room; RFC 6386 is silent
+    // on the encoder's choice). The selector runs the SAME §15 inter pass —
+    // including the per-MB ref/mode deltas above — for each candidate, so
+    // the chosen pair reaches the wire and decoder lockstep holds.
+    let (eff_lf_level, eff_sharpness) = if auto_lf {
         let has_coeffs: Vec<bool> = all_coeffs
             .iter()
             .map(crate::loop_filter::mb_has_coeffs)
@@ -8444,7 +8446,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             ref_frames: &ref_frames_out,
             inter_modes: &inter_modes_out,
         };
-        crate::loop_filter::select_filter_level(
+        crate::loop_filter::select_filter_params(
             &planes,
             &modes,
             &has_coeffs,
@@ -8453,9 +8455,10 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             Some(&inter_info),
         )
     } else {
-        params.loop_filter_level
+        (params.loop_filter_level, params.sharpness_level)
     };
     lf_config.loop_filter_level = eff_lf_level;
+    lf_config.sharpness_level = eff_sharpness;
     if eff_lf_level != 0 {
         crate::loop_filter::filter_inter_frame(
             &mut planes,
@@ -8483,7 +8486,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
         &mut hdr,
         params.filter_type,
         eff_lf_level,
-        params.sharpness_level,
+        eff_sharpness,
         lf_deltas,
     )?;
     // §9.5 — partition count. Macroblock rows are distributed

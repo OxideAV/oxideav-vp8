@@ -19,10 +19,11 @@ Decoder and encoder are both at production status.
   the working quantisers while holding PSNR — the §13.4 token-probability
   fitter, §9.3 / §10
   segment-based adaptive quantisation (`encode_keyframe_adaptive_quant`),
-  **§9.4 RD loop-filter-level auto-selection** on both the keyframe
-  (`encode_keyframe_auto_loop_filter`) and inter
-  (`encode_p_frame_multi_ref_auto_loop_filter`) paths — searches the
-  `0..=63` level range for the level that minimises post-§15
+  **§9.4 RD loop-filter `(level, sharpness)` auto-selection** on both the
+  keyframe (`encode_keyframe_auto_loop_filter`) and inter
+  (`encode_p_frame_multi_ref_auto_loop_filter`) paths, also exposed as a
+  `Vp8TwoPassConfig::auto_loop_filter` stream knob — searches the §9.4
+  level / sharpness ranges for the pair that minimises post-§15
   reconstruction SSD against the source, writing the winner to the header
   so the decoder runs the identical filter; +0.19 dB on a coarse-quantised
   blocky frame while holding byte-exact encoder↔decoder lockstep, and a

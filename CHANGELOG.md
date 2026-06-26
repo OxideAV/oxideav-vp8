@@ -4,15 +4,16 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
-### Added — §9.4 RD loop-filter-level auto-selection (round 373)
+### Added — §9.4 RD loop-filter `(level, sharpness)` auto-selection (round 373)
 
-The encoder can now **choose** its `loop_filter_level` rather than taking
-it as a fixed config knob. RFC 6386 §15 only *defines* the loop filter; the
-level choice is a non-normative encoder-side rate-distortion decision (the
-spec is silent on it). The new selector searches the §9.4 range `0..=63`
-for the level that minimises the post-§15 visible-window SSD of the
-encoder's own reconstruction against the source picture, then writes that
-level to the §9.4 header so a compliant decoder runs the identical filter.
+The encoder can now **choose** its `loop_filter_level` and
+`sharpness_level` rather than taking them as fixed config knobs. RFC 6386
+§15 only *defines* the loop filter; the level / sharpness choice is a
+non-normative encoder-side rate-distortion decision (the spec is silent on
+it). The new selector searches the §9.4 ranges for the pair that minimises
+the post-§15 visible-window SSD of the encoder's own reconstruction against
+the source picture, then writes them to the §9.4 header so a compliant
+decoder runs the identical filter.
 
 * **`loop_filter::select_filter_level`** — given the unfiltered
   reconstruction planes, per-MB modes / `has_coeffs`, the base
@@ -26,6 +27,13 @@ level to the §9.4 header so a compliant decoder runs the identical filter.
   and runs the real §15 pass, so the chosen level is exactly reproducible
   by `filter_frame` / `filter_inter_frame`. Level 0 is always a candidate,
   so the selector can never *increase* distortion.
+* **`loop_filter::select_filter_params`** — the joint
+  `(loop_filter_level, sharpness_level)` selector. Coordinate descent: pick
+  the level at the base sharpness (level dominates the distortion), then
+  sweep all 8 §15.4 sharpness values at that level. `select_filter_level`
+  is now a thin wrapper that returns its `.0`. Both auto encoders and the
+  two-pass driver write the chosen sharpness to the wire alongside the
+  level, so decoder lockstep holds for the pair.
 * **`loop_filter::reconstruction_ssd`** — total Y+U+V visible-window SSD of
   a reconstruction against a `SourcePlanes`, the selector's scoring metric
   (also useful to callers measuring encode fidelity).

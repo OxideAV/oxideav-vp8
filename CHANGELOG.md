@@ -68,6 +68,17 @@ decoder runs the identical filter.
   choosing level 0 for a lossless flat reconstruction
   (`select_filter_level_*`); the inter path is exercised by
   `tests/encoder_pframe_auto_loop_filter.rs`.
+* **Measured PSNR delta + a documented inter-stream caveat**
+  (`tests/encoder_auto_loop_filter_psnr.rs`): on a single keyframe the auto
+  path is a **strict** +0.19 dB win (no forward reference dependence). On a
+  6-frame I+P stream the *greedy per-frame* selector measures **−0.22 dB**
+  vs the unfiltered baseline, because each filtered reconstruction becomes
+  the next frame's prediction reference — optimising a frame in isolation
+  can slightly degrade the reference for the following P-frame. The test
+  records this delta (bounded, not asserted strict) so the trade-off is
+  tracked. **Follow-up**: a reference-aware inter selector (lookahead or a
+  reference-quality model that biases toward lighter filtering on frames
+  refreshing long-lived references) would close the gap.
 
 ### Added — §13 trellis coefficient-level RDO quantisation (round 367)
 

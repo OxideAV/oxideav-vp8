@@ -19,7 +19,13 @@ Decoder and encoder are both at production status.
   the working quantisers while holding PSNR — the §13.4 token-probability
   fitter, §9.3 / §10
   segment-based adaptive quantisation (`encode_keyframe_adaptive_quant`),
-  and a two-pass rate-control family offering both a complexity-aware
+  **§9.4 RD loop-filter-level auto-selection**
+  (`encode_keyframe_auto_loop_filter` — searches the `0..=63` level range
+  for the level that minimises post-§15 reconstruction SSD against the
+  source, writing the winner to the header so the decoder runs the
+  identical filter; +0.19 dB on a coarse-quantised blocky frame while
+  holding byte-exact encoder↔decoder lockstep), and a two-pass
+  rate-control family offering both a complexity-aware
   constant-quality schedule and a closed-loop **bitrate-targeting** mode
   (solve a per-GOP base qindex to a byte budget, then correct
   frame-by-frame from the running rate debt). The per-coefficient

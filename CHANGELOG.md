@@ -4,6 +4,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §9.4 RD loop-filter-level auto-selection (round 373)
+
+The encoder can now **choose** its `loop_filter_level` rather than taking
+it as a fixed config knob. RFC 6386 §15 only *defines* the loop filter; the
+level choice is a non-normative encoder-side rate-distortion decision (the
+spec is silent on it). The new selector searches the §9.4 range `0..=63`
+for the level that minimises the post-§15 visible-window SSD of the
+encoder's own reconstruction against the source picture, then writes that
+level to the §9.4 header so a compliant decoder runs the identical filter.
+
+* **`loop_filter::select_filter_level`** — given the unfiltered
+  reconstruction planes, per-MB modes / `has_coeffs`, the base
+  `FrameFilterConfig`, the source planes (`loop_filter::SourcePlanes`), and
+  an optional inter side-info bundle (`loop_filter::InterFilterInfo`),
+  returns the distortion-minimising level. The search is a coarse grid
+  (`step = 4`) plus a local `±3` refine around the grid winner — exact when
+  the SSD-vs-level curve is unimodal (the common case: too little filtering
+  leaves block edges, too much over-smooths detail), ~23 candidate
+  evaluations instead of 64. Each candidate clones the unfiltered planes
+  and runs the real §15 pass, so the chosen level is exactly reproducible
+  by `filter_frame` / `filter_inter_frame`. Level 0 is always a candidate,
+  so the selector can never *increase* distortion.
+* **`loop_filter::reconstruction_ssd`** — total Y+U+V visible-window SSD of
+  a reconstruction against a `SourcePlanes`, the selector's scoring metric
+  (also useful to callers measuring encode fidelity).
+* **`encode_keyframe_auto_loop_filter`** /
+  **`encode_keyframe_auto_loop_filter_with_reconstruction`** — keyframe
+  drivers that ignore `params.loop_filter_level` and let the selector pick
+  it. All other `KeyframeParams` fields are honoured verbatim.
+* **Measured**: on a coarse-quantised (qi 100) blocky 64×48 source the
+  auto path lifts reconstruction PSNR (Y+U+V) from 40.29 dB (unfiltered) to
+  40.48 dB (+0.19 dB) while staying in byte-exact encoder↔decoder lockstep
+  (`tests/encoder_auto_loop_filter.rs`).
+
 ### Added — §13 trellis coefficient-level RDO quantisation (round 367)
 
 The keyframe encoder gained a **trellis quantiser** — the first

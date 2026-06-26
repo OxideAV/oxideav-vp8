@@ -4548,6 +4548,33 @@ pub fn encode_keyframe_with_reconstruction(
     encode_keyframe_with_reconstruction_and_token_updates(frame, params, None)
 }
 
+/// Encode a key frame with RD-selected §9.4 `loop_filter_level`.
+///
+/// Identical to [`encode_keyframe`] except that `params.loop_filter_level`
+/// is **ignored**: after the raster walk, the encoder searches the §9.4
+/// level range for the level that minimises post-§15 visible-window SSD
+/// against the source (clean-room — RFC 6386 leaves the level choice to
+/// the encoder; see [`crate::loop_filter::select_filter_level`]) and
+/// writes that level into the §9.4 header. All other `params` fields
+/// (quantiser, sharpness, filter type, partition count) are honoured
+/// verbatim. Returns the on-the-wire bytes.
+pub fn encode_keyframe_auto_loop_filter(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_keyframe_inner_lf(frame, params, None, None, true).map(|(bytes, _)| bytes)
+}
+
+/// [`encode_keyframe_auto_loop_filter`] returning both the bitstream and
+/// the post-§15 reconstruction planes (for a multi-frame driver that
+/// installs the keyframe as the §9 reference without re-decoding).
+pub fn encode_keyframe_auto_loop_filter_with_reconstruction(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_inner_lf(frame, params, None, None, true)
+}
+
 /// Encode a key frame and return both the bitstream bytes **and** the
 /// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`],
 /// optionally threading a §13.4 `token_prob_update()` payload through
@@ -4589,6 +4616,28 @@ fn encode_keyframe_inner(
     params: &KeyframeParams,
     token_updates: Option<&TokenProbUpdates>,
     counts: Option<&mut BranchCounts>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_inner_lf(frame, params, token_updates, counts, false)
+}
+
+/// `encode_keyframe_inner` extended with the round-373 §9.4 RD
+/// loop-filter-level auto-selection switch.
+///
+/// When `auto_lf` is `false` the behaviour is byte-identical to the
+/// historical [`encode_keyframe_inner`]: `params.loop_filter_level` is the
+/// frame's filter level verbatim. When `auto_lf` is `true` the level
+/// stored in `params` is *ignored* and, after the raster walk produces the
+/// unfiltered reconstruction, [`crate::loop_filter::select_filter_level`]
+/// picks the level that minimises post-§15 visible-window SSD against the
+/// source `frame`; that chosen level is then both applied to the
+/// reconstruction and written into the §9.4 header, so the encoder's
+/// reconstruction stays in lock-step with a compliant decoder.
+fn encode_keyframe_inner_lf(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
+    auto_lf: bool,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
@@ -4747,32 +4796,63 @@ fn encode_keyframe_inner(
     // (steps 2 and 4); that test reduces to "any non-zero coefficient",
     // which is invariant under dequantisation by the non-zero §14.1 Q
     // steps, so we can pass the raw quantised `all_coeffs` directly.
-    if params.loop_filter_level != 0 {
-        let lf_config = crate::loop_filter::FrameFilterConfig {
-            // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
-            // simple. Mirrors the bit `write_loop_filter` writes below;
-            // the encoder's own post-walk filter must match what the
-            // decoder will run.
-            simple: params.filter_type,
-            key_frame: true,
-            loop_filter_level: params.loop_filter_level,
-            sharpness_level: params.sharpness_level,
-            // Segmentation off (we emit `update_mb_segmentation_map =
-            // false`), so the segment override never applies.
-            segmentation_enabled: false,
-            segment_abs: false,
-            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
-            // `mode_ref_lf_delta_enabled = false`, so every delta is 0.
-            delta_enabled: false,
-            ref_delta_current: 0,
-            bpred_mode_delta: 0,
-            ref_delta_last: 0,
-            ref_delta_golden: 0,
-            ref_delta_altref: 0,
-            zero_mv_mode_delta: 0,
-            other_mv_mode_delta: 0,
-            split_mv_mode_delta: 0,
+    // The §15 base config (level filled in below). Segmentation off and
+    // `mode_ref_lf_delta_enabled = false`, so every per-MB override is 0
+    // and each MB's effective level reduces to the frame base.
+    let mut lf_config = crate::loop_filter::FrameFilterConfig {
+        // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
+        // simple. Mirrors the bit `write_loop_filter` writes below;
+        // the encoder's own post-walk filter must match what the
+        // decoder will run.
+        simple: params.filter_type,
+        key_frame: true,
+        loop_filter_level: params.loop_filter_level,
+        sharpness_level: params.sharpness_level,
+        segmentation_enabled: false,
+        segment_abs: false,
+        segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+        delta_enabled: false,
+        ref_delta_current: 0,
+        bpred_mode_delta: 0,
+        ref_delta_last: 0,
+        ref_delta_golden: 0,
+        ref_delta_altref: 0,
+        zero_mv_mode_delta: 0,
+        other_mv_mode_delta: 0,
+        split_mv_mode_delta: 0,
+    };
+    // §9.4 effective loop-filter level. When `auto_lf` is set the RD
+    // selector replaces `params.loop_filter_level` with the
+    // distortion-minimising level (clean-room; RFC 6386 is silent on the
+    // encoder's level choice). The chosen value is written to the header
+    // below so the decoder runs the identical §15 pass.
+    let eff_lf_level = if auto_lf {
+        let has_coeffs: Vec<bool> = all_coeffs
+            .iter()
+            .map(crate::loop_filter::mb_has_coeffs)
+            .collect();
+        let src = crate::loop_filter::SourcePlanes {
+            width: width as usize,
+            height: height as usize,
+            y: frame.y,
+            u: frame.u,
+            v: frame.v,
+            y_stride: frame.y_stride,
+            uv_stride: frame.uv_stride,
         };
+        crate::loop_filter::select_filter_level(
+            &planes,
+            &modes,
+            &has_coeffs,
+            &lf_config,
+            &src,
+            None,
+        )
+    } else {
+        params.loop_filter_level
+    };
+    lf_config.loop_filter_level = eff_lf_level;
+    if eff_lf_level != 0 {
         crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
     }
     // `planes` is the macroblock-aligned post-§15 reconstruction. It is
@@ -4799,7 +4879,7 @@ fn encode_keyframe_inner(
     write_loop_filter(
         &mut hdr,
         params.filter_type,
-        params.loop_filter_level,
+        eff_lf_level,
         params.sharpness_level,
         false,
     )?;

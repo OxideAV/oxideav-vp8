@@ -1567,6 +1567,195 @@ pub fn filter_frame(
     filter_frame_flags(planes, modes, &has_coeffs, config);
 }
 
+/// Borrowed view of a source picture's three planes plus the §9.1 visible
+/// window, for scoring a candidate loop-filter reconstruction against the
+/// original.
+///
+/// The planes are the encoder's *source* I420 picture (not the
+/// reconstruction). `y` is `y_stride`-strided and at least `height` rows;
+/// `u` / `v` are `uv_stride`-strided and at least `(height + 1) / 2` rows.
+/// Only the visible `width × height` (luma) / `⌈w/2⌉ × ⌈h/2⌉` (chroma)
+/// window is scored — the macroblock-padding region the reconstruction
+/// carries past the visible edge has no source counterpart and is excluded
+/// from the distortion sum.
+#[derive(Debug, Clone, Copy)]
+pub struct SourcePlanes<'a> {
+    /// Visible luma width in pixels (§9.1).
+    pub width: usize,
+    /// Visible luma height in pixels (§9.1).
+    pub height: usize,
+    /// Source luma plane, row-major, `y_stride`-strided.
+    pub y: &'a [u8],
+    /// Source U chroma plane, row-major, `uv_stride`-strided.
+    pub u: &'a [u8],
+    /// Source V chroma plane, row-major, `uv_stride`-strided.
+    pub v: &'a [u8],
+    /// Luma row stride in bytes (≥ `width`).
+    pub y_stride: usize,
+    /// Chroma row stride in bytes (≥ `⌈width/2⌉`).
+    pub uv_stride: usize,
+}
+
+/// Sum of squared differences between the visible window of a
+/// reconstruction plane and the matching source plane.
+///
+/// `recon` is the macroblock-padded reconstruction plane (`recon_stride`);
+/// `src` is the source plane (`src_stride`). Only the `w × h` visible
+/// window is summed. Returned as `u64` so a full-frame luma sum of 8-bit
+/// squared error (≤ `65025` per pixel) cannot overflow for any §9.1-legal
+/// frame.
+fn plane_visible_ssd(
+    recon: &[u8],
+    recon_stride: usize,
+    src: &[u8],
+    src_stride: usize,
+    w: usize,
+    h: usize,
+) -> u64 {
+    let mut ssd = 0u64;
+    for r in 0..h {
+        let recon_row = &recon[r * recon_stride..r * recon_stride + w];
+        let src_row = &src[r * src_stride..r * src_stride + w];
+        for (a, b) in recon_row.iter().zip(src_row.iter()) {
+            let d = *a as i32 - *b as i32;
+            ssd += (d * d) as u64;
+        }
+    }
+    ssd
+}
+
+/// Total Y+U+V visible-window SSD of a reconstruction against its source.
+///
+/// Sums [`plane_visible_ssd`] over the three planes; the chroma planes use
+/// the §9.1-derived `⌈w/2⌉ × ⌈h/2⌉` window.
+pub fn reconstruction_ssd(planes: &KeyframePlanes, src: &SourcePlanes<'_>) -> u64 {
+    let cw = src.width.div_ceil(2);
+    let ch = src.height.div_ceil(2);
+    plane_visible_ssd(
+        &planes.y,
+        planes.y_stride,
+        src.y,
+        src.y_stride,
+        src.width,
+        src.height,
+    ) + plane_visible_ssd(&planes.u, planes.uv_stride, src.u, src.uv_stride, cw, ch)
+        + plane_visible_ssd(&planes.v, planes.uv_stride, src.v, src.uv_stride, cw, ch)
+}
+
+/// Per-macroblock inter-frame side information the §15 filter consults to
+/// derive each MB's effective level (the §9.4 reference / mode deltas).
+/// Bundled so [`select_filter_level`] can score key-frame and inter-frame
+/// reconstructions through one code path.
+#[derive(Debug, Clone, Copy)]
+pub struct InterFilterInfo<'a> {
+    /// Per-MB reference frame (raster order). `None` ⇒ intra MB.
+    pub ref_frames: &'a [Option<crate::motion_comp::RefFrame>],
+    /// Per-MB inter prediction mode (raster order). `None` ⇒ intra MB.
+    pub inter_modes: &'a [Option<crate::near_mv::InterMode>],
+}
+
+/// RD-driven §9.4 `loop_filter_level` selection (clean-room; RFC 6386 is
+/// silent on the encoder's level choice — §15 only *defines* the filter).
+///
+/// Given the **unfiltered** reconstruction `planes`, the per-MB `modes` /
+/// `has_coeffs`, the encoder's `base` filter config (sharpness, filter
+/// type, key/inter, segmentation + delta state) and the original `src`
+/// picture, this searches the §9.4 level range `0..=63` for the level that
+/// minimises the post-filter visible-window SSD against `src`, and returns
+/// it.
+///
+/// The §15 filter is monotone-ish but not strictly convex in the level, so
+/// rather than trust a pure descent we run a **coarse grid then a local
+/// refine**: score levels `0, step, 2·step, …` then a `±(step-1)` window
+/// around the grid winner. With the default `step = 4` that is at most
+/// `⌈64/4⌉ + 7 ≈ 23` candidate evaluations instead of 64, and it is exact
+/// whenever the SSD-vs-level curve is unimodal (the common case — too
+/// little filtering leaves block edges, too much over-smooths real
+/// detail). Each candidate clones the unfiltered planes (so the search is
+/// side-effect free) and runs the real §15 pass, so the returned level is
+/// exactly reproducible by [`filter_frame`] / [`filter_inter_frame`].
+///
+/// `inter` is `Some` for a P-frame (the per-MB reference / mode arrays the
+/// inter filter consults) and `None` for a key frame. The returned level
+/// is clamped to `0..=63`; level `0` (no filtering) is always a candidate
+/// and wins when the source is already block-edge-free (e.g. a flat or
+/// already-smooth frame), so the selector never *adds* distortion.
+pub fn select_filter_level(
+    planes: &KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    base: &FrameFilterConfig,
+    src: &SourcePlanes<'_>,
+    inter: Option<&InterFilterInfo<'_>>,
+) -> u8 {
+    const STEP: u8 = 4;
+
+    // Score one candidate level against the source by cloning the
+    // unfiltered planes, running the real §15 pass at that level, and
+    // measuring visible-window SSD. Level 0 short-circuits the §15
+    // whole-frame skip (no clone, no filter) per §15 page 84.
+    let score = |level: u8| -> u64 {
+        if level == 0 {
+            return reconstruction_ssd(planes, src);
+        }
+        let mut cand = planes.clone();
+        let cfg = FrameFilterConfig {
+            loop_filter_level: level,
+            ..*base
+        };
+        match inter {
+            Some(info) => filter_inter_frame_flags(
+                &mut cand,
+                modes,
+                has_coeffs,
+                info.ref_frames,
+                info.inter_modes,
+                &cfg,
+            ),
+            None => filter_frame_flags(&mut cand, modes, has_coeffs, &cfg),
+        }
+        reconstruction_ssd(&cand, src)
+    };
+
+    // Coarse grid: 0, STEP, 2·STEP, … 63, plus the endpoint 63.
+    let mut best_level = 0u8;
+    let mut best_ssd = score(0);
+    let mut l = STEP;
+    while l <= 63 {
+        let s = score(l);
+        if s < best_ssd {
+            best_ssd = s;
+            best_level = l;
+        }
+        l = l.saturating_add(STEP);
+    }
+    // Always consider the top of the range so a frame that genuinely wants
+    // the maximum filter is reachable even if 63 is not on the grid.
+    {
+        let s = score(63);
+        if s < best_ssd {
+            best_ssd = s;
+            best_level = 63;
+        }
+    }
+
+    // Local refine: sweep the ±(STEP-1) neighbourhood of the grid winner.
+    let lo = best_level.saturating_sub(STEP - 1);
+    let hi = best_level.saturating_add(STEP - 1).min(63);
+    for cand in lo..=hi {
+        if cand == best_level {
+            continue;
+        }
+        let s = score(cand);
+        if s < best_ssd {
+            best_ssd = s;
+            best_level = cand;
+        }
+    }
+
+    best_level
+}
+
 /// Flag-driven core of [`filter_frame`]: the §15.1 step-2/4 decision needs
 /// only one boolean per macroblock (`mb_has_coeffs`), so the decode loop can
 /// compute that flag while the coefficients are still hot in cache and avoid

@@ -2757,6 +2757,98 @@ mod tests {
         }
     }
 
+    // ----- §9.4 RD loop-filter-level selection -------------------------
+
+    /// A reconstruction that flat-matches its source: no block-edge error,
+    /// so any filtering can only spread error and the selector must pick
+    /// level 0.
+    #[test]
+    fn select_filter_level_flat_source_picks_zero() {
+        let mb_cols = 2;
+        let mb_rows = 2;
+        let n = mb_cols * mb_rows;
+        let planes = flat_planes(120, mb_cols, mb_rows);
+        let modes: Vec<_> = (0..n).map(|_| mode(IntraYMode::Dc, None)).collect();
+        let has_coeffs = vec![true; n]; // pretend every MB coded, so subblock edges are eligible
+        let cfg = base_config();
+        // Source equals the reconstruction exactly.
+        let src = SourcePlanes {
+            width: mb_cols * 16,
+            height: mb_rows * 16,
+            y: &planes.y,
+            u: &planes.u,
+            v: &planes.v,
+            y_stride: planes.y_stride,
+            uv_stride: planes.uv_stride,
+        };
+        let level = select_filter_level(&planes, &modes, &has_coeffs, &cfg, &src, None);
+        assert_eq!(level, 0, "flat lossless reconstruction wants no filtering");
+        // And the SSD at the chosen level is exactly zero.
+        assert_eq!(reconstruction_ssd(&planes, &src), 0);
+    }
+
+    /// A reconstruction with a sharp inter-MB-edge step the source does
+    /// NOT have: filtering smooths the step toward the (smooth) source, so
+    /// the selector must engage at a non-zero level and the chosen level's
+    /// SSD must beat the unfiltered SSD.
+    #[test]
+    fn select_filter_level_engages_on_block_edge() {
+        let mb_cols = 2;
+        let mb_rows = 1;
+        let n = mb_cols * mb_rows;
+        // Reconstruction: left MB at 100, right MB at 160 — a hard 60-level
+        // step down the shared vertical MB edge at column 16.
+        let mut planes = flat_planes(100, mb_cols, mb_rows);
+        let ys = planes.y_stride;
+        for r in 0..mb_rows * 16 {
+            for col in 16..mb_cols * 16 {
+                planes.y[r * ys + col] = 160;
+            }
+        }
+        // Source: a gentle ramp across the same edge (no hard step), so the
+        // reconstruction's block edge is genuine coding error the filter
+        // can shave toward the truth.
+        let mut src_y = vec![0u8; ys * mb_rows * 16];
+        for r in 0..mb_rows * 16 {
+            for col in 0..mb_cols * 16 {
+                // 100 on the far left climbing to 160 on the far right.
+                src_y[r * ys + col] = (100 + col * 60 / (mb_cols * 16 - 1)) as u8;
+            }
+        }
+        // Chroma source = reconstruction (no chroma error to confound the Y
+        // signal).
+        let src = SourcePlanes {
+            width: mb_cols * 16,
+            height: mb_rows * 16,
+            y: &src_y,
+            u: &planes.u,
+            v: &planes.v,
+            y_stride: ys,
+            uv_stride: planes.uv_stride,
+        };
+        let modes: Vec<_> = (0..n).map(|_| mode(IntraYMode::Dc, None)).collect();
+        let has_coeffs = vec![true; n];
+        let cfg = base_config();
+
+        let unfiltered = reconstruction_ssd(&planes, &src);
+        let level = select_filter_level(&planes, &modes, &has_coeffs, &cfg, &src, None);
+        assert!(
+            level > 0,
+            "a hard block edge against a smooth source must engage the filter, got level {level}"
+        );
+
+        // The chosen level must actually reduce the SSD vs unfiltered.
+        let mut filtered = planes.clone();
+        let mut fc = cfg;
+        fc.loop_filter_level = level;
+        filter_frame_flags(&mut filtered, &modes, &has_coeffs, &fc);
+        let after = reconstruction_ssd(&filtered, &src);
+        assert!(
+            after < unfiltered,
+            "chosen level {level} SSD {after} must beat unfiltered {unfiltered}"
+        );
+    }
+
     // ----- §15 SIMD kernel byte-exactness ------------------------------
     //
     // The SIMD kernels must reproduce the scalar per-segment kernels

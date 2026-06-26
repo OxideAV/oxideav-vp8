@@ -7109,6 +7109,45 @@ pub fn encode_p_frame_multi_ref(
     )
 }
 
+/// §16.2 multi-reference P-frame encoder with RD-selected §9.4
+/// `loop_filter_level` and the §11 intra-mode picker enabled.
+///
+/// Identical to [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`]
+/// (default refresh ladder) except that `params.loop_filter_level` is
+/// **ignored**: after the inter mode-decision / motion-search walk, the
+/// encoder searches the §9.4 level range for the level that minimises
+/// post-§15 visible-window SSD of its own reconstruction against the
+/// source `frame` (clean-room — RFC 6386 leaves the level choice to the
+/// encoder; see [`crate::loop_filter::select_filter_level`]) and writes
+/// that level into the §9.4 header. The per-MB §9.4 reference / mode
+/// deltas default off (`LoopFilterDeltas::default()`), so each MB's
+/// effective level reduces to the frame base. Returns the bitstream and
+/// the post-§15 reconstruction (for installation into the §9 reference
+/// ladder).
+pub fn encode_p_frame_multi_ref_auto_loop_filter(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        &RefreshControls::default(),
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+        None,
+        None,
+        true,
+        true,
+    )
+}
+
 /// §16.2 multi-reference P-frame encoder with caller-driven §9.7 /
 /// §9.8 reference-slot refresh control **and** caller-driven §9.4
 /// per-reference / per-mode `loop_filter_delta` layer.
@@ -7553,6 +7592,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_intra_pick(
         None,
         None,
         true,
+        false,
     )
 }
 
@@ -7646,6 +7686,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick(
         None,
         None,
         true,
+        false,
     )
 }
 
@@ -7732,6 +7773,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fi
         None,
         Some(&mut counts),
         true,
+        false,
     )?;
 
     // Fit. 2.0 bits of slack — matches every other inter fitter and
@@ -7769,6 +7811,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fi
         Some(&fitted),
         None,
         true,
+        false,
     )?;
 
     // Bytes-vs-default safety guard. Falling back also drops the pass-2
@@ -7806,6 +7849,7 @@ fn encode_p_frame_multi_ref_inner(
         carried_mode_deltas,
         token_updates,
         None,
+        false,
         false,
     )
 }
@@ -7853,6 +7897,7 @@ fn encode_p_frame_multi_ref_inner_with_counts(
         token_updates,
         counts,
         false,
+        false,
     )
 }
 
@@ -7880,6 +7925,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     token_updates: Option<&TokenProbUpdates>,
     counts: Option<&mut BranchCounts>,
     pick_intra: bool,
+    auto_lf: bool,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     lf_deltas.validate()?;
@@ -8349,29 +8395,68 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
         lf_deltas.effective(carried_ref_deltas, carried_mode_deltas);
 
     // ---- §15 loop-filter post-pass --------------------------------------
-    if params.loop_filter_level != 0 {
-        let lf_config = crate::loop_filter::FrameFilterConfig {
-            // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
-            // simple. Mirrors the bit `write_loop_filter_with_deltas`
-            // writes below; the encoder's own post-walk filter must
-            // match what the decoder will run.
-            simple: params.filter_type,
-            key_frame: false,
-            loop_filter_level: params.loop_filter_level,
-            sharpness_level: params.sharpness_level,
-            segmentation_enabled: false,
-            segment_abs: false,
-            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
-            delta_enabled: lf_deltas.enabled,
-            ref_delta_current: effective_ref_deltas[0],
-            bpred_mode_delta: effective_mode_deltas[0],
-            ref_delta_last: effective_ref_deltas[1],
-            ref_delta_golden: effective_ref_deltas[2],
-            ref_delta_altref: effective_ref_deltas[3],
-            zero_mv_mode_delta: effective_mode_deltas[1],
-            other_mv_mode_delta: effective_mode_deltas[2],
-            split_mv_mode_delta: effective_mode_deltas[3],
+    //
+    // Base §15 config, level filled in below. `filter_type` mirrors the
+    // bit `write_loop_filter_with_deltas` writes; the encoder's post-walk
+    // filter must match what the decoder will run. The per-MB §9.4
+    // reference / mode deltas are the effective (carried + this-frame)
+    // values resolved above.
+    let mut lf_config = crate::loop_filter::FrameFilterConfig {
+        simple: params.filter_type,
+        key_frame: false,
+        loop_filter_level: params.loop_filter_level,
+        sharpness_level: params.sharpness_level,
+        segmentation_enabled: false,
+        segment_abs: false,
+        segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+        delta_enabled: lf_deltas.enabled,
+        ref_delta_current: effective_ref_deltas[0],
+        bpred_mode_delta: effective_mode_deltas[0],
+        ref_delta_last: effective_ref_deltas[1],
+        ref_delta_golden: effective_ref_deltas[2],
+        ref_delta_altref: effective_ref_deltas[3],
+        zero_mv_mode_delta: effective_mode_deltas[1],
+        other_mv_mode_delta: effective_mode_deltas[2],
+        split_mv_mode_delta: effective_mode_deltas[3],
+    };
+    // §9.4 effective loop-filter level. With `auto_lf` the RD selector
+    // replaces `params.loop_filter_level` with the level that minimises
+    // post-§15 reconstruction SSD against the source (clean-room; RFC 6386
+    // is silent on the encoder's choice). The selector runs the SAME §15
+    // inter pass — including the per-MB ref/mode deltas above — for each
+    // candidate, so the chosen level reaches the wire and decoder lockstep
+    // holds.
+    let eff_lf_level = if auto_lf {
+        let has_coeffs: Vec<bool> = all_coeffs
+            .iter()
+            .map(crate::loop_filter::mb_has_coeffs)
+            .collect();
+        let src = crate::loop_filter::SourcePlanes {
+            width: width as usize,
+            height: height as usize,
+            y: frame.y,
+            u: frame.u,
+            v: frame.v,
+            y_stride: frame.y_stride,
+            uv_stride: frame.uv_stride,
         };
+        let inter_info = crate::loop_filter::InterFilterInfo {
+            ref_frames: &ref_frames_out,
+            inter_modes: &inter_modes_out,
+        };
+        crate::loop_filter::select_filter_level(
+            &planes,
+            &modes,
+            &has_coeffs,
+            &lf_config,
+            &src,
+            Some(&inter_info),
+        )
+    } else {
+        params.loop_filter_level
+    };
+    lf_config.loop_filter_level = eff_lf_level;
+    if eff_lf_level != 0 {
         crate::loop_filter::filter_inter_frame(
             &mut planes,
             &modes,
@@ -8397,7 +8482,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     write_loop_filter_with_deltas(
         &mut hdr,
         params.filter_type,
-        params.loop_filter_level,
+        eff_lf_level,
         params.sharpness_level,
         lf_deltas,
     )?;

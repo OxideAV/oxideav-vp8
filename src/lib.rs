@@ -427,6 +427,7 @@ pub use encoder::{
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors, encode_p_frame_multi_ref,
+    encode_p_frame_multi_ref_auto_loop_filter,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,
     encode_p_frame_multi_ref_with_refresh_and_intra_pick,

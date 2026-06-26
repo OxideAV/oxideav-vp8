@@ -33,10 +33,20 @@ level to the §9.4 header so a compliant decoder runs the identical filter.
   **`encode_keyframe_auto_loop_filter_with_reconstruction`** — keyframe
   drivers that ignore `params.loop_filter_level` and let the selector pick
   it. All other `KeyframeParams` fields are honoured verbatim.
+* **`encode_p_frame_multi_ref_auto_loop_filter`** — the inter (P-frame)
+  analogue with the §11 intra-mode picker on and the default §9.7 / §9.8
+  refresh ladder. The selector runs the §15 *inter* pass — including the
+  per-MB §9.4 reference / mode deltas — for each candidate, so the chosen
+  level reaches the wire and inter encoder↔decoder lockstep holds (verified
+  through a stateful I-then-P self-decode).
 * **Measured**: on a coarse-quantised (qi 100) blocky 64×48 source the
   auto path lifts reconstruction PSNR (Y+U+V) from 40.29 dB (unfiltered) to
   40.48 dB (+0.19 dB) while staying in byte-exact encoder↔decoder lockstep
-  (`tests/encoder_auto_loop_filter.rs`).
+  (`tests/encoder_auto_loop_filter.rs`). Unit tests pin the selector
+  engaging on a synthetic block edge against a smooth source and correctly
+  choosing level 0 for a lossless flat reconstruction
+  (`select_filter_level_*`); the inter path is exercised by
+  `tests/encoder_pframe_auto_loop_filter.rs`.
 
 ### Added — §13 trellis coefficient-level RDO quantisation (round 367)
 

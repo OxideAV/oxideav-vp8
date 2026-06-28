@@ -28,6 +28,13 @@ knob is entirely clean-room.
   whole-block pick all honour the per-stream dial. The mode-decision
   lambda is unchanged — the strength only re-prices the coefficient
   search, so mode picks are identical across strengths.
+* Reaches every front-door encoder: the single-pass `Vp8Encoder`, the
+  registry `make_encoder_with_config` factory, the
+  `Vp8KeyframeStreamEncoder` / inter-stream encoders (which already carry
+  a `KeyframeParams`), and the two-pass `Vp8TwoPassEncoder` via
+  `Vp8TwoPassConfig::base.trellis_strength` — pinned by
+  `two_pass_honours_base_trellis_strength` (a strong setting trims the
+  four-frame clip versus `OFF` while every frame still decodes).
 * The reconstruction the encoder writes back always uses the
   trellis-chosen levels, so encoder↔decoder pixel lockstep holds at every
   strength — verified on the keyframe path by

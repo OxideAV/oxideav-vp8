@@ -9287,6 +9287,7 @@ mod factory {
         let keyframe = KeyframeParams {
             y_ac_qi: config.qindex,
             loop_filter_level: config.lf_level,
+            trellis_strength: config.trellis_strength,
             ..KeyframeParams::default()
         };
         build_frame_encoder(
@@ -9893,6 +9894,7 @@ impl Vp8TwoPassEncoder {
         let params = KeyframeParams {
             y_ac_qi: qindex,
             loop_filter_level: self.config.base.lf_level,
+            trellis_strength: self.config.base.trellis_strength,
             ..KeyframeParams::default()
         };
 

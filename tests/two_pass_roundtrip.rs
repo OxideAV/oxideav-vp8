@@ -457,3 +457,37 @@ fn encoder_fallback_without_first_pass_uses_base_qindex() {
     assert_eq!(decoded.width, 32);
     assert_eq!(decoded.height, 32);
 }
+
+/// The §13 `TrellisStrength` carried on `Vp8TwoPassConfig::base` reaches
+/// the second-pass emit: a strong setting shrinks the clip's total bytes
+/// versus `OFF`, and every frame still decodes through the stateful driver
+/// at both settings (the knob never breaks lockstep).
+#[test]
+fn two_pass_honours_base_trellis_strength() {
+    use oxideav_vp8::{TrellisStrength, Vp8EncoderConfig};
+
+    let mk = |s: TrellisStrength| Vp8TwoPassConfig {
+        base: Vp8EncoderConfig {
+            qindex: 48,
+            trellis_strength: s,
+            ..Vp8EncoderConfig::default()
+        },
+        ..Vp8TwoPassConfig::default()
+    };
+
+    let total = |bytes: &[Vec<u8>]| -> usize { bytes.iter().map(Vec::len).sum() };
+
+    let (_s_off, _sched_off, off_bytes) = run_four_frame_clip(mk(TrellisStrength::OFF));
+    let (_s_hot, _sched_hot, hot_bytes) = run_four_frame_clip(mk(TrellisStrength::new(4.0)));
+
+    // `run_four_frame_clip` already decodes every frame through the
+    // stateful driver and panics on any failure, so a successful return at
+    // both strengths proves lockstep holds. Here we additionally pin that
+    // the knob actually trims the clip.
+    assert!(
+        total(&hot_bytes) < total(&off_bytes),
+        "strength 4.0 clip ({} B) should beat OFF ({} B)",
+        total(&hot_bytes),
+        total(&off_bytes),
+    );
+}

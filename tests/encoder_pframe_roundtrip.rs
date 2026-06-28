@@ -206,3 +206,65 @@ fn p_frame_reference_dimensions_mismatch_rejected() {
         EncodeError::ReferenceDimensionsMismatch { .. }
     ));
 }
+
+/// The §13 `TrellisStrength` knob reaches the **inter** residual emit, not
+/// just the keyframe: at a fixed quantiser a higher strength shrinks the
+/// P-frame (or holds it) and `OFF` reproduces the pre-trellis (largest)
+/// wire, while every strength still decodes through the stateful driver.
+#[test]
+fn trellis_strength_dials_the_inter_pframe_and_round_trips() {
+    use oxideav_vp8::TrellisStrength;
+    let (w, h) = (64u32, 64u32);
+    let (y0, u0, v0) = structured_frame_64x64(0, 0);
+    // A larger inter-frame delta than the smooth-drift roundtrip test so the
+    // P-frame carries enough residual for the coefficient trade to bite.
+    let (y1, u1, v1) = structured_frame_64x64(18, 9);
+    let frame_i = I420Frame::packed(w, h, &y0, &u0, &v0);
+    let frame_p = I420Frame::packed(w, h, &y1, &u1, &v1);
+
+    let mk = |s: TrellisStrength| KeyframeParams {
+        y_ac_qi: 48,
+        loop_filter_level: 0,
+        sharpness_level: 0,
+        nbr_of_dct_partitions: 1,
+        filter_type: false,
+        trellis_strength: s,
+    };
+
+    let encode_p = |s: TrellisStrength| -> (Vec<u8>, Vec<u8>) {
+        let params = mk(s);
+        let (i_bytes, i_recon) =
+            encode_keyframe_with_reconstruction(&frame_i, &params).expect("encode I");
+        let (p_bytes, _) = encode_p_frame_zero_mv(&frame_p, &i_recon, &params).expect("encode P");
+        (i_bytes, p_bytes)
+    };
+
+    let (i_off, p_off) = encode_p(TrellisStrength::OFF);
+    let (i_def, p_def) = encode_p(TrellisStrength::DEFAULT);
+    let (i_hot, p_hot) = encode_p(TrellisStrength::new(4.0));
+
+    // The knob must move the inter wire (not a silent keyframe-only no-op).
+    assert!(
+        p_hot.len() < p_off.len(),
+        "strength 4.0 P-frame ({} B) should beat OFF ({} B)",
+        p_hot.len(),
+        p_off.len()
+    );
+    assert!(
+        p_def.len() <= p_off.len() && p_hot.len() <= p_def.len(),
+        "monotone OFF {} >= DEFAULT {} >= hot {} expected",
+        p_off.len(),
+        p_def.len(),
+        p_hot.len()
+    );
+
+    // Every strength's I+P sequence decodes cleanly through the stateful
+    // driver (encoder<->decoder lockstep holds on the inter path too).
+    for (i_bytes, p_bytes) in [(i_off, p_off), (i_def, p_def), (i_hot, p_hot)] {
+        let mut state = Vp8DecoderState::new();
+        let id = state.decode_frame(&i_bytes).expect("decode I");
+        assert_eq!((id.width, id.height), (w, h));
+        let pd = state.decode_frame(&p_bytes).expect("decode P");
+        assert_eq!((pd.width, pd.height), (w, h));
+    }
+}

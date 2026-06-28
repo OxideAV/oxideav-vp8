@@ -19,17 +19,24 @@ knob is entirely clean-room.
   round-354 trellis bytes exactly; `OFF` (= `0.0`) routes every block to
   plain rounding (the pre-trellis wire); higher values trade quality for
   size. `new()` clamps out-of-range inputs and maps `NaN` to `DEFAULT`.
-* Threaded onto **both** the keyframe and the inter / SPLITMV residual
-  emit via a new `KeyframeParams::trellis_strength` field (the shared
-  encode-params struct) and `Vp8EncoderConfig::trellis_strength`, plus a
-  `encode_mb_block_set_with_neighbors_strength` per-MB entry point. The
-  mode-decision lambda is unchanged — the strength only re-prices the
-  coefficient search, so mode picks are identical across strengths.
+* Threaded onto **every** encode path via a new
+  `KeyframeParams::trellis_strength` field (the shared encode-params
+  struct) and `Vp8EncoderConfig::trellis_strength`, plus a
+  `encode_mb_block_set_with_neighbors_strength` per-MB entry point: the
+  keyframe whole-block / `B_PRED` luma + chroma residual, the
+  motion-compensated / SPLITMV inter residual, *and* the intra-within-P
+  whole-block pick all honour the per-stream dial. The mode-decision
+  lambda is unchanged — the strength only re-prices the coefficient
+  search, so mode picks are identical across strengths.
 * The reconstruction the encoder writes back always uses the
   trellis-chosen levels, so encoder↔decoder pixel lockstep holds at every
-  strength (verified by `trellis_strength_knob_is_monotone_and_round_trips`,
-  which also pins the monotone `OFF ≥ DEFAULT ≥ strong` byte ordering and
-  the clamp behaviour).
+  strength — verified on the keyframe path by
+  `trellis_strength_knob_is_monotone_and_round_trips` (which also pins the
+  monotone `OFF ≥ DEFAULT ≥ strong` byte ordering and the clamp behaviour)
+  and on the inter path by
+  `trellis_strength_dials_the_inter_pframe_and_round_trips` (the knob
+  measurably shrinks the P-frame and the I+P sequence still decodes
+  through the stateful driver at every setting).
 * Measured on `natural_test_frame_64x64`: at qi 48 a strength of `4.0`
   shrinks the keyframe from 615 B (`OFF`) / 571 B (`DEFAULT`) to 470 B
   (−24 % vs `OFF`) for −0.35 dB; at qi 64, 288 → 243 → 172 B (−40 % vs

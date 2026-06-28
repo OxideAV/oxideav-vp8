@@ -6856,6 +6856,7 @@ fn if_uv_mode_tree_bits(mode: IntraUvMode) -> f64 {
 /// Y2/Y/UV token mass is roughly proportional across candidates of
 /// similar prediction quality, and matching the inter picker's
 /// distortion form keeps the cross-candidate trade apples-to-apples).
+#[allow(clippy::too_many_arguments)]
 fn score_intra_mb_candidate(
     y_mode: IntraYMode,
     uv_mode: IntraUvMode,
@@ -6864,6 +6865,7 @@ fn score_intra_mb_candidate(
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
     coeff_probs: Option<&CoeffProbs>,
+    trellis_strength: TrellisStrength,
 ) -> IntraMbPick {
     debug_assert!(
         y_mode != IntraYMode::B,
@@ -6871,14 +6873,13 @@ fn score_intra_mb_candidate(
     );
     // §13 trellis RD context for the intra-in-P-frame whole-block paths,
     // available once the caller resolves this frame's coefficient probs.
-    // The inter encode entry points run the trellis at the calibrated
-    // default; the per-stream strength knob is threaded onto the keyframe
-    // path (the inter wiring lands in a follow-up).
+    // The strength is the per-stream knob threaded down from the inter
+    // encode entry (the same `KeyframeParams::trellis_strength` field).
     let trellis_rd = coeff_probs.map(|cp| MbRdCtx {
         factors,
         coeff_probs: cp,
         lambda,
-        trellis: TrellisStrength::DEFAULT,
+        trellis: trellis_strength,
     });
 
     // ---- §12 prediction. Each `predict_y16x16` / `predict_uv8x8`
@@ -7018,12 +7019,14 @@ fn score_intra_mb_candidate(
 /// the earliest-tried, i.e. `(Dc, Dc)` — the round-160 pick. Encode-wire
 /// bytes are therefore identical to round 160 on any source where DC
 /// would have won there.
+#[allow(clippy::too_many_arguments)]
 fn pick_intra_mb_all(
     pixels: &MbPixels,
     neighbors: &crate::reconstruct::MbNeighbors,
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
     coeff_probs: Option<&CoeffProbs>,
+    trellis_strength: TrellisStrength,
 ) -> IntraMbPick {
     const Y_MODES: [IntraYMode; 4] = [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
     const UV_MODES: [IntraUvMode; 4] = [
@@ -7043,6 +7046,7 @@ fn pick_intra_mb_all(
                 factors,
                 lambda,
                 coeff_probs,
+                trellis_strength,
             );
             match best.as_ref() {
                 None => best = Some(cand),
@@ -8379,8 +8383,14 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             let mut chose_intra = false;
             if pick_intra {
                 let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
-                let intra_pick =
-                    pick_intra_mb_all(&pixels, &neighbors, &factors, lambda, Some(&coeff_probs));
+                let intra_pick = pick_intra_mb_all(
+                    &pixels,
+                    &neighbors,
+                    &factors,
+                    lambda,
+                    Some(&coeff_probs),
+                    inter_trellis_strength,
+                );
                 let prob_intra_pick: u8 = 128;
                 let inter_total = chosen.j
                     + lambda * ref_frame_tree_bits(chosen_ref_frame, prob_last_pick, prob_gf_pick)
@@ -12995,7 +13005,14 @@ mod tests {
             u: uv_vstripe,
             v: uv_vstripe,
         };
-        let pick_v = pick_intra_mb_all(&pixels_v, &make_neighbors(), &factors, lambda, None);
+        let pick_v = pick_intra_mb_all(
+            &pixels_v,
+            &make_neighbors(),
+            &factors,
+            lambda,
+            None,
+            TrellisStrength::DEFAULT,
+        );
         assert_eq!(
             pick_v.y_mode,
             IntraYMode::V,
@@ -13034,7 +13051,14 @@ mod tests {
             u: uv_hstripe,
             v: uv_hstripe,
         };
-        let pick_h = pick_intra_mb_all(&pixels_h, &make_neighbors(), &factors, lambda, None);
+        let pick_h = pick_intra_mb_all(
+            &pixels_h,
+            &make_neighbors(),
+            &factors,
+            lambda,
+            None,
+            TrellisStrength::DEFAULT,
+        );
         assert_eq!(
             pick_h.y_mode,
             IntraYMode::H,
@@ -13080,7 +13104,14 @@ mod tests {
             u: uv_tm,
             v: uv_tm,
         };
-        let pick_tm = pick_intra_mb_all(&pixels_tm, &make_neighbors(), &factors, lambda, None);
+        let pick_tm = pick_intra_mb_all(
+            &pixels_tm,
+            &make_neighbors(),
+            &factors,
+            lambda,
+            None,
+            TrellisStrength::DEFAULT,
+        );
         assert_eq!(
             pick_tm.y_mode,
             IntraYMode::Tm,
@@ -13114,6 +13145,7 @@ mod tests {
             &factors,
             lambda,
             None,
+            TrellisStrength::DEFAULT,
         );
         assert_eq!(
             pick_flat.y_mode,

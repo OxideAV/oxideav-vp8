@@ -133,6 +133,7 @@ fn five_frame_keyframe_stream_mid_quant_meets_30db_per_frame() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     });
     let mut byte_streams: Vec<Vec<u8>> = Vec::with_capacity(n_frames);
     for (i, src) in sources.iter().enumerate() {

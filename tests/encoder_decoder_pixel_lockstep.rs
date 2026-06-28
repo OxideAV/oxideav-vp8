@@ -138,6 +138,7 @@ fn lockstep_partial_mb_normal_filter() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     assert_pixel_lockstep(33, 17, &params, None);
 }
@@ -151,6 +152,7 @@ fn lockstep_simple_filter_extremes() {
         sharpness_level: 7,
         nbr_of_dct_partitions: 2,
         filter_type: true,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     assert_pixel_lockstep(48, 48, &params, None);
 }
@@ -165,6 +167,7 @@ fn lockstep_one_pixel_strips() {
         sharpness_level: 2,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     assert_pixel_lockstep(1, 1, &params, None);
     assert_pixel_lockstep(1, 33, &params, None);
@@ -182,6 +185,7 @@ fn lockstep_eight_partitions_all_populated_and_empty() {
         sharpness_level: 1,
         nbr_of_dct_partitions: 8,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     assert_pixel_lockstep(64, 130, &params, None);
     assert_pixel_lockstep(24, 24, &params, None);
@@ -205,6 +209,7 @@ fn lockstep_token_prob_updates_at_l8_extremes() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 4,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     assert_pixel_lockstep(47, 32, &unfiltered, Some(&updates));
 
@@ -214,6 +219,7 @@ fn lockstep_token_prob_updates_at_l8_extremes() {
         sharpness_level: 4,
         nbr_of_dct_partitions: 1,
         filter_type: true,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     assert_pixel_lockstep(40, 24, &filtered, Some(&updates));
 }

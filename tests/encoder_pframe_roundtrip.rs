@@ -92,6 +92,7 @@ fn i_plus_p_zero_mv_self_decode_psnr_clears_30db_at_mid_qi() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // ---- Encode the I frame and capture its post-§15 reconstruction

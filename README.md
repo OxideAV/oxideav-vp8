@@ -42,10 +42,14 @@ Decoder and encoder are both at production status.
 VP8 has no remaining bitstream gaps in this crate; ongoing work is
 encoder rate-distortion quality (the §13 trellis quantiser now covers
 every encode path — keyframe, intra-within-P-frame, and the
-motion-compensated / SPLITMV inter emit; exposing the trellis
-aggressiveness as a quality/size knob is the next step), performance
-tuning (SIMD primitives, profile-guided fast paths), and bench / fuzz
-coverage — see `BENCHMARKS.md`.
+motion-compensated / SPLITMV inter emit — and its aggressiveness is now
+exposed as the **`TrellisStrength`** quality/size knob on
+`KeyframeParams` / `Vp8EncoderConfig`: `DEFAULT` holds the calibrated
+"shave-bits-hold-PSNR" trade, higher values spend more PSNR for fewer
+bytes, `OFF` reverts to plain round-quantisation; a strength of `4.0`
+shrinks a coarse-quantised keyframe ~24–40 % below the no-trellis wire for
+~0.3 dB), performance tuning (SIMD primitives, profile-guided fast paths),
+and bench / fuzz coverage — see `BENCHMARKS.md`.
 
 ## Install
 
@@ -203,6 +207,18 @@ worst-but-safe). `KeyframeParams::y_ac_qi` (range `0..=127`, default
 AC luma / chroma quantiser bank in lockstep. Lower = higher quality /
 larger output; higher = lower quality / smaller output. See
 `BENCHMARKS.md` for the rate / throughput trade-off sweep.
+
+`KeyframeParams::trellis_strength` (and `Vp8EncoderConfig::trellis_strength`)
+is a second, orthogonal size dial — a `TrellisStrength` multiplier on the
+§13 coefficient-RDO trellis aggressiveness. `TrellisStrength::DEFAULT`
+reproduces the historically-calibrated trade (hold the PSNR floor, trim
+~12–13 % of bytes); a higher strength spends more PSNR for fewer bytes
+(`4.0` ≈ −24–40 % vs the no-trellis wire at mid/high quantisers for
+~0.3 dB); `TrellisStrength::OFF` reverts to plain round-quantisation.
+`TrellisStrength::new()` clamps into `0.0..=8.0` and maps `NaN` to the
+default. The dial re-prices only the coefficient search, not the mode
+decision, and the reconstruction always uses the trellis-chosen levels, so
+encoder↔decoder pixel lockstep holds at every strength.
 
 ## With the OxideAV runtime (`registry` feature, the default)
 

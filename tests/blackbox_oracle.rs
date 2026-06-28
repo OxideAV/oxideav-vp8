@@ -200,6 +200,7 @@ fn our_encode_ffmpeg_decode(width: u32, height: u32) -> Result<f64, String> {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let vp8 =
         encode_keyframe(&src.frame(), &params).map_err(|e| format!("encode_keyframe: {e}"))?;

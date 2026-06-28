@@ -107,6 +107,7 @@ fn stream_intra_pick_bytes_match_bare_encoder_composition() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // K source: black. P source: bright 200. The picker on the
@@ -184,6 +185,7 @@ fn stream_intra_pick_scheduler_keyframe_interval_4() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (y, u, v) = flat_color(width as usize, height as usize, 128);
     let frame = I420Frame::packed(width, height, &y, &u, &v);
@@ -221,6 +223,7 @@ fn stream_intra_pick_force_keyframe_reanchors_interval() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (y, u, v) = flat_color(width as usize, height as usize, 100);
     let frame = I420Frame::packed(width, height, &y, &u, &v);
@@ -260,6 +263,7 @@ fn stream_intra_pick_refresh_drives_slot_rotation() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (k_y, k_u, k_v) = flat_color(width as usize, height as usize, 0);
     let (p_y, p_u, p_v) = flat_color(width as usize, height as usize, 200);
@@ -364,6 +368,7 @@ fn stream_intra_pick_refresh_errors_when_no_last() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (y, u, v) = flat_color(width as usize, height as usize, 128);
     let frame = I420Frame::packed(width, height, &y, &u, &v);
@@ -388,6 +393,7 @@ fn stream_intra_pick_dimensions_change_rejected() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (y1, u1, v1) = flat_color(32, 32, 128);
     let f1 = I420Frame::packed(32, 32, &y1, &u1, &v1);

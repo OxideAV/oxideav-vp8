@@ -100,6 +100,7 @@ fn params() -> KeyframeParams {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     }
 }
 

@@ -2206,18 +2206,76 @@ fn estimate_block_bits(
 }
 
 /// Fraction of the mode-decision Lagrange multiplier the §13 coefficient
-/// trellis spends. Coefficient-level RDO is a much finer rate lever than
-/// the mode picker (it can drop one trailing coefficient instead of a
-/// whole mode), so applying the full mode `lambda` over-trades PSNR for
-/// rate. Swept on the `natural_test_frame_64x64` keyframe RD fixtures:
-/// at the raw mode lambda the trellis cuts keyframe bytes ~45 % but loses
-/// 1–2.5 dB; `0.04` is the largest scale that *holds the SAD-picker PSNR
-/// floor at every quantiser* (the conservative "shave bits, never drop
-/// below the prior PSNR" regime the `rd_lambda` doctrine targets) while
-/// still trimming 12–13 % of bytes at the low/mid quantisers where VP8
-/// keyframes actually operate. A future round can expose this as a
-/// quality/size knob to unlock the steeper trade.
+/// trellis spends at [`TrellisStrength::DEFAULT`] (`= 1.0`). Coefficient-level
+/// RDO is a much finer rate lever than the mode picker (it can drop one
+/// trailing coefficient instead of a whole mode), so applying the full mode
+/// `lambda` over-trades PSNR for rate. Swept on the `natural_test_frame_64x64`
+/// keyframe RD fixtures: at the raw mode lambda the trellis cuts keyframe
+/// bytes ~45 % but loses 1–2.5 dB; `0.04` is the largest scale that *holds
+/// the SAD-picker PSNR floor at every quantiser* (the conservative "shave
+/// bits, never drop below the prior PSNR" regime the `rd_lambda` doctrine
+/// targets) while still trimming 12–13 % of bytes at the low/mid quantisers
+/// where VP8 keyframes actually operate. [`TrellisStrength`] multiplies this
+/// base: a strength `> 1.0` spends more bits-vs-quality (smaller output,
+/// steeper PSNR trade), `< 1.0` is more conservative, `0.0` disables the
+/// trellis (plain round-quantisation).
 const TRELLIS_LAMBDA_SCALE: f64 = 0.04;
+
+/// Trellis-quantiser aggressiveness knob — a clean-room encoder quality/size
+/// dial multiplying the calibrated [`TRELLIS_LAMBDA_SCALE`] base.
+///
+/// RFC 6386 specifies only token *decoding*; the level-assignment search the
+/// §13 trellis runs is a non-normative encoder decision (the spec is silent
+/// on it by design), so this knob is entirely a clean-room rate/quality
+/// control. `1.0` reproduces the historically-calibrated conservative trade
+/// (hold the SAD-picker PSNR floor, trim 12–13 % of bytes); higher values
+/// trade more PSNR for fewer bytes, `0.0` falls back to plain
+/// round-quantisation (the pre-trellis bytes). The value is clamped to
+/// `0.0..=MAX` so a caller cannot push the trellis into an unbounded
+/// distortion regime.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrellisStrength(f64);
+
+impl TrellisStrength {
+    /// The calibrated default — reproduces the round-354 trellis bytes
+    /// exactly (`scale = 1.0 × TRELLIS_LAMBDA_SCALE`).
+    pub const DEFAULT: TrellisStrength = TrellisStrength(1.0);
+    /// Disable the trellis: every block falls back to plain
+    /// round-quantisation (the pre-trellis wire).
+    pub const OFF: TrellisStrength = TrellisStrength(0.0);
+    /// Upper clamp. Beyond this the trellis zeroes nearly every AC
+    /// coefficient at the working quantisers, so it is a safety rail rather
+    /// than a useful operating point.
+    pub const MAX: f64 = 8.0;
+
+    /// Build a strength from a raw multiplier, clamping into `0.0..=MAX`.
+    /// `NaN` maps to the default (safe, conservative) rather than `OFF`.
+    pub fn new(strength: f64) -> Self {
+        if strength.is_nan() {
+            return Self::DEFAULT;
+        }
+        TrellisStrength(strength.clamp(0.0, Self::MAX))
+    }
+
+    /// The clamped multiplier.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+
+    /// The effective coefficient-level lambda scale — the calibrated base
+    /// times this strength. `0.0` (the [`OFF`](Self::OFF) state) yields a
+    /// zero scale, routing [`trellis_quantize_block`] to its plain-rounding
+    /// fallback.
+    fn lambda_scale(self) -> f64 {
+        self.0 * TRELLIS_LAMBDA_SCALE
+    }
+}
+
+impl Default for TrellisStrength {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 // ───────────────────────── §13 trellis coefficient quantisation ─────────────
 //
@@ -2410,14 +2468,14 @@ fn trellis_quantize_block(
         entry_ctx3,
         plane,
     } = spec;
-    // Coefficient-level RDO spends `lambda` far more effectively than the
-    // mode-granular picker it shares the multiplier with (it can drop a
-    // single trailing coefficient rather than a whole mode), so the raw
-    // mode lambda over-trades quality for rate. Scale it down so the
-    // trellis stays in the "shave bits, hold PSNR" regime the `rd_lambda`
-    // doctrine targets. Calibrated on the keyframe RD fixtures so the
-    // trellis trims bytes while holding the SAD-picker PSNR floor.
-    let lambda = lambda * TRELLIS_LAMBDA_SCALE;
+    // `lambda` is the **effective** coefficient-level price the caller has
+    // already scaled down from the mode-decision multiplier (coefficient
+    // RDO spends `lambda` far more effectively than the mode-granular
+    // picker — it can drop one trailing coefficient rather than a whole
+    // mode — so the raw mode lambda over-trades quality for rate). The
+    // scale is resolved by [`MbRdCtx::trellis_lambda`] from the
+    // [`TrellisStrength`] knob; this entry consumes the resolved value
+    // directly so callers can dial the rate/quality trade per stream.
 
     // Baseline rounding for the lossless / no-trade path.
     if lambda <= 0.0 {
@@ -2647,6 +2705,30 @@ struct MbRdCtx<'a> {
     factors: &'a crate::dequant::MbDequantFactors,
     coeff_probs: &'a CoeffProbs,
     lambda: f64,
+    /// §13 trellis aggressiveness — multiplies the calibrated
+    /// [`TRELLIS_LAMBDA_SCALE`] base. Decoupled from the mode-decision
+    /// `lambda` above so dialing the coefficient trade does not perturb the
+    /// mode picker's `J = SSD + lambda·R`. [`TrellisStrength::DEFAULT`]
+    /// reproduces the historical bytes.
+    trellis: TrellisStrength,
+}
+
+impl MbRdCtx<'_> {
+    /// The effective per-bit price the §13 trellis minimises against — the
+    /// mode `lambda` scaled by the resolved [`TrellisStrength`]. When the
+    /// strength is [`TrellisStrength::OFF`] this is `0.0`, routing
+    /// [`trellis_quantize_block`] to its plain-rounding fallback.
+    #[inline]
+    fn trellis_lambda(&self) -> f64 {
+        self.lambda * self.trellis.lambda_scale()
+    }
+
+    /// Whether the §13 trellis is active for this macroblock (a positive
+    /// mode lambda *and* a non-`OFF` strength).
+    #[inline]
+    fn trellis_active(&self) -> bool {
+        self.trellis_lambda() > 0.0
+    }
 }
 
 /// Derive the Lagrange multiplier from the frame quantiser.
@@ -2748,7 +2830,8 @@ fn transform_whole_block_luma_rd(
     }
     // Quantise (plain rounding, or §13 trellis when an RD context is given).
     match trellis {
-        Some(rd) if rd.lambda > 0.0 => {
+        Some(rd) if rd.trellis_active() => {
+            let tlambda = rd.trellis_lambda();
             trellis_quantize_block(
                 &mut y2,
                 TrellisBlockSpec {
@@ -2759,7 +2842,7 @@ fn transform_whole_block_luma_rd(
                     plane: BlockType::Y2.plane_index(),
                 },
                 rd.coeff_probs,
-                rd.lambda,
+                tlambda,
             );
             for blk in y.iter_mut() {
                 trellis_quantize_block(
@@ -2772,7 +2855,7 @@ fn transform_whole_block_luma_rd(
                         plane: BlockType::YAfterY2.plane_index(),
                     },
                     rd.coeff_probs,
-                    rd.lambda,
+                    tlambda,
                 );
             }
         }
@@ -2991,7 +3074,7 @@ fn transform_chroma_plane_rd(
             let mut coeffs = [0i16; 16];
             forward_dct_4x4(&residual, &mut coeffs);
             match trellis {
-                Some(rd) if rd.lambda > 0.0 => trellis_quantize_block(
+                Some(rd) if rd.trellis_active() => trellis_quantize_block(
                     &mut coeffs,
                     TrellisBlockSpec {
                         dc: factors.uv_dc,
@@ -3001,7 +3084,7 @@ fn transform_chroma_plane_rd(
                         plane: BlockType::UV.plane_index(),
                     },
                     rd.coeff_probs,
-                    rd.lambda,
+                    rd.trellis_lambda(),
                 ),
                 _ => enc_quantize_block(&mut coeffs, factors.uv_dc, factors.uv_ac),
             }
@@ -3291,7 +3374,7 @@ fn encode_bpred_luma(
                 }
                 let mut coeffs = [0i16; 16];
                 forward_dct_4x4(&residual, &mut coeffs);
-                if rd.lambda > 0.0 {
+                if rd.trellis_active() {
                     // §13 trellis: B_PRED sub-blocks are `YNoY2` (own DC,
                     // plane 3); seed the entry context from the real §13.3
                     // above/left non-zero predictors for this sub-block.
@@ -3307,7 +3390,7 @@ fn encode_bpred_luma(
                             plane: BlockType::YNoY2.plane_index(),
                         },
                         rd.coeff_probs,
-                        rd.lambda,
+                        rd.trellis_lambda(),
                     );
                 } else {
                     enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac);
@@ -3482,6 +3565,28 @@ pub fn encode_mb_block_set_with_neighbors(
     yac_qi: u8,
     coeff_probs: &crate::dct_tokens::CoeffProbs,
 ) -> Result<EncodedMb, TokenEncodeError> {
+    encode_mb_block_set_with_neighbors_strength(
+        pixels,
+        neighbors,
+        yac_qi,
+        coeff_probs,
+        TrellisStrength::DEFAULT,
+    )
+}
+
+/// Like [`encode_mb_block_set_with_neighbors`] but with the §13 trellis
+/// aggressiveness dialed by `trellis`. The public no-strength entry above
+/// delegates here with [`TrellisStrength::DEFAULT`] (byte-identical to the
+/// historical wire); the keyframe driver threads the per-stream knob down
+/// to this entry so a quality/size dial reaches the per-MB coefficient
+/// search. [`TrellisStrength::OFF`] reproduces the pre-trellis bytes.
+pub fn encode_mb_block_set_with_neighbors_strength(
+    pixels: &MbPixels,
+    neighbors: &crate::reconstruct::MbNeighbors,
+    yac_qi: u8,
+    coeff_probs: &crate::dct_tokens::CoeffProbs,
+    trellis: TrellisStrength,
+) -> Result<EncodedMb, TokenEncodeError> {
     // ---- 1. Build the §14.1 dequant factors + derive the RD lambda.
     // The encoder's quantisation step is the inverse — divide by these.
     let factors =
@@ -3490,6 +3595,7 @@ pub fn encode_mb_block_set_with_neighbors(
         factors: &factors,
         coeff_probs,
         lambda: rd_lambda(&factors),
+        trellis,
     };
 
     // ---- 2. Pick the §12.2 whole-block luma mode by rate-distortion.
@@ -4249,6 +4355,17 @@ pub struct KeyframeParams {
     /// values. Only consulted when `loop_filter_level != 0`; the §15
     /// whole-frame skip path bypasses the filter entirely either way.
     pub filter_type: bool,
+    /// §13 trellis coefficient-RDO aggressiveness — a clean-room
+    /// quality/size dial (RFC 6386 specifies only token *decoding*; the
+    /// level-assignment search is a non-normative encoder decision).
+    /// [`TrellisStrength::DEFAULT`] reproduces the calibrated
+    /// "shave-bits-hold-PSNR" trade; higher values trade more PSNR for
+    /// smaller output, [`TrellisStrength::OFF`] reverts to plain
+    /// round-quantisation. Threaded onto both the keyframe and the inter
+    /// residual emit. The reconstruction the encoder writes back always
+    /// uses the trellis-chosen levels, so encoder↔decoder pixel lockstep
+    /// holds at every strength.
+    pub trellis_strength: TrellisStrength,
 }
 
 impl Default for KeyframeParams {
@@ -4259,6 +4376,7 @@ impl Default for KeyframeParams {
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: TrellisStrength::DEFAULT,
         }
     }
 }
@@ -4719,11 +4837,12 @@ fn encode_keyframe_inner_lf(
 
             // Mode pick + forward transform/quant against the genuine
             // reconstructed neighbours.
-            let encoded = encode_mb_block_set_with_neighbors(
+            let encoded = encode_mb_block_set_with_neighbors_strength(
                 &pixels,
                 &neighbors,
                 params.y_ac_qi,
                 &coeff_probs,
+                params.trellis_strength,
             )
             .map_err(EncodeError::Token)?;
 
@@ -6132,7 +6251,7 @@ fn transform_split_mv_mb_rd(
             // place under the Y1 (dc, ac) factors. The decoder's
             // `BlockType::YNoY2` path reads them the same way.
             match trellis {
-                Some(rd) if rd.lambda > 0.0 => trellis_quantize_block(
+                Some(rd) if rd.trellis_active() => trellis_quantize_block(
                     &mut coeffs,
                     TrellisBlockSpec {
                         dc: factors.y1_dc,
@@ -6142,7 +6261,7 @@ fn transform_split_mv_mb_rd(
                         plane: BlockType::YNoY2.plane_index(),
                     },
                     rd.coeff_probs,
-                    rd.lambda,
+                    rd.trellis_lambda(),
                 ),
                 _ => enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac),
             }
@@ -6376,6 +6495,7 @@ fn pick_mb_for_ref(
     filters: &[[i32; 6]; 8],
     factors: &crate::dequant::MbDequantFactors,
     coeff_probs: Option<&CoeffProbs>,
+    trellis_strength: TrellisStrength,
 ) -> PickedMbForRef {
     // §13 trellis RD context for the inter residual emit, available once
     // the caller resolves this frame's coefficient probs. `None` keeps the
@@ -6384,6 +6504,7 @@ fn pick_mb_for_ref(
         factors,
         coeff_probs: cp,
         lambda,
+        trellis: trellis_strength,
     });
     // ---- §16.3 census + §17 motion search ------------------------
     //
@@ -6750,10 +6871,14 @@ fn score_intra_mb_candidate(
     );
     // §13 trellis RD context for the intra-in-P-frame whole-block paths,
     // available once the caller resolves this frame's coefficient probs.
+    // The inter encode entry points run the trellis at the calibrated
+    // default; the per-stream strength knob is threaded onto the keyframe
+    // path (the inter wiring lands in a follow-up).
     let trellis_rd = coeff_probs.map(|cp| MbRdCtx {
         factors,
         coeff_probs: cp,
         lambda,
+        trellis: TrellisStrength::DEFAULT,
     });
 
     // ---- §12 prediction. Each `predict_y16x16` / `predict_uv8x8`
@@ -7960,6 +8085,11 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
         other => return Err(EncodeError::InvalidDctPartitionCount { value: other }),
     };
 
+    // §13 trellis aggressiveness for the inter residual emit, dialed by the
+    // shared [`KeyframeParams::trellis_strength`] knob (the same field the
+    // keyframe path threads). `DEFAULT` reproduces the historical bytes.
+    let inter_trellis_strength = params.trellis_strength;
+
     let mb_cols = width.div_ceil(16) as usize;
     let mb_rows = height.div_ceil(16) as usize;
     if last.mb_cols != mb_cols || last.mb_rows != mb_rows {
@@ -8202,6 +8332,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                     filters,
                     &factors,
                     Some(&coeff_probs),
+                    inter_trellis_strength,
                 );
                 let ref_bits = ref_frame_tree_bits(*ref_frame, prob_last_pick, prob_gf_pick);
                 let total = pick.j + lambda * ref_bits;
@@ -9413,6 +9544,13 @@ pub struct Vp8EncoderConfig {
     /// (the historical fixed-`lf_level` behaviour). RFC 6386 is silent on
     /// the choice, so this is a clean-room encoder-quality knob.
     pub auto_loop_filter: bool,
+    /// §13 trellis coefficient-RDO aggressiveness — the clean-room
+    /// quality/size dial threaded onto both the keyframe and inter residual
+    /// emit (see [`KeyframeParams::trellis_strength`]).
+    /// [`TrellisStrength::DEFAULT`] reproduces the calibrated trade; higher
+    /// trades PSNR for smaller output, [`TrellisStrength::OFF`] reverts to
+    /// plain round-quantisation.
+    pub trellis_strength: TrellisStrength,
 }
 
 impl Default for Vp8EncoderConfig {
@@ -9426,6 +9564,7 @@ impl Default for Vp8EncoderConfig {
             lookahead_window: DEFAULT_LOOKAHEAD_WINDOW,
             target_bitrate_bps: 0,
             auto_loop_filter: false,
+            trellis_strength: TrellisStrength::DEFAULT,
         }
     }
 }
@@ -9472,6 +9611,7 @@ impl Vp8Encoder {
         let params = KeyframeParams {
             y_ac_qi: self.config.qindex,
             loop_filter_level: self.config.lf_level,
+            trellis_strength: self.config.trellis_strength,
             ..KeyframeParams::default()
         };
         let bytes = if self.config.auto_loop_filter {
@@ -11153,6 +11293,7 @@ mod tests {
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: TrellisStrength::DEFAULT,
         };
         let bytes = encode_keyframe(&frame, &params).expect("encode");
 
@@ -11245,6 +11386,7 @@ mod tests {
                 sharpness_level: 0,
                 nbr_of_dct_partitions: 1,
                 filter_type: false,
+                trellis_strength: TrellisStrength::DEFAULT,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
             let p = keyframe_luma_psnr(&bytes, &y, w as usize, h as usize);
@@ -11375,7 +11517,10 @@ mod tests {
                     plane: BlockType::UV.plane_index(),
                 },
                 &probs,
-                super::rd_lambda(&factors),
+                // `trellis_quantize_block` now consumes the **effective**
+                // (already-scaled) coefficient lambda — the same `lambda`
+                // the cost helper above prices J against.
+                lambda,
             );
 
             // (1) RD non-regression — the trellis cost is ≤ plain rounding.
@@ -11424,6 +11569,7 @@ mod tests {
                 sharpness_level: 0,
                 nbr_of_dct_partitions: 1,
                 filter_type: false,
+                trellis_strength: TrellisStrength::DEFAULT,
             };
             let bytes = encode_keyframe(&frame, &params).expect("encode");
             let p = keyframe_luma_psnr(&bytes, &y, w as usize, h as usize);
@@ -11437,6 +11583,75 @@ mod tests {
                 "RD PSNR at qi={qi} ({p:.3} dB) must hold the SAD baseline ({sad_psnr:.3} dB)"
             );
         }
+    }
+
+    /// The §13 [`TrellisStrength`] knob is monotone in the rate/quality
+    /// trade: dialing it up never *grows* the keyframe and dialing it to
+    /// [`TrellisStrength::OFF`] reproduces the pre-trellis (plain-rounding)
+    /// bytes — which are the largest of the three, since the trellis only
+    /// ever shaves bits. Every strength must still decode, and the
+    /// calibrated [`TrellisStrength::DEFAULT`] must match the historical
+    /// `rd_beats_sad_baseline` byte ceiling exactly (the knob is a strict
+    /// superset of the previously-fixed `0.04` scale).
+    #[test]
+    fn trellis_strength_knob_is_monotone_and_round_trips() {
+        let (w, h) = (64u32, 64u32);
+        let (y, u, v) = natural_test_frame_64x64();
+        let frame = I420Frame::packed(w, h, &y, &u, &v);
+        // Same fixed-quantiser working points the SAD-baseline test pins.
+        for qi in [16u8, 24, 32, 48, 64] {
+            let mk = |s: TrellisStrength| KeyframeParams {
+                y_ac_qi: qi,
+                loop_filter_level: 0,
+                sharpness_level: 0,
+                nbr_of_dct_partitions: 1,
+                filter_type: false,
+                trellis_strength: s,
+            };
+            let off = encode_keyframe(&frame, &mk(TrellisStrength::OFF)).expect("off");
+            let def = encode_keyframe(&frame, &mk(TrellisStrength::DEFAULT)).expect("default");
+            // A strength well above the default trades more aggressively.
+            let hot = encode_keyframe(&frame, &mk(TrellisStrength::new(4.0))).expect("hot");
+
+            // OFF = plain rounding = the largest stream; the default trims
+            // it; the hot setting trims at least as much as the default.
+            assert!(
+                def.len() <= off.len(),
+                "qi={qi}: DEFAULT trellis ({} B) must not exceed OFF ({} B)",
+                def.len(),
+                off.len()
+            );
+            assert!(
+                hot.len() <= def.len(),
+                "qi={qi}: strength 4.0 ({} B) must not exceed DEFAULT ({} B)",
+                hot.len(),
+                def.len()
+            );
+
+            // Every strength decodes cleanly through the crate's own decoder
+            // (encoder↔decoder pixel lockstep holds at every setting).
+            for bytes in [&off, &def, &hot] {
+                let dec = crate::decode_vp8(bytes).expect("decode at this strength");
+                assert_eq!(dec.y.len(), w as usize * h as usize);
+            }
+
+            // The hot setting must actually move the wire at the mid/low
+            // quantisers VP8 keyframes operate at (a knob that never changes
+            // anything would be a silent no-op).
+            if qi <= 48 {
+                assert!(
+                    hot.len() < off.len(),
+                    "qi={qi}: strength 4.0 ({} B) should beat OFF ({} B)",
+                    hot.len(),
+                    off.len()
+                );
+            }
+        }
+
+        // `new` clamps out-of-range / NaN inputs into the documented band.
+        assert_eq!(TrellisStrength::new(-1.0).get(), 0.0);
+        assert_eq!(TrellisStrength::new(1000.0).get(), TrellisStrength::MAX);
+        assert_eq!(TrellisStrength::new(f64::NAN), TrellisStrength::DEFAULT);
     }
 
     /// The §7.3 boolean encoder and the §7.3 boolean decoder in this

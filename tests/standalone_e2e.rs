@@ -152,6 +152,7 @@ fn standalone_keyframe_roundtrip_psnr_meets_30db() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
     let dec: Vp8DecodedFrame = decode_vp8(&bytes).expect("decode_vp8");

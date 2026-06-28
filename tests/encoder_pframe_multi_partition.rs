@@ -96,6 +96,7 @@ fn encode_ip_at(partitions: u8) -> (Vec<u8>, f64) {
         sharpness_level: 0,
         nbr_of_dct_partitions: partitions,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // The K-frame stays at 1 partition for every iteration — only the
@@ -214,6 +215,7 @@ fn p_frame_multi_partition_short_frame_roundtrip() {
             sharpness_level: 0,
             nbr_of_dct_partitions: count,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         let k_params = KeyframeParams {
             nbr_of_dct_partitions: 1,
@@ -282,6 +284,7 @@ fn p_frame_invalid_partition_count_rejected() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (k_y, k_u, k_v) = gradient_source(width, height);
     let k_frame = I420Frame::packed(width, height, &k_y, &k_u, &k_v);
@@ -297,6 +300,7 @@ fn p_frame_invalid_partition_count_rejected() {
             sharpness_level: 0,
             nbr_of_dct_partitions: bad,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         match encode_p_frame_multi_ref(&p_frame, &k_planes, None, None, &params) {
             Err(EncodeError::InvalidDctPartitionCount { value }) => assert_eq!(

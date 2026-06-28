@@ -426,7 +426,8 @@ pub use encoder::{
     encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
-    encode_mb_block_set, encode_mb_block_set_with_neighbors, encode_p_frame_multi_ref,
+    encode_mb_block_set, encode_mb_block_set_with_neighbors,
+    encode_mb_block_set_with_neighbors_strength, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_auto_loop_filter,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,
@@ -444,7 +445,7 @@ pub use encoder::{
     write_update_segmentation, AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector,
     EncodeError, EncodedMb, I420Frame, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas,
     MbPixels, RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder,
-    SilentKeyframeParams, TokenEncodeError, TokenEncoder, UpdateSegmentationLayer,
+    SilentKeyframeParams, TokenEncodeError, TokenEncoder, TrellisStrength, UpdateSegmentationLayer,
 };
 
 /// Framework `make_encoder` / `make_encoder_with_qindex` /

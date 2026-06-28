@@ -233,6 +233,7 @@ fn i_plus_p_translated_feature_emits_newmv_and_clears_30db() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     let (i_bytes, i_recon) =
@@ -327,6 +328,7 @@ fn flat_scene_picker_stays_on_zeromv_path() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     let (i_bytes, i_recon) =

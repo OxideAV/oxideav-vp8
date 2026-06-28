@@ -103,6 +103,7 @@ fn disabled_deltas_byte_match_intra_pick_only_path() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     let (k_y, k_u, k_v) = flat_color(width as usize, height as usize, 0);
@@ -160,6 +161,7 @@ fn bare_encoder_byte_match_on_composition() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     let (k_y, k_u, k_v) = flat_color(width as usize, height as usize, 0);
@@ -264,6 +266,7 @@ fn carries_deltas_and_resets_on_keyframe() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let mut enc = Vp8InterStreamEncoder::new(params, 100).expect("non-zero interval");
     let mut dec = Vp8DecoderState::new();
@@ -388,6 +391,7 @@ fn refresh_errors_when_no_last() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (y, u, v) = flat_color(width as usize, height as usize, 128);
     let frame = I420Frame::packed(width, height, &y, &u, &v);
@@ -413,6 +417,7 @@ fn dimensions_change_rejected() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let (y1, u1, v1) = flat_color(32, 32, 128);
     let f1 = I420Frame::packed(32, 32, &y1, &u1, &v1);

@@ -265,6 +265,7 @@ fn i_plus_p_quarter_pixel_shift_emits_quarter_pixel_newmv_and_clears_44db() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     let (i_bytes, i_recon) =

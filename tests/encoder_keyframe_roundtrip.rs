@@ -123,6 +123,7 @@ fn roundtrip_at_partitioned(
         sharpness_level: 0,
         nbr_of_dct_partitions,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
     let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
     let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -199,6 +200,7 @@ fn keyframe_multi_partition_psnr_matches_single_partition_baseline() {
             sharpness_level: 0,
             nbr_of_dct_partitions: count,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -256,6 +258,7 @@ fn keyframe_multi_partition_short_frame_roundtrip() {
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -268,6 +271,7 @@ fn keyframe_multi_partition_short_frame_roundtrip() {
             sharpness_level: 0,
             nbr_of_dct_partitions: count,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own keyframe");
@@ -292,6 +296,7 @@ fn keyframe_invalid_partition_count_rejected() {
             sharpness_level: 0,
             nbr_of_dct_partitions: bad,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::InvalidDctPartitionCount { value }) => assert_eq!(value, bad),
@@ -331,6 +336,7 @@ fn keyframe_loop_filter_levels_roundtrip() {
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
 
@@ -387,6 +393,7 @@ fn keyframe_loop_filter_level_out_of_range_rejected() {
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::LoopFilterLevelOutOfRange { value }) => assert_eq!(value, bad),
@@ -408,6 +415,7 @@ fn keyframe_sharpness_level_out_of_range_rejected() {
             sharpness_level: bad,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         match encode_keyframe(&src.frame(), &params) {
             Err(EncodeError::SharpnessLevelOutOfRange { value }) => assert_eq!(value, bad),
@@ -430,6 +438,7 @@ fn keyframe_sharpness_level_roundtrip() {
             sharpness_level: sharpness,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         };
         let bytes = encode_keyframe(&src.frame(), &params).expect("encode_keyframe");
         let dec = decode_vp8(&bytes).expect("decode_vp8 of our own filtered keyframe");

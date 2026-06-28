@@ -133,6 +133,7 @@ fn intra_pick_selects_intra_when_inter_residual_is_large() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // K frame: all black — populates LAST / GOLDEN / ALTREF with the
@@ -192,6 +193,7 @@ fn intra_pick_does_not_grow_wire_on_perfect_inter_source() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // Build a K-frame reference. Reuse the same picture as the
@@ -279,6 +281,7 @@ fn intra_pick_three_frame_stream_self_decodes() {
         sharpness_level: 0,
         nbr_of_dct_partitions: 1,
         filter_type: false,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // K: black; P: flat mid-bright 200.

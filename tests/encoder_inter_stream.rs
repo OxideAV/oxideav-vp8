@@ -139,6 +139,7 @@ fn ten_frame_inter_stream_mid_quant_meets_30db_per_frame() {
             sharpness_level: 0,
             nbr_of_dct_partitions: 1,
             filter_type: false,
+            trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
         },
         keyframe_interval,
     )

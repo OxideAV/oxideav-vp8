@@ -4,6 +4,38 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §13 trellis aggressiveness `TrellisStrength` quality/size knob (round 379)
+
+The §13 coefficient-level RDO trellis previously ran at a single
+hard-calibrated Lagrange-scale (`0.04`) chosen to hold the SAD-picker PSNR
+floor. That scale is now the **default** of a public `TrellisStrength`
+dial, so callers can spend more PSNR for fewer bytes (or revert to plain
+round-quantisation) per stream. RFC 6386 specifies only token *decoding*;
+the level-assignment search is a non-normative encoder decision, so the
+knob is entirely clean-room.
+
+* **`TrellisStrength`** — a clamped (`0.0..=8.0`) multiplier on the
+  calibrated coefficient-lambda base. `DEFAULT` (= `1.0`) reproduces the
+  round-354 trellis bytes exactly; `OFF` (= `0.0`) routes every block to
+  plain rounding (the pre-trellis wire); higher values trade quality for
+  size. `new()` clamps out-of-range inputs and maps `NaN` to `DEFAULT`.
+* Threaded onto **both** the keyframe and the inter / SPLITMV residual
+  emit via a new `KeyframeParams::trellis_strength` field (the shared
+  encode-params struct) and `Vp8EncoderConfig::trellis_strength`, plus a
+  `encode_mb_block_set_with_neighbors_strength` per-MB entry point. The
+  mode-decision lambda is unchanged — the strength only re-prices the
+  coefficient search, so mode picks are identical across strengths.
+* The reconstruction the encoder writes back always uses the
+  trellis-chosen levels, so encoder↔decoder pixel lockstep holds at every
+  strength (verified by `trellis_strength_knob_is_monotone_and_round_trips`,
+  which also pins the monotone `OFF ≥ DEFAULT ≥ strong` byte ordering and
+  the clamp behaviour).
+* Measured on `natural_test_frame_64x64`: at qi 48 a strength of `4.0`
+  shrinks the keyframe from 615 B (`OFF`) / 571 B (`DEFAULT`) to 470 B
+  (−24 % vs `OFF`) for −0.35 dB; at qi 64, 288 → 243 → 172 B (−40 % vs
+  `OFF`) for −0.26 dB. Low quantisers are already near-saturated by the
+  default trade.
+
 ### Added — §9.4 RD loop-filter `(level, sharpness)` auto-selection (round 373)
 
 The encoder can now **choose** its `loop_filter_level` and

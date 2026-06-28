@@ -86,11 +86,17 @@ fuzz_target!(|data: &[u8]| {
             alt_ref_interval,
             lookahead_window: 0,
             target_bitrate_bps: 0,
+            // §13 trellis aggressiveness, fuzz-derived from the high nibble
+            // of `data[7]` (clamped `0..=8`, `0` = OFF / plain rounding) so
+            // the two-pass panic-freedom sweep exercises the whole knob.
+            trellis_strength: oxideav_vp8::TrellisStrength::new(f64::from(data[7] >> 4)),
+            ..Vp8EncoderConfig::default()
         },
         target_bitrate_bps: 0,
         overshoot_ratio: 1.2,
         fps_num: 0,
         fps_den: 1,
+        ..Vp8TwoPassConfig::default()
     };
 
     // I420 plane sizes for tightly-packed strides at the chosen

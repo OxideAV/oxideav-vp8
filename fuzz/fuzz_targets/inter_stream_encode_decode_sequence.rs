@@ -81,6 +81,7 @@ fuzz_target!(|data: &[u8]| {
         sharpness_level: data[4] % 8,
         nbr_of_dct_partitions: 1u8 << (data[5] % 4),
         filter_type: (data[6] & 0x01) != 0,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     let keyframe_interval = 1u64 + u64::from(data[7] % 8);

@@ -118,6 +118,7 @@ fuzz_target!(|data: &[u8]| {
         sharpness_level: data[5] % 8,
         nbr_of_dct_partitions,
         filter_type: (data[5] & 0x80) != 0,
+        trellis_strength: oxideav_vp8::TrellisStrength::DEFAULT,
     };
 
     // I420 plane lengths for tightly-packed strides at the chosen

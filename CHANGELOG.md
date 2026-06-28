@@ -65,6 +65,14 @@ knob is entirely clean-room.
   re-priced. `DEFAULT` is byte-identical to the historical
   `encode_keyframe_adaptive_quant` (pinned by
   `adaptive_quant_trellis_strength_trims_bytes_and_round_trips`).
+* **Fuzz coverage.** The `encode_decode_pixel_lockstep` differential
+  target now fuzz-derives the `TrellisStrength` (high nibble of its flags
+  byte, clamped `0..=8`, `0` = OFF) so the encoder↔decoder pixel-exact
+  oracle runs across the whole knob range at every quantiser / dimension,
+  and `panic_free_two_pass_stream` drives a fuzz-derived strength too. (The
+  two-pass target also picked up the pre-existing `auto_loop_filter` field
+  it was missing, and both now use `..Default::default()` spreads so future
+  config fields can't silently break them.)
 
 ### Added — §9.4 RD loop-filter `(level, sharpness)` auto-selection (round 373)
 

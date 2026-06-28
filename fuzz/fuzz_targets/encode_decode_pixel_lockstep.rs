@@ -66,7 +66,7 @@
 //! | `[3]`      | `loop_filter_level = b % 64` (0 ⇒ §15 skip path) |
 //! | `[4]`      | `sharpness_level = b % 8` |
 //! | `[5]`      | `nbr_of_dct_partitions ∈ {1, 2, 4, 8}` via `b % 4` |
-//! | `[6]`      | flags: bit 0 = `filter_type` (§15.2 simple vs §15.3 normal), bit 1 = thread a §13.4 update payload |
+//! | `[6]`      | flags: bit 0 = `filter_type` (§15.2 simple vs §15.3 normal), bit 1 = thread a §13.4 update payload, bits 4..7 = §13 `TrellisStrength` (`b >> 4`, clamped `0..=8`; `0` = OFF / plain rounding) |
 //! | `[7..31]`  | eight §13.4 update triples: 2-byte LE slot selector (`% 1056` → `(plane, band, ctx, position)`) + 1 raw probability byte |
 //! | `[31..]`   | I420 pixel payload — tiled across the three planes |
 //!
@@ -77,7 +77,7 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp8::{
     decode_vp8, encode_keyframe_with_reconstruction_and_token_updates, I420Frame, KeyframeParams,
-    TokenProbUpdates,
+    TokenProbUpdates, TrellisStrength,
 };
 use oxideav_vp8_fuzz::accept_dimensions;
 
@@ -102,12 +102,21 @@ fuzz_target!(|data: &[u8]| {
     // Normalised (always-valid) parameter envelope. The rejection
     // surface is covered by `panic_free_encode_keyframe`; here every
     // accepted input must produce a decodable, pixel-exact bitstream.
+    // §13 trellis aggressiveness, fuzz-derived from the high nibble of the
+    // flags byte so the pixel-lockstep differential covers the whole knob
+    // range — including OFF (plain rounding) and the strong settings — at
+    // every quantiser / dimension. The encoder must stay bit-exact with the
+    // decoder at *every* strength (the reconstruction always reflects the
+    // trellis-chosen levels), so a mismatch here is a real lockstep defect.
+    let trellis_strength = TrellisStrength::new(f64::from(data[6] >> 4));
+
     let params = KeyframeParams {
         y_ac_qi: data[2] % 128,
         loop_filter_level: data[3] % 64,
         sharpness_level: data[4] % 8,
         nbr_of_dct_partitions: 1u8 << (data[5] % 4),
         filter_type: (data[6] & 0x01) != 0,
+        trellis_strength,
     };
 
     // Optional sparse §13.4 token_prob_update() payload: up to eight

@@ -5237,6 +5237,22 @@ pub fn encode_keyframe_adaptive_quant(
     Ok(bytes)
 }
 
+/// As [`encode_keyframe_adaptive_quant`] but with the §13 trellis
+/// aggressiveness dialed by `trellis` ([`TrellisStrength`]).
+/// `AdaptiveQuantConfig` derives `Eq`, so the strength is a separate
+/// argument rather than a struct field; [`TrellisStrength::DEFAULT`]
+/// reproduces the historical bytes, [`TrellisStrength::OFF`] reverts to
+/// plain round-quantisation. Per-segment quantisation is unchanged — the
+/// strength only re-prices the §13 coefficient search inside each MB.
+pub fn encode_keyframe_adaptive_quant_with_trellis(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+    trellis: TrellisStrength,
+) -> Result<Vec<u8>, EncodeError> {
+    let (bytes, _planes) = encode_keyframe_adaptive_quant_inner(frame, config, trellis)?;
+    Ok(bytes)
+}
+
 /// As [`encode_keyframe_adaptive_quant`], but also returns the
 /// macroblock-aligned post-§15 reconstruction planes (the LAST/GOLDEN/
 /// ALTREF candidate a multi-frame driver would install) so callers avoid
@@ -5244,6 +5260,24 @@ pub fn encode_keyframe_adaptive_quant(
 pub fn encode_keyframe_adaptive_quant_with_reconstruction(
     frame: &I420Frame,
     config: &AdaptiveQuantConfig,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_adaptive_quant_inner(frame, config, TrellisStrength::DEFAULT)
+}
+
+/// As [`encode_keyframe_adaptive_quant_with_reconstruction`] but with the
+/// §13 trellis aggressiveness dialed by `trellis`.
+pub fn encode_keyframe_adaptive_quant_with_reconstruction_and_trellis(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+    trellis: TrellisStrength,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_adaptive_quant_inner(frame, config, trellis)
+}
+
+fn encode_keyframe_adaptive_quant_inner(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+    trellis: TrellisStrength,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
@@ -5311,8 +5345,14 @@ pub fn encode_keyframe_adaptive_quant_with_reconstruction(
             let seg = classify_segment(variance, &config.variance_boundaries);
             let q = seg_qindex[seg as usize];
 
-            let encoded = encode_mb_block_set_with_neighbors(&pixels, &neighbors, q, &coeff_probs)
-                .map_err(EncodeError::Token)?;
+            let encoded = encode_mb_block_set_with_neighbors_strength(
+                &pixels,
+                &neighbors,
+                q,
+                &coeff_probs,
+                trellis,
+            )
+            .map_err(EncodeError::Token)?;
 
             let mb_skip_coeff = encoded.nonzero_block_count == 0;
 

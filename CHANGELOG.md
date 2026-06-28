@@ -57,6 +57,14 @@ knob is entirely clean-room.
   `make_encoder_with_quality` factory now applies both this and
   `quality_to_qindex`, so the single quality scalar tunes the quantiser
   **and** the trellis together.
+* **`encode_keyframe_adaptive_quant_with_trellis`** /
+  **`…_with_reconstruction_and_trellis`** — the §9.3 / §10 segment-based
+  adaptive-quant keyframe encoder now also accepts a `TrellisStrength`
+  (as a separate argument, since `AdaptiveQuantConfig` derives `Eq`). The
+  per-segment quantisation is unchanged; only the §13 coefficient search is
+  re-priced. `DEFAULT` is byte-identical to the historical
+  `encode_keyframe_adaptive_quant` (pinned by
+  `adaptive_quant_trellis_strength_trims_bytes_and_round_trips`).
 
 ### Added — §9.4 RD loop-filter `(level, sharpness)` auto-selection (round 373)
 

@@ -25,7 +25,7 @@
 
 use oxideav_vp8::{
     decode_vp8, encode_keyframe_adaptive_quant, encode_keyframe_adaptive_quant_with_reconstruction,
-    AdaptiveQuantConfig, I420Frame,
+    encode_keyframe_adaptive_quant_with_trellis, AdaptiveQuantConfig, I420Frame, TrellisStrength,
 };
 
 struct Source {
@@ -258,6 +258,64 @@ fn adaptive_quant_gradient_differs_from_uniform() {
         a, b,
         "adaptive-quant gradient produced identical bytes to the uniform encode"
     );
+}
+
+#[test]
+fn adaptive_quant_trellis_strength_trims_bytes_and_round_trips() {
+    // The §13 trellis-strength knob reaches the segment-based adaptive-quant
+    // path too: at a coarser base quantiser a strong setting shrinks the
+    // frame versus OFF / DEFAULT, the DEFAULT entry matches the historical
+    // bytes, and every strength still decodes.
+    let src = Source::new(64, 64);
+    let config = AdaptiveQuantConfig {
+        base_y_ac_qi: 56,
+        ..AdaptiveQuantConfig::default()
+    };
+
+    let off =
+        encode_keyframe_adaptive_quant_with_trellis(&src.frame(), &config, TrellisStrength::OFF)
+            .expect("off");
+    let def_via_knob = encode_keyframe_adaptive_quant_with_trellis(
+        &src.frame(),
+        &config,
+        TrellisStrength::DEFAULT,
+    )
+    .expect("default via knob");
+    let def_legacy = encode_keyframe_adaptive_quant(&src.frame(), &config).expect("legacy default");
+    let hot = encode_keyframe_adaptive_quant_with_trellis(
+        &src.frame(),
+        &config,
+        TrellisStrength::new(4.0),
+    )
+    .expect("hot");
+
+    // The DEFAULT-strength entry is byte-identical to the historical path.
+    assert_eq!(
+        def_via_knob, def_legacy,
+        "DEFAULT trellis strength must reproduce the historical adaptive-quant bytes"
+    );
+    // Monotone: OFF (plain rounding) >= DEFAULT >= hot, and the knob moves
+    // the wire at this coarse quantiser.
+    assert!(
+        def_legacy.len() <= off.len() && hot.len() <= def_legacy.len(),
+        "monotone OFF {} >= DEFAULT {} >= hot {} expected",
+        off.len(),
+        def_legacy.len(),
+        hot.len()
+    );
+    assert!(
+        hot.len() < off.len(),
+        "strength 4.0 ({} B) should beat OFF ({} B)",
+        hot.len(),
+        off.len()
+    );
+
+    // Every strength decodes cleanly.
+    for bytes in [&off, &def_via_knob, &hot] {
+        let dec = decode_vp8(bytes).expect("decode at this strength");
+        assert_eq!(dec.width, 64);
+        assert_eq!(dec.height, 64);
+    }
 }
 
 #[test]

@@ -49,6 +49,14 @@ knob is entirely clean-room.
   (−24 % vs `OFF`) for −0.35 dB; at qi 64, 288 → 243 → 172 B (−40 % vs
   `OFF`) for −0.26 dB. Low quantisers are already near-saturated by the
   default trade.
+* **`quality_to_trellis_strength(quality)`** — a pure (`--no-default-features`
+  reachable) mapping that pairs the WebP-canonical `0.0..=100.0` quality
+  dial with a coherent `TrellisStrength`: `quality ≥ 90` holds `DEFAULT`
+  (no PSNR sacrifice for a near-lossless request), lower quality ramps
+  linearly to `4.0` at `quality = 0`. The registry
+  `make_encoder_with_quality` factory now applies both this and
+  `quality_to_qindex`, so the single quality scalar tunes the quantiser
+  **and** the trellis together.
 
 ### Added — §9.4 RD loop-filter `(level, sharpness)` auto-selection (round 373)
 

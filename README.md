@@ -218,7 +218,16 @@ reproduces the historically-calibrated trade (hold the PSNR floor, trim
 `TrellisStrength::new()` clamps into `0.0..=8.0` and maps `NaN` to the
 default. The dial re-prices only the coefficient search, not the mode
 decision, and the reconstruction always uses the trellis-chosen levels, so
-encoder↔decoder pixel lockstep holds at every strength.
+encoder↔decoder pixel lockstep holds at every strength. It is honoured on
+every encode front door — the keyframe / inter / SPLITMV residual, the
+single-pass `Vp8Encoder`, the registry factories, and the two-pass
+encoder via `Vp8TwoPassConfig::base.trellis_strength`.
+
+`encoder::quality_to_trellis_strength` maps the same `0.0..=100.0` quality
+scalar that drives `quality_to_qindex` onto a coherent `TrellisStrength`
+(≥ 90 → `DEFAULT`, ramping to `4.0` at `0`), so a single quality number
+tunes the quantiser and the trellis together; the registry
+`make_encoder_with_quality` factory applies both.
 
 ## With the OxideAV runtime (`registry` feature, the default)
 

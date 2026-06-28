@@ -9154,6 +9154,45 @@ pub fn quality_to_qindex(quality: f32) -> u8 {
     q.clamp(0.0, 127.0) as u8
 }
 
+/// Map a WebP-canonical `0.0..=100.0` quality scalar onto a coherent
+/// [`TrellisStrength`] for the §13 coefficient trellis.
+///
+/// The mapping pairs the quality dial with the trellis aggressiveness so a
+/// single quality number tunes *both* the §9.6 quantiser
+/// ([`quality_to_qindex`]) and how hard the trellis shaves coefficient
+/// bits. The shape is clean-room (RFC 6386 is silent on encoder rate
+/// control):
+///
+/// * `quality >= 90` (visually-lossless target) → [`TrellisStrength::DEFAULT`]
+///   (`1.0`): the conservative "hold the PSNR floor" trade — a
+///   high-quality stream should not sacrifice PSNR for marginal byte
+///   savings.
+/// * As quality falls the strength ramps linearly toward `4.0` at
+///   `quality = 0` (the empirically-strong operating point that trims
+///   ~24–40 % of the no-trellis bytes for ~0.3 dB at mid/high quantisers,
+///   where a low-quality stream already lives).
+/// * `NaN` returns [`TrellisStrength::DEFAULT`] (the safe, conservative
+///   choice, matching the `quality_to_qindex` "couldn't tell" policy of
+///   not over-trading).
+///
+/// Pure — no [`oxideav_core`] / framework dependency — so it is reachable
+/// under `--no-default-features`. Callers that want the quantiser and the
+/// trellis tuned together can write
+/// `KeyframeParams { y_ac_qi: quality_to_qindex(q), trellis_strength:
+/// quality_to_trellis_strength(q), ..Default::default() }`.
+pub fn quality_to_trellis_strength(quality: f32) -> TrellisStrength {
+    if quality.is_nan() {
+        return TrellisStrength::DEFAULT;
+    }
+    let clamped = quality.clamp(0.0, 100.0);
+    // 1.0 at quality 90+, ramping to 4.0 at quality 0. Above 90 the
+    // `max(0.0)` floors the ramp term so the strength stays at the default.
+    const KNEE: f32 = 90.0;
+    const TOP_STRENGTH: f32 = 4.0;
+    let ramp = ((KNEE - clamped).max(0.0) / KNEE) * (TOP_STRENGTH - 1.0);
+    TrellisStrength::new((1.0 + ramp) as f64)
+}
+
 // ───────────────────────── framework factory (registry-gated) ─────────────────────────
 
 #[cfg(feature = "registry")]
@@ -9195,12 +9234,22 @@ mod factory {
 
     /// Build a framework-side VP8 encoder with the WebP-canonical
     /// `0.0..=100.0` `quality` (higher = better) translated into a
-    /// `y_ac_qi` via [`super::quality_to_qindex`].
+    /// `y_ac_qi` via [`super::quality_to_qindex`] **and** a coherent §13
+    /// trellis aggressiveness via [`super::quality_to_trellis_strength`]:
+    /// a high-quality request keeps the conservative
+    /// [`super::TrellisStrength::DEFAULT`] trade while a low-quality
+    /// request also lets the trellis shave coefficient bits harder, so the
+    /// single quality dial tunes both the quantiser and the trellis.
     pub fn make_encoder_with_quality(
         params: &CodecParameters,
         quality: f32,
     ) -> Result<Box<dyn Encoder>> {
-        make_encoder_with_qindex(params, super::quality_to_qindex(quality))
+        let config = super::Vp8EncoderConfig {
+            qindex: super::quality_to_qindex(quality),
+            trellis_strength: super::quality_to_trellis_strength(quality),
+            ..super::Vp8EncoderConfig::default()
+        };
+        make_encoder_from_config(params, config)
     }
 
     /// Build a framework-side VP8 encoder with an explicit VP8 §9.6
@@ -11664,6 +11713,38 @@ mod tests {
         assert_eq!(TrellisStrength::new(-1.0).get(), 0.0);
         assert_eq!(TrellisStrength::new(1000.0).get(), TrellisStrength::MAX);
         assert_eq!(TrellisStrength::new(f64::NAN), TrellisStrength::DEFAULT);
+    }
+
+    /// `quality_to_trellis_strength` pairs the quality dial with the §13
+    /// trellis: visually-lossless requests stay at `DEFAULT`, lower quality
+    /// ramps the strength up monotonically toward `4.0`, and `NaN` is the
+    /// conservative default.
+    #[test]
+    fn quality_to_trellis_strength_ramps_monotonically() {
+        // High quality holds the default (no PSNR sacrifice).
+        assert_eq!(quality_to_trellis_strength(100.0), TrellisStrength::DEFAULT);
+        assert_eq!(quality_to_trellis_strength(90.0), TrellisStrength::DEFAULT);
+        // Above-100 / below-0 clamp like the qindex mapping.
+        assert_eq!(quality_to_trellis_strength(150.0), TrellisStrength::DEFAULT);
+        // Bottom of the range hits the strong operating point.
+        assert!((quality_to_trellis_strength(0.0).get() - 4.0).abs() < 1e-6);
+        // NaN is the conservative default.
+        assert_eq!(
+            quality_to_trellis_strength(f32::NAN),
+            TrellisStrength::DEFAULT
+        );
+
+        // Monotone in quality: lower quality ⇒ greater-or-equal strength.
+        // Walk q from 100 down to 0; each step's strength must not drop.
+        let mut prev = 0.0f64;
+        for q in (0..=100).rev() {
+            let s = quality_to_trellis_strength(q as f32).get();
+            assert!(
+                s >= prev - 1e-9,
+                "strength must not fall as quality falls (q={q}: {s} < {prev})"
+            );
+            prev = s;
+        }
     }
 
     /// The §7.3 boolean encoder and the §7.3 boolean decoder in this

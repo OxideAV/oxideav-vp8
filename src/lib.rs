@@ -439,13 +439,14 @@ pub use encoder::{
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates,
     encode_p_frame_multi_ref_with_token_updates, encode_p_frame_zero_mv, encode_silent_keyframe,
     fit_token_prob_updates, make_silent_keyframe_encoder, patch_first_partition_size,
-    quality_to_qindex, write_frame_tag, write_loop_filter, write_loop_filter_with_deltas,
-    write_mb_no_skip_coeff, write_no_token_prob_updates, write_quant_indices,
-    write_segment_update_flags, write_token_partition_count, write_token_prob_updates,
-    write_update_segmentation, AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector,
-    EncodeError, EncodedMb, I420Frame, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas,
-    MbPixels, RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder,
-    SilentKeyframeParams, TokenEncodeError, TokenEncoder, TrellisStrength, UpdateSegmentationLayer,
+    quality_to_qindex, quality_to_trellis_strength, write_frame_tag, write_loop_filter,
+    write_loop_filter_with_deltas, write_mb_no_skip_coeff, write_no_token_prob_updates,
+    write_quant_indices, write_segment_update_flags, write_token_partition_count,
+    write_token_prob_updates, write_update_segmentation, AdaptiveQuantConfig, BoolEncoder,
+    BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, KeyframeParams,
+    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
+    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
+    TokenEncoder, TrellisStrength, UpdateSegmentationLayer,
 };
 
 /// Framework `make_encoder` / `make_encoder_with_qindex` /

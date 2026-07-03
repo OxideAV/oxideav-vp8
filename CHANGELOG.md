@@ -20,6 +20,28 @@ key-frame reset state, i.e. the defaults); update-free key frames keep
 the historical `1` bit-for-bit. Pinned by
 `fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
 
+### Added — §9.3 / §10 segment-based adaptive quantisation on P-frames (round 387)
+
+* **`InterSegmentationConfig`** +
+  **`encode_p_frame_multi_ref_adaptive_quant`** — the inter mirror of
+  the keyframe AQ path: each macroblock is classified into one of four
+  segments by §10 source-luma variance, **quantised and RD-priced at
+  its segment's effective qindex**, and the frame header carries the
+  full §9.3 `update_segmentation()` block (delta-mode quant features,
+  optional per-segment loop-filter deltas, map update, and
+  distribution-fitted `mb_segment_tree_probs` — one `fit_prob_l8` per
+  tree node, mirroring the §16.2 ref-selector fit) while the §11 / §16
+  mode layer prefixes each MB with its `segment_id` in the decoder's
+  exact read order (`segment_id → mb_skip_coeff → is_inter_mb`).
+* Composes with the full `InterCodingOptions` toggle set (§11 intra
+  pick, §9.4 auto loop-filter, two-pass §13.4 fitter) and any §9.7 /
+  §9.8 refresh ladder; every public inter entry funnels through the new
+  `encode_p_frame_multi_ref_inner_full` (the `None` path is
+  byte-identical to the previous wire).
+* Black-box: `ffmpeg` decodes the K + segmented-P stream to
+  byte-identical pixels vs the crate's own decoder
+  (`tests/encoder_pframe_adaptive_quant.rs`).
+
 ### Fixed — intra-pick walk double-pushed `split_candidates` (round 387)
 
 Under `pick_intra = true`, every intra-chosen macroblock pushed **two**

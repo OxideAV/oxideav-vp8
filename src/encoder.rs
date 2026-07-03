@@ -8326,10 +8326,118 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
     refresh: &RefreshControls,
     options: &InterCodingOptions,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_options_and_segmentation(
+        frame, last, golden, altref, params, refresh, options, None,
+    )
+}
+
+/// §9.3 / §10 segmentation layer for the inter (P-frame) encoder — the
+/// round-387 companion of the keyframe path's [`AdaptiveQuantConfig`].
+///
+/// Macroblocks are classified into four segments by §10 source-luma
+/// variance ([`AdaptiveQuantConfig::variance_boundaries`] semantics);
+/// each segment carries a §9.3 `quantizer_update` delta (added to the
+/// frame `y_ac_qi`, clamped to `0..=127`) and, optionally, a §9.3
+/// `loop_filter_update` delta (added to the frame filter level, clamped
+/// to `0..=63` per §20.6). The per-MB RD picker prices every candidate
+/// at its segment's quantiser, so flat segments genuinely code coarser
+/// and busy segments finer — activity-masking AQ on P-frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterSegmentationConfig {
+    /// Three ascending luma-variance boundaries splitting macroblocks
+    /// into the four segments (see
+    /// [`AdaptiveQuantConfig::variance_boundaries`]).
+    pub variance_boundaries: [u32; 3],
+    /// Per-segment §10 `quantizer_update_value` deltas (signed,
+    /// magnitude ≤ 127), added to the frame `y_ac_qi` in delta mode.
+    pub quant_delta: [i8; 4],
+    /// Optional per-segment §10 loop-filter deltas (signed, magnitude
+    /// ≤ 63). `None` omits the §9.3 loop-filter feature entirely (every
+    /// MB filters at the frame base level).
+    pub lf_delta: Option<[i8; 4]>,
+}
+
+impl Default for InterSegmentationConfig {
+    /// The [`AdaptiveQuantConfig`] default gradient: flat → coarser,
+    /// detailed → finer; no loop-filter feature.
+    fn default() -> Self {
+        InterSegmentationConfig {
+            variance_boundaries: [
+                SEGMENT_VARIANCE_THRESHOLDS[1],
+                SEGMENT_VARIANCE_THRESHOLDS[2],
+                SEGMENT_VARIANCE_THRESHOLDS[3],
+            ],
+            quant_delta: [8, 0, -6, -12],
+            lf_delta: None,
+        }
+    }
+}
+
+/// §16.2 multi-reference P-frame encoder with §9.3 / §10 **segment-based
+/// adaptive quantisation** (and optionally the per-segment loop-filter
+/// feature), composable with the full [`InterCodingOptions`] toggle set
+/// and caller-driven §9.7 / §9.8 refresh control.
+///
+/// The inter mirror of [`encode_keyframe_adaptive_quant`]: each MB is
+/// classified by §10 source-luma variance, quantised and RD-priced at
+/// its segment's effective qindex, and the frame header carries the
+/// §9.3 `update_segmentation()` block (delta-mode features + the
+/// distribution-fitted `mb_segment_tree_probs`) while the §11 / §16
+/// mode layer prefixes each MB with its `segment_id` — exactly the
+/// stream the decoder's inter path resolves through its per-segment
+/// dequant factors and the §20.6 per-segment filter override.
+///
+/// `lf_delta` magnitudes above 63 are rejected with
+/// [`EncodeError::LoopFilterLevelOutOfRange`]. Returns the wire bytes
+/// plus the matching post-§15 reconstruction planes.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_multi_ref_adaptive_quant(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    segmentation: &InterSegmentationConfig,
+    options: &InterCodingOptions,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    if let Some(d) = segmentation.lf_delta {
+        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
+            return Err(EncodeError::LoopFilterLevelOutOfRange {
+                value: bad.unsigned_abs(),
+            });
+        }
+    }
+    encode_p_frame_options_and_segmentation(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        options,
+        Some(segmentation),
+    )
+}
+
+/// Shared body of the two coding-options front doors above: the
+/// optional two-pass §13.4 fitter around the full inter driver, with
+/// the §9.3 / §10 segmentation layer threaded through both passes.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_options_and_segmentation(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    options: &InterCodingOptions,
+    segmentation: Option<&InterSegmentationConfig>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
 
     if !options.fitted_token_prob_updates {
-        return encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        return encode_p_frame_multi_ref_inner_full(
             frame,
             last,
             golden,
@@ -8343,14 +8451,15 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
             None,
             options.intra_pick,
             options.auto_loop_filter,
+            segmentation,
         );
     }
 
     // Pass 1 — §13.5 defaults + observed branch counts, with the
-    // requested picker / auto-LF switches active so the recorded counts
-    // reflect the MB mix pass 2 will re-produce.
+    // requested picker / auto-LF / segmentation switches active so the
+    // recorded counts reflect the MB mix pass 2 will re-produce.
     let mut counts = empty_branch_counts();
-    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_with_counts_and_pick(
+    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_full(
         frame,
         last,
         golden,
@@ -8364,6 +8473,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
         Some(&mut counts),
         options.intra_pick,
         options.auto_loop_filter,
+        segmentation,
     )?;
 
     // 2.0 bits of slack — matches every other inter fitter.
@@ -8373,7 +8483,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
     }
 
     // Pass 2 — re-encode against the merged table.
-    let (bytes_fitted, planes_fitted) = encode_p_frame_multi_ref_inner_with_counts_and_pick(
+    let (bytes_fitted, planes_fitted) = encode_p_frame_multi_ref_inner_full(
         frame,
         last,
         golden,
@@ -8387,6 +8497,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
         None,
         options.intra_pick,
         options.auto_loop_filter,
+        segmentation,
     )?;
 
     // Bytes-vs-default guard; the shipped planes always match the
@@ -8531,6 +8642,51 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     pick_intra: bool,
     auto_lf: bool,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner_full(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        token_updates,
+        counts,
+        pick_intra,
+        auto_lf,
+        None,
+    )
+}
+
+/// The complete inter (P-frame) driver — every public inter entry point
+/// funnels here. Adds the round-387 §9.3 / §10 `segmentation` layer on
+/// top of [`encode_p_frame_multi_ref_inner_with_counts_and_pick`]'s
+/// toggles: when `Some(seg)`, each macroblock is classified into one of
+/// four segments by §10 luma variance, quantised (and RD-priced) at
+/// that segment's effective qindex, the §9.3 `update_segmentation()`
+/// block travels in the header (quant deltas + optional loop-filter
+/// deltas + distribution-fitted `mb_segment_tree_probs`), and the §11 /
+/// §16 mode layer prefixes each MB with its `segment_id`. `None`
+/// reproduces the historical wire byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_multi_ref_inner_full(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
+    pick_intra: bool,
+    auto_lf: bool,
+    segmentation: Option<&InterSegmentationConfig>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     lf_deltas.validate()?;
     let width = frame.width;
@@ -8620,6 +8776,31 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
         0,
         0,
     );
+
+    // §9.3 / §10 segmentation context: the four per-segment §14.1
+    // dequant factor sets (delta mode on the §9.6 baseline — exactly
+    // what the decoder's `resolve_segment_dequant_factors` rebuilds
+    // from the header we emit below) plus the matching per-segment RD
+    // lambdas. `None` leaves the historical single-factor path.
+    let seg_ctx = segmentation.map(|s| {
+        let mut seg_factors = [factors; crate::loop_filter::MAX_MB_SEGMENTS];
+        let mut seg_lambdas = [0.0f64; crate::loop_filter::MAX_MB_SEGMENTS];
+        for i in 0..crate::loop_filter::MAX_MB_SEGMENTS {
+            seg_factors[i] = crate::dequant::MbDequantFactors::from_base_and_deltas(
+                params.y_ac_qi as i32 + s.quant_delta[i] as i32,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            seg_lambdas[i] = rd_lambda(&seg_factors[i]);
+        }
+        (s, seg_factors, seg_lambdas)
+    });
+    // Per-segment MB counts, for the post-walk `mb_segment_tree_probs`
+    // distribution fit.
+    let mut seg_counts = [0u32; crate::loop_filter::MAX_MB_SEGMENTS];
 
     // Per-reference plane bundle. `Last` is always populated; the
     // optional Golden / AltRef refs are populated when their slot is
@@ -8773,6 +8954,20 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             let raster = mb_row * mb_cols + mb_col;
             let pixels = frame.extract_mb(mb_row, mb_col);
 
+            // §10 segment classification (source-luma variance vs the
+            // config boundaries — same classifier as the adaptive-quant
+            // keyframe path) and the segment's factors / lambda. With
+            // segmentation off this reduces to the frame-wide pair.
+            let mb_segment_id = seg_ctx.as_ref().map(|(s, _, _)| {
+                let sid = classify_segment(mb_luma_variance(&pixels.y), &s.variance_boundaries);
+                seg_counts[sid as usize] += 1;
+                sid
+            });
+            let (mb_factors, mb_lambda) = match (&seg_ctx, mb_segment_id) {
+                (Some((_, f, l)), Some(sid)) => (&f[sid as usize], l[sid as usize]),
+                _ => (&factors, lambda),
+            };
+
             // ---- Per-ref picker: run for each available reference ----------
             //
             // For each available reference (LAST + optional GOLDEN +
@@ -8805,14 +9000,14 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                     mb_cols,
                     mb_rows,
                     &mv_contexts,
-                    lambda,
+                    mb_lambda,
                     filters,
-                    &factors,
+                    mb_factors,
                     Some(&coeff_probs),
                     inter_trellis_strength,
                 );
                 let ref_bits = ref_frame_tree_bits(*ref_frame, prob_last_pick, prob_gf_pick);
-                let total = pick.j + lambda * ref_bits;
+                let total = pick.j + mb_lambda * ref_bits;
                 if total < best_total_j {
                     best_total_j = total;
                     best = Some(pick);
@@ -8859,16 +9054,17 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                 let intra_pick = pick_intra_mb_all(
                     &pixels,
                     &neighbors,
-                    &factors,
-                    lambda,
+                    mb_factors,
+                    mb_lambda,
                     Some(&coeff_probs),
                     inter_trellis_strength,
                 );
                 let prob_intra_pick: u8 = 128;
                 let inter_total = chosen.j
-                    + lambda * ref_frame_tree_bits(chosen_ref_frame, prob_last_pick, prob_gf_pick)
-                    + lambda * bool_bits(prob_intra_pick, true);
-                let intra_total = intra_pick.j + lambda * bool_bits(prob_intra_pick, false);
+                    + mb_lambda
+                        * ref_frame_tree_bits(chosen_ref_frame, prob_last_pick, prob_gf_pick)
+                    + mb_lambda * bool_bits(prob_intra_pick, true);
+                let intra_total = intra_pick.j + mb_lambda * bool_bits(prob_intra_pick, false);
                 if intra_total < inter_total {
                     chose_intra = true;
                     intra_y_modes[raster] = intra_pick.y_mode;
@@ -8910,7 +9106,7 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                 IntraUvMode::Dc
             };
             modes.push(MacroblockModes {
-                segment_id: None,
+                segment_id: mb_segment_id,
                 mb_skip_coeff,
                 y_mode: y_mode_for_lf,
                 subblock_modes: None,
@@ -9005,6 +9201,21 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     let prob_last_fit = fit_prob_l8(count_last, count_golden + count_altref);
     let prob_gf_fit = fit_prob_l8(count_golden, count_altref);
 
+    // ---- §10 mb_segment_tree_probs fit -----------------------------------
+    //
+    // The §10 segment tree is: node 0 splits {0,1} vs {2,3}, node 1
+    // splits 0 vs 1, node 2 splits 2 vs 3. Fit each node's L(8) prob to
+    // the observed per-MB segment distribution (same `fit_prob_l8`
+    // machinery as the §16.2 ref_frame selector above); an unvisited
+    // node gets the neutral 128 that nothing reads.
+    let seg_tree_probs: Option<[u8; 3]> = seg_ctx.as_ref().map(|_| {
+        [
+            fit_prob_l8(seg_counts[0] + seg_counts[1], seg_counts[2] + seg_counts[3]),
+            fit_prob_l8(seg_counts[0], seg_counts[1]),
+            fit_prob_l8(seg_counts[2], seg_counts[3]),
+        ]
+    });
+
     // ---- §9.4 effective per-reference / per-mode delta resolution -------
     //
     // RFC 6386 §9.4: per-slot deltas persist across frames; a slot's
@@ -9023,14 +9234,27 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
     // filter must match what the decoder will run. The per-MB §9.4
     // reference / mode deltas are the effective (carried + this-frame)
     // values resolved above.
+    let mut seg_lf_level = [0i16; crate::loop_filter::MAX_MB_SEGMENTS];
+    if let Some((s, _, _)) = &seg_ctx {
+        if let Some(d) = s.lf_delta {
+            for (dst, &src) in seg_lf_level.iter_mut().zip(d.iter()) {
+                *dst = i16::from(src);
+            }
+        }
+    }
     let mut lf_config = crate::loop_filter::FrameFilterConfig {
         simple: params.filter_type,
         key_frame: false,
         loop_filter_level: params.loop_filter_level,
         sharpness_level: params.sharpness_level,
-        segmentation_enabled: false,
+        // With segmentation on, each MB's §15 level resolves through
+        // the §20.6 segment override (delta mode; an absent lf_delta
+        // resolves to 0 exactly as the decoder's
+        // `FrameFilterConfig::interframe` maps `loop_filter_update =
+        // None` slots).
+        segmentation_enabled: seg_ctx.is_some(),
         segment_abs: false,
-        segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+        segment_lf_level: seg_lf_level,
         delta_enabled: lf_deltas.enabled,
         ref_delta_current: effective_ref_deltas[0],
         bpred_mode_delta: effective_mode_deltas[0],
@@ -9095,8 +9319,38 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
 
     // Inter frames do NOT emit color_space / clamping_type (those are
     // key-frame-only per §9.2).
-    // §9.3 — segmentation off.
-    write_segment_update_flags(&mut hdr, false);
+    // §9.3 — segmentation. With the round-387 segmentation layer on,
+    // the full update_segmentation() block travels: per-segment §10
+    // quantizer deltas (always, including explicit zeros so the
+    // decoder's persisted state matches `seg_factors` exactly),
+    // optional per-segment loop-filter deltas, map update, and the
+    // distribution-fitted mb_segment_tree_probs.
+    match (&seg_ctx, &seg_tree_probs) {
+        (Some((s, _, _)), Some(probs)) => {
+            let layer = UpdateSegmentationLayer {
+                update_mb_segmentation_map: true,
+                feature_mode_absolute: false,
+                quantizer: [
+                    Some(i16::from(s.quant_delta[0])),
+                    Some(i16::from(s.quant_delta[1])),
+                    Some(i16::from(s.quant_delta[2])),
+                    Some(i16::from(s.quant_delta[3])),
+                ],
+                loop_filter: match s.lf_delta {
+                    Some(d) => [
+                        Some(i16::from(d[0])),
+                        Some(i16::from(d[1])),
+                        Some(i16::from(d[2])),
+                        Some(i16::from(d[3])),
+                    ],
+                    None => [None; 4],
+                },
+                segment_prob: [Some(probs[0]), Some(probs[1]), Some(probs[2])],
+            };
+            write_update_segmentation(&mut hdr, &layer);
+        }
+        _ => write_segment_update_flags(&mut hdr, false),
+    }
     // §9.4 — loop filter. `filter_type` follows `params.filter_type`
     // (false ⇒ §15.3 normal, true ⇒ §15.2 simple). The §19.2
     // `mb_lf_adjustments()` sub-block follows whatever the caller's
@@ -9241,6 +9495,16 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
             let raster = mb_row * mb_cols + mb_col;
             let mb = &modes[raster];
             let is_intra = is_intra_per_mb[raster];
+
+            // 0. segment_id (§10) — only when the frame updates the
+            //    segmentation map. Coded via the §10 mb_segment_tree
+            //    against the fitted probs, BEFORE mb_skip_coeff,
+            //    matching the decoder's inter read order
+            //    (segment_id → mb_skip_coeff → is_inter_mb).
+            if let Some(probs) = &seg_tree_probs {
+                let sid = mb.segment_id.unwrap_or(0);
+                hdr.write_treed(&crate::macroblock::MB_SEGMENT_TREE, |i| probs[i], sid);
+            }
 
             // 1. mb_skip_coeff (mb_no_skip_coeff = 1).
             hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);

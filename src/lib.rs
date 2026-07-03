@@ -436,7 +436,7 @@ pub use encoder::{
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors,
     encode_mb_block_set_with_neighbors_strength, encode_p_frame_multi_ref,
-    encode_p_frame_multi_ref_auto_loop_filter,
+    encode_p_frame_multi_ref_adaptive_quant, encode_p_frame_multi_ref_auto_loop_filter,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,
     encode_p_frame_multi_ref_with_refresh_and_coding_options,
@@ -453,9 +453,10 @@ pub use encoder::{
     write_quant_indices, write_segment_update_flags, write_token_partition_count,
     write_token_prob_updates, write_update_segmentation, AdaptiveQuantConfig, BoolEncoder,
     BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, InterCodingOptions,
-    KeyframeCodingOptions, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels,
-    RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams,
-    TokenEncodeError, TokenEncoder, TrellisStrength, UpdateSegmentationLayer,
+    InterSegmentationConfig, KeyframeCodingOptions, KeyframeParams, LoopFilterDeltaSlot,
+    LoopFilterDeltas, MbPixels, RefreshControls, ScaleCode as EncoderScaleCode,
+    SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError, TokenEncoder, TrellisStrength,
+    UpdateSegmentationLayer,
 };
 
 /// Framework `make_encoder` / `make_encoder_with_qindex` /

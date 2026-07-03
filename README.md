@@ -9,6 +9,8 @@ Decoder and encoder are both at production status.
 * **Decode** — RFC 6386 key-frame and inter-frame decode, bit-exact
   against the reference output on a multi-frame fixture corpus
   (mid-GOP golden refresh, multi-frame auto-alt-ref, ARNR).
+  `Vp8DecoderState::last_frame_shown()` surfaces the §9.1 `show_frame`
+  bit so players can suppress invisible altref-update frames.
 * **Encode** — full encoder with SPLITMV, GOLDEN / ALTREF,
   multi-partition output, refresh controls, loop-filter deltas, the
   §11 intra mode picker, **§13 trellis coefficient-level RDO
@@ -34,6 +36,23 @@ Decoder and encoder are both at production status.
   frame-by-frame from the running rate debt). The per-coefficient
   token emission hot path is allocation-free (§13.2 token bit paths
   precomputed into a static table).
+* **B-frame-less GOLDEN / ALTREF management** — **invisible
+  altref-update frames** (§9.1 `show_frame = 0`, §9.7
+  `refresh_alternate_frame = 1` / `refresh_last = 0`,
+  `encode_invisible_altref_update`), an **ARNR motion-compensated
+  temporal filter** that synthesizes the anchor picture
+  (`arnr::build_arnr_altref` — per-16×16 whole-pel alignment, SAD
+  occlusion guard, difference-weighted blend), and the lagged
+  **`Vp8AltrefStreamEncoder`** that assembles them: lookahead groups
+  each ship one invisible anchor plus visible multi-ref P-frames, the
+  §9.7 copy ladder promotes ALTREF → GOLDEN at group ends (bracketing
+  reference pairs for two header bits), and a MAD scene-cut detector
+  closes groups and forces keys at content changes. On 12 noisy
+  translating frames at qi 44 the anchored P-frames total −31 % bytes
+  vs a no-anchor multi-ref baseline, anchors included the stream is
+  still smaller. Also reachable as `Vp8Encoder::encode_sequence`
+  (consuming `Vp8EncoderConfig::alt_ref_interval` /
+  `lookahead_window` / `golden_interval`).
 * The full public surface is reachable both with the default
   `registry` build and under `--no-default-features`; a compile-only
   assertion suite lives in
@@ -162,6 +181,47 @@ base and adds a feedback correction proportional to the running rate
 debt (`rate_debt_bytes()`), so an over-budget stream coarsens later
 frames and an under-budget one spends quality. The whole rate-control
 family is clean-room — RFC 6386 is silent on rate control by design.
+
+### Auto-altref (lagged) stream encode
+
+`Vp8AltrefStreamEncoder` buffers source frames into lookahead groups;
+each completed group emits one **invisible** ARNR anchor (a §9.1
+`show_frame = 0` frame that installs a temporally-filtered picture into
+the §9.7 ALTREF slot) followed by the group's visible multi-reference
+P-frames:
+
+```rust
+use oxideav_vp8::{AltrefStreamConfig, I420Frame, Vp8AltrefStreamEncoder, Vp8DecoderState};
+
+let config = AltrefStreamConfig::default();   // window 8, ARNR 3, scene-cut on
+let mut enc = Vp8AltrefStreamEncoder::new(config).unwrap();
+
+let mut packets = Vec::new();
+for frame in &i420_frames {
+    packets.extend(enc.push_frame(frame)?);   // lagged: 0..N packets per push
+}
+packets.extend(enc.finish()?);                // drain the tail group
+
+// The stream has MORE packets than source frames (one invisible anchor
+// per group). Decode in order; display only the visible ones.
+let mut dec = Vp8DecoderState::new();
+for p in &packets {
+    let picture = dec.decode_frame(&p.bytes)?;
+    if p.is_visible() {
+        // present `picture`
+    } // else: reference-slot side effects only — drop the picture
+}
+```
+
+`AltrefStreamConfig` knobs: `altref_window` (group size), `arnr`
+(temporal-filter strength; `0` anchors on the raw frame),
+`keyframe_interval`, `golden_promotion` (§9.7 `copy_buffer_to_golden=2`
+on group-final P-frames so GOLDEN carries the previous anchor), and
+`scene_cut_mad_threshold` (close the group + force a key at hard content
+changes; `0.0` disables). The same pipeline is reachable through the
+historical `Vp8Encoder` via `encode_sequence(&frames)`, which maps
+`Vp8EncoderConfig::alt_ref_interval` / `lookahead_window` /
+`golden_interval` onto the stream driver.
 
 ### Segment-based adaptive-quant keyframe encode
 

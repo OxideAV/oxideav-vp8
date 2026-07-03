@@ -273,6 +273,7 @@
 #![cfg_attr(feature = "simd", feature(portable_simd))]
 #![warn(missing_debug_implementations)]
 
+pub mod arnr;
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;
@@ -382,6 +383,7 @@ pub mod tables {
     };
 }
 
+pub use arnr::{build_arnr_altref, ArnrConfig, ArnrPicture};
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
     CodedHeaderError, MbLfAdjustments, MvProbUpdates, QuantIndices, TokenProbUpdates,

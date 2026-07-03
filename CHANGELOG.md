@@ -38,6 +38,34 @@ them.
   untouched, and a measured payoff — the anchored P-frame is smaller
   than the same source encoded without the altref update.
 
+### Added — motion-compensated temporal filter for altref synthesis (round 384)
+
+The `arnr` module builds the *picture* the invisible altref-update frame
+transports: a noise-reduced blend of a lookahead window of source frames.
+RFC 6386 only defines how an altref picture travels (§9.1 / §9.7), never
+how an encoder should construct one, so the filter is a clean-room
+encoder-quality design like the two-pass rate-control family.
+
+* **`arnr::build_arnr_altref(frames, center, &ArnrConfig)`** — for every
+  16×16 block of the center frame, each other window frame is aligned by
+  a whole-pel three-round refinement search (±15 px, step 8 → 4 → 2 → 1,
+  edge-clamped fetches), a per-block SAD cutoff drops occluded /
+  scene-changed neighbours outright, and surviving pixels blend with a
+  difference-driven weight `w = 16·S/(S + d²)` (the center pixel always
+  at full weight). Chroma reuses the halved luma motion. Returns an
+  owned **`ArnrPicture`** whose `as_i420()` feeds
+  `encode_invisible_altref_update` directly.
+* **`ArnrConfig`** — a single `strength` dial (`0..=6`, default 3):
+  `0` is an exact center-frame pass-through, higher values tolerate
+  larger pixel differences before down-weighting. `new()` clamps.
+* Reachable under `--no-default-features` (no framework dependency).
+* Unit coverage: strength-0 / single-frame identity, a static noisy
+  window must at least halve the center frame's MSE against the clean
+  scene, motion compensation must still denoise a translating scene,
+  an unmatchable (inverted) neighbour is excluded bit-exactly, dimension
+  mismatches surface `ReferenceDimensionsMismatch`, and the config
+  clamp.
+
 ### Added — §13 trellis aggressiveness `TrellisStrength` quality/size knob (round 379)
 
 The §13 coefficient-level RDO trellis previously ran at a single

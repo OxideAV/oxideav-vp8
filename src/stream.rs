@@ -2091,17 +2091,27 @@ pub struct AltrefStreamConfig {
     /// [`crate::arnr::ArnrConfig`]). `strength = 0` anchors on the raw
     /// last frame of each group.
     pub arnr: crate::arnr::ArnrConfig,
+    /// §9.7 copy-ladder GOLDEN promotion. When `true` (the default),
+    /// the **last** P-frame of every anchored group carries
+    /// `copy_buffer_to_golden = 2` (ALTREF → GOLDEN — two header bits,
+    /// no pixel data travels), so the next group's P-frames see a
+    /// *bracketing* reference pair: GOLDEN holds the previous group's
+    /// anchor while the fresh invisible update re-points ALTREF at the
+    /// next one. `false` leaves GOLDEN pinned at the most recent key
+    /// frame.
+    pub golden_promotion: bool,
 }
 
 impl Default for AltrefStreamConfig {
     /// Key the first frame only, 8-frame lookahead groups, default
-    /// ARNR strength.
+    /// ARNR strength, GOLDEN promotion on.
     fn default() -> Self {
         AltrefStreamConfig {
             params: KeyframeParams::default(),
             keyframe_interval: 0,
             altref_window: 8,
             arnr: crate::arnr::ArnrConfig::default(),
+            golden_promotion: true,
         }
     }
 }
@@ -2349,6 +2359,7 @@ impl Vp8AltrefStreamEncoder {
         // frames of lookahead context and at least one P-frame to use
         // it (a single-frame group's anchor would just duplicate that
         // frame's own encode).
+        let mut anchored = false;
         if p_count > 0 && group.len() >= 2 {
             let views: Vec<I420Frame<'_>> = group.iter().map(|f| f.as_i420()).collect();
             let anchor = crate::arnr::build_arnr_altref(&views, views.len() - 1, &self.config.arnr)
@@ -2362,6 +2373,7 @@ impl Vp8AltrefStreamEncoder {
                 &self.config.params,
             )?;
             self.altref = Some(alt_recon);
+            anchored = true;
             out.push(AltrefStreamPacket {
                 bytes,
                 kind: AltrefPacketKind::AltrefUpdate,
@@ -2369,17 +2381,35 @@ impl Vp8AltrefStreamEncoder {
             });
         }
 
-        // Visible P-frames — default §9.7 ladder (refresh_last = 1),
-        // per-MB LAST / GOLDEN / ALTREF selection.
+        // Visible P-frames — §9.7 `refresh_last = 1` ladder, per-MB
+        // LAST / GOLDEN / ALTREF selection. With `golden_promotion` on,
+        // the group's last P-frame additionally carries
+        // `copy_buffer_to_golden = 2`: per the §20 page-147 walk the
+        // copy is applied *before* `refresh_last` and reads the
+        // pre-refresh ALTREF (this group's anchor), so GOLDEN enters
+        // the next group holding the anchor at a cost of two header
+        // bits.
         for (j, frame) in group.iter().enumerate().skip(first_p) {
+            let promote = self.config.golden_promotion && anchored && j == group.len() - 1;
+            let refresh = RefreshControls {
+                copy_buffer_to_golden: if promote { 2 } else { 0 },
+                ..RefreshControls::default()
+            };
             let last_planes = self.last.as_ref().expect("keyframe path ran");
-            let (bytes, recon) = encode_p_frame_multi_ref(
+            let (bytes, recon) = encode_p_frame_multi_ref_with_refresh(
                 &frame.as_i420(),
                 last_planes,
                 self.golden.as_ref(),
                 self.altref.as_ref(),
                 &self.config.params,
+                &refresh,
             )?;
+            // Encoder-side slot mirror of the §20 page-147 walk:
+            // copy_gf (ALTREF → GOLDEN, pre-refresh state) precedes
+            // refresh_last.
+            if promote {
+                self.golden = self.altref.clone();
+            }
             self.last = Some(recon);
             out.push(AltrefStreamPacket {
                 bytes,

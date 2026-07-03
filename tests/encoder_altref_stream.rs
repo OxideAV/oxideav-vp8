@@ -106,6 +106,7 @@ fn lagged_altref_stream_structure_decode_and_payoff() {
         keyframe_interval: 0, // key only frame 0
         altref_window: 4,
         arnr: ArnrConfig::default(),
+        ..AltrefStreamConfig::default()
     };
 
     // ---- Drive the lagged encoder -----------------------------------
@@ -217,6 +218,7 @@ fn keyframe_cadence_closes_groups_early() {
         keyframe_interval: 5,
         altref_window: 4,
         arnr: ArnrConfig::default(),
+        ..AltrefStreamConfig::default()
     };
     let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
     let mut packets = Vec::new();
@@ -270,4 +272,84 @@ fn zero_window_is_rejected_and_dimension_lock_holds() {
         err,
         oxideav_vp8::StreamEncodeError::DimensionsChanged { .. }
     ));
+}
+
+/// §9.7 copy-ladder GOLDEN promotion: with `golden_promotion` on, the
+/// last P-frame of each anchored group carries
+/// `copy_buffer_to_golden = 2`, so after that frame decodes the
+/// decoder's GOLDEN slot holds the group's anchor reconstruction (which
+/// the pre-promotion ALTREF slot held). With the knob off, GOLDEN stays
+/// at the keyframe throughout. Both wires decode cleanly; the promotion
+/// is verified against the decoder's own slot state — encoder and
+/// decoder walk the same §20 page-147 ladder.
+#[test]
+fn golden_promotion_installs_the_anchor_into_golden() {
+    let params = KeyframeParams {
+        y_ac_qi: 44,
+        ..KeyframeParams::default()
+    };
+    for promotion in [true, false] {
+        let config = AltrefStreamConfig {
+            params,
+            keyframe_interval: 0,
+            altref_window: 4,
+            arnr: ArnrConfig::default(),
+            golden_promotion: promotion,
+        };
+        let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
+        let mut packets = Vec::new();
+        for t in 0..8usize {
+            let (y, u, v) = noisy_frame(t);
+            let frame = I420Frame::packed(W as u32, H as u32, &y, &u, &v);
+            packets.extend(enc.push_frame(&frame).expect("push"));
+        }
+        packets.extend(enc.finish().expect("finish"));
+
+        let mut dec = Vp8DecoderState::new();
+        let mut kf_golden: Option<Vec<u8>> = None;
+        let mut anchor_recon: Option<Vec<u8>> = None;
+        // Locate the end of group 1: packets are
+        // [K, anchor, P1, P2, P3, anchor, P4..P7] — the last P of
+        // group 1 sits just before the *second* anchor.
+        let second_anchor = packets
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.kind == AltrefPacketKind::AltrefUpdate)
+            .map(|(i, _)| i)
+            .nth(1)
+            .expect("two groups → two anchors");
+        let group1_last_p = second_anchor - 1;
+
+        for (i, p) in packets.iter().enumerate() {
+            let picture = dec.decode_frame(&p.bytes).expect("decodes");
+            if p.kind == AltrefPacketKind::Key {
+                kf_golden = Some(dec.golden.as_ref().expect("golden set").y.clone());
+            }
+            if p.kind == AltrefPacketKind::AltrefUpdate && anchor_recon.is_none() {
+                // The invisible frame's decoded picture *is* the anchor
+                // reconstruction the decoder just put into ALTREF.
+                anchor_recon = Some(picture.y.clone());
+            }
+            if i == group1_last_p {
+                let golden_y = &dec.golden.as_ref().expect("golden set").y;
+                let anchor_y = anchor_recon.as_ref().expect("anchor seen");
+                let kf_y = kf_golden.as_ref().expect("keyframe seen");
+                if promotion {
+                    // GOLDEN now holds the anchor (64×64 is MB-aligned,
+                    // so the slot plane equals the decoded picture).
+                    assert_eq!(
+                        &golden_y[..],
+                        &anchor_y[..],
+                        "promotion must copy ALTREF (the anchor) into GOLDEN"
+                    );
+                } else {
+                    assert_eq!(
+                        &golden_y[..],
+                        &kf_y[..],
+                        "without promotion GOLDEN stays at the keyframe"
+                    );
+                }
+            }
+        }
+    }
 }

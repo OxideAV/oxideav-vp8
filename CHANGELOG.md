@@ -38,6 +38,22 @@ them.
   untouched, and a measured payoff — the anchored P-frame is smaller
   than the same source encoded without the altref update.
 
+### Added — §9.7 copy-ladder GOLDEN promotion in the auto-altref stream (round 384)
+
+First encoder-side use of the §9.7 `copy_buffer_to_*` ladder:
+**`AltrefStreamConfig::golden_promotion`** (default on) makes the last
+P-frame of every anchored group carry `copy_buffer_to_golden = 2`
+(ALTREF → GOLDEN — two header bits, no pixel data travels). The next
+group's P-frames then see a *bracketing* reference pair — GOLDEN holds
+the previous group's anchor while the fresh invisible update re-points
+ALTREF at the next one — instead of GOLDEN staying pinned at the last
+key frame. The encoder mirrors the §20 page-147 walk (the copy applies
+before `refresh_last` and reads the pre-refresh ALTREF), pinned by
+`golden_promotion_installs_the_anchor_into_golden`: after the promoting
+frame decodes, the *decoder's* GOLDEN slot equals the anchor
+reconstruction bit-exactly (and stays at the keyframe with the knob
+off).
+
 ### Added — `Vp8AltrefStreamEncoder`: lagged auto-altref stream driver (round 384)
 
 The management layer that assembles the round's building blocks into a

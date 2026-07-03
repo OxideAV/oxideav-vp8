@@ -85,10 +85,10 @@ fn segment_lf_feature_round_trips_through_header_parser() {
     let seg = coded.update_segmentation.expect("update_segmentation");
     assert!(seg.update_segment_feature_data);
     assert!(!seg.segment_feature_mode_absolute, "delta mode");
-    for s in 0..4 {
+    for (s, &delta) in DELTAS.iter().enumerate() {
         assert_eq!(
             seg.loop_filter_update[s],
-            Some(i16::from(DELTAS[s])),
+            Some(i16::from(delta)),
             "segment {s} loop_filter_update"
         );
         assert!(seg.quantizer_update[s].is_some(), "quant feature intact");

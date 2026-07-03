@@ -156,15 +156,20 @@ fn segmented_p_frame_header_round_trips() {
     assert!(seg.update_mb_segmentation_map, "map travels every frame");
     assert!(seg.update_segment_feature_data);
     assert!(!seg.segment_feature_mode_absolute, "delta mode");
-    for s in 0..4 {
+    for (s, (&qd, &ld)) in cfg
+        .quant_delta
+        .iter()
+        .zip(cfg.lf_delta.as_ref().unwrap().iter())
+        .enumerate()
+    {
         assert_eq!(
             seg.quantizer_update[s],
-            Some(i16::from(cfg.quant_delta[s])),
+            Some(i16::from(qd)),
             "segment {s} quantizer_update"
         );
         assert_eq!(
             seg.loop_filter_update[s],
-            Some(i16::from(cfg.lf_delta.unwrap()[s])),
+            Some(i16::from(ld)),
             "segment {s} loop_filter_update"
         );
     }

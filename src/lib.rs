@@ -517,8 +517,8 @@ pub use reconstruct::{
 };
 pub use state::{bench_rotate_reference_slots, RefFrameSlot, Vp8DecoderState};
 pub use stream::{
-    EncodedStreamFrame, FrameKind, StreamEncodeError, Vp8InterStreamEncoder,
-    Vp8KeyframeStreamEncoder,
+    AltrefPacketKind, AltrefStreamConfig, AltrefStreamPacket, EncodedStreamFrame, FrameKind,
+    StreamEncodeError, Vp8AltrefStreamEncoder, Vp8InterStreamEncoder, Vp8KeyframeStreamEncoder,
 };
 
 /// Crate-local error type for the not-yet-implemented surfaces.

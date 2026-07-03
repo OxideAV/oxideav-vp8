@@ -2069,6 +2069,328 @@ fn ref_slot_to_keyframe_planes(slot: &RefFrameSlot) -> KeyframePlanes {
     }
 }
 
+// ───────────────────────── auto-altref (lagged) stream driver ─────────────────
+
+/// Configuration for [`Vp8AltrefStreamEncoder`].
+#[derive(Debug, Clone, Copy)]
+pub struct AltrefStreamConfig {
+    /// Per-frame encode parameters (§9.6 quantiser, §9.4 loop filter,
+    /// §13 trellis strength, …) applied to every emitted frame.
+    pub params: KeyframeParams,
+    /// Key-frame cadence in *source* frames: frame 0 and every
+    /// `keyframe_interval`-th source frame is coded as a key frame.
+    /// `0` keys only the first frame.
+    pub keyframe_interval: u64,
+    /// Lookahead group size in source frames (≥ 1). Each full group is
+    /// encoded together: one invisible ARNR altref anchor (built from
+    /// the whole group, aligned to its last frame) followed by the
+    /// group's visible frames. `1` degenerates to plain streaming (no
+    /// anchors — a single-frame group has nothing to look ahead at).
+    pub altref_window: usize,
+    /// Temporal-filter dial for the anchor synthesis (see
+    /// [`crate::arnr::ArnrConfig`]). `strength = 0` anchors on the raw
+    /// last frame of each group.
+    pub arnr: crate::arnr::ArnrConfig,
+}
+
+impl Default for AltrefStreamConfig {
+    /// Key the first frame only, 8-frame lookahead groups, default
+    /// ARNR strength.
+    fn default() -> Self {
+        AltrefStreamConfig {
+            params: KeyframeParams::default(),
+            keyframe_interval: 0,
+            altref_window: 8,
+            arnr: crate::arnr::ArnrConfig::default(),
+        }
+    }
+}
+
+/// Classification of one packet emitted by [`Vp8AltrefStreamEncoder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AltrefPacketKind {
+    /// §9.1 key frame (visible; refreshes all three slots).
+    Key,
+    /// Invisible §9.7 altref-update frame (`show_frame = 0`,
+    /// `refresh_alternate_frame = 1`, `refresh_last = 0`). Not part of
+    /// the display sequence — a muxer stores it, a player never shows
+    /// it.
+    AltrefUpdate,
+    /// Visible §16 multi-reference P-frame (`refresh_last = 1`).
+    Inter,
+}
+
+/// One packet emitted by [`Vp8AltrefStreamEncoder`]. The stream emits
+/// **more packets than source frames** (one extra invisible anchor per
+/// lookahead group); `source_index` ties visible packets back to their
+/// source frame.
+#[derive(Debug, Clone)]
+pub struct AltrefStreamPacket {
+    /// Raw VP8 elementary-stream bytes (one packet = one frame; feed to
+    /// [`crate::state::Vp8DecoderState::decode_frame`] in emission
+    /// order).
+    pub bytes: Vec<u8>,
+    /// What the packet carries.
+    pub kind: AltrefPacketKind,
+    /// 0-based index of the source frame this packet displays, or
+    /// `None` for an invisible anchor (which displays nothing).
+    pub source_index: Option<u64>,
+}
+
+impl AltrefStreamPacket {
+    /// Convenience: `true` iff a player should display this packet's
+    /// decoded picture (mirrors the §9.1 `show_frame` bit on the wire).
+    pub fn is_visible(&self) -> bool {
+        self.source_index.is_some()
+    }
+}
+
+/// Owned tightly-packed copy of a source picture (the lookahead buffer
+/// element).
+#[derive(Debug, Clone)]
+struct OwnedI420 {
+    width: u32,
+    height: u32,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+impl OwnedI420 {
+    fn from_frame(frame: &I420Frame<'_>) -> Self {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut y = Vec::with_capacity(w * h);
+        for r in 0..h {
+            y.extend_from_slice(&frame.y[r * frame.y_stride..r * frame.y_stride + w]);
+        }
+        let mut u = Vec::with_capacity(cw * ch);
+        let mut v = Vec::with_capacity(cw * ch);
+        for r in 0..ch {
+            u.extend_from_slice(&frame.u[r * frame.uv_stride..r * frame.uv_stride + cw]);
+            v.extend_from_slice(&frame.v[r * frame.uv_stride..r * frame.uv_stride + cw]);
+        }
+        OwnedI420 {
+            width: frame.width,
+            height: frame.height,
+            y,
+            u,
+            v,
+        }
+    }
+
+    fn as_i420(&self) -> I420Frame<'_> {
+        I420Frame::packed(self.width, self.height, &self.y, &self.u, &self.v)
+    }
+}
+
+/// Lagged multi-frame VP8 encoder with **automatic invisible-altref
+/// management** — the B-frame-less GOLDEN / ALTREF pattern assembled
+/// from this round's building blocks:
+///
+/// 1. Source frames buffer into lookahead groups of
+///    [`AltrefStreamConfig::altref_window`] frames.
+/// 2. When a group completes, [`crate::arnr::build_arnr_altref`]
+///    synthesizes a noise-reduced anchor aligned to the group's **last**
+///    frame, and [`crate::encoder::encode_invisible_altref_update`]
+///    ships it as an invisible frame (§9.1 `show_frame = 0`, §9.7
+///    `refresh_alternate_frame = 1` / `refresh_last = 0`).
+/// 3. The group's frames then encode as visible multi-reference
+///    P-frames whose per-MB §16.2 `ref_frame` selector can predict from
+///    the anchor — forward prediction from a picture that is never
+///    displayed.
+///
+/// Because the pipeline is lagged, [`Self::push_frame`] returns zero or
+/// more packets per call and [`Self::finish`] drains the tail group.
+/// Packets must reach the decoder in emission order; visible packets
+/// map 1:1 onto source frames (`source_index`), invisible anchors carry
+/// `source_index = None`.
+///
+/// The encoder mirrors the §9.7 / §9.8 slot ladder exactly as
+/// [`crate::state::Vp8DecoderState`] applies it, so every packet
+/// self-decodes in pixel lockstep (pinned by
+/// `tests/encoder_altref_stream.rs`).
+#[derive(Debug, Clone)]
+pub struct Vp8AltrefStreamEncoder {
+    config: AltrefStreamConfig,
+    dimensions: Option<(u32, u32)>,
+    /// Lookahead buffer — the group being accumulated.
+    pending: Vec<OwnedI420>,
+    /// Source index of `pending[0]`.
+    pending_start: u64,
+    /// Total source frames pushed.
+    input_count: u64,
+    /// §9 reference slots (encoder-side mirror of the decoder's).
+    last: Option<KeyframePlanes>,
+    golden: Option<KeyframePlanes>,
+    altref: Option<KeyframePlanes>,
+}
+
+impl Vp8AltrefStreamEncoder {
+    /// Build a fresh lagged encoder. Returns `None` when
+    /// `config.altref_window == 0` (a zero-frame lookahead group cannot
+    /// make progress).
+    pub fn new(config: AltrefStreamConfig) -> Option<Self> {
+        if config.altref_window == 0 {
+            return None;
+        }
+        Some(Vp8AltrefStreamEncoder {
+            config,
+            dimensions: None,
+            pending: Vec::new(),
+            pending_start: 0,
+            input_count: 0,
+            last: None,
+            golden: None,
+            altref: None,
+        })
+    }
+
+    /// The configuration this stream was built with.
+    pub fn config(&self) -> &AltrefStreamConfig {
+        &self.config
+    }
+
+    /// Total source frames pushed so far (buffered + encoded).
+    pub fn input_count(&self) -> u64 {
+        self.input_count
+    }
+
+    /// Source frames currently buffered awaiting their group to
+    /// complete (the current lag, `0..altref_window`).
+    pub fn buffered(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Whether source frame `index` is scheduled as a key frame.
+    fn is_key_index(&self, index: u64) -> bool {
+        index == 0
+            || (self.config.keyframe_interval > 0 && index % self.config.keyframe_interval == 0)
+    }
+
+    /// Feed one source frame; returns every packet the stream can emit
+    /// so far (empty while the lookahead group is still filling).
+    ///
+    /// Dimensions are locked at the first frame
+    /// ([`StreamEncodeError::DimensionsChanged`] otherwise). A frame
+    /// scheduled as a key frame closes the in-progress group early so
+    /// the key frame starts a fresh group.
+    pub fn push_frame(
+        &mut self,
+        frame: &I420Frame<'_>,
+    ) -> Result<Vec<AltrefStreamPacket>, StreamEncodeError> {
+        let dims = (frame.width, frame.height);
+        match self.dimensions {
+            Some(locked) if locked != dims => {
+                return Err(StreamEncodeError::DimensionsChanged {
+                    first: locked,
+                    got: dims,
+                });
+            }
+            None => self.dimensions = Some(dims),
+            _ => {}
+        }
+        let mut out = Vec::new();
+        // A scheduled key frame closes the previous group early: the
+        // anchor of a group must not look across a key frame (the key
+        // frame resets all three slots anyway).
+        if self.is_key_index(self.input_count) && !self.pending.is_empty() {
+            self.flush_group(&mut out)?;
+        }
+        if self.pending.is_empty() {
+            self.pending_start = self.input_count;
+        }
+        self.pending.push(OwnedI420::from_frame(frame));
+        self.input_count += 1;
+        if self.pending.len() >= self.config.altref_window {
+            self.flush_group(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Drain the in-progress lookahead group (call once after the final
+    /// `push_frame`). Idempotent — a drained stream returns no packets.
+    pub fn finish(&mut self) -> Result<Vec<AltrefStreamPacket>, StreamEncodeError> {
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            self.flush_group(&mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Encode one completed lookahead group:
+    /// `[K?] [invisible anchor] [P …]`.
+    fn flush_group(&mut self, out: &mut Vec<AltrefStreamPacket>) -> Result<(), StreamEncodeError> {
+        let group = core::mem::take(&mut self.pending);
+        let start = self.pending_start;
+        let mut first_p = 0usize;
+
+        // Key frame: scheduled, or forced because the stream has no
+        // reference yet.
+        if self.is_key_index(start) || self.last.is_none() {
+            let (bytes, recon) =
+                encode_keyframe_with_reconstruction(&group[0].as_i420(), &self.config.params)?;
+            self.last = Some(recon.clone());
+            self.golden = Some(recon.clone());
+            self.altref = Some(recon);
+            out.push(AltrefStreamPacket {
+                bytes,
+                kind: AltrefPacketKind::Key,
+                source_index: Some(start),
+            });
+            first_p = 1;
+        }
+
+        let p_count = group.len() - first_p;
+
+        // Invisible anchor: only worth shipping when the group has ≥ 2
+        // frames of lookahead context and at least one P-frame to use
+        // it (a single-frame group's anchor would just duplicate that
+        // frame's own encode).
+        if p_count > 0 && group.len() >= 2 {
+            let views: Vec<I420Frame<'_>> = group.iter().map(|f| f.as_i420()).collect();
+            let anchor = crate::arnr::build_arnr_altref(&views, views.len() - 1, &self.config.arnr)
+                .map_err(StreamEncodeError::Frame)?;
+            let last_planes = self.last.as_ref().expect("keyframe path ran");
+            let (bytes, alt_recon) = crate::encoder::encode_invisible_altref_update(
+                &anchor.as_i420(),
+                last_planes,
+                self.golden.as_ref(),
+                self.altref.as_ref(),
+                &self.config.params,
+            )?;
+            self.altref = Some(alt_recon);
+            out.push(AltrefStreamPacket {
+                bytes,
+                kind: AltrefPacketKind::AltrefUpdate,
+                source_index: None,
+            });
+        }
+
+        // Visible P-frames — default §9.7 ladder (refresh_last = 1),
+        // per-MB LAST / GOLDEN / ALTREF selection.
+        for (j, frame) in group.iter().enumerate().skip(first_p) {
+            let last_planes = self.last.as_ref().expect("keyframe path ran");
+            let (bytes, recon) = encode_p_frame_multi_ref(
+                &frame.as_i420(),
+                last_planes,
+                self.golden.as_ref(),
+                self.altref.as_ref(),
+                &self.config.params,
+            )?;
+            self.last = Some(recon);
+            out.push(AltrefStreamPacket {
+                bytes,
+                kind: AltrefPacketKind::Inter,
+                source_index: Some(start + j as u64),
+            });
+        }
+        Ok(())
+    }
+}
+
 // ─────────────────────────────────── tests ────────────────────────────────────
 
 #[cfg(test)]

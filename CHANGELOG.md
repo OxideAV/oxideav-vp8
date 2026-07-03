@@ -38,6 +38,43 @@ them.
   untouched, and a measured payoff — the anchored P-frame is smaller
   than the same source encoded without the altref update.
 
+### Added — `Vp8AltrefStreamEncoder`: lagged auto-altref stream driver (round 384)
+
+The management layer that assembles the round's building blocks into a
+stream encoder with **automatic invisible-altref management** (the
+B-frame-less GOLDEN / ALTREF pattern): source frames buffer into
+lookahead groups; each completed group ships one invisible ARNR anchor
+(`arnr::build_arnr_altref` aligned to the group's last frame, sent via
+`encode_invisible_altref_update`) followed by the group's visible
+multi-reference P-frames, whose per-MB §16.2 `ref_frame` selector can
+predict from the never-displayed anchor.
+
+* **`Vp8AltrefStreamEncoder`** — lagged push API: `push_frame` returns
+  zero or more packets (nothing mid-group, the whole group at its
+  boundary), `finish()` drains the tail (idempotent). Dimensions lock at
+  the first frame; the encoder mirrors the decoder's §9.7 / §9.8 slot
+  ladder so every packet self-decodes in pixel lockstep.
+* **`AltrefStreamConfig`** — `params` (per-frame `KeyframeParams`),
+  `keyframe_interval` (key cadence in source frames; a scheduled key
+  closes the in-progress group early so anchors never look across a key
+  frame), `altref_window` (lookahead group size; `1` degenerates to
+  plain streaming, `0` is rejected at construction), `arnr` (filter
+  strength).
+* **`AltrefStreamPacket` / `AltrefPacketKind`** — emitted packets carry
+  their kind (`Key` / `AltrefUpdate` / `Inter`) and `source_index`
+  (`None` for invisible anchors — the stream emits more packets than
+  source frames; visible packets map 1:1 onto sources in order).
+* Measured (`tests/encoder_altref_stream.rs`, 12 noisy translating
+  64×64 frames, qi 44, window 4): the anchored stream's P-frames total
+  **5720 B vs 8281 B** for a no-anchor multi-ref baseline (−31 %), and
+  the whole stream *including* the keyframe and all three invisible
+  anchors (8428 B) still undercuts the baseline's keyframe + P bytes —
+  the anchors pay for themselves. Mean visible PSNR-Y vs the clean
+  (pre-noise) scene: 31.9 dB. The test also pins the packet structure
+  (1 K + 3 anchors + 11 P), the per-packet `last_frame_shown()`
+  visibility lockstep, the key-cadence early group close (keys at
+  0 / 5 / 10 with interval 5), and the dimension lock.
+
 ### Added — motion-compensated temporal filter for altref synthesis (round 384)
 
 The `arnr` module builds the *picture* the invisible altref-update frame

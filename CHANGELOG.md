@@ -38,6 +38,25 @@ them.
   untouched, and a measured payoff — the anchored P-frame is smaller
   than the same source encoded without the altref update.
 
+### Added — `Vp8Encoder::encode_sequence` batch front door (round 384)
+
+* The historical single-pass **`Vp8Encoder`** (previously
+  keyframe-only) gains **`encode_sequence(&[I420Frame])`**, driving the
+  lagged auto-altref pipeline and finally consuming the
+  `Vp8EncoderConfig` stream-level knobs that had been persisted but
+  dead since 0.1.13: **`alt_ref_interval`** is the lookahead group size
+  (`0` = plain streaming, no anchors), **`lookahead_window`** caps it,
+  and **`golden_interval`** sets the key-frame cadence of the sequence
+  (`0` keys only frame 0; scene cuts still force keys via the driver's
+  MAD detector). `qindex` / `lf_level` / `trellis_strength` apply per
+  frame as on `encode_keyframe`. Returns the decode-ordered
+  `AltrefStreamPacket` list (more packets than source frames) and
+  updates `Vp8EncoderStats` per packet. Pinned by
+  `vp8_encoder_encode_sequence_honours_the_config_knobs` (group / key
+  structure from the config knobs, stats bookkeeping, full stateful
+  decode with visibility lockstep, and the `alt_ref_interval = 0`
+  1-packet-per-frame degeneration).
+
 ### Added — scene-cut-aware group management in the auto-altref stream (round 384)
 
 * **`AltrefStreamConfig::scene_cut_mad_threshold`** (default `40.0`,

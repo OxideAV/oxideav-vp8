@@ -9795,6 +9795,83 @@ impl Vp8Encoder {
         self.stats.bytes_emitted += bytes.len() as u64;
         Ok(bytes)
     }
+
+    /// Encode a whole source sequence as an **auto-altref inter
+    /// stream** — the round-384 batch front door that finally consumes
+    /// the config's stream-level knobs:
+    ///
+    /// * [`alt_ref_interval`](Vp8EncoderConfig::alt_ref_interval) —
+    ///   the lookahead group size: every completed group ships one
+    ///   invisible ARNR anchor (§9.1 `show_frame = 0`, §9.7
+    ///   `refresh_alternate_frame = 1`) followed by the group's visible
+    ///   multi-reference P-frames. `0` disables anchors (plain
+    ///   streaming, group size 1).
+    /// * [`lookahead_window`](Vp8EncoderConfig::lookahead_window) —
+    ///   caps the group size (the encoder never buffers more source
+    ///   frames than this).
+    /// * [`golden_interval`](Vp8EncoderConfig::golden_interval) — used
+    ///   as the **key-frame cadence** of the sequence (`0` keys only
+    ///   frame 0); scene cuts additionally force keys via the stream
+    ///   driver's default MAD detector.
+    /// * `qindex` / `lf_level` / `trellis_strength` apply to every
+    ///   frame, exactly as on [`Self::encode_keyframe`].
+    ///
+    /// Returns the full packet list in decode order — **more packets
+    /// than source frames** (one invisible anchor per group; see
+    /// [`crate::stream::AltrefStreamPacket`]). Feed them to
+    /// [`crate::state::Vp8DecoderState::decode_frame`] in order; a
+    /// player drops packets whose
+    /// [`is_visible()`](crate::stream::AltrefStreamPacket::is_visible)
+    /// is `false`.
+    ///
+    /// [`auto_loop_filter`](Vp8EncoderConfig::auto_loop_filter) is not
+    /// applied on this path (the lagged driver runs the fixed
+    /// `lf_level`); an RD-selected loop filter for the sequence path
+    /// can layer on in a future round.
+    pub fn encode_sequence(
+        &mut self,
+        frames: &[I420Frame<'_>],
+    ) -> crate::error::Result<Vec<crate::stream::AltrefStreamPacket>> {
+        let window = if self.config.alt_ref_interval == 0 {
+            1
+        } else {
+            self.config
+                .alt_ref_interval
+                .min(self.config.lookahead_window.max(1)) as usize
+        };
+        let config = crate::stream::AltrefStreamConfig {
+            params: KeyframeParams {
+                y_ac_qi: self.config.qindex,
+                loop_filter_level: self.config.lf_level,
+                trellis_strength: self.config.trellis_strength,
+                ..KeyframeParams::default()
+            },
+            keyframe_interval: u64::from(self.config.golden_interval),
+            altref_window: window,
+            ..crate::stream::AltrefStreamConfig::default()
+        };
+        let mut enc = crate::stream::Vp8AltrefStreamEncoder::new(config)
+            .expect("window is clamped to >= 1 above");
+        let mut packets = Vec::new();
+        for frame in frames {
+            packets.extend(
+                enc.push_frame(frame)
+                    .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?,
+            );
+        }
+        packets.extend(
+            enc.finish()
+                .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?,
+        );
+        for p in &packets {
+            self.stats.frames_encoded += 1;
+            self.stats.bytes_emitted += p.bytes.len() as u64;
+            if p.kind == crate::stream::AltrefPacketKind::Key {
+                self.stats.keyframes_emitted += 1;
+            }
+        }
+        Ok(packets)
+    }
 }
 
 /// Two-pass encoder configuration.

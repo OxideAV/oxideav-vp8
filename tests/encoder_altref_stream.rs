@@ -428,3 +428,76 @@ fn scene_cut_closes_the_group_and_keys() {
         assert_eq!(visible, 10);
     }
 }
+
+/// The historical single-pass `Vp8Encoder` front door drives the same
+/// lagged pipeline via `encode_sequence`, consuming the config's
+/// stream-level knobs: `alt_ref_interval` → lookahead group size
+/// (capped by `lookahead_window`), `golden_interval` → key cadence.
+#[test]
+fn vp8_encoder_encode_sequence_honours_the_config_knobs() {
+    use oxideav_vp8::encoder::{Vp8Encoder, Vp8EncoderConfig};
+
+    let sources: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..10).map(noisy_frame).collect();
+    let config = Vp8EncoderConfig {
+        qindex: 44,
+        alt_ref_interval: 5,
+        lookahead_window: 16,
+        golden_interval: 0, // key only frame 0 on this path
+        ..Vp8EncoderConfig::default()
+    };
+    let mut enc = Vp8Encoder::new(config);
+    let frames: Vec<I420Frame<'_>> = sources
+        .iter()
+        .map(|(y, u, v)| I420Frame::packed(W as u32, H as u32, y, u, v))
+        .collect();
+    let packets = enc.encode_sequence(&frames).expect("sequence encodes");
+
+    // 10 frames at window 5 → 2 groups → 2 invisible anchors.
+    assert_eq!(packets.len(), 12);
+    assert_eq!(
+        packets
+            .iter()
+            .filter(|p| p.kind == AltrefPacketKind::AltrefUpdate)
+            .count(),
+        2
+    );
+    assert_eq!(
+        packets
+            .iter()
+            .filter(|p| p.kind == AltrefPacketKind::Key)
+            .count(),
+        1
+    );
+
+    // Stats reflect the emitted packets.
+    assert_eq!(enc.stats().frames_encoded, 12);
+    assert_eq!(enc.stats().keyframes_emitted, 1);
+    assert_eq!(
+        enc.stats().bytes_emitted,
+        packets.iter().map(|p| p.bytes.len() as u64).sum::<u64>()
+    );
+
+    // The whole stream decodes with correct visibility.
+    let mut dec = Vp8DecoderState::new();
+    let mut visible = 0usize;
+    for p in &packets {
+        dec.decode_frame(&p.bytes).expect("decodes");
+        assert_eq!(dec.last_frame_shown(), Some(p.is_visible()));
+        visible += usize::from(p.is_visible());
+    }
+    assert_eq!(visible, 10);
+
+    // alt_ref_interval = 0 → plain streaming: exactly one packet per
+    // source frame, no anchors.
+    let mut plain = Vp8Encoder::new(Vp8EncoderConfig {
+        qindex: 44,
+        alt_ref_interval: 0,
+        golden_interval: 0,
+        ..Vp8EncoderConfig::default()
+    });
+    let plain_packets = plain.encode_sequence(&frames).expect("plain encodes");
+    assert_eq!(plain_packets.len(), 10);
+    assert!(plain_packets
+        .iter()
+        .all(|p| p.kind != AltrefPacketKind::AltrefUpdate));
+}

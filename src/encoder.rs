@@ -7280,6 +7280,76 @@ pub fn encode_p_frame_multi_ref(
     )
 }
 
+/// Rewrite the §9.1 frame-tag `show_frame` bit in an already-assembled
+/// VP8 frame.
+///
+/// The §9.1 tag is a 3-byte little-endian word whose bit 4 is
+/// `show_frame` ("0 when current frame is not for display, 1 when
+/// current frame is for display"); the surrounding bits (`frame_type`,
+/// `version`, `first_partition_size`) are independent fields, so
+/// flipping bit 4 in byte 0 changes the frame's visibility and nothing
+/// else. Every partition boundary, probability, and coefficient byte
+/// stays untouched — the invisible wire is byte-identical to the
+/// visible one except for this single bit.
+pub(crate) fn set_show_frame_bit(frame: &mut [u8], show_frame: bool) {
+    debug_assert!(
+        frame.len() >= 3,
+        "a VP8 frame is at least the 3-byte §9.1 tag"
+    );
+    if let Some(b0) = frame.first_mut() {
+        if show_frame {
+            *b0 |= 0x10;
+        } else {
+            *b0 &= !0x10;
+        }
+    }
+}
+
+/// Encode an **invisible altref-update frame** — the §9.1 / §9.7
+/// building block of B-frame-less GOLDEN / ALTREF management.
+///
+/// The frame is a regular §16.2 multi-reference interframe (full
+/// motion-search / mode-decision walk, §11 intra-within-inter picker
+/// enabled) with two deliberate departures from the conventional
+/// P-frame pattern:
+///
+/// * the §9.7 / §9.8 refresh ladder is
+///   `refresh_alternate_frame = 1, refresh_last = 0` (GOLDEN untouched)
+///   — the reconstruction lands **only** in the ALTREF slot, so the
+///   LAST chain of the display sequence is not perturbed;
+/// * the §9.1 frame-tag `show_frame` bit is 0 ("not for display"), so
+///   a compliant player decodes the frame for its reference-slot side
+///   effects and drops the picture from presentation.
+///
+/// Feeding a *future* (or temporally-filtered) source picture through
+/// this entry gives subsequent P-frames a forward-looking prediction
+/// anchor via the per-MB §16.2 `ref_frame` selector — prediction from
+/// a picture that has never been displayed, without any bidirectional
+/// coding machinery. The returned reconstruction is exactly what the
+/// decoder's ALTREF slot will hold after it processes these bytes.
+///
+/// `last` / `golden` / `altref` are the encoder-side reference slots
+/// the update frame itself may predict from (same contract as
+/// [`encode_p_frame_multi_ref`]).
+pub fn encode_invisible_altref_update(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let refresh = RefreshControls {
+        refresh_alternate_frame: true,
+        refresh_last: false,
+        ..RefreshControls::default()
+    };
+    let (mut bytes, planes) = encode_p_frame_multi_ref_with_refresh_and_intra_pick(
+        frame, last, golden, altref, params, &refresh,
+    )?;
+    set_show_frame_bit(&mut bytes, false);
+    Ok((bytes, planes))
+}
+
 /// §16.2 multi-reference P-frame encoder with RD-selected §9.4
 /// `loop_filter_level` and the §11 intra-mode picker enabled.
 ///
@@ -11896,6 +11966,42 @@ mod tests {
         assert!(hdr.show_frame);
         assert!(hdr.key_frame);
         assert_eq!(hdr.first_partition_size, 1234);
+    }
+
+    /// `set_show_frame_bit` flips exactly the §9.1 bit-4 and preserves
+    /// every neighbouring tag field (frame_type / version /
+    /// first_partition_size) plus every byte after the tag.
+    #[test]
+    fn set_show_frame_bit_flips_only_bit_4() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_frame_tag(
+            &mut buf,
+            false, // inter frame
+            3,     // version=3
+            true,  // show=1
+            0x5_4321,
+            16,
+            16,
+            ScaleCode::None,
+            ScaleCode::None,
+        )
+        .unwrap();
+        buf.extend_from_slice(&[0xAA, 0x55, 0xF0]); // fake payload
+        let visible = buf.clone();
+
+        set_show_frame_bit(&mut buf, false);
+        let hdr = Vp8FrameHeader::parse(&buf).unwrap();
+        assert!(!hdr.key_frame);
+        assert_eq!(hdr.version, 3);
+        assert!(!hdr.show_frame);
+        assert_eq!(hdr.first_partition_size, 0x5_4321);
+        // Only byte 0 differs, and only in bit 4.
+        assert_eq!(buf[0] ^ visible[0], 0x10);
+        assert_eq!(&buf[1..], &visible[1..]);
+
+        // Round-trip back to visible restores the original bytes.
+        set_show_frame_bit(&mut buf, true);
+        assert_eq!(buf, visible);
     }
 
     /// Dimensions outside the 14-bit field are rejected.

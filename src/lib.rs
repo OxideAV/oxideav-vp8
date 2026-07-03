@@ -420,7 +420,7 @@ pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_M
 pub use encoder::{
     classify_coeff_token, count_block_branches, count_inter_frame_branches,
     count_keyframe_branches, count_mb_branches, empty_branch_counts, encode_coeff_block,
-    encode_keyframe, encode_keyframe_adaptive_quant,
+    encode_invisible_altref_update, encode_keyframe, encode_keyframe_adaptive_quant,
     encode_keyframe_adaptive_quant_with_reconstruction,
     encode_keyframe_adaptive_quant_with_reconstruction_and_trellis,
     encode_keyframe_adaptive_quant_with_trellis, encode_keyframe_auto_loop_filter,

@@ -4,6 +4,40 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — §9.1 / §9.7 invisible altref-update frames (round 384)
+
+First milestone of B-frame-less GOLDEN / ALTREF management: the encoder
+can now emit **invisible frames** (§9.1 `show_frame = 0`, "not for
+display") that install a prediction-only picture into the ALTREF slot,
+and the decoder surfaces the visibility bit so players can suppress
+them.
+
+* **`encode_invisible_altref_update`** — encodes a source picture as a
+  full §16.2 multi-reference interframe (motion search + §11
+  intra-within-inter picker) with the §9.7 ladder
+  `refresh_alternate_frame = 1, refresh_last = 0` and the §9.1
+  `show_frame` bit cleared. The reconstruction lands only in ALTREF;
+  the LAST display chain is untouched. Feeding a *future* source
+  picture through it gives subsequent P-frames a forward-looking
+  prediction anchor via the per-MB §16.2 `ref_frame` selector — the
+  altref slot's intended use, with no bidirectional machinery.
+* The §9.1 tag layout makes visibility a single independent bit (bit 4
+  of byte 0), so the invisible wire is **byte-identical to its visible
+  twin except that one bit** — pinned by
+  `set_show_frame_bit_flips_only_bit_4` (unit) and the twin-diff leg of
+  the new integration test.
+* **`Vp8DecoderState::last_frame_shown()`** — `Some(false)` after
+  decoding a frame whose §9.1 `show_frame` bit is 0 (the caller should
+  drop the returned picture from display; the §9.7 reference side
+  effects are applied either way), `Some(true)` after a visible frame,
+  `None` before any successful decode.
+* `tests/encoder_altref_invisible.rs` drives the full K → invisible
+  altref (future picture) → P sequence through the stateful decoder:
+  pixel lockstep on all three frames, `last_frame_shown` flag sequence,
+  proof that the invisible frame leaves the decoder's LAST slot
+  untouched, and a measured payoff — the anchored P-frame is smaller
+  than the same source encoded without the altref update.
+
 ### Added — §13 trellis aggressiveness `TrellisStrength` quality/size knob (round 379)
 
 The §13 coefficient-level RDO trellis previously ran at a single

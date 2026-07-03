@@ -354,6 +354,13 @@ pub struct Vp8DecoderState {
     /// Visible height carried across frames — same semantics as
     /// [`visible_width`](Self::visible_width).
     visible_height: Option<u32>,
+    /// §9.1 `show_frame` bit of the most recently decoded frame.
+    /// `Some(false)` after an "invisible" frame (§9.1: "0 when current
+    /// frame is not for display") — typically an altref-update frame
+    /// that rotates the §9.7 reference slots without contributing a
+    /// picture to the presentation sequence. `None` before any frame
+    /// has been decoded successfully.
+    last_frame_shown: Option<bool>,
 }
 
 impl Default for Vp8DecoderState {
@@ -379,6 +386,7 @@ impl Vp8DecoderState {
             mode_lf_deltas: [0; 4],
             visible_width: None,
             visible_height: None,
+            last_frame_shown: None,
         }
     }
 
@@ -407,11 +415,33 @@ impl Vp8DecoderState {
     /// predict from.
     pub fn decode_frame(&mut self, bytes: &[u8]) -> Result<Vp8DecodedFrame, DecodeError> {
         let header = Vp8FrameHeader::parse(bytes)?;
-        if header.key_frame {
+        let shown = header.show_frame;
+        let decoded = if header.key_frame {
             self.decode_key_frame(&header, bytes)
         } else {
             self.decode_inter_frame(&header, bytes)
-        }
+        }?;
+        // Record the §9.1 show_frame bit only once the frame has decoded
+        // successfully — a failed decode leaves the previous frame's
+        // visibility (like every other piece of carried state).
+        self.last_frame_shown = Some(shown);
+        Ok(decoded)
+    }
+
+    /// §9.1 `show_frame` bit of the most recently decoded frame.
+    ///
+    /// Returns `Some(false)` when that frame was an "invisible" frame —
+    /// §9.1 defines `show_frame` as "0 when current frame is not for
+    /// display, 1 when current frame is for display". Encoders use
+    /// invisible frames to install a prediction-only picture into the
+    /// §9.7 GOLDEN / ALTREF slots (e.g. a temporally-filtered altref)
+    /// without adding it to the presentation sequence, so a playback
+    /// caller should drop the returned picture from display when this
+    /// reads `Some(false)` (the reference-slot side effects have already
+    /// been applied either way). `None` before any frame has been
+    /// decoded successfully.
+    pub fn last_frame_shown(&self) -> Option<bool> {
+        self.last_frame_shown
     }
 
     /// Key-frame decode path — re-uses [`decode_vp8`](crate::decoder::decode_vp8)

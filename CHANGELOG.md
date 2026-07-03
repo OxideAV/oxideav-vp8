@@ -4,6 +4,63 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.4...v0.2.5) - 2026-07-03
+
+### Fixed
+
+- *(reconstruct)* expand bug_u predict call to satisfy CI rustfmt
+- *(reconstruct)* B_PRED off-frame chroma top-left must default to 127, not 0
+
+### Other
+
+- iterate the delta tables instead of range-indexing (clippy 1.96 needless_range_loop)
+- document the round-387 composable coding options, lagged registry adapter and segmentation depth
+- §9.3/§10 segmentation layer on the lagged altref driver
+- §9.3/§10 segment-based adaptive quantisation on P-frames
+- fix intra-pick walk double-pushing split_candidates
+- §10 per-segment loop-filter feature on the adaptive-quant keyframe
+- lagged send_frame/flush semantics on the config-path Encoder adapter
+- auto-LF / fitted §13.4 / intra-pick toggles on the lagged altref driver
+- fitted keyframes must not persist their §13.4 table (§9.10)
+- composable KeyframeCodingOptions / InterCodingOptions front doors
+- document the round-384 golden/altref management subsystem
+- Vp8Encoder::encode_sequence — auto-altref batch front door
+- scene-cut-aware group management in the auto-altref driver
+- altref_stream_encode_decode — lagged auto-altref driver oracle
+- §9.7 ALTREF→GOLDEN copy-ladder promotion in the auto-altref driver
+- Vp8AltrefStreamEncoder — lagged auto-altref group encoding
+- motion-compensated temporal filter for altref synthesis
+- §9.1/§9.7 invisible altref-update frames + decoder visibility surface
+- cover the TrellisStrength knob + repair KeyframeParams/two-pass targets
+- extend the TrellisStrength knob to the segment adaptive-quant path
+- quality_to_trellis_strength pairs the quality dial with the §13 trellis
+- thread TrellisStrength through two-pass + registry encode front doors
+- thread the TrellisStrength knob through the intra-within-P + inter pick
+- expose §13 trellis aggressiveness as the TrellisStrength quality/size knob
+- measured PSNR test for auto loop-filter (+ inter-stream caveat)
+- honour auto loop-filter + lf_level in the single-pass config + factory
+- jointly RD-select §15.4 sharpness_level with the loop-filter level
+- wire §9.4 RD auto loop-filter into the two-pass stream encoder
+- extend §9.4 RD loop-filter-level auto-selection to the inter path
+- §9.4 RD loop-filter-level auto-selection (keyframe)
+- extend §13 trellis RDO to the motion-compensated inter emit
+- extend §13 trellis RDO to the intra-within-P-frame path
+- §13 trellis coefficient-level RDO quantisation on the keyframe paths
+- document closed-loop bitrate-targeting two-pass mode (round 354)
+- closed-loop bitrate feedback in Vp8TwoPassEncoder (round 354)
+- bitrate-budget solver for two-pass rate control (round 354)
+- clean-room bit-cost model for rate control (round 354)
+- document §9.3/§10 segment-based adaptive-quant encoder (round 346)
+- adaptive_quant_encode_decode_lockstep target (round 346)
+- §9.3/§10 segment-based adaptive-quant keyframe encoder (round 346)
+- §9.3 update_segmentation() writer + §10 per-MB segment_id emission (round 346)
+- route §12.3 B_TM_PRED through the shared SIMD TM kernel (round 334)
+- §12.2 DC edge-sum SIMD reduction (round 329)
+- add panic_free_split_mv_predict (§16.4/§18 whole-MB SPLITMV synthesiser)
+- §15 SIMD kernels — −44% whole-frame keyframe deblock (round 314)
+- refresh to current status, drop per-round changelog cruft
+- automatic §9.7 golden-frame refresh cadence on Vp8InterStreamEncoder
+
 ### Fixed — §9.10 entropy persistence after a key frame with §13.4 updates (round 387)
 
 A key frame that carried a §13.4 `token_prob_update()` payload wrote

@@ -37,7 +37,7 @@
 //! | `[3]` | `loop_filter_level` (`% 64`) |
 //! | `[4]` | `altref_window` (`b % 6` — `0` pins the constructor rejection) |
 //! | `[5]` | `keyframe_interval` (`b % 8`) |
-//! | `[6]` | ARNR strength raw byte (full range — `ArnrConfig::new` clamps) |
+//! | `[6]` | low nibble: ARNR strength (`ArnrConfig::new` clamps); high nibble × 8: scene-cut MAD threshold (0 disables) |
 //! | `[7]` | bit 0: `golden_promotion`; bits 1..: frame count seed |
 //! | `[8..]` | per-frame fill seeds, then tiled pixel payload |
 //!
@@ -76,8 +76,12 @@ fuzz_target!(|data: &[u8]| {
         params,
         keyframe_interval: u64::from(data[5] % 8),
         altref_window,
-        arnr: ArnrConfig::new(data[6]),
+        arnr: ArnrConfig::new(data[6] & 0x0f),
         golden_promotion: (data[7] & 0x01) != 0,
+        // High nibble of the strength byte drives the scene-cut
+        // threshold (0 disables; up to MAD 120 — fuzz fills routinely
+        // jump whole flat levels, so cuts really fire).
+        scene_cut_mad_threshold: f64::from(data[6] >> 4) * 8.0,
     };
 
     let mut enc = match Vp8AltrefStreamEncoder::new(config) {

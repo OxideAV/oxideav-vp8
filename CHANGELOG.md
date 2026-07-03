@@ -38,6 +38,23 @@ them.
   untouched, and a measured payoff — the anchored P-frame is smaller
   than the same source encoded without the altref update.
 
+### Added — scene-cut-aware group management in the auto-altref stream (round 384)
+
+* **`AltrefStreamConfig::scene_cut_mad_threshold`** (default `40.0`,
+  `0.0` disables) — a per-push scene-cut detector on the lagged
+  driver: when a frame's mean absolute luma difference against its
+  predecessor exceeds the threshold, the in-progress lookahead group
+  is closed *before* the frame and the frame is coded as a **key
+  frame**, even off the scheduled cadence. Rationale: an ARNR anchor
+  must not blend across a cut (the per-block SAD guard already keeps
+  foreign pixels out of the blend, but a cross-cut group would still
+  waste an anchor and chain P-frames off dead references), and the new
+  scene cannot predict from the old one anyway.
+  `scene_cut_closes_the_group_and_keys` pins the detector (an inverted
+  scene at frame 6 keys at 0 / 6 with detection on, 0 only with it
+  off, both wires decoding cleanly), and the fuzz target drives the
+  threshold across `0..=120`.
+
 ### Added — fuzz target for the auto-altref stream layer (round 384)
 
 * **`altref_stream_encode_decode`** — drives fuzz-chosen

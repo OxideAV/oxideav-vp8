@@ -295,6 +295,7 @@ fn golden_promotion_installs_the_anchor_into_golden() {
             altref_window: 4,
             arnr: ArnrConfig::default(),
             golden_promotion: promotion,
+            ..AltrefStreamConfig::default()
         };
         let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
         let mut packets = Vec::new();
@@ -351,5 +352,79 @@ fn golden_promotion_installs_the_anchor_into_golden() {
                 }
             }
         }
+    }
+}
+
+/// Scene-cut detection: a hard content change mid-stream must close the
+/// running lookahead group *before* the cut frame and code the cut
+/// frame as a key frame, so no anchor blends across the cut and no
+/// P-frame chains off dead references. With detection disabled
+/// (`scene_cut_mad_threshold = 0.0`) the same content stays on the pure
+/// count-based grouping (no key at the cut).
+#[test]
+fn scene_cut_closes_the_group_and_keys() {
+    // Scene A: frames 0..6 (translating texture). Scene B: frames
+    // 6..10 — inverted luma, a whole-frame MAD far above the default
+    // threshold.
+    let source = |t: usize| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (mut y, u, v) = noisy_frame(t);
+        if t >= 6 {
+            for px in y.iter_mut() {
+                *px = 255 - *px;
+            }
+        }
+        (y, u, v)
+    };
+    let params = KeyframeParams {
+        y_ac_qi: 44,
+        ..KeyframeParams::default()
+    };
+    for detect in [true, false] {
+        let config = AltrefStreamConfig {
+            params,
+            keyframe_interval: 0,
+            altref_window: 4,
+            arnr: ArnrConfig::default(),
+            scene_cut_mad_threshold: if detect { 40.0 } else { 0.0 },
+            ..AltrefStreamConfig::default()
+        };
+        let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
+        let mut packets = Vec::new();
+        for t in 0..10usize {
+            let (y, u, v) = source(t);
+            let frame = I420Frame::packed(W as u32, H as u32, &y, &u, &v);
+            packets.extend(enc.push_frame(&frame).expect("push"));
+        }
+        packets.extend(enc.finish().expect("finish"));
+
+        let key_indices: Vec<u64> = packets
+            .iter()
+            .filter(|p| p.kind == AltrefPacketKind::Key)
+            .map(|p| p.source_index.expect("keys are visible"))
+            .collect();
+        if detect {
+            assert_eq!(
+                key_indices,
+                vec![0, 6],
+                "the cut frame must be keyed and must start its own group"
+            );
+        } else {
+            assert_eq!(
+                key_indices,
+                vec![0],
+                "without detection only the scheduled key remains"
+            );
+        }
+
+        // Either wire decodes cleanly end-to-end with correct
+        // visibility bookkeeping.
+        let mut dec = Vp8DecoderState::new();
+        let mut visible = 0usize;
+        for p in &packets {
+            dec.decode_frame(&p.bytes).expect("decodes");
+            assert_eq!(dec.last_frame_shown(), Some(p.is_visible()));
+            visible += usize::from(p.is_visible());
+        }
+        assert_eq!(visible, 10);
     }
 }

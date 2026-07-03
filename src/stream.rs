@@ -2100,11 +2100,23 @@ pub struct AltrefStreamConfig {
     /// next one. `false` leaves GOLDEN pinned at the most recent key
     /// frame.
     pub golden_promotion: bool,
+    /// Scene-cut detector threshold, in mean-absolute-luma-difference
+    /// per pixel against the previously pushed frame (`0.0..=255.0`).
+    /// When a pushed frame's MAD against its predecessor exceeds the
+    /// threshold, the in-progress group is closed **before** the frame
+    /// enters the buffer and the frame is coded as a key frame: an
+    /// anchor must not blend across a cut (per-block SAD rejection
+    /// already keeps foreign content out of the blend, but a
+    /// cross-scene group would still waste an anchor and chain
+    /// P-frames off dead references). `0.0` disables detection (the
+    /// pure count-based grouping). Default `40.0` — far above photo
+    /// noise / motion MAD, comfortably below a full scene change.
+    pub scene_cut_mad_threshold: f64,
 }
 
 impl Default for AltrefStreamConfig {
     /// Key the first frame only, 8-frame lookahead groups, default
-    /// ARNR strength, GOLDEN promotion on.
+    /// ARNR strength, GOLDEN promotion on, scene-cut keying at MAD 40.
     fn default() -> Self {
         AltrefStreamConfig {
             params: KeyframeParams::default(),
@@ -2112,6 +2124,7 @@ impl Default for AltrefStreamConfig {
             altref_window: 8,
             arnr: crate::arnr::ArnrConfig::default(),
             golden_promotion: true,
+            scene_cut_mad_threshold: 40.0,
         }
     }
 }
@@ -2230,12 +2243,36 @@ pub struct Vp8AltrefStreamEncoder {
     pending: Vec<OwnedI420>,
     /// Source index of `pending[0]`.
     pending_start: u64,
+    /// `true` when `pending[0]` entered on a detected scene cut, so
+    /// [`Self::flush_group`] must key it even off the scheduled
+    /// cadence.
+    pending_forced_key: bool,
+    /// Copy of the most recently pushed source frame — the scene-cut
+    /// detector's comparison baseline (spans group boundaries).
+    last_pushed: Option<OwnedI420>,
     /// Total source frames pushed.
     input_count: u64,
     /// §9 reference slots (encoder-side mirror of the decoder's).
     last: Option<KeyframePlanes>,
     golden: Option<KeyframePlanes>,
     altref: Option<KeyframePlanes>,
+}
+
+/// Mean absolute luma difference per pixel between the previous
+/// (packed) frame and the incoming (possibly strided) one — the
+/// scene-cut metric. Both frames are dimension-locked by the caller.
+fn luma_mad(prev: &OwnedI420, frame: &I420Frame<'_>) -> f64 {
+    let w = prev.width as usize;
+    let h = prev.height as usize;
+    let mut sad = 0u64;
+    for r in 0..h {
+        let a = &prev.y[r * w..r * w + w];
+        let b = &frame.y[r * frame.y_stride..r * frame.y_stride + w];
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            sad += u64::from(x.abs_diff(y));
+        }
+    }
+    sad as f64 / (w * h) as f64
 }
 
 impl Vp8AltrefStreamEncoder {
@@ -2251,6 +2288,8 @@ impl Vp8AltrefStreamEncoder {
             dimensions: None,
             pending: Vec::new(),
             pending_start: 0,
+            pending_forced_key: false,
+            last_pushed: None,
             input_count: 0,
             last: None,
             golden: None,
@@ -2303,16 +2342,27 @@ impl Vp8AltrefStreamEncoder {
             _ => {}
         }
         let mut out = Vec::new();
-        // A scheduled key frame closes the previous group early: the
-        // anchor of a group must not look across a key frame (the key
-        // frame resets all three slots anyway).
-        if self.is_key_index(self.input_count) && !self.pending.is_empty() {
+        // Scene-cut detection: a frame whose luma MAD against its
+        // predecessor exceeds the configured threshold starts new
+        // content — close the running group *before* it (an anchor
+        // must not blend across the cut) and key it.
+        let scene_cut = self.config.scene_cut_mad_threshold > 0.0
+            && self
+                .last_pushed
+                .as_ref()
+                .is_some_and(|prev| luma_mad(prev, frame) > self.config.scene_cut_mad_threshold);
+        // A scheduled key frame closes the previous group early too:
+        // the anchor of a group must not look across a key frame (the
+        // key frame resets all three slots anyway).
+        if (scene_cut || self.is_key_index(self.input_count)) && !self.pending.is_empty() {
             self.flush_group(&mut out)?;
         }
         if self.pending.is_empty() {
             self.pending_start = self.input_count;
+            self.pending_forced_key = scene_cut;
         }
         self.pending.push(OwnedI420::from_frame(frame));
+        self.last_pushed = Some(self.pending.last().expect("just pushed").clone());
         self.input_count += 1;
         if self.pending.len() >= self.config.altref_window {
             self.flush_group(&mut out)?;
@@ -2335,11 +2385,12 @@ impl Vp8AltrefStreamEncoder {
     fn flush_group(&mut self, out: &mut Vec<AltrefStreamPacket>) -> Result<(), StreamEncodeError> {
         let group = core::mem::take(&mut self.pending);
         let start = self.pending_start;
+        let forced_key = core::mem::take(&mut self.pending_forced_key);
         let mut first_p = 0usize;
 
-        // Key frame: scheduled, or forced because the stream has no
-        // reference yet.
-        if self.is_key_index(start) || self.last.is_none() {
+        // Key frame: scheduled, scene-cut-forced, or forced because
+        // the stream has no reference yet.
+        if self.is_key_index(start) || forced_key || self.last.is_none() {
             let (bytes, recon) =
                 encode_keyframe_with_reconstruction(&group[0].as_i420(), &self.config.params)?;
             self.last = Some(recon.clone());

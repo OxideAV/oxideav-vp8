@@ -50,9 +50,45 @@ Decoder and encoder are both at production status.
   closes groups and forces keys at content changes. On 12 noisy
   translating frames at qi 44 the anchored P-frames total −31 % bytes
   vs a no-anchor multi-ref baseline, anchors included the stream is
-  still smaller. Also reachable as `Vp8Encoder::encode_sequence`
+  still smaller. Round 387 made the per-frame quality features
+  **composable** (`KeyframeCodingOptions` / `InterCodingOptions` — the
+  §11 intra picker, §9.4 auto loop-filter and two-pass §13.4 fitted
+  token-prob updates now combine freely) and threaded them through the
+  driver as `AltrefStreamConfig` toggles: on the 12-frame ARNR sequence
+  the fitter alone is −8.2 % stream bytes at equal PSNR, all three
+  toggles −17.5 % at equal-or-better PSNR, black-box verified by an
+  `ffmpeg` cross-decode that matches our decoder **byte-exactly** on
+  every visible frame. Also reachable as `Vp8Encoder::encode_sequence`
   (consuming `Vp8EncoderConfig::alt_ref_interval` /
-  `lookahead_window` / `golden_interval`).
+  `lookahead_window` / `golden_interval` / `auto_loop_filter`) and, on
+  the framework side, as the **lagged `oxideav_core::Encoder` adapter**
+  behind `make_encoder_with_config` (`send_frame` buffers lookahead
+  groups, `receive_packet` surfaces `NeedMore` mid-group, `flush`
+  drains the tail; invisible anchors carry `pts = None`, only key
+  frames set `flags.keyframe`; `alt_ref_interval = 0` restores zero-lag
+  K/P streaming — the still-image `make_encoder` /
+  `make_encoder_with_quality` doors keep their historical
+  keyframe-per-frame contract).
+* **Segmentation depth (round 387)** — the §9.3
+  `update_segment_feature_data` block is now complete on both frame
+  kinds: the adaptive-quant keyframe gained the per-segment
+  **loop-filter feature**
+  (`encode_keyframe_adaptive_quant_with_segment_lf_deltas`), and
+  P-frames gained the full **segment-based adaptive quantisation**
+  layer (`InterSegmentationConfig` /
+  `encode_p_frame_multi_ref_adaptive_quant`, also an
+  `AltrefStreamConfig.segmentation` stream knob): per-MB §10 variance
+  classification, per-segment quantisers driving the RD walk,
+  distribution-fitted `mb_segment_tree_probs`, per-MB `segment_id` in
+  the §11 / §16 mode layer, and the §20.6 per-segment filter override —
+  every shape `ffmpeg`-cross-decoded byte-exact. Round 387 also fixed
+  two latent encoder bugs: fitted key frames now write
+  `refresh_entropy_probs = 0` so the carried entropy base stays at the
+  §13.5 defaults every inter encoder assumes (was: silent pixel drift
+  on the first P-frame after a fitted key frame), and the intra-pick
+  walk no longer double-pushes its §16.4 `split_candidates` slot (was:
+  wrong split data — or a panic — whenever an intra MB preceded a
+  SPLITMV MB).
 * The full public surface is reachable both with the default
   `registry` build and under `--no-default-features`; a compile-only
   assertion suite lives in

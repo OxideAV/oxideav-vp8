@@ -20,6 +20,27 @@ key-frame reset state, i.e. the defaults); update-free key frames keep
 the historical `1` bit-for-bit. Pinned by
 `fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
 
+### Changed — registry `Encoder` adapter: real lag/flush semantics (round 387)
+
+`make_encoder_with_config` no longer re-keys every `send_frame`: it now
+returns a **lagged inter-stream adapter** (`Vp8LaggedEncoder`) wrapping
+the auto-altref stream driver, finally consuming the config's
+stream-level knobs. `alt_ref_interval` sets the lookahead group size
+(`0` = zero-lag K/P streaming with immediate packets, no anchors),
+`lookahead_window` caps it, `golden_interval` is the key-frame cadence,
+`auto_loop_filter` RD-selects the §9.4 level per frame; the §13.4
+fitted emission + §11 intra picker are always on (never-grow guards).
+Protocol: `receive_packet` surfaces `NeedMore` while a group fills,
+`flush` drains the tail and arms `Eof`; visible packets carry their
+source `pts` in order, invisible anchors carry `pts = None`, and only
+key frames set `flags.keyframe`. Pinned by
+`tests/registry_lagged_encoder.rs`.
+
+The still-image doors (`make_encoder`, `make_encoder_with_qindex`,
+`make_encoder_with_quality`) keep the historical zero-latency
+one-keyframe-per-`send_frame` contract byte-for-byte — the RIFF-VP8
+image consumers' path is untouched.
+
 ### Added — lagged altref driver feature toggles + batch front door upgrade (round 387)
 
 * **`AltrefStreamConfig.auto_loop_filter` / `.fitted_token_prob_updates`

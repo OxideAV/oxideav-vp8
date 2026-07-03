@@ -146,7 +146,11 @@ fn make_encoder_with_config_auto_loop_filter_flows_through() {
             },
         ],
     };
+    // Round-387: the config path is the lagged inter-stream adapter —
+    // a single frame buffers into the lookahead group, so the packet
+    // only becomes available after `flush` drains the tail group.
     enc.send_frame(&Frame::Video(vframe)).expect("send_frame");
+    enc.flush().expect("flush");
     let pkt = enc.receive_packet().expect("receive_packet");
     assert!(pkt.flags.keyframe);
 

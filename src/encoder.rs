@@ -9611,24 +9611,28 @@ mod factory {
     /// [`super::TrellisStrength::DEFAULT`] trade while a low-quality
     /// request also lets the trellis shave coefficient bits harder, so the
     /// single quality dial tunes both the quantiser and the trellis.
+    ///
+    /// Like [`make_encoder`] / [`make_encoder_with_qindex`], this is a
+    /// **zero-latency single-frame door**: every `send_frame` emits one
+    /// key frame packet immediately (the still-image contract the
+    /// RIFF-VP8 image consumers rely on). The lagged inter-stream
+    /// semantics live on the [`super::make_encoder_with_config`] path.
     pub fn make_encoder_with_quality(
         params: &CodecParameters,
         quality: f32,
     ) -> Result<Box<dyn Encoder>> {
-        let config = super::Vp8EncoderConfig {
-            qindex: super::quality_to_qindex(quality),
+        let (width, height, pixel_format) = validate_video_params(params)?;
+        let keyframe = KeyframeParams {
+            y_ac_qi: super::quality_to_qindex(quality),
             trellis_strength: super::quality_to_trellis_strength(quality),
-            ..super::Vp8EncoderConfig::default()
+            ..KeyframeParams::default()
         };
-        make_encoder_from_config(params, config)
+        build_frame_encoder(params, width, height, pixel_format, keyframe, false)
     }
 
-    /// Build a framework-side VP8 encoder with an explicit VP8 §9.6
-    /// `y_ac_qi` quantiser index (`0..=127`, lower = better).
-    pub fn make_encoder_with_qindex(
-        params: &CodecParameters,
-        qindex: u8,
-    ) -> Result<Box<dyn Encoder>> {
+    /// Shared `CodecParameters` validation for every factory entry:
+    /// positive dimensions inside the §9.1 14-bit fields, Yuv420P only.
+    fn validate_video_params(params: &CodecParameters) -> Result<(u32, u32, PixelFormat)> {
         let width = params
             .width
             .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
@@ -9651,6 +9655,16 @@ mod factory {
                 "vp8 encoder: only PixelFormat::Yuv420P is supported",
             ));
         }
+        Ok((width, height, pixel_format))
+    }
+
+    /// Build a framework-side VP8 encoder with an explicit VP8 §9.6
+    /// `y_ac_qi` quantiser index (`0..=127`, lower = better).
+    pub fn make_encoder_with_qindex(
+        params: &CodecParameters,
+        qindex: u8,
+    ) -> Result<Box<dyn Encoder>> {
+        let (width, height, pixel_format) = validate_video_params(params)?;
         if qindex > 127 {
             return Err(Error::invalid(
                 "vp8 encoder: qindex out of range (must be 0..=127)",
@@ -9663,37 +9677,39 @@ mod factory {
         build_frame_encoder(params, width, height, pixel_format, keyframe, false)
     }
 
-    /// Build a framework-side VP8 encoder from a full
-    /// [`super::Vp8EncoderConfig`]: honours `qindex`, the §9.4 `lf_level`,
-    /// and the `auto_loop_filter` RD-selection switch (when set,
-    /// `lf_level` is ignored and the §9.4 level / sharpness are chosen per
-    /// frame).
+    /// Build a framework-side **lagged inter-stream** VP8 encoder from a
+    /// full [`super::Vp8EncoderConfig`] — the round-387 upgrade that
+    /// finally makes the `Box<dyn Encoder>` adapter consume the config's
+    /// stream-level knobs instead of re-keying every frame:
+    ///
+    /// * `qindex` / `lf_level` / `trellis_strength` — per-frame encode
+    ///   parameters (as before);
+    /// * `auto_loop_filter` — RD-selected §9.4 level / sharpness per
+    ///   emitted frame (`lf_level` ignored when set);
+    /// * `alt_ref_interval` — lookahead group size: each completed group
+    ///   ships one invisible ARNR anchor followed by its visible
+    ///   multi-reference P-frames. `0` disables anchors (group size 1 —
+    ///   zero lag, K/P streaming with immediate packet availability);
+    /// * `lookahead_window` — caps the group size;
+    /// * `golden_interval` — key-frame cadence in source frames (`0`
+    ///   keys only frame 0); scene cuts force additional keys.
+    ///
+    /// The returned encoder follows the standard lagged
+    /// [`Encoder`] protocol: `send_frame` may buffer (`receive_packet`
+    /// surfaces [`Error::NeedMore`] while a lookahead group is
+    /// filling), `flush` drains the tail group, and the stream emits
+    /// **more packets than source frames** (invisible anchor packets
+    /// carry `pts = None` and `flags.keyframe = false`; a muxer stores
+    /// them in decode order, a player never displays them). Like
+    /// [`super::Vp8Encoder::encode_sequence`], the §13.4 fitted
+    /// token-prob-update emission and the §11 intra-within-inter picker
+    /// are enabled on every frame (never-grow byte guards; the cost is
+    /// a second encode pass per frame).
     pub(crate) fn make_encoder_from_config(
         params: &CodecParameters,
         config: super::Vp8EncoderConfig,
     ) -> Result<Box<dyn Encoder>> {
-        let width = params
-            .width
-            .ok_or_else(|| Error::invalid("vp8 encoder: missing width"))?;
-        let height = params
-            .height
-            .ok_or_else(|| Error::invalid("vp8 encoder: missing height"))?;
-        if width == 0 || height == 0 {
-            return Err(Error::invalid(
-                "vp8 encoder: width and height must be positive",
-            ));
-        }
-        if width > 0x3FFF || height > 0x3FFF {
-            return Err(Error::invalid(
-                "vp8 encoder: width/height exceed VP8 14-bit field (max 16383)",
-            ));
-        }
-        let pixel_format = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        if pixel_format != PixelFormat::Yuv420P {
-            return Err(Error::unsupported(
-                "vp8 encoder: only PixelFormat::Yuv420P is supported",
-            ));
-        }
+        let (width, height, pixel_format) = validate_video_params(params)?;
         if config.qindex > 127 {
             return Err(Error::invalid(
                 "vp8 encoder: qindex out of range (must be 0..=127)",
@@ -9704,20 +9720,159 @@ mod factory {
                 "vp8 encoder: lf_level out of range (must be 0..=63)",
             ));
         }
-        let keyframe = KeyframeParams {
-            y_ac_qi: config.qindex,
-            loop_filter_level: config.lf_level,
-            trellis_strength: config.trellis_strength,
-            ..KeyframeParams::default()
+
+        let mut output_params = params.clone();
+        output_params.media_type = MediaType::Video;
+        output_params.codec_id = CodecId::new(VP8_CODEC_ID);
+        output_params.width = Some(width);
+        output_params.height = Some(height);
+        output_params.pixel_format = Some(pixel_format);
+        let time_base = params
+            .frame_rate
+            .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num));
+
+        // Same knob mapping as `Vp8Encoder::encode_sequence`.
+        let window = if config.alt_ref_interval == 0 {
+            1
+        } else {
+            config.alt_ref_interval.min(config.lookahead_window.max(1)) as usize
         };
-        build_frame_encoder(
-            params,
+        let stream_config = crate::stream::AltrefStreamConfig {
+            params: KeyframeParams {
+                y_ac_qi: config.qindex,
+                loop_filter_level: config.lf_level,
+                trellis_strength: config.trellis_strength,
+                ..KeyframeParams::default()
+            },
+            keyframe_interval: u64::from(config.golden_interval),
+            altref_window: window,
+            auto_loop_filter: config.auto_loop_filter,
+            fitted_token_prob_updates: true,
+            intra_pick: true,
+            ..crate::stream::AltrefStreamConfig::default()
+        };
+        let stream = crate::stream::Vp8AltrefStreamEncoder::new(stream_config)
+            .expect("window is clamped to >= 1 above");
+
+        Ok(Box::new(Vp8LaggedEncoder {
+            output_params,
             width,
             height,
-            pixel_format,
-            keyframe,
-            config.auto_loop_filter,
-        )
+            stream,
+            time_base,
+            pts_queue: VecDeque::new(),
+            pending: VecDeque::new(),
+            eof: false,
+        }))
+    }
+
+    /// Lagged [`oxideav_core::Encoder`] adapter around the auto-altref
+    /// stream driver ([`crate::stream::Vp8AltrefStreamEncoder`]) — the
+    /// framework face of the round-384 GOLDEN/ALTREF subsystem.
+    ///
+    /// Protocol: `send_frame` buffers source pictures into lookahead
+    /// groups (returning `Ok(())` immediately); `receive_packet` pops
+    /// finished packets or surfaces [`Error::NeedMore`] while the group
+    /// is filling; `flush` drains the tail group and arms the final
+    /// [`Error::Eof`]. Visible packets carry their source frame's `pts`
+    /// (in push order — the driver emits visible packets in source
+    /// order); invisible anchor packets carry `pts = None`. Only key
+    /// frames set `flags.keyframe`.
+    pub(crate) struct Vp8LaggedEncoder {
+        output_params: CodecParameters,
+        width: u32,
+        height: u32,
+        stream: crate::stream::Vp8AltrefStreamEncoder,
+        time_base: TimeBase,
+        /// pts of pushed source frames not yet emitted as visible
+        /// packets (front = oldest). Visible packets pop in order.
+        pts_queue: VecDeque<Option<i64>>,
+        pending: VecDeque<Packet>,
+        eof: bool,
+    }
+
+    impl std::fmt::Debug for Vp8LaggedEncoder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Vp8LaggedEncoder")
+                .field("width", &self.width)
+                .field("height", &self.height)
+                .field("buffered", &self.stream.buffered())
+                .field("pending", &self.pending.len())
+                .field("eof", &self.eof)
+                .finish()
+        }
+    }
+
+    impl Vp8LaggedEncoder {
+        /// Convert a batch of stream packets into framework [`Packet`]s,
+        /// consuming the pts queue for visible ones.
+        fn enqueue(&mut self, packets: Vec<crate::stream::AltrefStreamPacket>) {
+            for p in packets {
+                let is_key = p.kind == crate::stream::AltrefPacketKind::Key;
+                let pts = match p.source_index {
+                    Some(_) => self.pts_queue.pop_front().flatten(),
+                    None => None,
+                };
+                let mut pkt = Packet::new(0, self.time_base, p.bytes);
+                pkt.pts = pts;
+                pkt.dts = pts;
+                pkt.flags.keyframe = is_key;
+                self.pending.push_back(pkt);
+            }
+        }
+    }
+
+    impl Encoder for Vp8LaggedEncoder {
+        fn codec_id(&self) -> &CodecId {
+            &self.output_params.codec_id
+        }
+
+        fn output_params(&self) -> &CodecParameters {
+            &self.output_params
+        }
+
+        fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+            if self.eof {
+                return Err(Error::invalid(
+                    "vp8 encoder: send_frame after flush (encoder is drained)",
+                ));
+            }
+            let v = match frame {
+                Frame::Video(v) => v,
+                _ => return Err(Error::invalid("vp8 encoder: video frames only")),
+            };
+            let (y, u, vv) = packed_planes_from_video_frame(v, self.width, self.height)?;
+            let src = I420Frame::packed(self.width, self.height, &y, &u, &vv);
+            self.pts_queue.push_back(v.pts);
+            let emitted = self
+                .stream
+                .push_frame(&src)
+                .map_err(|e| Error::invalid(e.to_string()))?;
+            self.enqueue(emitted);
+            Ok(())
+        }
+
+        fn receive_packet(&mut self) -> Result<Packet> {
+            if let Some(p) = self.pending.pop_front() {
+                Ok(p)
+            } else if self.eof {
+                Err(Error::Eof)
+            } else {
+                Err(Error::NeedMore)
+            }
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            if !self.eof {
+                let emitted = self
+                    .stream
+                    .finish()
+                    .map_err(|e| Error::invalid(e.to_string()))?;
+                self.enqueue(emitted);
+                self.eof = true;
+            }
+            Ok(())
+        }
     }
 
     /// Shared constructor for the framework-side keyframe encoder adapter.
@@ -9754,11 +9909,13 @@ mod factory {
         }))
     }
 
-    /// [`oxideav_core::Encoder`] adapter around the direct-API
-    /// [`encode_keyframe`] driver. One source [`Frame::Video`]
-    /// produces one keyframe [`Packet`] (the P-frame ladder is wired
-    /// behind the per-frame state machine and is not exercised on this
-    /// adapter yet — each `send_frame` re-keys).
+    /// Zero-latency [`oxideav_core::Encoder`] adapter around the
+    /// direct-API [`encode_keyframe`] driver. One source
+    /// [`Frame::Video`] produces one keyframe [`Packet`] immediately —
+    /// the still-image contract behind [`make_encoder`] /
+    /// [`make_encoder_with_qindex`] / [`make_encoder_with_quality`].
+    /// The inter-stream / lagged semantics live on
+    /// [`Vp8LaggedEncoder`] via [`super::make_encoder_with_config`].
     pub(crate) struct Vp8FrameEncoder {
         output_params: CodecParameters,
         width: u32,
@@ -9824,15 +9981,14 @@ mod factory {
         }
     }
 
-    /// Pull the three I420 planes out of `frame` (validating the layout
-    /// the encoder needs), then drive [`encode_keyframe`] with them.
-    fn encode_video_frame(
+    /// Pull the three I420 planes out of `frame` as tightly-packed
+    /// buffers (validating the layout the encoder needs). Shared by the
+    /// zero-latency keyframe adapter and the lagged stream adapter.
+    fn packed_planes_from_video_frame(
         frame: &VideoFrame,
         width: u32,
         height: u32,
-        keyframe: &KeyframeParams,
-        auto_lf: bool,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         if frame.planes.len() < 3 {
             return Err(Error::invalid(
                 "vp8 encoder: VideoFrame must carry 3 planes (Y/U/V)",
@@ -9860,10 +10016,23 @@ mod factory {
         // (stride == width). Always repack here so the borrow lifetimes
         // stay simple; zero-copy is a future optimisation when the
         // supplied frame already matches.
-        let y_packed = repack_plane(&y_plane.data, y_plane.stride, w, h);
-        let u_packed = repack_plane(&u_plane.data, u_plane.stride, uvw, uvh);
-        let v_packed = repack_plane(&v_plane.data, v_plane.stride, uvw, uvh);
+        Ok((
+            repack_plane(&y_plane.data, y_plane.stride, w, h),
+            repack_plane(&u_plane.data, u_plane.stride, uvw, uvh),
+            repack_plane(&v_plane.data, v_plane.stride, uvw, uvh),
+        ))
+    }
 
+    /// Pull the three I420 planes out of `frame` (validating the layout
+    /// the encoder needs), then drive [`encode_keyframe`] with them.
+    fn encode_video_frame(
+        frame: &VideoFrame,
+        width: u32,
+        height: u32,
+        keyframe: &KeyframeParams,
+        auto_lf: bool,
+    ) -> Result<Vec<u8>> {
+        let (y_packed, u_packed, v_packed) = packed_planes_from_video_frame(frame, width, height)?;
         let src = I420Frame::packed(width, height, &y_packed, &u_packed, &v_packed);
         let bytes = if auto_lf {
             encode_keyframe_auto_loop_filter(&src, keyframe)

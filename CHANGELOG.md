@@ -20,6 +20,19 @@ key-frame reset state, i.e. the defaults); update-free key frames keep
 the historical `1` bit-for-bit. Pinned by
 `fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
 
+### Fixed — intra-pick walk double-pushed `split_candidates` (round 387)
+
+Under `pick_intra = true`, every intra-chosen macroblock pushed **two**
+slots into the per-MB `split_candidates` table (the §16.4 wire-emit
+side-band), so from the frame's first intra MB onward every macroblock
+read its left neighbour's slot. A later SPLITMV macroblock then emitted
+a *different MB's* §16.4 partition/mode data (silent wire corruption —
+encoder reconstruction and emitted bytes disagree) or panicked on a
+`None` slot. Present since the round-160/161 intra-within-inter picker;
+first triggerable content mix (intra MB before SPLITMV MB in raster
+order) surfaced while testing the round-387 inter segmentation layer.
+Regression pinned by `tests/encoder_pframe_intra_pick_splitmv.rs`.
+
 ### Added — §10 per-segment loop-filter feature on the adaptive-quant keyframe (round 387)
 
 * **`encode_keyframe_adaptive_quant_with_segment_lf_deltas`** (+

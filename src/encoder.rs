@@ -8925,7 +8925,6 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                 ref_frames_out.push(None);
                 inter_modes_out.push(None);
                 chosen_mvs.push(crate::motion_vector::Mv::default());
-                split_candidates.push(None);
                 use_bpred_per_mb.push(false);
                 is_intra_per_mb[raster] = true;
                 // intra_y_modes[raster] / intra_uv_modes[raster] were
@@ -8968,6 +8967,13 @@ fn encode_p_frame_multi_ref_inner_with_counts_and_pick(
                     split_mvs: None,
                 }
             };
+            // Single push site for `split_candidates` — intra MBs push
+            // `None`, inter MBs their candidate. (Round 387 fix: the
+            // intra branch above ALSO pushed a `None`, so every MB
+            // after the frame's first intra pick read its left
+            // neighbour's slot — a raster misalignment that emitted the
+            // wrong §16.4 split data, or panicked, whenever an intra MB
+            // preceded a SPLITMV MB under `pick_intra = true`.)
             if !chose_intra {
                 split_candidates.push(chosen_split);
             } else {

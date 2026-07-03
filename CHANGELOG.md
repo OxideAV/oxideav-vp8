@@ -38,6 +38,22 @@ them.
   untouched, and a measured payoff — the anchored P-frame is smaller
   than the same source encoded without the altref update.
 
+### Added — fuzz target for the auto-altref stream layer (round 384)
+
+* **`altref_stream_encode_decode`** — drives fuzz-chosen
+  `(dimensions, qindex, lf_level, altref_window, keyframe_interval,
+  ARNR strength, golden_promotion, frame count)` configurations
+  through `Vp8AltrefStreamEncoder` and decodes every emitted packet
+  through one stateful `Vp8DecoderState`. Oracles beyond
+  panic-freedom: no encode rejection in the normalised envelope, no
+  decode rejection of the encoder's own packets, per-packet
+  wire-visibility lockstep (`last_frame_shown` vs packet kind),
+  visible packets covering each source frame exactly once in order,
+  `finish()` idempotence, and the `altref_window = 0` constructor
+  rejection. This is the only target that reaches the invisible-frame
+  §9.1 / §9.7 layer, the copy-ladder promotion, and the ARNR filter.
+  Local smoke: ~8.3 k execs / 45 s, zero findings.
+
 ### Added — §9.7 copy-ladder GOLDEN promotion in the auto-altref stream (round 384)
 
 First encoder-side use of the §9.7 `copy_buffer_to_*` ladder:

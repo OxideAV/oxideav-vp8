@@ -2136,6 +2136,14 @@ pub struct AltrefStreamConfig {
     /// round-383 `encode_invisible_altref_update` behaviour); this knob
     /// extends it to the P-frames. Default `false`.
     pub intra_pick: bool,
+    /// §9.3 / §10 segment-based adaptive quantisation on every **inter**
+    /// frame the driver emits (invisible anchors and visible P-frames):
+    /// per-MB variance classification, per-segment quantisers driving
+    /// the RD walk, and the full `update_segmentation()` header block
+    /// (see [`crate::encoder::InterSegmentationConfig`]). Key frames
+    /// keep the frame-wide quantiser (the keyframe AQ path is a
+    /// separate front door). Default `None`.
+    pub segmentation: Option<crate::encoder::InterSegmentationConfig>,
 }
 
 impl Default for AltrefStreamConfig {
@@ -2152,6 +2160,7 @@ impl Default for AltrefStreamConfig {
             auto_loop_filter: false,
             fitted_token_prob_updates: false,
             intra_pick: false,
+            segmentation: None,
         }
     }
 }
@@ -2468,15 +2477,15 @@ impl Vp8AltrefStreamEncoder {
             let anchor = crate::arnr::build_arnr_altref(&views, views.len() - 1, &self.config.arnr)
                 .map_err(StreamEncodeError::Frame)?;
             let last_planes = self.last.as_ref().expect("keyframe path ran");
-            let (bytes, alt_recon) =
-                crate::encoder::encode_invisible_altref_update_with_coding_options(
-                    &anchor.as_i420(),
-                    last_planes,
-                    self.golden.as_ref(),
-                    self.altref.as_ref(),
-                    &self.config.params,
-                    &anchor_options,
-                )?;
+            let (bytes, alt_recon) = crate::encoder::encode_invisible_altref_update_full(
+                &anchor.as_i420(),
+                last_planes,
+                self.golden.as_ref(),
+                self.altref.as_ref(),
+                &self.config.params,
+                &anchor_options,
+                self.config.segmentation.as_ref(),
+            )?;
             self.altref = Some(alt_recon);
             anchored = true;
             out.push(AltrefStreamPacket {
@@ -2501,16 +2510,16 @@ impl Vp8AltrefStreamEncoder {
                 ..RefreshControls::default()
             };
             let last_planes = self.last.as_ref().expect("keyframe path ran");
-            let (bytes, recon) =
-                crate::encoder::encode_p_frame_multi_ref_with_refresh_and_coding_options(
-                    &frame.as_i420(),
-                    last_planes,
-                    self.golden.as_ref(),
-                    self.altref.as_ref(),
-                    &self.config.params,
-                    &refresh,
-                    &p_options,
-                )?;
+            let (bytes, recon) = crate::encoder::encode_p_frame_options_and_segmentation(
+                &frame.as_i420(),
+                last_planes,
+                self.golden.as_ref(),
+                self.altref.as_ref(),
+                &self.config.params,
+                &refresh,
+                &p_options,
+                self.config.segmentation.as_ref(),
+            )?;
             // Encoder-side slot mirror of the §20 page-147 walk:
             // copy_gf (ALTREF → GOLDEN, pre-refresh state) precedes
             // refresh_last.

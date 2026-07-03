@@ -20,6 +20,17 @@ key-frame reset state, i.e. the defaults); update-free key frames keep
 the historical `1` bit-for-bit. Pinned by
 `fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
 
+### Added — segmentation on the lagged altref driver (round 387)
+
+* **`AltrefStreamConfig.segmentation`** — the §9.3 / §10 adaptive-quant
+  layer threaded through the lagged auto-altref stream driver: every
+  inter frame the driver emits (invisible ARNR anchors and visible
+  P-frames) classifies its macroblocks by variance, quantises at the
+  per-segment qindex, and carries the full `update_segmentation()`
+  header block. `None` (default) reproduces the previous wire
+  byte-for-byte. Fuzz oracle extended to the segmentation toggle (all
+  sixteen feature combinations now walk the stateful-decode contract).
+
 ### Added — §9.3 / §10 segment-based adaptive quantisation on P-frames (round 387)
 
 * **`InterSegmentationConfig`** +

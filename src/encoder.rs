@@ -8424,7 +8424,7 @@ pub fn encode_p_frame_multi_ref_adaptive_quant(
 /// optional two-pass §13.4 fitter around the full inter driver, with
 /// the §9.3 / §10 segmentation layer threaded through both passes.
 #[allow(clippy::too_many_arguments)]
-fn encode_p_frame_options_and_segmentation(
+pub(crate) fn encode_p_frame_options_and_segmentation(
     frame: &I420Frame,
     last: &crate::frame::KeyframePlanes,
     golden: Option<&crate::frame::KeyframePlanes>,
@@ -8435,6 +8435,14 @@ fn encode_p_frame_options_and_segmentation(
     segmentation: Option<&InterSegmentationConfig>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
+    // §9.3: the loop-filter feature value is a signed 6-bit magnitude.
+    if let Some(d) = segmentation.and_then(|s| s.lf_delta) {
+        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
+            return Err(EncodeError::LoopFilterLevelOutOfRange {
+                value: bad.unsigned_abs(),
+            });
+        }
+    }
 
     if !options.fitted_token_prob_updates {
         return encode_p_frame_multi_ref_inner_full(
@@ -8527,13 +8535,36 @@ pub fn encode_invisible_altref_update_with_coding_options(
     params: &KeyframeParams,
     options: &InterCodingOptions,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_invisible_altref_update_full(frame, last, golden, altref, params, options, None)
+}
+
+/// [`encode_invisible_altref_update_with_coding_options`] with the
+/// §9.3 / §10 segmentation layer threaded through the underlying inter
+/// encode — the anchor-side face the lagged stream driver uses when its
+/// segmentation knob is on.
+pub(crate) fn encode_invisible_altref_update_full(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    options: &InterCodingOptions,
+    segmentation: Option<&InterSegmentationConfig>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let refresh = RefreshControls {
         refresh_alternate_frame: true,
         refresh_last: false,
         ..RefreshControls::default()
     };
-    let (mut bytes, planes) = encode_p_frame_multi_ref_with_refresh_and_coding_options(
-        frame, last, golden, altref, params, &refresh, options,
+    let (mut bytes, planes) = encode_p_frame_options_and_segmentation(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        &refresh,
+        options,
+        segmentation,
     )?;
     set_show_frame_bit(&mut bytes, false);
     Ok((bytes, planes))

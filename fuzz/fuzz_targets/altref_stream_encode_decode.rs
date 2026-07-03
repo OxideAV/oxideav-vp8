@@ -36,7 +36,7 @@
 //! | `[2]` | `y_ac_qi` (`% 128`) |
 //! | `[3]` | `loop_filter_level` (`% 64`) |
 //! | `[4]` | `altref_window` (`b % 6` — `0` pins the constructor rejection) |
-//! | `[5]` | bits 0..3: `keyframe_interval`; bit 4: `auto_loop_filter`; bit 5: `fitted_token_prob_updates`; bit 6: `intra_pick` |
+//! | `[5]` | bits 0..3: `keyframe_interval`; bit 4: `auto_loop_filter`; bit 5: `fitted_token_prob_updates`; bit 6: `intra_pick`; bit 7: default `segmentation` layer |
 //! | `[6]` | low nibble: ARNR strength (`ArnrConfig::new` clamps); high nibble × 8: scene-cut MAD threshold (0 disables) |
 //! | `[7]` | bit 0: `golden_promotion`; bits 1..: frame count seed |
 //! | `[8..]` | per-frame fill seeds, then tiled pixel payload |
@@ -45,8 +45,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp8::{
-    AltrefStreamConfig, ArnrConfig, I420Frame, KeyframeParams, Vp8AltrefStreamEncoder,
-    Vp8DecoderState,
+    AltrefStreamConfig, ArnrConfig, I420Frame, InterSegmentationConfig, KeyframeParams,
+    Vp8AltrefStreamEncoder, Vp8DecoderState,
 };
 use oxideav_vp8_fuzz::accept_dimensions;
 
@@ -87,6 +87,14 @@ fuzz_target!(|data: &[u8]| {
         auto_loop_filter: (data[5] & 0x10) != 0,
         fitted_token_prob_updates: (data[5] & 0x20) != 0,
         intra_pick: (data[5] & 0x40) != 0,
+        segmentation: if (data[5] & 0x80) != 0 {
+            Some(InterSegmentationConfig {
+                lf_delta: Some([4, 1, -1, -4]),
+                ..InterSegmentationConfig::default()
+            })
+        } else {
+            None
+        },
     };
 
     let mut enc = match Vp8AltrefStreamEncoder::new(config) {

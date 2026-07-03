@@ -358,3 +358,50 @@ fn ffmpeg_cross_decodes_fully_toggled_stream_byte_exact() {
         assert_eq!(pic.v.as_slice(), ff_v, "V mismatch on visible frame {f}");
     }
 }
+
+#[test]
+fn segmented_stream_keeps_structure_and_decodes_lockstep() {
+    // Round-387 segmentation layer on the lagged driver: every inter
+    // frame (anchors + P-frames) carries the §9.3 update_segmentation()
+    // block with per-segment quantisers; the whole stream still
+    // decodes packet-for-packet with the correct visibility mirror.
+    let config = AltrefStreamConfig {
+        segmentation: Some(oxideav_vp8::InterSegmentationConfig {
+            quant_delta: [10, 2, -4, -10],
+            lf_delta: Some([6, 2, -2, -6]),
+            ..oxideav_vp8::InterSegmentationConfig::default()
+        }),
+        intra_pick: true,
+        ..base_config()
+    };
+    let packets = encode_stream(config);
+    assert_eq!(packets.len(), 15, "packet structure preserved");
+
+    // Every inter packet's header carries the segmentation block.
+    for p in &packets {
+        if p.kind == AltrefPacketKind::Key {
+            continue;
+        }
+        let hdr = oxideav_vp8::Vp8FrameHeader::parse(&p.bytes).expect("tag");
+        let part = &p.bytes[hdr.header_bytes_consumed
+            ..hdr.header_bytes_consumed + hdr.first_partition_size as usize];
+        let coded = oxideav_vp8::Vp8CodedHeader::parse(part, false).expect("coded header");
+        assert!(
+            coded.segmentation_enabled,
+            "{:?} packet must carry segmentation",
+            p.kind
+        );
+    }
+
+    let visible = decode_all(&packets);
+    assert_eq!(visible.len(), FRAMES);
+    for (f, pic) in visible.iter().enumerate() {
+        let (sy, _, _) = source_frame(f);
+        let psnr = luma_psnr(&sy, &pic.y);
+        assert!(
+            psnr >= 28.0,
+            "visible frame {f} PSNR-Y {psnr:.2} dB below 28 dB floor (AQ shifts bits, \
+             but the stream must stay faithful)"
+        );
+    }
+}

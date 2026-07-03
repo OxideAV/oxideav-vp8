@@ -1,5 +1,7 @@
 # oxideav-vp8
 
+[![CI](https://github.com/OxideAV/oxideav-vp8/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-vp8/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-vp8.svg)](https://crates.io/crates/oxideav-vp8) [![docs.rs](https://docs.rs/oxideav-vp8/badge.svg)](https://docs.rs/oxideav-vp8) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust VP8 video codec (RFC 6386) for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework.
 Decoder and encoder are both at production status.

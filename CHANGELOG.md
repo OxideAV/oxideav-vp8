@@ -20,6 +20,25 @@ key-frame reset state, i.e. the defaults); update-free key frames keep
 the historical `1` bit-for-bit. Pinned by
 `fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
 
+### Added — §10 per-segment loop-filter feature on the adaptive-quant keyframe (round 387)
+
+* **`encode_keyframe_adaptive_quant_with_segment_lf_deltas`** (+
+  `_and_trellis`) — the second half of the §9.3
+  `update_segment_feature_data` block: on top of the per-segment
+  quantiser gradient, each segment now carries a §9.3
+  `loop_filter_update` delta (signed, magnitude ≤ 63, delta mode), and
+  each macroblock's §15 level resolves to
+  `clamp(base + delta[seg], 0, 63)` per §20.6 in the encoder's own
+  post-walk pass and in any compliant decoder alike — coarser segments
+  can deblock harder while detailed segments keep their texture.
+* The §15 whole-frame skip mirrors the decoder's gate exactly (frame
+  base level 0 skips filtering regardless of the deltas); out-of-range
+  deltas are rejected; the wire round-trips through
+  `Vp8CodedHeader::parse` slot-for-slot.
+* Black-box: `ffmpeg` decodes the segment-LF keyframe to byte-identical
+  pixels vs the crate's own decoder
+  (`tests/encoder_keyframe_segment_lf.rs`).
+
 ### Changed — registry `Encoder` adapter: real lag/flush semantics (round 387)
 
 `make_encoder_with_config` no longer re-keys every `send_frame`: it now

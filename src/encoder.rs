@@ -5375,10 +5375,81 @@ pub fn encode_keyframe_adaptive_quant_with_reconstruction_and_trellis(
     encode_keyframe_adaptive_quant_inner(frame, config, trellis)
 }
 
+/// Encode a key frame with §9.3 / §10 segment-based adaptive
+/// quantisation **and** the §10 per-segment loop-filter feature — the
+/// full two-feature `update_segment_feature_data` block.
+///
+/// On top of [`encode_keyframe_adaptive_quant`]'s per-segment quantiser
+/// gradient, `segment_lf_deltas[s]` is the §9.3 `loop_filter_update`
+/// value for segment `s` (delta mode, signed, magnitude ≤ 63): each
+/// macroblock's §15 filter level resolves to
+/// `clamp(loop_filter_level + segment_lf_deltas[seg], 0, 63)` per
+/// §20.6, in the encoder's own post-walk pass and in any compliant
+/// decoder alike. The natural pairing with the quantiser gradient is
+/// **coarser segments filter harder** (they carry more blocking) while
+/// detailed segments filter lighter (preserving texture) — i.e. deltas
+/// with the same sign as `quant_delta`.
+///
+/// Values outside ±63 are rejected with
+/// [`EncodeError::LoopFilterLevelOutOfRange`]. The §15 whole-frame skip
+/// mirrors the decoder: `config.loop_filter_level == 0` skips the
+/// filter regardless of the deltas. `[0; 4]` emits the feature with
+/// explicit zero deltas (wire differs from the no-feature encode; the
+/// resolved levels do not).
+///
+/// Returns the wire bytes plus the matching post-§15 reconstruction.
+pub fn encode_keyframe_adaptive_quant_with_segment_lf_deltas(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+    segment_lf_deltas: &[i8; 4],
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_adaptive_quant_inner_lf(
+        frame,
+        config,
+        TrellisStrength::DEFAULT,
+        Some(segment_lf_deltas),
+    )
+}
+
+/// As [`encode_keyframe_adaptive_quant_with_segment_lf_deltas`] with
+/// the §13 trellis aggressiveness dialed by `trellis`.
+pub fn encode_keyframe_adaptive_quant_with_segment_lf_deltas_and_trellis(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+    segment_lf_deltas: &[i8; 4],
+    trellis: TrellisStrength,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_adaptive_quant_inner_lf(frame, config, trellis, Some(segment_lf_deltas))
+}
+
 fn encode_keyframe_adaptive_quant_inner(
     frame: &I420Frame,
     config: &AdaptiveQuantConfig,
     trellis: TrellisStrength,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_adaptive_quant_inner_lf(frame, config, trellis, None)
+}
+
+/// [`encode_keyframe_adaptive_quant_inner`] extended with the round-387
+/// §10 per-segment **loop-filter feature**: when `segment_lf_deltas =
+/// Some(d)`, the §9.3 `update_segmentation()` block additionally
+/// carries the four `loop_filter_update` values (delta mode, added to
+/// the frame base and clamped to `0..=63` per §20.6), and the
+/// encoder's own §15 post-walk filter pass resolves each MB's level
+/// through the same segment override the decoder applies
+/// ([`crate::loop_filter::calculate_mb_filter_level`]) — so the
+/// per-segment quantiser gradient can pair with a matching per-segment
+/// deblock gradient (coarser segments → stronger filtering).
+///
+/// The §15 whole-frame skip mirrors the decoder's gate exactly: a frame
+/// base `loop_filter_level == 0` skips the filter regardless of the
+/// segment deltas (they still travel in the header for state
+/// completeness). `None` reproduces the historical wire byte-for-byte.
+fn encode_keyframe_adaptive_quant_inner_lf(
+    frame: &I420Frame,
+    config: &AdaptiveQuantConfig,
+    trellis: TrellisStrength,
+    segment_lf_deltas: Option<&[i8; 4]>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
@@ -5399,6 +5470,15 @@ fn encode_keyframe_adaptive_quant_inner(
         return Err(EncodeError::SharpnessLevelOutOfRange {
             value: config.sharpness_level,
         });
+    }
+    // §9.3: the loop-filter feature value is a signed 6-bit magnitude —
+    // reject anything outside ±63 before the walk runs.
+    if let Some(d) = segment_lf_deltas {
+        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
+            return Err(EncodeError::LoopFilterLevelOutOfRange {
+                value: bad.unsigned_abs(),
+            });
+        }
     }
 
     let mb_cols = width.div_ceil(16) as usize;
@@ -5498,19 +5578,29 @@ fn encode_keyframe_adaptive_quant_inner(
         }
     }
 
-    // ---- §15 loop-filter post-pass (segment LF feature not emitted) ------
+    // ---- §15 loop-filter post-pass ---------------------------------------
+    // Gate mirrors the decoder exactly: frame base level 0 skips the
+    // whole-frame filter even when segment deltas are present.
     if config.loop_filter_level != 0 {
+        let mut segment_lf_level = [0i16; crate::loop_filter::MAX_MB_SEGMENTS];
+        if let Some(d) = segment_lf_deltas {
+            for (dst, &src) in segment_lf_level.iter_mut().zip(d.iter()) {
+                *dst = i16::from(src);
+            }
+        }
         let lf_config = crate::loop_filter::FrameFilterConfig {
             simple: config.filter_type,
             key_frame: true,
             loop_filter_level: config.loop_filter_level,
             sharpness_level: config.sharpness_level,
-            // We emit per-segment *quantizer* deltas but no per-segment
-            // loop-filter deltas, so the §15 level is the frame base for
-            // every segment.
-            segmentation_enabled: false,
+            // With `segment_lf_deltas = Some`, each MB's §15 level is
+            // `clamp(base + delta[seg], 0, 63)` per §20.6 — the same
+            // resolution the decoder's `FrameFilterConfig::keyframe`
+            // performs from the §9.3 header we emit below. `None` keeps
+            // the frame base for every segment (historical wire).
+            segmentation_enabled: segment_lf_deltas.is_some(),
             segment_abs: false,
-            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+            segment_lf_level,
             delta_enabled: false,
             ref_delta_current: 0,
             bpred_mode_delta: 0,
@@ -5549,7 +5639,19 @@ fn encode_keyframe_adaptive_quant_inner(
             Some(config.quant_delta[2] as i16),
             Some(config.quant_delta[3] as i16),
         ],
-        loop_filter: [None; 4],
+        // §10 per-segment loop-filter feature (round 387): each segment
+        // carries its delta when the caller supplied one (a 0 delta is
+        // still emitted as Some(0), mirroring the quantizer convention
+        // above so the decoder's persisted value is explicit).
+        loop_filter: match segment_lf_deltas {
+            Some(d) => [
+                Some(i16::from(d[0])),
+                Some(i16::from(d[1])),
+                Some(i16::from(d[2])),
+                Some(i16::from(d[3])),
+            ],
+            None => [None; 4],
+        },
         segment_prob: [Some(seg_probs[0]), Some(seg_probs[1]), Some(seg_probs[2])],
     };
     write_update_segmentation(&mut hdr, &layer);

@@ -426,6 +426,8 @@ pub use encoder::{
     encode_keyframe, encode_keyframe_adaptive_quant,
     encode_keyframe_adaptive_quant_with_reconstruction,
     encode_keyframe_adaptive_quant_with_reconstruction_and_trellis,
+    encode_keyframe_adaptive_quant_with_segment_lf_deltas,
+    encode_keyframe_adaptive_quant_with_segment_lf_deltas_and_trellis,
     encode_keyframe_adaptive_quant_with_trellis, encode_keyframe_auto_loop_filter,
     encode_keyframe_auto_loop_filter_with_reconstruction,
     encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_reconstruction,

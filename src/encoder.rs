@@ -10085,10 +10085,17 @@ impl Vp8Encoder {
     /// [`is_visible()`](crate::stream::AltrefStreamPacket::is_visible)
     /// is `false`.
     ///
-    /// [`auto_loop_filter`](Vp8EncoderConfig::auto_loop_filter) is not
-    /// applied on this path (the lagged driver runs the fixed
-    /// `lf_level`); an RD-selected loop filter for the sequence path
-    /// can layer on in a future round.
+    /// [`auto_loop_filter`](Vp8EncoderConfig::auto_loop_filter) applies
+    /// per emitted frame (key frames, anchors, and P-frames each get an
+    /// RD-selected §9.4 level / sharpness; `lf_level` is ignored when
+    /// it is set). As the offline batch front door, this path
+    /// additionally enables the §13.4 fitted `token_prob_update()`
+    /// in-header emission and the §11 intra-within-inter picker on
+    /// every frame — both quality/density features with a never-grow
+    /// byte guard, paid for with extra encode passes an offline batch
+    /// caller accepts. A caller that wants the round-384 single-pass
+    /// wire drives [`crate::stream::Vp8AltrefStreamEncoder`] directly
+    /// with those toggles off.
     pub fn encode_sequence(
         &mut self,
         frames: &[I420Frame<'_>],
@@ -10109,6 +10116,9 @@ impl Vp8Encoder {
             },
             keyframe_interval: u64::from(self.config.golden_interval),
             altref_window: window,
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: true,
+            intra_pick: true,
             ..crate::stream::AltrefStreamConfig::default()
         };
         let mut enc = crate::stream::Vp8AltrefStreamEncoder::new(config)

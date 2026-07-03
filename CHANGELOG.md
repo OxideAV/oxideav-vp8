@@ -20,6 +20,29 @@ key-frame reset state, i.e. the defaults); update-free key frames keep
 the historical `1` bit-for-bit. Pinned by
 `fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
 
+### Added — lagged altref driver feature toggles + batch front door upgrade (round 387)
+
+* **`AltrefStreamConfig.auto_loop_filter` / `.fitted_token_prob_updates`
+  / `.intra_pick`** — the coding-options toggles threaded through the
+  lagged auto-altref stream driver: every emitted frame (key frames,
+  invisible ARNR anchors, visible P-frames) can now carry an
+  RD-selected §9.4 loop-filter level, a per-frame fitted §13.4
+  `token_prob_update()` in-header payload, and (P-frames) the §11
+  intra-within-inter picker. All-off reproduces the round-384 wire
+  byte-for-byte. On the 12-frame ARNR test sequence the fitter alone
+  is −8.2 % stream bytes at equal PSNR; all three toggles together are
+  −17.5 % (10 708 → 8 834 bytes) at equal-or-better PSNR.
+* **`Vp8Encoder::encode_sequence`** now consumes
+  `Vp8EncoderConfig::auto_loop_filter` and always enables the fitted
+  §13.4 emission + intra picker (it is the offline batch front door;
+  both features carry a never-grow byte guard).
+* Black-box: the fully-toggled anchored stream (invisible frames
+  included) wrapped in IVF decodes through `ffmpeg` to **byte-identical
+  pixels** vs the crate's own decoder, frame for visible frame
+  (`tests/encoder_altref_stream_options.rs`).
+* Fuzz: `altref_stream_encode_decode` now drives all eight toggle
+  combinations through the same stateful-decode oracle.
+
 ### Added — generic coding-options front doors (round 387)
 
 The per-frame quality/size features that previously each owned a

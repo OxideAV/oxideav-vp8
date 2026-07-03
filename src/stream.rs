@@ -2112,6 +2112,30 @@ pub struct AltrefStreamConfig {
     /// pure count-based grouping). Default `40.0` — far above photo
     /// noise / motion MAD, comfortably below a full scene change.
     pub scene_cut_mad_threshold: f64,
+    /// §9.4 RD loop-filter auto-selection for **every** emitted frame
+    /// (key frames, invisible anchors, and P-frames): when `true`,
+    /// `params.loop_filter_level` / `sharpness_level` are ignored and
+    /// each frame's level / sharpness pair is chosen to minimise the
+    /// post-§15 visible-window SSD of the frame's own reconstruction
+    /// against its source (see
+    /// [`crate::encoder::KeyframeCodingOptions::auto_loop_filter`]).
+    /// Default `false` (the fixed-level round-384 behaviour).
+    pub auto_loop_filter: bool,
+    /// §13.4 in-header `token_prob_update()` emission, fitted per frame
+    /// to the observed §13.3 branch counts by the two-pass
+    /// [`crate::encoder::fit_token_prob_updates`] fitter, on **every**
+    /// emitted frame. The fitted pass only ships when it shrinks the
+    /// wire (never-grow guard), at the cost of a second encode pass per
+    /// frame. Default `false`.
+    pub fitted_token_prob_updates: bool,
+    /// §11 intra-within-inter picker on the visible P-frames: every MB
+    /// additionally scores the 16 whole-block `(y_mode, uv_mode)` intra
+    /// candidates against the best inter pick — insurance for occluded
+    /// / uncovered content the reference set cannot predict. The
+    /// invisible anchor always encodes with the picker on (it is the
+    /// round-383 `encode_invisible_altref_update` behaviour); this knob
+    /// extends it to the P-frames. Default `false`.
+    pub intra_pick: bool,
 }
 
 impl Default for AltrefStreamConfig {
@@ -2125,6 +2149,9 @@ impl Default for AltrefStreamConfig {
             arnr: crate::arnr::ArnrConfig::default(),
             golden_promotion: true,
             scene_cut_mad_threshold: 40.0,
+            auto_loop_filter: false,
+            fitted_token_prob_updates: false,
+            intra_pick: false,
         }
     }
 }
@@ -2388,11 +2415,36 @@ impl Vp8AltrefStreamEncoder {
         let forced_key = core::mem::take(&mut self.pending_forced_key);
         let mut first_p = 0usize;
 
+        // Per-frame feature toggles from the stream config. All-false
+        // reproduces the round-384 wire byte-for-byte (the coding-
+        // options front doors are pinned byte-identical to the
+        // dedicated entries this driver previously called).
+        let kf_options = crate::encoder::KeyframeCodingOptions {
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+        };
+        // The invisible anchor keeps the §11 intra picker hardwired on
+        // (the encode_invisible_altref_update behaviour).
+        let anchor_options = crate::encoder::InterCodingOptions {
+            intra_pick: true,
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+        };
+        let p_options = crate::encoder::InterCodingOptions {
+            intra_pick: self.config.intra_pick,
+            auto_loop_filter: self.config.auto_loop_filter,
+            fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+        };
+
         // Key frame: scheduled, scene-cut-forced, or forced because
         // the stream has no reference yet.
         if self.is_key_index(start) || forced_key || self.last.is_none() {
             let (bytes, recon) =
-                encode_keyframe_with_reconstruction(&group[0].as_i420(), &self.config.params)?;
+                crate::encoder::encode_keyframe_with_reconstruction_and_coding_options(
+                    &group[0].as_i420(),
+                    &self.config.params,
+                    &kf_options,
+                )?;
             self.last = Some(recon.clone());
             self.golden = Some(recon.clone());
             self.altref = Some(recon);
@@ -2416,13 +2468,15 @@ impl Vp8AltrefStreamEncoder {
             let anchor = crate::arnr::build_arnr_altref(&views, views.len() - 1, &self.config.arnr)
                 .map_err(StreamEncodeError::Frame)?;
             let last_planes = self.last.as_ref().expect("keyframe path ran");
-            let (bytes, alt_recon) = crate::encoder::encode_invisible_altref_update(
-                &anchor.as_i420(),
-                last_planes,
-                self.golden.as_ref(),
-                self.altref.as_ref(),
-                &self.config.params,
-            )?;
+            let (bytes, alt_recon) =
+                crate::encoder::encode_invisible_altref_update_with_coding_options(
+                    &anchor.as_i420(),
+                    last_planes,
+                    self.golden.as_ref(),
+                    self.altref.as_ref(),
+                    &self.config.params,
+                    &anchor_options,
+                )?;
             self.altref = Some(alt_recon);
             anchored = true;
             out.push(AltrefStreamPacket {
@@ -2447,14 +2501,16 @@ impl Vp8AltrefStreamEncoder {
                 ..RefreshControls::default()
             };
             let last_planes = self.last.as_ref().expect("keyframe path ran");
-            let (bytes, recon) = encode_p_frame_multi_ref_with_refresh(
-                &frame.as_i420(),
-                last_planes,
-                self.golden.as_ref(),
-                self.altref.as_ref(),
-                &self.config.params,
-                &refresh,
-            )?;
+            let (bytes, recon) =
+                crate::encoder::encode_p_frame_multi_ref_with_refresh_and_coding_options(
+                    &frame.as_i420(),
+                    last_planes,
+                    self.golden.as_ref(),
+                    self.altref.as_ref(),
+                    &self.config.params,
+                    &refresh,
+                    &p_options,
+                )?;
             // Encoder-side slot mirror of the §20 page-147 walk:
             // copy_gf (ALTREF → GOLDEN, pre-refresh state) precedes
             // refresh_last.

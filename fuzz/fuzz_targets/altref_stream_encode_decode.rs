@@ -36,7 +36,7 @@
 //! | `[2]` | `y_ac_qi` (`% 128`) |
 //! | `[3]` | `loop_filter_level` (`% 64`) |
 //! | `[4]` | `altref_window` (`b % 6` — `0` pins the constructor rejection) |
-//! | `[5]` | `keyframe_interval` (`b % 8`) |
+//! | `[5]` | bits 0..3: `keyframe_interval`; bit 4: `auto_loop_filter`; bit 5: `fitted_token_prob_updates`; bit 6: `intra_pick` |
 //! | `[6]` | low nibble: ARNR strength (`ArnrConfig::new` clamps); high nibble × 8: scene-cut MAD threshold (0 disables) |
 //! | `[7]` | bit 0: `golden_promotion`; bits 1..: frame count seed |
 //! | `[8..]` | per-frame fill seeds, then tiled pixel payload |
@@ -74,7 +74,7 @@ fuzz_target!(|data: &[u8]| {
     let altref_window = usize::from(data[4] % 6);
     let config = AltrefStreamConfig {
         params,
-        keyframe_interval: u64::from(data[5] % 8),
+        keyframe_interval: u64::from(data[5] & 0x07),
         altref_window,
         arnr: ArnrConfig::new(data[6] & 0x0f),
         golden_promotion: (data[7] & 0x01) != 0,
@@ -82,6 +82,11 @@ fuzz_target!(|data: &[u8]| {
         // threshold (0 disables; up to MAD 120 — fuzz fills routinely
         // jump whole flat levels, so cuts really fire).
         scene_cut_mad_threshold: f64::from(data[6] >> 4) * 8.0,
+        // Round-387 per-frame feature toggles — all eight combinations
+        // must hold the same decode oracle.
+        auto_loop_filter: (data[5] & 0x10) != 0,
+        fitted_token_prob_updates: (data[5] & 0x20) != 0,
+        intra_pick: (data[5] & 0x40) != 0,
     };
 
     let mut enc = match Vp8AltrefStreamEncoder::new(config) {

@@ -422,12 +422,14 @@ pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_M
 pub use encoder::{
     classify_coeff_token, count_block_branches, count_inter_frame_branches,
     count_keyframe_branches, count_mb_branches, empty_branch_counts, encode_coeff_block,
-    encode_invisible_altref_update, encode_keyframe, encode_keyframe_adaptive_quant,
+    encode_invisible_altref_update, encode_invisible_altref_update_with_coding_options,
+    encode_keyframe, encode_keyframe_adaptive_quant,
     encode_keyframe_adaptive_quant_with_reconstruction,
     encode_keyframe_adaptive_quant_with_reconstruction_and_trellis,
     encode_keyframe_adaptive_quant_with_trellis, encode_keyframe_auto_loop_filter,
     encode_keyframe_auto_loop_filter_with_reconstruction,
     encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_reconstruction,
+    encode_keyframe_with_reconstruction_and_coding_options,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors,
@@ -435,6 +437,7 @@ pub use encoder::{
     encode_p_frame_multi_ref_auto_loop_filter,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,
+    encode_p_frame_multi_ref_with_refresh_and_coding_options,
     encode_p_frame_multi_ref_with_refresh_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
@@ -447,10 +450,10 @@ pub use encoder::{
     write_loop_filter_with_deltas, write_mb_no_skip_coeff, write_no_token_prob_updates,
     write_quant_indices, write_segment_update_flags, write_token_partition_count,
     write_token_prob_updates, write_update_segmentation, AdaptiveQuantConfig, BoolEncoder,
-    BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, KeyframeParams,
-    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
-    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
-    TokenEncoder, TrellisStrength, UpdateSegmentationLayer,
+    BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, InterCodingOptions,
+    KeyframeCodingOptions, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels,
+    RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams,
+    TokenEncodeError, TokenEncoder, TrellisStrength, UpdateSegmentationLayer,
 };
 
 /// Framework `make_encoder` / `make_encoder_with_qindex` /

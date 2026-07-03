@@ -4,6 +4,34 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added — generic coding-options front doors (round 387)
+
+The per-frame quality/size features that previously each owned a
+dedicated function name (`_intra_pick`, `_auto_loop_filter`,
+`_fitted_token_prob_updates`) are now **composable** behind two small
+toggle structs, unlocking the previously unreachable combinations
+(notably §9.4 auto loop-filter + §13.4 fitted token-prob updates on the
+same frame):
+
+* **`KeyframeCodingOptions`** +
+  **`encode_keyframe_with_reconstruction_and_coding_options`** — the
+  generic key-frame front door. All-default reproduces
+  `encode_keyframe_with_reconstruction` byte-for-byte; each single
+  toggle reproduces its dedicated entry byte-for-byte (pinned by
+  `tests/encoder_coding_options.rs`).
+* **`InterCodingOptions`** +
+  **`encode_p_frame_multi_ref_with_refresh_and_coding_options`** — the
+  generic §16.2 multi-reference P-frame front door with caller-driven
+  §9.7 / §9.8 refresh control. Same equivalence guarantees, including
+  byte-identity with the two-pass
+  `..._intra_pick_and_fitted_token_prob_updates` fitter at matching
+  toggles.
+* **`encode_invisible_altref_update_with_coding_options`** — the §9.1
+  `show_frame = 0` / §9.7 `refresh_alternate_frame = 1` anchor-update
+  frame with the full toggle set on the underlying inter encode.
+* The two-pass fitters share a new `any_token_prob_update` no-op test
+  (internal refactor; emitted bytes unchanged).
+
 ### Added — §9.1 / §9.7 invisible altref-update frames (round 384)
 
 First milestone of B-frame-less GOLDEN / ALTREF management: the encoder

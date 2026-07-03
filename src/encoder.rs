@@ -4214,6 +4214,16 @@ pub fn fit_token_prob_updates(
     out
 }
 
+/// `true` when at least one §13.4 slot of `updates` carries a
+/// replacement probability — the "is the fitted table a no-op?" test
+/// every two-pass fitter runs before paying for a second encode pass.
+fn any_token_prob_update(updates: &crate::coded_header::TokenProbUpdates) -> bool {
+    updates.iter().any(|p| {
+        p.iter()
+            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
+    })
+}
+
 // ─────────────────────── §9 / §11 / §19.2 keyframe raster driver ───────────────────────
 
 /// A source I420 (YCbCr 4:2:0) picture handed to the keyframe raster
@@ -4539,10 +4549,7 @@ pub fn encode_keyframe_with_fitted_token_prob_updates(
     // If no slot crossed the threshold, the default encode wins
     // trivially (the all-`None` path is byte-identical to the
     // round-154 wire).
-    let any_update = fitted.iter().any(|p| {
-        p.iter()
-            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
-    });
+    let any_update = any_token_prob_update(&fitted);
     if !any_update {
         return Ok(bytes_default);
     }
@@ -4606,10 +4613,7 @@ pub fn encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(
 
     // No slot crossed the threshold ⇒ default encode wins trivially
     // (all-`None` path is byte-identical to the round-154 wire).
-    let any_update = fitted.iter().any(|p| {
-        p.iter()
-            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
-    });
+    let any_update = any_token_prob_update(&fitted);
     if !any_update {
         return Ok((bytes_default, planes_default));
     }
@@ -4691,6 +4695,89 @@ pub fn encode_keyframe_auto_loop_filter_with_reconstruction(
     params: &KeyframeParams,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     encode_keyframe_inner_lf(frame, params, None, None, true)
+}
+
+/// Orthogonal per-frame quality/size feature toggles for the generic
+/// key-frame front door
+/// [`encode_keyframe_with_reconstruction_and_coding_options`].
+///
+/// Each flag switches on one already-proven encoder feature; the
+/// all-`false` default reproduces
+/// [`encode_keyframe_with_reconstruction`] byte-for-byte. This struct
+/// replaces the combinatorial `_auto_loop_filter` /
+/// `_fitted_token_prob_updates` function-name ladder for callers (like
+/// the lagged stream driver) that need the features **combined**.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyframeCodingOptions {
+    /// RD-select the §9.4 `loop_filter_level` / sharpness per frame
+    /// (ignoring `params.loop_filter_level`) — the
+    /// [`encode_keyframe_auto_loop_filter`] behaviour.
+    pub auto_loop_filter: bool,
+    /// Two-pass §13.4 `token_prob_update()` fit: pass 1 records the
+    /// observed §13.3 branch counts, [`fit_token_prob_updates`] derives
+    /// the profitable replacements, pass 2 re-encodes against the
+    /// merged table, and the smaller wire ships — the
+    /// [`encode_keyframe_with_fitted_token_prob_updates`] behaviour.
+    pub fitted_token_prob_updates: bool,
+}
+
+/// Generic key-frame front door combining the §9.4 auto-loop-filter
+/// selector and the §13.4 fitted token-prob-update emission behind one
+/// [`KeyframeCodingOptions`] toggle set.
+///
+/// * `options == Default` — byte-identical to
+///   [`encode_keyframe_with_reconstruction`];
+/// * only `auto_loop_filter` — byte-identical to
+///   [`encode_keyframe_auto_loop_filter_with_reconstruction`];
+/// * only `fitted_token_prob_updates` — byte-identical to
+///   [`encode_keyframe_with_reconstruction_and_fitted_token_prob_updates`];
+/// * both — the previously unreachable combination: the two-pass fitter
+///   runs with the RD loop-filter selector active on **both** passes
+///   (each pass picks its own §9.4 level; the shipped wire's header
+///   level always matches the shipped reconstruction, so decoder
+///   lockstep holds).
+///
+/// Returns the wire bytes plus the matching post-§15 reconstruction
+/// planes for the §9 reference ladder.
+pub fn encode_keyframe_with_reconstruction_and_coding_options(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeCodingOptions,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    if !options.fitted_token_prob_updates {
+        return encode_keyframe_inner_lf(frame, params, None, None, options.auto_loop_filter);
+    }
+
+    // Pass 1 — §13.5 defaults + observed branch counts (same shape as
+    // the dedicated keyframe fitter, with the auto-LF switch threaded).
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) = encode_keyframe_inner_lf(
+        frame,
+        params,
+        None,
+        Some(&mut counts),
+        options.auto_loop_filter,
+    )?;
+
+    // 2.0 bits of slack — matches every other fitter in the crate.
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+    if !any_token_prob_update(&fitted) {
+        return Ok((bytes_default, planes_default));
+    }
+
+    // Pass 2 — re-encode with the fitted updates (picker + token emit
+    // run against the merged table; auto-LF re-selects on the pass-2
+    // reconstruction).
+    let (bytes_fitted, planes_fitted) =
+        encode_keyframe_inner_lf(frame, params, Some(&fitted), None, options.auto_loop_filter)?;
+
+    // Ship the smaller wire, always with its matching planes so a
+    // streaming caller's LAST slot equals the decoder's reconstruction.
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
 }
 
 /// Encode a key frame and return both the bitstream bytes **and** the
@@ -7620,10 +7707,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob
     // If no slot crossed the threshold, the default encode wins
     // trivially (the all-`None` path is byte-identical to the round-156
     // inter wire).
-    let any_update = fitted.iter().any(|p| {
-        p.iter()
-            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
-    });
+    let any_update = any_token_prob_update(&fitted);
     if !any_update {
         return Ok((bytes_default, planes_default));
     }
@@ -8026,10 +8110,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fi
     // If no slot crossed the threshold, the default encode wins trivially
     // (the all-`None` path is byte-identical to the round-163
     // _intra_pick wire).
-    let any_update = fitted.iter().any(|p| {
-        p.iter()
-            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
-    });
+    let any_update = any_token_prob_update(&fitted);
     if !any_update {
         return Ok((bytes_default, planes_default));
     }
@@ -8063,6 +8144,172 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fi
     } else {
         Ok((bytes_default, planes_default))
     }
+}
+
+/// Orthogonal per-frame quality/size feature toggles for the generic
+/// inter front door
+/// [`encode_p_frame_multi_ref_with_refresh_and_coding_options`].
+///
+/// Each flag switches on one already-proven inter encoder feature; the
+/// all-`false` default reproduces
+/// [`encode_p_frame_multi_ref_with_refresh`] byte-for-byte. This struct
+/// replaces the combinatorial `_intra_pick` / `_auto_loop_filter` /
+/// `_fitted_token_prob_updates` function-name ladder for callers (like
+/// the lagged stream driver) that need the features **combined**.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterCodingOptions {
+    /// §11 intra-within-inter picker: every MB additionally scores the
+    /// 16 whole-block `(y_mode, uv_mode)` intra candidates against the
+    /// best inter pick — the
+    /// [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`]
+    /// behaviour.
+    pub intra_pick: bool,
+    /// RD-select the §9.4 `loop_filter_level` / sharpness per frame
+    /// (ignoring `params.loop_filter_level`) — the
+    /// [`encode_p_frame_multi_ref_auto_loop_filter`] behaviour, but
+    /// composable with any refresh ladder and the other toggles.
+    pub auto_loop_filter: bool,
+    /// Two-pass §13.4 `token_prob_update()` fit (defaults pass →
+    /// [`fit_token_prob_updates`] → fitted pass → smaller wire ships).
+    pub fitted_token_prob_updates: bool,
+}
+
+/// Generic §16.2 multi-reference P-frame front door combining the §11
+/// intra-within-inter picker, the §9.4 auto-loop-filter selector, and
+/// the §13.4 fitted token-prob-update emission behind one
+/// [`InterCodingOptions`] toggle set, with caller-driven §9.7 / §9.8
+/// refresh control.
+///
+/// Equivalences (each pinned by `tests/encoder_coding_options.rs`):
+///
+/// * `options == Default` — byte-identical to
+///   [`encode_p_frame_multi_ref_with_refresh`];
+/// * only `intra_pick` — byte-identical to
+///   [`encode_p_frame_multi_ref_with_refresh_and_intra_pick`];
+/// * only `auto_loop_filter` (with the default refresh ladder) —
+///   byte-identical to [`encode_p_frame_multi_ref_auto_loop_filter`]
+///   minus that entry's hardwired intra pick — pass
+///   `intra_pick: true, auto_loop_filter: true` for the exact match;
+/// * `intra_pick + fitted_token_prob_updates` — byte-identical to
+///   [`encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates`]
+///   at default `LoopFilterDeltas` / zero carried deltas.
+///
+/// The §9.4 per-reference / per-mode delta layer stays off on this
+/// entry (`LoopFilterDeltas::default()`, zero carried state) — a caller
+/// that threads LF deltas across frames should keep using the explicit
+/// `_with_refresh_and_lf_deltas_*` ladder.
+///
+/// Returns the wire bytes plus the matching post-§15 reconstruction
+/// planes (what the decoder's refreshed slots will hold).
+pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    options: &InterCodingOptions,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    refresh.validate()?;
+
+    if !options.fitted_token_prob_updates {
+        return encode_p_frame_multi_ref_inner_with_counts_and_pick(
+            frame,
+            last,
+            golden,
+            altref,
+            params,
+            refresh,
+            &LoopFilterDeltas::default(),
+            [0; 4],
+            [0; 4],
+            None,
+            None,
+            options.intra_pick,
+            options.auto_loop_filter,
+        );
+    }
+
+    // Pass 1 — §13.5 defaults + observed branch counts, with the
+    // requested picker / auto-LF switches active so the recorded counts
+    // reflect the MB mix pass 2 will re-produce.
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+        None,
+        Some(&mut counts),
+        options.intra_pick,
+        options.auto_loop_filter,
+    )?;
+
+    // 2.0 bits of slack — matches every other inter fitter.
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+    if !any_token_prob_update(&fitted) {
+        return Ok((bytes_default, planes_default));
+    }
+
+    // Pass 2 — re-encode against the merged table.
+    let (bytes_fitted, planes_fitted) = encode_p_frame_multi_ref_inner_with_counts_and_pick(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        &LoopFilterDeltas::default(),
+        [0; 4],
+        [0; 4],
+        Some(&fitted),
+        None,
+        options.intra_pick,
+        options.auto_loop_filter,
+    )?;
+
+    // Bytes-vs-default guard; the shipped planes always match the
+    // shipped wire so a streaming caller's slots stay in decoder
+    // lockstep.
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
+}
+
+/// [`encode_invisible_altref_update`] with the full
+/// [`InterCodingOptions`] toggle set — the §9.1 `show_frame = 0` /
+/// §9.7 `refresh_alternate_frame = 1` anchor-update frame, but with the
+/// §9.4 auto-loop-filter selector and/or the §13.4 fitted
+/// token-prob-update emission active on the underlying inter encode.
+///
+/// With `options = InterCodingOptions { intra_pick: true, ..Default }`
+/// the wire is byte-identical to [`encode_invisible_altref_update`]
+/// (that entry hardwires the §11 intra picker on).
+pub fn encode_invisible_altref_update_with_coding_options(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    options: &InterCodingOptions,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let refresh = RefreshControls {
+        refresh_alternate_frame: true,
+        refresh_last: false,
+        ..RefreshControls::default()
+    };
+    let (mut bytes, planes) = encode_p_frame_multi_ref_with_refresh_and_coding_options(
+        frame, last, golden, altref, params, &refresh, options,
+    )?;
+    set_show_frame_bit(&mut bytes, false);
+    Ok((bytes, planes))
 }
 
 #[allow(clippy::too_many_arguments)]

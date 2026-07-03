@@ -355,3 +355,108 @@ fn fit_token_prob_updates_emits_at_high_bias_slots() {
         }
     }
 }
+
+// ────────────── §9.10 refresh_entropy_probs / carried-base contract ──────────────
+
+/// Round-387 regression: a key frame that ships a §13.4 update payload
+/// must write `refresh_entropy_probs = 0`.
+///
+/// Every inter entry point in the crate codes its §13.4 overlay against
+/// a carried base of §13.5 defaults. Before round 387 a fitted key
+/// frame wrote `refresh_entropy_probs = 1`, persisting its merged table
+/// into the decoder's carried state — the next P-frame then decoded
+/// against `overlay(kf_merged, p_updates)` while the encoder had coded
+/// against `overlay(defaults, p_updates)`: silent probability
+/// divergence, pixel drift with no decode error (observed as a ~10 dB
+/// PSNR drop on the first P-frame after a fitted key frame).
+///
+/// Contract pinned here:
+///
+///   * fitted key frame (updates on the wire) → `refresh_entropy_probs
+///     = 0` in the parsed header;
+///   * update-free key frame → the historical `1`;
+///   * fitted K followed by fitted P self-decodes in **pixel lockstep**
+///     (the drift scenario that exposed the bug).
+#[test]
+fn fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep() {
+    use oxideav_vp8::{
+        encode_keyframe_with_reconstruction,
+        encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
+        encode_p_frame_multi_ref_with_fitted_token_prob_updates, Vp8DecoderState,
+    };
+
+    let (w, h) = (64usize, 64usize);
+    let make = |shift: usize| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut y = vec![0u8; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                let cc = c + shift;
+                y[r * w + c] = ((60 + (r * 2 + cc) % 120) as i32
+                    + (((cc * 13) % 31) as i32 - 15) * 2)
+                    .clamp(0, 255) as u8;
+            }
+        }
+        let u = vec![100u8; (w / 2) * (h / 2)];
+        let v = vec![140u8; (w / 2) * (h / 2)];
+        (y, u, v)
+    };
+    let params = KeyframeParams {
+        y_ac_qi: 40,
+        ..KeyframeParams::default()
+    };
+
+    let (ky, ku, kv) = make(0);
+    let kf_src = I420Frame::packed(w as u32, h as u32, &ky, &ku, &kv);
+    let (kf_bytes, kf_planes) =
+        encode_keyframe_with_reconstruction_and_fitted_token_prob_updates(&kf_src, &params)
+            .expect("fitted keyframe");
+
+    // Header contract — the fitted key frame must NOT persist its
+    // merged table.
+    let hdr = Vp8FrameHeader::parse(&kf_bytes).expect("tag");
+    let partition = &kf_bytes
+        [hdr.header_bytes_consumed..hdr.header_bytes_consumed + hdr.first_partition_size as usize];
+    let coded = Vp8CodedHeader::parse(partition, true).expect("coded header");
+    let carries_updates = coded.token_prob_updates.iter().any(|p| {
+        p.iter()
+            .any(|b| b.iter().any(|c| c.iter().any(|s| s.is_some())))
+    });
+    assert!(
+        carries_updates,
+        "test premise: the fitter must have emitted §13.4 updates on this content"
+    );
+    assert!(
+        !coded.refresh_entropy_probs,
+        "a key frame carrying §13.4 updates must write refresh_entropy_probs = 0"
+    );
+
+    // Update-free key frame keeps the historical 1.
+    let plain = encode_keyframe_with_reconstruction(&kf_src, &params)
+        .expect("plain keyframe")
+        .0;
+    let hdr2 = Vp8FrameHeader::parse(&plain).expect("tag");
+    let part2 = &plain[hdr2.header_bytes_consumed
+        ..hdr2.header_bytes_consumed + hdr2.first_partition_size as usize];
+    let coded2 = Vp8CodedHeader::parse(part2, true).expect("coded header");
+    assert!(
+        coded2.refresh_entropy_probs,
+        "an update-free key frame keeps refresh_entropy_probs = 1"
+    );
+
+    // Drift scenario: fitted K → fitted P, pixel lockstep end-to-end.
+    let (py, pu, pv) = make(2);
+    let p_src = I420Frame::packed(w as u32, h as u32, &py, &pu, &pv);
+    let (p_bytes, p_planes) = encode_p_frame_multi_ref_with_fitted_token_prob_updates(
+        &p_src, &kf_planes, None, None, &params,
+    )
+    .expect("fitted P-frame");
+
+    let mut dec = Vp8DecoderState::new();
+    let dk = dec.decode_frame(&kf_bytes).expect("keyframe decodes");
+    assert_eq!(dk.y, kf_planes.y, "keyframe lockstep");
+    let dp = dec.decode_frame(&p_bytes).expect("P-frame decodes");
+    assert_eq!(
+        dp.y, p_planes.y,
+        "fitted P-frame after fitted keyframe must stay in pixel lockstep"
+    );
+}

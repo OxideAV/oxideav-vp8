@@ -4461,8 +4461,11 @@ pub fn encode_keyframe(frame: &I420Frame, params: &KeyframeParams) -> Result<Vec
 /// the 1056 zero-flag wire and the merged `coeff_probs` is identical to
 /// the defaults). Otherwise the §13.4 sub-block carries the changed
 /// positions and downstream token decoding uses the merged table for
-/// the lifetime of the frame (and beyond, since key frames also set
-/// `refresh_entropy_probs = 1`).
+/// the lifetime of the frame **only**: a key frame carrying updates
+/// writes `refresh_entropy_probs = 0`, so the decoder's carried table
+/// reverts to the §13.5 defaults afterwards (the base every inter
+/// entry point in this crate codes against — see the §9.7 comment in
+/// the keyframe driver).
 ///
 /// Returns the bitstream bytes only; pair with the underlying
 /// [`encode_keyframe_with_reconstruction_and_token_updates`] when the
@@ -5095,8 +5098,19 @@ fn encode_keyframe_inner_lf(
     write_token_partition_count(&mut hdr, params.nbr_of_dct_partitions)?;
     // §9.6 — quant indices (baseline only).
     write_quant_indices(&mut hdr, params.y_ac_qi, None, None, None, None, None)?;
-    // §9.7 (key frame) — refresh_entropy_probs.
-    hdr.write_bool(128, true);
+    // §9.7 (key frame) — refresh_entropy_probs. An update-free key
+    // frame keeps the historical 1 (its merged table IS the §13.5
+    // defaults, so persisting it is a no-op). A key frame that carries
+    // a §13.4 update payload writes 0 instead, so per §9.10 the
+    // decoder's carried table reverts to the key-frame reset state (the
+    // §13.5 defaults) once the frame is done: every inter entry point
+    // in this crate codes its §13.4 overlay against a defaults carried
+    // base, and a persisted key-frame overlay would silently diverge
+    // the encoder's and decoder's probability tables on every following
+    // P-frame (pixel drift with no decode error — caught by the
+    // round-387 lagged-driver fitter integration test).
+    let persists_updates = token_updates.is_some_and(any_token_prob_update);
+    hdr.write_bool(128, !persists_updates);
     // §13 / §9.9 — token-prob update sub-block. With `token_updates =
     // Some(u)` the per-position replacement layer is written and the
     // merged `coeff_probs` above is what the encoder's tokens are coded

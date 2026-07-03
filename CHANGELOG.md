@@ -4,6 +4,22 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Fixed — §9.10 entropy persistence after a key frame with §13.4 updates (round 387)
+
+A key frame that carried a §13.4 `token_prob_update()` payload wrote
+`refresh_entropy_probs = 1`, persisting its merged probability table
+into the decoder's carried entropy state. Every inter entry point in
+the crate codes its own §13.4 overlay against a carried base of §13.5
+**defaults**, so the first P-frame after a fitted key frame decoded
+against `overlay(kf_merged, p_updates)` while the encoder had coded
+against `overlay(defaults, p_updates)` — silent probability divergence,
+pixel drift with no decode error (~10 dB PSNR loss on the first
+P-frame). Key frames carrying updates now write
+`refresh_entropy_probs = 0` (per §9.10 the carried table reverts to the
+key-frame reset state, i.e. the defaults); update-free key frames keep
+the historical `1` bit-for-bit. Pinned by
+`fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep`.
+
 ### Added — generic coding-options front doors (round 387)
 
 The per-frame quality/size features that previously each owned a

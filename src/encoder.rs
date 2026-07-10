@@ -10406,14 +10406,53 @@ mod factory {
         let u_plane = &frame.planes[1];
         let v_plane = &frame.planes[2];
 
-        if y_plane.data.len() < y_plane.stride * h
-            || u_plane.data.len() < u_plane.stride * uvh
-            || v_plane.data.len() < v_plane.stride * uvh
-        {
-            return Err(Error::invalid(
-                "vp8 encoder: VideoFrame plane buffers shorter than declared dimensions",
-            ));
+        // Per-plane geometry validation. Two hostile shapes must be
+        // rejected here rather than detonating in the row repack below:
+        // a stride narrower than the row width (whose total buffer
+        // length can still satisfy a naive `stride * rows` check while
+        // the *last* row read `off .. off + row_w` runs past the end),
+        // and a stride so large that `stride * rows` wraps `usize`.
+        // The length requirement is the exact repack footprint —
+        // `stride * (rows - 1) + row_w` — computed with checked
+        // arithmetic so overflow is a clean `Err`.
+        fn validate_plane(
+            plane: &oxideav_core::frame::VideoPlane,
+            row_w: usize,
+            rows: usize,
+            name: &str,
+        ) -> Result<()> {
+            if rows == 0 {
+                return Ok(());
+            }
+            if plane.stride < row_w {
+                return Err(Error::invalid(format!(
+                    "vp8 encoder: {name} plane stride {} narrower than row width {row_w}",
+                    plane.stride
+                )));
+            }
+            let needed = plane
+                .stride
+                .checked_mul(rows - 1)
+                .and_then(|n| n.checked_add(row_w))
+                .ok_or_else(|| {
+                    Error::invalid(format!(
+                        "vp8 encoder: {name} plane stride {} x {rows} rows overflows",
+                        plane.stride
+                    ))
+                })?;
+            if plane.data.len() < needed {
+                return Err(Error::invalid(format!(
+                    "vp8 encoder: {name} plane buffer {} bytes, needs {needed} \
+                     (stride {}, {rows} rows of {row_w})",
+                    plane.data.len(),
+                    plane.stride
+                )));
+            }
+            Ok(())
         }
+        validate_plane(y_plane, w, h, "Y")?;
+        validate_plane(u_plane, uvw, uvh, "U")?;
+        validate_plane(v_plane, uvw, uvh, "V")?;
 
         // The direct-API I420Frame requires tightly-packed planes
         // (stride == width). Always repack here so the borrow lifetimes

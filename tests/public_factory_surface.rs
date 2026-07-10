@@ -186,3 +186,110 @@ fn quality_to_qindex_via_crate_root_and_module() {
     let via_module = encoder::quality_to_qindex(75.0);
     assert_eq!(via_root, via_module);
 }
+
+// ───────────────────── round-408 fuzz-regression tests ─────────────────────
+//
+// The `encoder_trait_frame_lifecycle` fuzz target proved that the
+// framework `send_frame` plane-extraction seam accepted `VideoFrame`
+// shapes whose row repack then sliced out of bounds. Each hostile
+// shape below must be answered with `Err`, never a panic, and must
+// leave the encoder usable for a subsequent well-formed frame.
+
+/// Build a 3-plane `VideoFrame` from explicit per-plane
+/// `(stride, byte_len)` pairs.
+fn shaped_frame(y: (usize, usize), u: (usize, usize), v: (usize, usize)) -> VideoFrame {
+    let plane = |(stride, len): (usize, usize)| VideoPlane {
+        stride,
+        data: vec![0x80u8; len],
+    };
+    VideoFrame {
+        pts: Some(0),
+        planes: vec![plane(y), plane(u), plane(v)],
+    }
+}
+
+#[test]
+fn send_frame_rejects_stride_narrower_than_row_width() {
+    // 16×16 luma with stride 15 and exactly stride*rows bytes: the old
+    // `len < stride * h` check passed (240 >= 240), then the row
+    // repack read `15*15 .. 15*15+16` = 225..241 out of a 240-byte
+    // buffer — an out-of-bounds slice panic reachable from the public
+    // `Encoder` trait.
+    let mut enc = make_encoder(&vp8_params(16, 16)).expect("make_encoder");
+    let bad = shaped_frame((15, 15 * 16), (8, 8 * 8), (8, 8 * 8));
+    assert!(
+        enc.send_frame(&Frame::Video(bad)).is_err(),
+        "stride < row width must be rejected, not sliced out of bounds"
+    );
+    // The rejection must not have wedged the encoder.
+    enc.send_frame(&Frame::Video(flat_grey_frame(16, 16)))
+        .expect("well-formed frame after a rejected one must encode");
+}
+
+#[test]
+fn send_frame_rejects_stride_times_rows_overflow() {
+    // `stride * height` used to be computed unchecked: usize::MAX/2+1
+    // × 16 wraps, letting the bogus plane through to the repack.
+    let mut enc = make_encoder(&vp8_params(16, 16)).expect("make_encoder");
+    let bad = shaped_frame((usize::MAX / 2 + 1, 16 * 16), (8, 8 * 8), (8, 8 * 8));
+    assert!(
+        enc.send_frame(&Frame::Video(bad)).is_err(),
+        "stride x rows overflow must be a clean Err"
+    );
+}
+
+#[test]
+fn send_frame_rejects_short_plane_buffer() {
+    let mut enc = make_encoder(&vp8_params(16, 16)).expect("make_encoder");
+    let bad = shaped_frame((16, 16 * 16 - 1), (8, 8 * 8), (8, 8 * 8));
+    assert!(
+        enc.send_frame(&Frame::Video(bad)).is_err(),
+        "a plane shorter than its repack footprint must be rejected"
+    );
+}
+
+#[test]
+fn send_frame_rejects_zero_stride_chroma() {
+    let mut enc = make_encoder(&vp8_params(16, 16)).expect("make_encoder");
+    let bad = shaped_frame((16, 16 * 16), (0, 8 * 8), (8, 8 * 8));
+    assert!(
+        enc.send_frame(&Frame::Video(bad)).is_err(),
+        "zero-stride chroma must be rejected (stride < row width)"
+    );
+}
+
+#[test]
+fn send_frame_rejects_missing_planes() {
+    let mut enc = make_encoder(&vp8_params(16, 16)).expect("make_encoder");
+    let two_planes = VideoFrame {
+        pts: Some(0),
+        planes: vec![
+            VideoPlane {
+                stride: 16,
+                data: vec![0x80u8; 16 * 16],
+            },
+            VideoPlane {
+                stride: 8,
+                data: vec![0x80u8; 8 * 8],
+            },
+        ],
+    };
+    assert!(
+        enc.send_frame(&Frame::Video(two_planes)).is_err(),
+        "fewer than 3 planes must be rejected"
+    );
+}
+
+#[test]
+fn send_frame_accepts_last_row_without_stride_padding() {
+    // The repack footprint is stride*(rows-1) + row_width: a frame
+    // whose final row is not padded out to the full stride is legal.
+    let mut enc = make_encoder(&vp8_params(16, 16)).expect("make_encoder");
+    let ok = shaped_frame((20, 20 * 15 + 16), (10, 10 * 7 + 8), (10, 10 * 7 + 8));
+    enc.send_frame(&Frame::Video(ok))
+        .expect("unpadded final row must be accepted");
+    assert!(
+        enc.receive_packet().is_ok(),
+        "the accepted frame must produce a packet"
+    );
+}

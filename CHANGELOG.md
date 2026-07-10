@@ -6,6 +6,24 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Fixed
 
+- *(encoder)* the framework `Encoder::send_frame` adapters (both the
+  per-frame keyframe encoder behind `make_encoder` /
+  `make_encoder_with_qindex` / `make_encoder_with_quality` and the lagged
+  lookahead encoder behind `make_encoder_with_config`) no longer panic
+  with an out-of-bounds slice on a hostile `VideoFrame`. The plane
+  extraction validated `data.len() >= stride * rows`, which a plane with
+  `stride < row width` satisfies even though the row repack's final
+  `off .. off + row_w` read runs past the buffer — and the unchecked
+  `stride * rows` product could itself overflow. Plane geometry is now
+  validated per plane (stride ≥ row width; buffer covers the exact
+  `stride·(rows−1) + row_w` repack footprint, computed with checked
+  arithmetic), so every mis-shaped frame surfaces as `Err` and a frame
+  whose final row is not padded out to the full stride — previously
+  spuriously rejected — is now accepted. Found by the new
+  `encoder_trait_frame_lifecycle` fuzz target on its first session;
+  regression tests in `tests/public_factory_surface.rs`, witness seed
+  committed under `fuzz/corpus/encoder_trait_frame_lifecycle/seeds/`.
+
 - *(inverse-transform)* §14.4 scalar inverse DCT no longer panics
   ("attempt to multiply with overflow") on hostile post-dequant
   coefficients. §14.1 dequant stores `(coeff * factor) as i16`, whose
@@ -22,6 +40,21 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+- *(fuzz)* four new structure-aware fuzz targets closing the remaining
+  public-surface gaps (round 408): `panic_free_arnr_altref` (the ARNR
+  temporal-filter altref synthesiser under strided planes, odd
+  dimensions, and raw strength bytes, with pass-through / fixed-point /
+  re-entry identity oracles), `encoder_trait_frame_lifecycle` (the
+  `oxideav_core::Encoder` factory + lifecycle adapters under hostile
+  `CodecParameters`, arbitrary f32 quality bit patterns, and mis-shaped
+  `VideoFrame` planes, decode-lockstep on every emitted packet),
+  `ivf_write_parse_roundtrip` (the IVF writer half locked field-exact
+  against the parser plus a mutation demux walk), and
+  `inter_stream_refresh_lf_deltas_drive` (the seven caller-driven
+  §9.7/§9.8 refresh + §9.4 lf-deltas P-frame entry points of
+  `Vp8InterStreamEncoder`, with the carried-delta accessors locked
+  against `LoopFilterDeltas::effective` and a stateful decode-lockstep
+  leg). Committed seed corpora for all four.
 - *(decoder)* §9.1 declared-frame-size DoS cap — `decode_vp8_with_max_pixels`
   and `Vp8DecoderState::with_max_pixels_per_frame` reject a key frame whose
   declared `width × height` exceeds a caller-configured cap

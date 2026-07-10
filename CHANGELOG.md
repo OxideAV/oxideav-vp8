@@ -4,6 +4,30 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.5...v0.3.0) - 2026-07-10
+
+### Added
+
+- *(decoder)* enforce a §9.1 declared-frame-size DoS cap on the decode entry points
+
+### Fixed
+
+- *(encoder)* validate VideoFrame plane geometry in the framework send_frame adapters
+- *(inverse-transform)* §14.4 scalar inverse DCT wraps like the 32-bit reference, no overflow panic
+
+### Other
+
+- *(bool-encoder)* register-local fixed-prob-128 write_literal loop
+- *(encoder)* precompute the §8.1 mode-tree paths the RD scorers price against
+- *(benchmarks)* encoder profile refresh + trellis hoisting negative result
+- *(benchmarks)* record the fused decode→dequant A/B + refreshed hotspot map
+- *(dct-tokens)* fuse the §14.1 dequant multiply into the §13.3 token walk
+- *(arnr)* in-bounds fast paths, monotone SAD early exit, weight LUT
+- ARNR altref-builder + §7.3 bool-encoder write harnesses
+- *(README)* note IVF writer, refresh/lf-deltas P-frame, ARNR, and trait-adapter fuzz coverage
+- *(fuzz)* four new structure-aware targets for the remaining public surface
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Added
 
 - two criterion benches for public hot layers that had no isolated

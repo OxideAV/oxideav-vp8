@@ -611,6 +611,68 @@ cargo-fuzz = true
 #                                     any `Ok` decode's visible dimensions
 #                                     stay within it, cross-driving the
 #                                     stateful builder for panic-freedom.
+#   * `panic_free_arnr_altref`       — the ARNR temporal-filter altref
+#                                     synthesiser (`arnr::build_arnr_altref`
+#                                     / `ArnrConfig` / `ArnrPicture`,
+#                                     round 408) driven directly with
+#                                     strided (non-packed) planes, odd
+#                                     dimensions, raw strength bytes,
+#                                     and the two rejection legs
+#                                     (dimension mismatch / zero-dim
+#                                     center). Oracles: output geometry,
+#                                     the strength-0 / single-frame
+#                                     pass-through identity, the
+#                                     identical-window fixed point, and
+#                                     an `as_i420` re-entry echo. The
+#                                     altref stream target reaches ARNR
+#                                     only through `push_frame` with
+#                                     packed pre-validated frames.
+#   * `encoder_trait_frame_lifecycle` — the `oxideav_core::Encoder`
+#                                     trait drivers behind `make_encoder`
+#                                     / `make_encoder_with_qindex` /
+#                                     `make_encoder_with_quality` /
+#                                     `make_encoder_with_config`
+#                                     (round 408): factory parameter
+#                                     envelope (raw qindex, arbitrary
+#                                     f32 quality bit patterns, config
+#                                     knobs), hostile `VideoFrame`
+#                                     shapes into `send_frame` (plane
+#                                     count / stride / length), the
+#                                     send → receive → flush lifecycle
+#                                     contract, and a decode-lockstep
+#                                     leg on every emitted packet.
+#                                     Found the round-408
+#                                     `repack_plane` out-of-bounds
+#                                     slice (stride < row width) on its
+#                                     first session.
+#   * `ivf_write_parse_roundtrip`    — the IVF writer half
+#                                     (`ivf::write_header` /
+#                                     `ivf::write_frame`, round 408)
+#                                     locked against the parser:
+#                                     field-exact header round-trip,
+#                                     multi-record size/pts/payload
+#                                     round-trip walk, and a
+#                                     single-byte-mutation demux-walk
+#                                     panic-freedom leg.
+#   * `inter_stream_refresh_lf_deltas_drive`
+#                                  — the seven caller-driven
+#                                     §9.7 / §9.8 refresh + §9.4
+#                                     lf-deltas P-frame entry points of
+#                                     `Vp8InterStreamEncoder`
+#                                     (round 408): arbitrary refresh
+#                                     ladders (including
+#                                     `refresh_last = false` and the
+#                                     out-of-range copy-selector
+#                                     rejection), `LoopFilterDeltas`
+#                                     `Some`/`None` mixes locked
+#                                     against the public `effective()`
+#                                     carry resolution via the
+#                                     `carried_*_deltas()` accessors,
+#                                     sparse attacker `TokenProbUpdates`
+#                                     grids on the `_token_updates`
+#                                     sibling, the two-pass fitter
+#                                     siblings, and a stateful decode
+#                                     lockstep on every emitted frame.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -840,5 +902,29 @@ doc = false
 [[bin]]
 name = "decode_pixel_cap_enforcement"
 path = "fuzz_targets/decode_pixel_cap_enforcement.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "panic_free_arnr_altref"
+path = "fuzz_targets/panic_free_arnr_altref.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encoder_trait_frame_lifecycle"
+path = "fuzz_targets/encoder_trait_frame_lifecycle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ivf_write_parse_roundtrip"
+path = "fuzz_targets/ivf_write_parse_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "inter_stream_refresh_lf_deltas_drive"
+path = "fuzz_targets/inter_stream_refresh_lf_deltas_drive.rs"
 test = false
 doc = false

@@ -15,5 +15,17 @@ corpus/panic_free_keyframe_reconstruct/*
 !corpus/decode_pixel_cap_enforcement/
 corpus/decode_pixel_cap_enforcement/*
 !corpus/decode_pixel_cap_enforcement/seeds/
+!corpus/encoder_trait_frame_lifecycle/
+corpus/encoder_trait_frame_lifecycle/*
+!corpus/encoder_trait_frame_lifecycle/seeds/
+!corpus/panic_free_arnr_altref/
+corpus/panic_free_arnr_altref/*
+!corpus/panic_free_arnr_altref/seeds/
+!corpus/ivf_write_parse_roundtrip/
+corpus/ivf_write_parse_roundtrip/*
+!corpus/ivf_write_parse_roundtrip/seeds/
+!corpus/inter_stream_refresh_lf_deltas_drive/
+corpus/inter_stream_refresh_lf_deltas_drive/*
+!corpus/inter_stream_refresh_lf_deltas_drive/seeds/
 artifacts
 coverage

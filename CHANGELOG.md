@@ -18,6 +18,18 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Changed
 
+- *(decoder)* whole-frame decode is ≈ 5–8 % faster on both the keyframe
+  and inter paths, bit-identically: the §14.1 dequant multiply is fused
+  into the §13.3 token-descent coefficient writes
+  (`decode_and_dequantize_mb` no longer runs the 400-multiply
+  occupancy-independent second pass over every coded macroblock — each
+  non-zero coefficient is scaled with the identical `i32` product /
+  `i16` truncation as it is produced, and zero lanes need no scaling at
+  all). Public `decode_mb_coeffs` / `decode_block` /
+  `MbDequantFactors::dequantize` are unchanged; pinned
+  stream-for-stream by a new four-shape equivalence test including the
+  cat6 × large-factor `i16`-truncation case.
+
 - *(arnr)* the temporal-filter altref builder is 2.4–2.5× faster
   (−60.4 % on a 5-frame static-noise 128×128 window, −57.8 % on a
   translating window) with bit-identical output: the SAD probe and both

@@ -2693,3 +2693,55 @@ odd-geometry plane so the overhang path is exercised). Full lib suite
 
 Throughput on the steady-state denoise shape rises from 12.7 to
 31.9 Mpx/s (2.52×).
+
+## Round 409 — fused §13.3 decode → §14.1 dequant (profile-opt, part 3)
+
+The standing r298 candidate. `MbDequantFactors::dequantize` re-walked
+all twenty-five 4×4 blocks of every coded macroblock (400
+occupancy-independent multiplies + an 800-byte load/store pass) after
+the token descent had already visited exactly the non-zero lanes.
+`decode_block_core` is now monomorphised on a `const DQ: bool`: under
+`DQ = true` each non-zero coefficient is scaled by its plane's DC/AC
+factor — the identical `i32` product and `i16` truncation the second
+pass performed — at the moment it is written, and the zero-run /
+untouched lanes need no scaling at all (`0 × factor` truncates to `0`,
+which is what the second pass stored). `decode_and_dequantize_mb`
+routes through the new fused `pub(crate) decode_mb_coeffs_dequant`
+walk, so both stateless and stateful whole-frame decode drivers drop
+the second pass on every coded MB. Public surfaces
+(`decode_mb_coeffs`, `decode_block`, `dequantize`) are unchanged; the
+`DQ = false` monomorphisation is the raw walk as before.
+
+### Bit-exactness
+
+`fused_dequant_walk_matches_decode_then_dequantize` pins the fused walk
+stream-for-stream against decode-then-dequantize over four §13 shapes:
+a dense MB whose cat6 magnitudes × large factors overflow `i16` (the
+truncation case), a sparse zero-run MB, a no-Y2 (B_PRED-shaped) MB,
+and a skip MB — asserting coefficients, both entropy contexts, and
+trailing-literal bit-position lockstep. Full suite 808 tests green on
+stable; 557 lib tests green on nightly + `simd` (the SIMD §14.1 block
+apply remains for the public `dequantize` API and its parity tests).
+
+### Measured A/B (two interleaved pre/post pairs, `--warm-up-time 2 --measurement-time 6`, Apple M4-class aarch64, stable)
+
+| Bench | Pre (pair medians) | Post (pair medians) | Δ |
+|---|---:|---:|---:|
+| `keyframe_decode/decode_keyframe_320x240_qi32` | 125.7 / 126.7 µs | **116.1 / 119.6 µs** | **≈ −6…−8 %** |
+| `inter_decode_short_clip/inter_decode_4f_128x128_qi32` | 115.2 / 114.8 µs | **105.9 / 108.6 µs** | **≈ −5…−8 %** |
+| `token_decode/inter_decode_12f_176x144_token_heavy` | 776.5 µs | 776.0 µs | ≈ −2 % (p = 0.06, token-dominated stream) |
+| `token_decode/decode_mb_coeffs_{dense,sparse}_64mb` | — | — | within noise (raw walk, unchanged by design) |
+
+Every post run sits below every pre run on both whole-frame benches.
+The win is the removed occupancy-independent second pass; it is largest
+on ordinary mixed-density frames and smallest on streams whose time is
+already dominated by the token descent itself.
+
+### Refreshed ranked decoder hotspot map (post r409 fusion)
+
+| Rank | Symbol | Note |
+|---|---|---|
+| 1 | `dct_tokens::decode_block_core` | now also carries the fused §14.1 multiply; resists a bit-identical change |
+| 2 | `inverse_transform::inverse_dct_4x4_add_into` | r294 DC-only fast path landed |
+| 3 | per-frame reference-slot plane copy (`_platform_memmove`) | CoW slot representation, API-gated, own round (r308 sized the true headroom below the `shipped_*` floor) |
+| 4 | `coded_header::parse_token_prob_update` | r291 zipped loop, small fixed floor |

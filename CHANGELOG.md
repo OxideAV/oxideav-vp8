@@ -16,6 +16,20 @@ All notable changes to `oxideav-vp8` are recorded here.
   idioms, each stream round-trip-verified through the crate's own
   decoder at setup). Baselines recorded in `BENCHMARKS.md`.
 
+### Changed
+
+- *(arnr)* the temporal-filter altref builder is 2.4–2.5× faster
+  (−60.4 % on a 5-frame static-noise 128×128 window, −57.8 % on a
+  translating window) with bit-identical output: the SAD probe and both
+  blend-accumulation loops take straight row slices when the displaced
+  block is fully in-bounds (the clamped per-pixel form is kept verbatim
+  for genuine edge crossings), the refinement search abandons a
+  candidate once its row-partial SAD reaches the incumbent best (only a
+  strictly smaller SAD ever wins, so selection is unchanged), and the
+  per-pixel blend-weight division is replaced by a 256-entry lookup
+  table. Five equivalence tests pin every fast path against the
+  original per-pixel clamped form.
+
 ### Fixed
 
 - *(encoder)* the framework `Encoder::send_frame` adapters (both the

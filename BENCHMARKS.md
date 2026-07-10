@@ -2641,3 +2641,55 @@ accumulation pays the same per-pixel clamp. The write-side bool coder
 shows the same balanced-vs-skewed spread as the decoder (≈ +57 % per
 bool at prob 128) with the renormalisation loop + byte-emit dominating
 the balanced regime.
+
+## Round 409 — ARNR fast paths (profile-opt, part 2)
+
+The new `arnr_build_altref` baseline showed the temporal filter paying a
+per-pixel edge-clamping `pel()` fetch (two `clamp`s + a row-base
+multiply) on **every** SAD probe pixel and every blend-accumulation
+pixel, plus an integer division per blended pixel — even though away
+from frame edges (the overwhelmingly common case) every displaced block
+is fully in-bounds. Three levers, none of which changes a single output
+pixel:
+
+* **in-bounds fast paths** — `block_sad` and both accumulation loops
+  (`accumulate_luma_block` / `accumulate_chroma_block`) now test the
+  displaced block's bounds once and take straight row slices when it is
+  interior; the original clamped per-pixel form is kept verbatim as the
+  edge path (chroma additionally requires an overhang-free output block,
+  preserving the deliberate double-accumulation into clamped edge pixels
+  on odd-dimension planes).
+* **monotone SAD early exit** — the refinement search passes its
+  incumbent `best_sad` into `block_sad`, which abandons a candidate as
+  soon as the row-partial SAD reaches it. Only a *strictly smaller* SAD
+  ever wins, so a winning candidate can never trigger the exit and a
+  losing one is rejected either way: identical `(mv, sad)` selection.
+* **weight lookup table** — the difference-driven blend weight
+  `W_MAX·S / (S + d²)` depends on `d` only through `|d| <= 255`, so one
+  256-entry table per `build_arnr_altref` call replaces the per-pixel
+  division.
+
+### Bit-exactness
+
+Four new pins: `weight_table_matches_pixel_weight` (every `(d,
+strength)` pair), `block_sad_fast_matches_generic` (interior + all four
+corner blocks × every MV in ±16), `refine_search_matches_no_early_exit_reference`
+(the full descent vs an exhaustive generic-SAD reference across
+convergent / walking / hopeless scenes, every block of the frame), and
+`accumulate_luma_block_fast_matches_generic` /
+`accumulate_chroma_block_fast_matches_generic` (verbatim copies of the
+original per-pixel loops as references; the chroma pin runs on a 25×23
+odd-geometry plane so the overhang path is exercised). Full lib suite
+551 (+8), all integration test binaries green — including
+`altref_arnr_on_decodes_bit_exact`.
+
+### Measured A/B (`--warm-up-time 2 --measurement-time 6`, criterion stored-baseline delta, Apple M4-class aarch64, stable)
+
+| Bench | Pre | Post | Δ |
+|---|---:|---:|---:|
+| `arnr_build_altref/arnr_5f_128x128_static_noise` | 1.294 ms | **513.2 µs** | **−60.4 %** |
+| `arnr_build_altref/arnr_3f_128x128_translating` | 656.9 µs | **278.0 µs** | **−57.8 %** |
+| `arnr_build_altref/arnr_5f_128x128_strength0` | 535.5 ns | 548.1 ns | within noise (untouched floor) |
+
+Throughput on the steady-state denoise shape rises from 12.7 to
+31.9 Mpx/s (2.52×).

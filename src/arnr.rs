@@ -106,12 +106,73 @@ fn pel(plane: &[u8], stride: usize, w: i32, h: i32, x: i32, y: i32) -> u8 {
 
 /// SAD of one `bw × bh` block of `src` (anchored at `(bx, by)`, fully
 /// in-bounds) against the edge-clamped block of `refp` displaced by
-/// `(mvx, mvy)`.
+/// `(mvx, mvy)`, accumulating each candidate row exactly as
+/// [`block_sad_generic`] does.
+///
+/// Two cost levers over the straightforward per-pixel form, neither of
+/// which changes any returned value the caller can observe:
+///
+/// * **in-bounds fast path** — when the whole displaced block lands
+///   strictly inside the reference plane (the overwhelmingly common
+///   case away from frame edges), the per-pixel `clamp` + row-base
+///   multiply of [`pel`] collapses to two straight row slices. The
+///   clamped generic path is kept verbatim for the genuine edge case
+///   and doubles as the equivalence reference
+///   (`block_sad_fast_matches_generic` pins them pixel-for-pixel).
+/// * **monotone early exit** — the row-partial SAD only ever grows, so
+///   once it reaches `early_exit_at` the final SAD is guaranteed to be
+///   `>= early_exit_at` and the candidate can be abandoned. The caller
+///   ([`refine_search`]) only accepts a candidate on a *strictly
+///   smaller* SAD, so returning any partial `>= early_exit_at` selects
+///   the identical winner with the identical best SAD: a candidate
+///   that would win never triggers the exit (every partial of a
+///   winning candidate is below the incumbent best), and a losing
+///   candidate is rejected either way
+///   (`refine_search_matches_no_early_exit_reference` pins the whole
+///   descent).
 fn block_sad(
     src: &I420Frame<'_>,
     refp: &I420Frame<'_>,
     (bx, by, bw, bh): (usize, usize, usize, usize),
     (mvx, mvy): (i32, i32),
+    early_exit_at: u32,
+) -> u32 {
+    let w = src.width as i32;
+    let h = src.height as i32;
+    let x0 = bx as i32 + mvx;
+    let y0 = by as i32 + mvy;
+    let in_bounds = x0 >= 0 && y0 >= 0 && x0 + bw as i32 <= w && y0 + bh as i32 <= h;
+    if !in_bounds {
+        return block_sad_generic(src, refp, (bx, by, bw, bh), (mvx, mvy), early_exit_at);
+    }
+    let (rx0, ry0) = (x0 as usize, y0 as usize);
+    let mut sad = 0u32;
+    for r in 0..bh {
+        let sy = by + r;
+        let src_row = &src.y[sy * src.y_stride + bx..sy * src.y_stride + bx + bw];
+        let ref_base = (ry0 + r) * refp.y_stride + rx0;
+        let ref_row = &refp.y[ref_base..ref_base + bw];
+        for (&s, &rp) in src_row.iter().zip(ref_row.iter()) {
+            sad += (s as i32 - rp as i32).unsigned_abs();
+        }
+        if sad >= early_exit_at {
+            return sad;
+        }
+    }
+    sad
+}
+
+/// The straightforward per-pixel edge-clamped SAD — the reference form
+/// [`block_sad`] must match, and the path it takes when the displaced
+/// block genuinely crosses a frame edge. Carries the same per-row
+/// monotone early exit (the partial sum is identical row-for-row, so
+/// the exit fires at exactly the same row on both paths).
+fn block_sad_generic(
+    src: &I420Frame<'_>,
+    refp: &I420Frame<'_>,
+    (bx, by, bw, bh): (usize, usize, usize, usize),
+    (mvx, mvy): (i32, i32),
+    early_exit_at: u32,
 ) -> u32 {
     let w = src.width as i32;
     let h = src.height as i32;
@@ -130,6 +191,9 @@ fn block_sad(
             );
             sad += (s as i32 - rp as i32).unsigned_abs();
         }
+        if sad >= early_exit_at {
+            return sad;
+        }
     }
     sad
 }
@@ -144,7 +208,7 @@ fn refine_search(
     blk: (usize, usize, usize, usize),
 ) -> (i32, i32, u32) {
     let mut best = (0i32, 0i32);
-    let mut best_sad = block_sad(src, refp, blk, (0, 0));
+    let mut best_sad = block_sad(src, refp, blk, (0, 0), u32::MAX);
     let mut step = 8i32;
     while step >= 1 {
         let center = best;
@@ -162,7 +226,10 @@ fn refine_search(
             if cand.0.abs() > 15 || cand.1.abs() > 15 {
                 continue;
             }
-            let sad = block_sad(src, refp, blk, cand);
+            // `best_sad` as the exit bound: only a strictly smaller SAD
+            // wins, so a candidate whose partial sum already reaches
+            // `best_sad` is rejected with or without the exit.
+            let sad = block_sad(src, refp, blk, cand, best_sad);
             if sad < best_sad {
                 best_sad = sad;
                 best = cand;
@@ -180,6 +247,156 @@ fn refine_search(
 #[inline]
 fn pixel_weight(d: i32, s_scale: u32) -> u32 {
     (W_MAX * s_scale) / (s_scale + (d * d) as u32)
+}
+
+/// Precompute [`pixel_weight`] for every possible absolute pixel
+/// difference (`|d| <= 255` for 8-bit planes). The weight depends on
+/// `d` only through `d²`, so one 256-entry table replaces the per-pixel
+/// integer division in the blend accumulation. Bit-identical by
+/// construction (`weight_table_matches_pixel_weight` sweeps every
+/// `(d, strength)` pair).
+fn weight_table(s_scale: u32) -> [u32; 256] {
+    let mut table = [0u32; 256];
+    for (d, slot) in table.iter_mut().enumerate() {
+        *slot = pixel_weight(d as i32, s_scale);
+    }
+    table
+}
+
+/// Accumulate one motion-aligned luma block of a window frame into the
+/// blend accumulators.
+///
+/// `ctr_y` is the tightly-packed `w × h` center copy (`out.y`); the
+/// reference plane arrives strided. The output positions `(bx..bx+bw,
+/// by..by+bh)` are always in-bounds (the block grid never leaves the
+/// frame); only the *displaced* reference fetch can cross an edge. When
+/// it does not — the overwhelmingly common case — the per-pixel
+/// edge-clamping [`pel`] collapses to a straight row slice; the clamped
+/// generic form is kept verbatim below and pinned pixel-for-pixel by
+/// `accumulate_luma_block_fast_matches_generic`.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_luma_block(
+    ctr_y: &[u8],
+    (f_y, f_stride): (&[u8], usize),
+    (w, h): (usize, usize),
+    (bx, by, bw, bh): (usize, usize, usize, usize),
+    (mvx, mvy): (i32, i32),
+    wt_table: &[u32; 256],
+    acc: &mut [u32],
+    wsum: &mut [u32],
+) {
+    let x0 = bx as i32 + mvx;
+    let y0 = by as i32 + mvy;
+    if x0 >= 0 && y0 >= 0 && x0 + bw as i32 <= w as i32 && y0 + bh as i32 <= h as i32 {
+        // In-bounds fast path: straight row slices, no per-pixel clamp.
+        let (rx0, ry0) = (x0 as usize, y0 as usize);
+        for r in 0..bh {
+            let out_base = (by + r) * w + bx;
+            let ref_base = (ry0 + r) * f_stride + rx0;
+            let ctr_row = &ctr_y[out_base..out_base + bw];
+            let ref_row = &f_y[ref_base..ref_base + bw];
+            let acc_row = &mut acc[out_base..out_base + bw];
+            let wsum_row = &mut wsum[out_base..out_base + bw];
+            for c in 0..bw {
+                let ref_px = ref_row[c] as i32;
+                let d = ref_px - ctr_row[c] as i32;
+                let wt = wt_table[d.unsigned_abs() as usize];
+                acc_row[c] += wt * ref_px as u32;
+                wsum_row[c] += wt;
+            }
+        }
+        return;
+    }
+    // Edge-crossing generic path — the reference form.
+    for r in 0..bh {
+        let yy = by + r;
+        for c in 0..bw {
+            let xx = bx + c;
+            let ctr_px = ctr_y[yy * w + xx] as i32;
+            let ref_px = pel(
+                f_y,
+                f_stride,
+                w as i32,
+                h as i32,
+                xx as i32 + mvx,
+                yy as i32 + mvy,
+            ) as i32;
+            let wt = wt_table[(ref_px - ctr_px).unsigned_abs() as usize];
+            acc[yy * w + xx] += wt * ref_px as u32;
+            wsum[yy * w + xx] += wt;
+        }
+    }
+}
+
+/// Accumulate one motion-aligned chroma block (one plane — called once
+/// for U and once for V) into the blend accumulators.
+///
+/// Unlike luma, the chroma *output* coordinates are themselves clamped
+/// (`.min(cw - 1)` / `.min(ch - 1)`) because an odd-dimension plane's
+/// last block row/column can overhang — and that clamping deliberately
+/// accumulates twice into the edge pixel, which must be preserved. The
+/// fast path therefore requires the output block to be overhang-free
+/// *and* the displaced reference fetch to be in-bounds; anything else
+/// takes the generic clamped form (pinned by
+/// `accumulate_chroma_block_fast_matches_generic`).
+#[allow(clippy::too_many_arguments)]
+fn accumulate_chroma_block(
+    ctr_plane: &[u8],
+    (f_plane, f_stride): (&[u8], usize),
+    (cw, ch): (usize, usize),
+    (cbx, cby, cbw, cbh): (usize, usize, usize, usize),
+    (cmvx, cmvy): (i32, i32),
+    wt_table: &[u32; 256],
+    acc: &mut [u32],
+    wsum: &mut [u32],
+) {
+    let x0 = cbx as i32 + cmvx;
+    let y0 = cby as i32 + cmvy;
+    let output_in_bounds = cbx + cbw <= cw && cby + cbh <= ch;
+    if output_in_bounds
+        && x0 >= 0
+        && y0 >= 0
+        && x0 + cbw as i32 <= cw as i32
+        && y0 + cbh as i32 <= ch as i32
+    {
+        let (rx0, ry0) = (x0 as usize, y0 as usize);
+        for r in 0..cbh {
+            let out_base = (cby + r) * cw + cbx;
+            let ref_base = (ry0 + r) * f_stride + rx0;
+            let ctr_row = &ctr_plane[out_base..out_base + cbw];
+            let ref_row = &f_plane[ref_base..ref_base + cbw];
+            let acc_row = &mut acc[out_base..out_base + cbw];
+            let wsum_row = &mut wsum[out_base..out_base + cbw];
+            for c in 0..cbw {
+                let ref_px = ref_row[c] as i32;
+                let d = ref_px - ctr_row[c] as i32;
+                let wt = wt_table[d.unsigned_abs() as usize];
+                acc_row[c] += wt * ref_px as u32;
+                wsum_row[c] += wt;
+            }
+        }
+        return;
+    }
+    // Overhanging / edge-crossing generic path — the reference form,
+    // including the double-accumulation into clamped edge pixels.
+    for r in 0..cbh {
+        let yy = (cby + r).min(ch - 1);
+        for c in 0..cbw {
+            let xx = (cbx + c).min(cw - 1);
+            let ctr_px = ctr_plane[yy * cw + xx] as i32;
+            let ref_px = pel(
+                f_plane,
+                f_stride,
+                cw as i32,
+                ch as i32,
+                xx as i32 + cmvx,
+                yy as i32 + cmvy,
+            ) as i32;
+            let wt = wt_table[(ref_px - ctr_px).unsigned_abs() as usize];
+            acc[yy * cw + xx] += wt * ref_px as u32;
+            wsum[yy * cw + xx] += wt;
+        }
+    }
 }
 
 /// Build a temporally-filtered altref anchor from a window of source
@@ -242,6 +459,9 @@ pub fn build_arnr_altref(
     // down-weights a |d| = 4 pixel to ~1/3, strength 6 keeps it at
     // ~14/16.
     let s_scale = 8u32 << cfg.strength.min(ArnrConfig::MAX_STRENGTH);
+    // One weight per possible |ref − center| difference — replaces the
+    // per-pixel division in the accumulation loops below.
+    let wt_table = weight_table(s_scale);
 
     // Per-16×16-block accumulation over the window.
     let mut acc_y = vec![0u32; w * h];
@@ -274,51 +494,35 @@ pub fn build_arnr_altref(
                     continue;
                 }
                 // Luma accumulation.
-                for r in 0..bh {
-                    let yy = by + r;
-                    for c in 0..bw {
-                        let xx = bx + c;
-                        let ctr_px = out.y[yy * w + xx] as i32;
-                        let ref_px = pel(
-                            f.y,
-                            f.y_stride,
-                            w as i32,
-                            h as i32,
-                            xx as i32 + mvx,
-                            yy as i32 + mvy,
-                        ) as i32;
-                        let wt = pixel_weight(ref_px - ctr_px, s_scale);
-                        acc_y[yy * w + xx] += wt * ref_px as u32;
-                        wsum_y[yy * w + xx] += wt;
-                    }
-                }
+                accumulate_luma_block(
+                    &out.y,
+                    (f.y, f.y_stride),
+                    (w, h),
+                    (bx, by, bw, bh),
+                    (mvx, mvy),
+                    &wt_table,
+                    &mut acc_y,
+                    &mut wsum_y,
+                );
                 // Chroma accumulation — luma MV halved (round toward
                 // zero), §18.2-style.
                 let (cmvx, cmvy) = (mvx / 2, mvy / 2);
                 let (cbx, cby) = (bx / 2, by / 2);
                 let (cbw, cbh) = (bw.div_ceil(2), bh.div_ceil(2));
-                for r in 0..cbh {
-                    let yy = (cby + r).min(ch - 1);
-                    for c in 0..cbw {
-                        let xx = (cbx + c).min(cw - 1);
-                        for (ctr_plane, fp, acc, wsum) in [
-                            (&out.u, f.u, &mut acc_u, &mut wsum_u),
-                            (&out.v, f.v, &mut acc_v, &mut wsum_v),
-                        ] {
-                            let ctr_px = ctr_plane[yy * cw + xx] as i32;
-                            let ref_px = pel(
-                                fp,
-                                f.uv_stride,
-                                cw as i32,
-                                ch as i32,
-                                xx as i32 + cmvx,
-                                yy as i32 + cmvy,
-                            ) as i32;
-                            let wt = pixel_weight(ref_px - ctr_px, s_scale);
-                            acc[yy * cw + xx] += wt * ref_px as u32;
-                            wsum[yy * cw + xx] += wt;
-                        }
-                    }
+                for (ctr_plane, fp, acc, wsum) in [
+                    (&out.u, f.u, &mut acc_u, &mut wsum_u),
+                    (&out.v, f.v, &mut acc_v, &mut wsum_v),
+                ] {
+                    accumulate_chroma_block(
+                        ctr_plane,
+                        (fp, f.uv_stride),
+                        (cw, ch),
+                        (cbx, cby, cbw, cbh),
+                        (cmvx, cmvy),
+                        &wt_table,
+                        acc,
+                        wsum,
+                    );
                 }
                 bx += 16;
             }
@@ -509,5 +713,311 @@ mod tests {
     fn config_clamps_strength() {
         assert_eq!(ArnrConfig::new(99).strength, ArnrConfig::MAX_STRENGTH);
         assert_eq!(ArnrConfig::new(2).strength, 2);
+    }
+
+    // =====================================================================
+    // Fast-path equivalence pins (round 409). Each optimized path must be
+    // pixel-for-pixel the straightforward per-pixel clamped form.
+    // =====================================================================
+
+    /// The weight table is a pure precomputation of `pixel_weight`.
+    #[test]
+    fn weight_table_matches_pixel_weight() {
+        for strength in 0..=ArnrConfig::MAX_STRENGTH {
+            let s_scale = 8u32 << strength;
+            let table = weight_table(s_scale);
+            for d in -255i32..=255 {
+                assert_eq!(
+                    table[d.unsigned_abs() as usize],
+                    pixel_weight(d, s_scale),
+                    "strength {strength} d {d}"
+                );
+            }
+        }
+    }
+
+    /// A pair of textured, noisy frames for the block-level pins.
+    fn stress_pair() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (cy, cu, _cv) = clean_scene();
+        let ry = noisy(&cy, 4242, 20);
+        let ru = noisy(&cu, 2424, 12);
+        (cy, ry, cu, ru)
+    }
+
+    /// `block_sad` (fast dispatch, no early exit) equals the clamped
+    /// generic form on interior blocks, edge blocks, and every MV the
+    /// refinement search can probe.
+    #[test]
+    fn block_sad_fast_matches_generic() {
+        let (cy, ry, cu, cv_) = stress_pair();
+        let src = I420Frame::packed(W as u32, H as u32, &cy, &cu, &cv_);
+        let refp = I420Frame::packed(W as u32, H as u32, &ry, &cu, &cv_);
+        // Interior, corner, and partial (right/bottom overhang-free)
+        // blocks; W = H = 48 so blocks at 32 touch the frame edge.
+        for &blk in &[
+            (16usize, 16usize, 16usize, 16usize),
+            (0, 0, 16, 16),
+            (32, 32, 16, 16),
+            (32, 0, 16, 16),
+            (0, 32, 16, 16),
+        ] {
+            for mvy in -16i32..=16 {
+                for mvx in -16i32..=16 {
+                    let fast = block_sad(&src, &refp, blk, (mvx, mvy), u32::MAX);
+                    let generic = block_sad_generic(&src, &refp, blk, (mvx, mvy), u32::MAX);
+                    assert_eq!(fast, generic, "blk {blk:?} mv ({mvx},{mvy})");
+                }
+            }
+        }
+    }
+
+    /// The whole refinement descent — with the monotone early exit and
+    /// the in-bounds fast path — returns exactly the `(mv, sad)` the
+    /// exhaustive no-early-exit generic descent returns.
+    #[test]
+    fn refine_search_matches_no_early_exit_reference() {
+        /// The original descent shape: generic SAD, no early exit.
+        fn refine_search_reference(
+            src: &I420Frame<'_>,
+            refp: &I420Frame<'_>,
+            blk: (usize, usize, usize, usize),
+        ) -> (i32, i32, u32) {
+            let mut best = (0i32, 0i32);
+            let mut best_sad = block_sad_generic(src, refp, blk, (0, 0), u32::MAX);
+            let mut step = 8i32;
+            while step >= 1 {
+                let center = best;
+                for (dx, dy) in [
+                    (-step, -step),
+                    (0, -step),
+                    (step, -step),
+                    (-step, 0),
+                    (step, 0),
+                    (-step, step),
+                    (0, step),
+                    (step, step),
+                ] {
+                    let cand = (center.0 + dx, center.1 + dy);
+                    if cand.0.abs() > 15 || cand.1.abs() > 15 {
+                        continue;
+                    }
+                    let sad = block_sad_generic(src, refp, blk, cand, u32::MAX);
+                    if sad < best_sad {
+                        best_sad = sad;
+                        best = cand;
+                    }
+                }
+                step /= 2;
+            }
+            (best.0, best.1, best_sad)
+        }
+
+        let (cy, cu, cv_) = clean_scene();
+        // Reference scenes: pure noise, a genuine +4 px translation, and
+        // an unrelated (inverted) frame — bracketing convergent,
+        // walking, and hopeless descents.
+        let noise_only = noisy(&cy, 99, 8);
+        let mut translated = vec![0u8; W * H];
+        for r in 0..H {
+            for c in 0..W {
+                let sc = (c as i32 - 4).clamp(0, W as i32 - 1) as usize;
+                translated[r * W + c] = cy[r * W + sc];
+            }
+        }
+        let translated = noisy(&translated, 7331, 5);
+        let alien: Vec<u8> = cy.iter().map(|&p| 255 - p).collect();
+
+        let src = I420Frame::packed(W as u32, H as u32, &cy, &cu, &cv_);
+        for ref_y in [&noise_only, &translated, &alien] {
+            let refp = I420Frame::packed(W as u32, H as u32, ref_y, &cu, &cv_);
+            let mut by = 0usize;
+            while by < H {
+                let bh = (H - by).min(16);
+                let mut bx = 0usize;
+                while bx < W {
+                    let bw = (W - bx).min(16);
+                    let blk = (bx, by, bw, bh);
+                    assert_eq!(
+                        refine_search(&src, &refp, blk),
+                        refine_search_reference(&src, &refp, blk),
+                        "blk {blk:?}"
+                    );
+                    bx += 16;
+                }
+                by += 16;
+            }
+        }
+    }
+
+    /// `accumulate_luma_block` (in-bounds fast path + generic edge path)
+    /// equals the original per-pixel `pel` + `pixel_weight` form on
+    /// every probed MV, in-bounds and edge-crossing alike.
+    #[test]
+    fn accumulate_luma_block_fast_matches_generic() {
+        /// The original accumulation loop, verbatim.
+        #[allow(clippy::too_many_arguments)]
+        fn reference(
+            ctr_y: &[u8],
+            f_y: &[u8],
+            f_stride: usize,
+            (w, h): (usize, usize),
+            (bx, by, bw, bh): (usize, usize, usize, usize),
+            (mvx, mvy): (i32, i32),
+            s_scale: u32,
+            acc: &mut [u32],
+            wsum: &mut [u32],
+        ) {
+            for r in 0..bh {
+                let yy = by + r;
+                for c in 0..bw {
+                    let xx = bx + c;
+                    let ctr_px = ctr_y[yy * w + xx] as i32;
+                    let ref_px = pel(
+                        f_y,
+                        f_stride,
+                        w as i32,
+                        h as i32,
+                        xx as i32 + mvx,
+                        yy as i32 + mvy,
+                    ) as i32;
+                    let wt = pixel_weight(ref_px - ctr_px, s_scale);
+                    acc[yy * w + xx] += wt * ref_px as u32;
+                    wsum[yy * w + xx] += wt;
+                }
+            }
+        }
+
+        let (cy, ry, _cu, _ru) = stress_pair();
+        let s_scale = 8u32 << 3;
+        let table = weight_table(s_scale);
+        for &blk in &[
+            (16usize, 16usize, 16usize, 16usize),
+            (0, 0, 16, 16),
+            (32, 32, 16, 16),
+        ] {
+            for mvy in [-15i32, -7, -1, 0, 1, 7, 15] {
+                for mvx in [-15i32, -7, -1, 0, 1, 7, 15] {
+                    let mut acc_a = vec![3u32; W * H];
+                    let mut wsum_a = vec![5u32; W * H];
+                    let mut acc_b = acc_a.clone();
+                    let mut wsum_b = wsum_a.clone();
+                    accumulate_luma_block(
+                        &cy,
+                        (&ry, W),
+                        (W, H),
+                        blk,
+                        (mvx, mvy),
+                        &table,
+                        &mut acc_a,
+                        &mut wsum_a,
+                    );
+                    reference(
+                        &cy,
+                        &ry,
+                        W,
+                        (W, H),
+                        blk,
+                        (mvx, mvy),
+                        s_scale,
+                        &mut acc_b,
+                        &mut wsum_b,
+                    );
+                    assert_eq!(acc_a, acc_b, "acc blk {blk:?} mv ({mvx},{mvy})");
+                    assert_eq!(wsum_a, wsum_b, "wsum blk {blk:?} mv ({mvx},{mvy})");
+                }
+            }
+        }
+    }
+
+    /// `accumulate_chroma_block` equals the original clamped form —
+    /// including the deliberate double-accumulation into clamped edge
+    /// pixels on an odd-dimension plane's overhanging last block.
+    #[test]
+    fn accumulate_chroma_block_fast_matches_generic() {
+        /// The original chroma accumulation loop, verbatim.
+        #[allow(clippy::too_many_arguments)]
+        fn reference(
+            ctr_plane: &[u8],
+            f_plane: &[u8],
+            f_stride: usize,
+            (cw, ch): (usize, usize),
+            (cbx, cby, cbw, cbh): (usize, usize, usize, usize),
+            (cmvx, cmvy): (i32, i32),
+            s_scale: u32,
+            acc: &mut [u32],
+            wsum: &mut [u32],
+        ) {
+            for r in 0..cbh {
+                let yy = (cby + r).min(ch - 1);
+                for c in 0..cbw {
+                    let xx = (cbx + c).min(cw - 1);
+                    let ctr_px = ctr_plane[yy * cw + xx] as i32;
+                    let ref_px = pel(
+                        f_plane,
+                        f_stride,
+                        cw as i32,
+                        ch as i32,
+                        xx as i32 + cmvx,
+                        yy as i32 + cmvy,
+                    ) as i32;
+                    let wt = pixel_weight(ref_px - ctr_px, s_scale);
+                    acc[yy * cw + xx] += wt * ref_px as u32;
+                    wsum[yy * cw + xx] += wt;
+                }
+            }
+        }
+
+        // A deliberately odd chroma geometry (25×23) so `div_ceil`
+        // blocks overhang on the right and bottom.
+        let (cw, ch) = (25usize, 23usize);
+        let mut ctr = vec![0u8; cw * ch];
+        for r in 0..ch {
+            for c in 0..cw {
+                ctr[r * cw + c] = (100 + ((r * 5 + c * 3) & 0x3f)) as u8;
+            }
+        }
+        let refp = noisy(&ctr, 555, 10);
+        let s_scale = 8u32 << 3;
+        let table = weight_table(s_scale);
+        // 8×8 chroma blocks over the odd plane, all halved MVs the luma
+        // search can produce.
+        for &blk in &[
+            (0usize, 0usize, 8usize, 8usize),
+            (8, 8, 8, 8),
+            (24, 16, 8, 8), // right + bottom overhang (cbx = 24 on cw = 25)
+            (16, 16, 8, 8),
+        ] {
+            for cmvy in [-7i32, -3, 0, 3, 7] {
+                for cmvx in [-7i32, -3, 0, 3, 7] {
+                    let mut acc_a = vec![1u32; cw * ch];
+                    let mut wsum_a = vec![2u32; cw * ch];
+                    let mut acc_b = acc_a.clone();
+                    let mut wsum_b = wsum_a.clone();
+                    accumulate_chroma_block(
+                        &ctr,
+                        (&refp, cw),
+                        (cw, ch),
+                        blk,
+                        (cmvx, cmvy),
+                        &table,
+                        &mut acc_a,
+                        &mut wsum_a,
+                    );
+                    reference(
+                        &ctr,
+                        &refp,
+                        cw,
+                        (cw, ch),
+                        blk,
+                        (cmvx, cmvy),
+                        s_scale,
+                        &mut acc_b,
+                        &mut wsum_b,
+                    );
+                    assert_eq!(acc_a, acc_b, "acc blk {blk:?} cmv ({cmvx},{cmvy})");
+                    assert_eq!(wsum_a, wsum_b, "wsum blk {blk:?} cmv ({cmvx},{cmvy})");
+                }
+            }
+        }
     }
 }

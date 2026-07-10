@@ -55,7 +55,9 @@
 //! [`decode_mb_coeffs`]: crate::dct_tokens::decode_mb_coeffs
 
 use crate::coded_header::QuantIndices;
-use crate::dct_tokens::{decode_mb_coeffs, CoeffProbs, MbCoeffError, MbEntropyCtx};
+use crate::dct_tokens::{
+    decode_mb_coeffs_dequant, CoeffProbs, MbCoeffError, MbDequantPairs, MbEntropyCtx,
+};
 use crate::frame::MbCoeffs;
 use crate::inverse_transform::{clamp_qindex, AC_QLOOKUP, DC_QLOOKUP};
 
@@ -387,9 +389,19 @@ pub fn decode_and_dequantize_mb(
     above: &mut MbEntropyCtx,
     left: &mut MbEntropyCtx,
 ) -> Result<MbCoeffs, MbCoeffError> {
-    let mut coeffs = decode_mb_coeffs(dec, has_y2, mb_skip_coeff, coeff_probs, above, left)?;
-    factors.dequantize(&mut coeffs);
-    Ok(coeffs)
+    // Fused walk: the §14.1 multiply is applied to each non-zero
+    // coefficient as the §13.3 descent writes it, instead of a second
+    // all-lanes pass over the whole macroblock afterwards. Bit-identical
+    // to decode-then-dequantize (untouched lanes hold 0 and 0 × factor
+    // truncates to 0); pinned stream-for-stream by
+    // `fused_dequant_walk_matches_decode_then_dequantize` and the
+    // whole-decoder fixture suite.
+    let pairs = MbDequantPairs {
+        y2: (factors.y2_dc, factors.y2_ac),
+        y1: (factors.y1_dc, factors.y1_ac),
+        uv: (factors.uv_dc, factors.uv_ac),
+    };
+    decode_mb_coeffs_dequant(dec, has_y2, mb_skip_coeff, coeff_probs, &pairs, above, left)
 }
 
 #[cfg(test)]

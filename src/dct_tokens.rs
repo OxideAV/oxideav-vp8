@@ -486,14 +486,31 @@ const SCAN_IDENTITY: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
 /// context for the first coefficient; `write_order[c]` the output
 /// slot for scan position `c` ([`SCAN_IDENTITY`] or [`ZIGZAG`]).
 /// Returns the number of non-zero coefficients written.
+///
+/// When the `DQ` const parameter is `true` the §14.1 dequant multiply
+/// is fused into the coefficient write: each non-zero value is scaled
+/// by `dc_factor` (raster slot 0) or `ac_factor` (raster slots 1..=15)
+/// — the identical `i32` product / `i16` truncation
+/// [`crate::dequant`]'s per-block apply performs — at the moment it is
+/// produced, so the all-lanes second pass over the macroblock (400
+/// occupancy-independent multiplies plus an 800-byte re-walk) never
+/// runs. Zero coefficients need no scaling (`0 × factor` truncates to
+/// `0`, exactly what the second pass stored), which is what makes the
+/// fusion bit-identical by construction; the equivalence is pinned
+/// stream-for-stream by `fused_dequant_walk_matches_decode_then_dequantize`.
+/// With `DQ = false` the factors are ignored and the generated code is
+/// the raw-coefficient walk, unchanged.
 #[inline]
-fn decode_block_core(
+#[allow(clippy::too_many_arguments)]
+fn decode_block_core<const DQ: bool>(
     dec: &mut BoolDecoder<'_>,
     plane_probs: &[[[u8; 11]; 3]; 8],
     first_coeff: usize,
     seed_ctx3: usize,
     write_order: &[usize; 16],
     coeffs: &mut [i16; 16],
+    dc_factor: i16,
+    ac_factor: i16,
 ) -> Result<usize, DctTokenError> {
     let mut ctx3 = seed_ctx3;
     let mut non_zero_count = 0usize;
@@ -559,7 +576,16 @@ fn decode_block_core(
         // = 2114, which still fits in i16 with sign.
         let sign = dec.read_bool(128)?;
         let signed = abs_value as i16;
-        coeffs[write_order[i]] = if sign { -signed } else { signed };
+        let slot = write_order[i];
+        let mut value = if sign { -signed } else { signed };
+        if DQ {
+            // Fused §14.1 apply: DC factor for raster slot 0, AC for
+            // slots 1..=15, product in i32 truncated to i16 — the exact
+            // arithmetic of the per-block second pass this replaces.
+            let factor = if slot == 0 { dc_factor } else { ac_factor };
+            value = ((value as i32) * (factor as i32)) as i16;
+        }
+        coeffs[slot] = value;
         non_zero_count += 1;
         i += 1;
     }
@@ -608,13 +634,15 @@ pub fn decode_block(
     // types — are realised structurally by `decode_block_core`'s inner
     // zero-run loop, which re-enters the tree at the DCT_0 node.
     let ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
-    decode_block_core(
+    decode_block_core::<false>(
         dec,
         &coeff_probs[block_type.plane_index()],
         block_type.first_coeff(),
         ctx3,
         &SCAN_IDENTITY,
         coeffs,
+        0,
+        0,
     )
 }
 
@@ -792,10 +820,78 @@ pub fn decode_mb_coeffs(
     above: &mut MbEntropyCtx,
     left: &mut MbEntropyCtx,
 ) -> Result<crate::frame::MbCoeffs, MbCoeffError> {
+    // Raw walk: the factor pairs are ignored under `DQ = false`.
+    decode_mb_coeffs_inner::<false>(
+        dec,
+        has_y2,
+        mb_skip_coeff,
+        coeff_probs,
+        &MbDequantPairs {
+            y2: (0, 0),
+            y1: (0, 0),
+            uv: (0, 0),
+        },
+        above,
+        left,
+    )
+}
+
+/// Per-plane §14.1 `(DC, AC)` dequant factor pairs for the fused
+/// decode→dequant walk ([`decode_mb_coeffs_dequant`]). A plain
+/// destructuring of [`crate::dequant::MbDequantFactors`] into the three
+/// plane pairs the §13 residual order selects between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MbDequantPairs {
+    /// Y2 (the 25th, WHT) block factors.
+    pub y2: (i16, i16),
+    /// Y1 (the sixteen luma DCT sub-blocks) factors.
+    pub y1: (i16, i16),
+    /// Chroma (the four U and four V sub-blocks) factors.
+    pub uv: (i16, i16),
+}
+
+/// The fused §13.3 decode → §14.1 dequant walk: identical to
+/// [`decode_mb_coeffs`] except that every non-zero coefficient is
+/// scaled by its plane's DC/AC factor at the moment it is written, so
+/// the caller receives the **dequantized** [`crate::frame::MbCoeffs`]
+/// directly and the per-macroblock second pass
+/// ([`crate::dequant::MbDequantFactors::dequantize`] — 400
+/// occupancy-independent multiplies over all twenty-five blocks) is
+/// never needed. Bit-identical to decode-then-dequantize by
+/// construction (untouched / zero-run lanes hold `0`, and `0 × factor`
+/// truncates to `0`); pinned stream-for-stream by
+/// `fused_dequant_walk_matches_decode_then_dequantize`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_mb_coeffs_dequant(
+    dec: &mut BoolDecoder<'_>,
+    has_y2: bool,
+    mb_skip_coeff: bool,
+    coeff_probs: &CoeffProbs,
+    pairs: &MbDequantPairs,
+    above: &mut MbEntropyCtx,
+    left: &mut MbEntropyCtx,
+) -> Result<crate::frame::MbCoeffs, MbCoeffError> {
+    decode_mb_coeffs_inner::<true>(dec, has_y2, mb_skip_coeff, coeff_probs, pairs, above, left)
+}
+
+/// Shared body of [`decode_mb_coeffs`] / [`decode_mb_coeffs_dequant`]:
+/// the §13 / §14.2 residual-order walk, monomorphised on whether the
+/// §14.1 apply is fused into the coefficient writes.
+#[allow(clippy::too_many_arguments)]
+fn decode_mb_coeffs_inner<const DQ: bool>(
+    dec: &mut BoolDecoder<'_>,
+    has_y2: bool,
+    mb_skip_coeff: bool,
+    coeff_probs: &CoeffProbs,
+    pairs: &MbDequantPairs,
+    above: &mut MbEntropyCtx,
+    left: &mut MbEntropyCtx,
+) -> Result<crate::frame::MbCoeffs, MbCoeffError> {
     let mut out = crate::frame::MbCoeffs::default();
 
     // §13.1: a skip macroblock reads no tokens. Update the predictor
-    // context per the §20.16 `reset_mb_context` rule and return zeros.
+    // context per the §20.16 `reset_mb_context` rule and return zeros
+    // (which dequantize to zeros, so the fused walk returns them as-is).
     if mb_skip_coeff {
         above.reset_for_skip(has_y2);
         left.reset_for_skip(has_y2);
@@ -807,10 +903,12 @@ pub fn decode_mb_coeffs(
     // into its raster slot via the §20.16 `ZIGZAG` write order — no
     // separate reorder pass), and write back the non-zero status into
     // both predictor vectors. `block_index` is the §20.16 residual
-    // block index (0..=24).
+    // block index (0..=24); `(dc_factor, ac_factor)` the plane's §14.1
+    // pair (ignored under `DQ = false`).
     let decode_one = |dec: &mut BoolDecoder<'_>,
                       block_index: usize,
                       block_type: BlockType,
+                      (dc_factor, ac_factor): (i16, i16),
                       above: &mut MbEntropyCtx,
                       left: &mut MbEntropyCtx,
                       raster: &mut [i16; 16]|
@@ -820,13 +918,15 @@ pub fn decode_mb_coeffs(
         // §13.3 page 65: ctx3 for the first coefficient is the count
         // of non-zero neighbours.
         let ctx3 = (above.nonzero[a_slot] as usize) + (left.nonzero[l_slot] as usize);
-        let nz = decode_block_core(
+        let nz = decode_block_core::<DQ>(
             dec,
             &coeff_probs[block_type.plane_index()],
             block_type.first_coeff(),
             ctx3,
             &ZIGZAG,
             raster,
+            dc_factor,
+            ac_factor,
         )
         .map_err(|source| MbCoeffError::Block {
             index: block_index,
@@ -845,7 +945,7 @@ pub fn decode_mb_coeffs(
     // when a Y2 block carries the DCs, else `YNoY2` (DCT starts at 0).
     if has_y2 {
         // Y2 is residual block 24 in the §20.16 index tables.
-        decode_one(dec, 24, BlockType::Y2, above, left, &mut out.y2)?;
+        decode_one(dec, 24, BlockType::Y2, pairs.y2, above, left, &mut out.y2)?;
     }
 
     let y_plane = if has_y2 {
@@ -854,15 +954,15 @@ pub fn decode_mb_coeffs(
         BlockType::YNoY2
     };
     for (i, y_block) in out.y.iter_mut().enumerate() {
-        decode_one(dec, i, y_plane, above, left, y_block)?;
+        decode_one(dec, i, y_plane, pairs.y1, above, left, y_block)?;
     }
 
     // U occupies residual blocks 16..=19, V occupies 20..=23.
     for (i, u_block) in out.u.iter_mut().enumerate() {
-        decode_one(dec, 16 + i, BlockType::UV, above, left, u_block)?;
+        decode_one(dec, 16 + i, BlockType::UV, pairs.uv, above, left, u_block)?;
     }
     for (i, v_block) in out.v.iter_mut().enumerate() {
-        decode_one(dec, 20 + i, BlockType::UV, above, left, v_block)?;
+        decode_one(dec, 20 + i, BlockType::UV, pairs.uv, above, left, v_block)?;
     }
 
     Ok(out)
@@ -2080,6 +2180,141 @@ mod tests {
             assert!(
                 garbage.y != y1 || garbage.y2 != y2_1 || garbage.u != u1 || garbage.v != v1,
                 "fresh-left decode unexpectedly matched — propagation not load-bearing?"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_dequant_walk_matches_decode_then_dequantize() {
+        // The fused §13.3 decode → §14.1 dequant walk
+        // (`decode_mb_coeffs_dequant`, the `DQ = true` monomorphisation)
+        // must be stream-for-stream identical to the two-pass form —
+        // `decode_mb_coeffs` followed by
+        // `MbDequantFactors::dequantize` — in every §13 shape:
+        //
+        // * a dense MB (every lane of every block non-zero, including
+        //   cat6 magnitudes whose product with a large factor overflows
+        //   i16 and must truncate identically);
+        // * a sparse MB (DC + a few low-frequency AC, long zero runs —
+        //   the common shape, exercising the DCT_0 re-entry loop and
+        //   the untouched-lane invariant);
+        // * a no-Y2 (B_PRED-shaped) MB where luma starts at coefficient
+        //   0 and carries its own DC;
+        // * a skip MB (no tokens; both paths return zeros and apply the
+        //   same context reset).
+        //
+        // The two decoders walk physically separate copies of the same
+        // byte stream with independently threaded above/left contexts;
+        // afterwards the coefficients, both contexts, and the number of
+        // consumed input bits must all agree (the trailing literal read
+        // proves bit-position lockstep).
+        use crate::coded_header::QuantIndices;
+        use crate::dequant::MbDequantFactors;
+
+        let probs = &DEFAULT_COEFF_PROBS;
+
+        // Large factors (high qi + worst-case deltas) so the cat6
+        // products genuinely overflow i16 and pin the truncation.
+        let factors = MbDequantFactors::from_quant_indices(&QuantIndices {
+            y_ac_qi: 120,
+            y_dc_delta: Some(7),
+            y2_dc_delta: Some(15),
+            y2_ac_delta: Some(15),
+            uv_dc_delta: Some(3),
+            uv_ac_delta: Some(9),
+        });
+        let pairs = MbDequantPairs {
+            y2: (factors.y2_dc, factors.y2_ac),
+            y1: (factors.y1_dc, factors.y1_ac),
+            uv: (factors.uv_dc, factors.uv_ac),
+        };
+
+        // Dense MB: every lane non-zero, cat6 values in every plane.
+        let dense_block: [i16; 16] = [
+            900, -3, 1, 70, //
+            2, -80, 5, 1, //
+            -1, 4, -2114, 2, //
+            3, -1, 1, -6,
+        ];
+        let dense_y2 = dense_block;
+        let dense_y = [dense_block; 16];
+        let dense_uv = [dense_block; 4];
+
+        // Sparse MB: DC + two low-frequency ACs, long zero runs.
+        let sparse_block: [i16; 16] = [
+            7, -1, 0, 0, //
+            1, 0, 0, 0, //
+            0, 0, 0, 0, //
+            0, 0, 0, 0,
+        ];
+        let sparse_y2 = sparse_block;
+        let sparse_y = [sparse_block; 16];
+        let sparse_uv = [sparse_block; 4];
+
+        // (has_y2, skip, y2, y, u, v) shapes.
+        let zero_y2 = [0i16; 16];
+        #[allow(clippy::type_complexity)]
+        let shapes: [(bool, bool, [i16; 16], [[i16; 16]; 16], [[i16; 16]; 4]); 4] = [
+            (true, false, dense_y2, dense_y, dense_uv),
+            (true, false, sparse_y2, sparse_y, sparse_uv),
+            (false, false, zero_y2, sparse_y, dense_uv),
+            (true, true, zero_y2, [[0i16; 16]; 16], [[0i16; 16]; 4]),
+        ];
+
+        for (case, &(has_y2, skip, y2, y, uv)) in shapes.iter().enumerate() {
+            // Encode the MB (skip MBs contribute no tokens; encode an
+            // empty stream and let both paths take the skip branch).
+            let mut bytes = if skip {
+                vec![0u8; 8]
+            } else {
+                let mut enc_above = MbEntropyCtx::default();
+                let mut enc_left = MbEntropyCtx::default();
+                encode_mb_shared(
+                    has_y2,
+                    probs,
+                    &mut enc_above,
+                    &mut enc_left,
+                    &y2,
+                    &y,
+                    &uv,
+                    &uv,
+                )
+            };
+            // Slack for the trailing lockstep literal read below.
+            bytes.extend_from_slice(&[0xA5; 8]);
+
+            // Path A: two-pass — decode raw, then dequantize.
+            let mut dec_a = BoolDecoder::init(&bytes).unwrap();
+            let mut above_a = MbEntropyCtx::default();
+            let mut left_a = MbEntropyCtx::default();
+            let mut two_pass =
+                decode_mb_coeffs(&mut dec_a, has_y2, skip, probs, &mut above_a, &mut left_a)
+                    .unwrap();
+            factors.dequantize(&mut two_pass);
+
+            // Path B: the fused walk.
+            let mut dec_b = BoolDecoder::init(&bytes).unwrap();
+            let mut above_b = MbEntropyCtx::default();
+            let mut left_b = MbEntropyCtx::default();
+            let fused = decode_mb_coeffs_dequant(
+                &mut dec_b,
+                has_y2,
+                skip,
+                probs,
+                &pairs,
+                &mut above_b,
+                &mut left_b,
+            )
+            .unwrap();
+
+            assert_eq!(fused, two_pass, "case {case}: coefficients diverge");
+            assert_eq!(above_a, above_b, "case {case}: above ctx diverges");
+            assert_eq!(left_a, left_b, "case {case}: left ctx diverges");
+            // Bit-position lockstep: the next reads must agree.
+            assert_eq!(
+                dec_a.read_literal(16).unwrap(),
+                dec_b.read_literal(16).unwrap(),
+                "case {case}: consumed bit counts diverge"
             );
         }
     }

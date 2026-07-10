@@ -226,3 +226,21 @@ harness = false
 [[bench]]
 name = "dequantize_mb"
 harness = false
+
+# Round 409 benches — two public hot layers that still had no isolated
+# harness. `arnr_build_altref` drives the motion-compensated temporal
+# filter behind the §9.7 altref anchor (per-16×16-block whole-pel
+# refinement search + difference-weighted blend) across a static-noise
+# window, a translating window, and the strength-0 pass-through floor.
+# `bool_encoder_write` is the §7.3 boolean *encoder* twin of the
+# round-295 `bool_decoder_read` bench — the skewed / balanced
+# `write_bool` regimes plus the `write_literal` / `write_signed_literal`
+# L(n) idioms, each stream round-trip-verified through the crate's own
+# decoder at setup.
+[[bench]]
+name = "arnr_build_altref"
+harness = false
+
+[[bench]]
+name = "bool_encoder_write"
+harness = false

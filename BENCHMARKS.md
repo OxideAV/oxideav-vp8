@@ -2592,3 +2592,52 @@ warnings` clean on both the stable scalar build and the nightly `simd` build;
 691 tests pass under `--features simd` (686 under the stable scalar build —
 the 5 extra are the simd-gated parity tests). No decoder/encoder logic change
 on the stable path; the stable build is byte-identical to before this round.
+
+## Round 409 — ARNR + §7.3 bool-encoder write harnesses (bench round, part 1)
+
+Round 409 (2026-07-11) opens the bench/profile axis by covering the two
+public hot layers that still had no isolated criterion harness:
+
+* **`arnr_build_altref`** — the motion-compensated temporal filter that
+  builds the §9.7 altref anchor (`build_arnr_altref`). Per 16×16 block
+  of the center frame it runs a whole-pel three-round refinement search
+  (±15 px, step 8 → 4 → 2 → 1) against every other window frame, drops
+  blocks above the occlusion SAD cutoff, and blends surviving pixels
+  with a difference-driven weight. Three workloads: a five-frame
+  static-noise window (the steady-state denoise shape), a three-frame
+  translating window (the motion-search-heavy shape), and the
+  strength-0 pass-through floor (plane copies only — the filter's
+  marginal cost is the delta against this row).
+* **`bool_encoder_write`** — the §7.3 boolean *encoder* twin of the
+  round-295 `bool_decoder_read` bench. Every coded bit of an encoded
+  frame passes through `BoolEncoder::write_bool` and its
+  carry-propagating renormalisation loop, but the write side was only
+  ever measured folded inside whole-frame encode. Regimes mirror the
+  decoder bench: skewed (prob 248) and balanced (prob 128, the renorm
+  worst case) `write_bool` streams, the `write_literal` L(8) idiom, and
+  the `write_signed_literal` §9.3 magnitude+sign idiom. Each measured
+  iteration builds and finishes a fresh partition (vector growth is
+  inseparable from real frame emission); every stream is round-trip
+  decoded at setup by the crate's own `BoolDecoder`.
+
+### Baselines (`--warm-up-time 2 --measurement-time 6`, Apple M4-class aarch64, macOS 25.1, rustc stable)
+
+| Bench | Time | Per-element |
+|---|---:|---:|
+| `arnr_build_altref/arnr_5f_128x128_static_noise` | **1.294 ms** | 12.66 Mpx/s |
+| `arnr_build_altref/arnr_3f_128x128_translating` | 656.9 µs | 24.94 Mpx/s |
+| `arnr_build_altref/arnr_5f_128x128_strength0` | 535.5 ns | (plane-copy floor) |
+| `bool_encoder_write/write_bool_skewed_64k` | 120.98 µs | 1.85 ns/bool |
+| `bool_encoder_write/write_bool_balanced_64k` | 190.95 µs | 2.91 ns/bool |
+| `bool_encoder_write/write_literal_8b_8k` | 182.23 µs | 2.78 ns/bool |
+| `bool_encoder_write/write_signed_literal_7b_8k` | 137.06 µs | 2.39 ns/bool |
+
+Findings feeding the rest of the round: the ARNR filter costs ≈ 2 400×
+its pass-through floor on a five-frame window — every candidate probe
+of the refinement search fetches its displaced block through a per-pixel
+edge-clamping `pel()` even when the block is fully in-bounds (the
+overwhelmingly common case away from frame edges), and the blend
+accumulation pays the same per-pixel clamp. The write-side bool coder
+shows the same balanced-vs-skewed spread as the decoder (≈ +57 % per
+bool at prob 128) with the renormalisation loop + byte-emit dominating
+the balanced regime.

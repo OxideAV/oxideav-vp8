@@ -4,6 +4,18 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- two criterion benches for public hot layers that had no isolated
+  harness: `arnr_build_altref` (the motion-compensated temporal filter
+  behind the §9.7 altref anchor — static-noise window, translating
+  window, and the strength-0 pass-through floor) and
+  `bool_encoder_write` (the §7.3 boolean *encoder* twin of the
+  round-295 `bool_decoder_read` bench — skewed / balanced `write_bool`
+  regimes plus the `write_literal` / `write_signed_literal` L(n)
+  idioms, each stream round-trip-verified through the crate's own
+  decoder at setup). Baselines recorded in `BENCHMARKS.md`.
+
 ### Fixed
 
 - *(encoder)* the framework `Encoder::send_frame` adapters (both the

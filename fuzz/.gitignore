@@ -9,5 +9,8 @@ corpus/decoder_trait_packet_lifecycle/*
 !corpus/ivf_demux_decode_walk/
 corpus/ivf_demux_decode_walk/*
 !corpus/ivf_demux_decode_walk/seeds/
+!corpus/panic_free_keyframe_reconstruct/
+corpus/panic_free_keyframe_reconstruct/*
+!corpus/panic_free_keyframe_reconstruct/seeds/
 artifacts
 coverage

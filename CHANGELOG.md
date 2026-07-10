@@ -4,6 +4,22 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(inverse-transform)* §14.4 scalar inverse DCT no longer panics
+  ("attempt to multiply with overflow") on hostile post-dequant
+  coefficients. §14.1 dequant stores `(coeff * factor) as i16`, whose
+  truncation can land anywhere in the `i16` range; a near-`i16::MAX`
+  block drives the second-pass `r * SINPI8_SQRT2` product past
+  `i32::MAX`. The reference §14.4 listing wraps in its 32-bit `int`
+  domain and the bit-exactness contract is defined against that wrapped
+  result — the release build and the `simd` lane path already wrap, so
+  the scalar path now uses explicit `wrapping_*` ops to match (byte-exact
+  output, no debug-assertion panic). Reachable via
+  `decode_vp8` / `Vp8DecoderState::decode_frame` → reconstruction on a
+  malformed key frame; a regression seed is committed under
+  `fuzz/corpus/panic_free_keyframe_reconstruct/seeds/`.
+
 ## [0.2.5](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.4...v0.2.5) - 2026-07-03
 
 ### Fixed

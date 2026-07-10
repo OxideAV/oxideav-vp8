@@ -607,6 +607,20 @@ fn inverse_dct_4x4_add_into_simd(
 /// implementation.
 #[allow(dead_code)] // Used by `inverse_dct_4x4` only on the !simd path.
 fn inverse_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
+    // §14.4 arithmetic runs in the 32-bit-`int` domain of the reference
+    // `short_idct4x4llm_c` listing, which relies on two's-complement
+    // wrap-around: the first-pass intermediates can reach ~1.3e5 for
+    // near-`i16::MAX` inputs, and the second-pass `r * SINPI8_SQRT2`
+    // product (~4.5e9 at that magnitude) exceeds `i32::MAX`. The listing's
+    // `int` overflow wraps, and the §14.4 bit-exactness contract (a
+    // conforming decoder reproduces the rounding bit-for-bit) is defined
+    // against that wrapped result — which is exactly what the release
+    // build and the `simd` lane path (documented wrapping `i32` multiply)
+    // already produce. Hostile post-dequant coefficients can drive those
+    // magnitudes (the §14.1 dequant `(coeff * factor) as i16` truncation
+    // can land anywhere in the `i16` range), so the scalar path uses
+    // explicit `wrapping_*` ops to match that semantics without tripping a
+    // debug-assertion overflow panic on such input.
     let mut tmp = [0i32; 16];
 
     // First pass: operate down each column (spec: ip[0], ip[4], ip[8],
@@ -618,21 +632,21 @@ fn inverse_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
         let i8 = input[8 + col] as i32;
         let i12 = input[12 + col] as i32;
 
-        let a1 = i0 + i8;
-        let b1 = i0 - i8;
+        let a1 = i0.wrapping_add(i8);
+        let b1 = i0.wrapping_sub(i8);
 
-        let t1 = (i4 * SINPI8_SQRT2) >> 16;
-        let t2 = i12 + ((i12 * COSPI8_SQRT2_MINUS1) >> 16);
-        let c1 = t1 - t2;
+        let t1 = i4.wrapping_mul(SINPI8_SQRT2) >> 16;
+        let t2 = i12.wrapping_add(i12.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+        let c1 = t1.wrapping_sub(t2);
 
-        let t1 = i4 + ((i4 * COSPI8_SQRT2_MINUS1) >> 16);
-        let t2 = (i12 * SINPI8_SQRT2) >> 16;
-        let d1 = t1 + t2;
+        let t1 = i4.wrapping_add(i4.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+        let t2 = i12.wrapping_mul(SINPI8_SQRT2) >> 16;
+        let d1 = t1.wrapping_add(t2);
 
-        tmp[col] = a1 + d1;
-        tmp[12 + col] = a1 - d1;
-        tmp[4 + col] = b1 + c1;
-        tmp[8 + col] = b1 - c1;
+        tmp[col] = a1.wrapping_add(d1);
+        tmp[12 + col] = a1.wrapping_sub(d1);
+        tmp[4 + col] = b1.wrapping_add(c1);
+        tmp[8 + col] = b1.wrapping_sub(c1);
     }
 
     // Second pass: operate across each row (spec: ip[0..=3] reading the
@@ -645,21 +659,21 @@ fn inverse_dct_4x4_scalar(input: &[i16; 16], output: &mut [i16; 16]) {
         let r2 = tmp[base + 2];
         let r3 = tmp[base + 3];
 
-        let a1 = r0 + r2;
-        let b1 = r0 - r2;
+        let a1 = r0.wrapping_add(r2);
+        let b1 = r0.wrapping_sub(r2);
 
-        let t1 = (r1 * SINPI8_SQRT2) >> 16;
-        let t2 = r3 + ((r3 * COSPI8_SQRT2_MINUS1) >> 16);
-        let c1 = t1 - t2;
+        let t1 = r1.wrapping_mul(SINPI8_SQRT2) >> 16;
+        let t2 = r3.wrapping_add(r3.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+        let c1 = t1.wrapping_sub(t2);
 
-        let t1 = r1 + ((r1 * COSPI8_SQRT2_MINUS1) >> 16);
-        let t2 = (r3 * SINPI8_SQRT2) >> 16;
-        let d1 = t1 + t2;
+        let t1 = r1.wrapping_add(r1.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+        let t2 = r3.wrapping_mul(SINPI8_SQRT2) >> 16;
+        let d1 = t1.wrapping_add(t2);
 
-        output[base] = ((a1 + d1 + 4) >> 3) as i16;
-        output[base + 3] = ((a1 - d1 + 4) >> 3) as i16;
-        output[base + 1] = ((b1 + c1 + 4) >> 3) as i16;
-        output[base + 2] = ((b1 - c1 + 4) >> 3) as i16;
+        output[base] = (a1.wrapping_add(d1).wrapping_add(4) >> 3) as i16;
+        output[base + 3] = (a1.wrapping_sub(d1).wrapping_add(4) >> 3) as i16;
+        output[base + 1] = (b1.wrapping_add(c1).wrapping_add(4) >> 3) as i16;
+        output[base + 2] = (b1.wrapping_sub(c1).wrapping_add(4) >> 3) as i16;
     }
 }
 
@@ -1057,6 +1071,104 @@ mod tests {
         let mut output = [0i16; 16];
         inverse_dct_4x4(&input, &mut output);
         assert_eq!(output, [8i16; 16]);
+    }
+
+    /// Regression (round 405): the §14.4 inverse DCT must not panic on
+    /// hostile post-dequant coefficients. §14.1 dequant stores
+    /// `(coeff * factor) as i16`, whose truncation can land anywhere in
+    /// the `i16` range; a full-range block drives the second-pass
+    /// `r * SINPI8_SQRT2` product past `i32::MAX`. The reference-C listing
+    /// wraps in its 32-bit `int` domain and the bit-exactness contract is
+    /// defined against that wrapped result, so the scalar path must wrap
+    /// (matching release mode and the `simd` lane path) rather than trip a
+    /// debug-assertion overflow panic. Before the fix this panicked with
+    /// "attempt to multiply with overflow"; the decode-side reachability
+    /// (`frame::decode_keyframe` → `inverse_dct_4x4_scalar`) was captured
+    /// by the `panic_free_keyframe_reconstruct` fuzz target on the scalar
+    /// build.
+    #[test]
+    fn dct_extreme_coefficients_wrap_without_panic() {
+        // Independent wrapping re-derivation of the §14.4 two-pass listing
+        // (the 32-bit-`int` reference semantics), used as the oracle.
+        fn wrapping_reference(input: &[i16; 16]) -> [i16; 16] {
+            let mut tmp = [0i32; 16];
+            for col in 0..4 {
+                let i0 = input[col] as i32;
+                let i4 = input[4 + col] as i32;
+                let i8 = input[8 + col] as i32;
+                let i12 = input[12 + col] as i32;
+                let a1 = i0.wrapping_add(i8);
+                let b1 = i0.wrapping_sub(i8);
+                let t1 = i4.wrapping_mul(SINPI8_SQRT2) >> 16;
+                let t2 = i12.wrapping_add(i12.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+                let c1 = t1.wrapping_sub(t2);
+                let t1b = i4.wrapping_add(i4.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+                let t2b = i12.wrapping_mul(SINPI8_SQRT2) >> 16;
+                let d1 = t1b.wrapping_add(t2b);
+                tmp[col] = a1.wrapping_add(d1);
+                tmp[12 + col] = a1.wrapping_sub(d1);
+                tmp[4 + col] = b1.wrapping_add(c1);
+                tmp[8 + col] = b1.wrapping_sub(c1);
+            }
+            let mut out = [0i16; 16];
+            for row in 0..4 {
+                let base = row * 4;
+                let r0 = tmp[base];
+                let r1 = tmp[base + 1];
+                let r2 = tmp[base + 2];
+                let r3 = tmp[base + 3];
+                let a1 = r0.wrapping_add(r2);
+                let b1 = r0.wrapping_sub(r2);
+                let t1 = r1.wrapping_mul(SINPI8_SQRT2) >> 16;
+                let t2 = r3.wrapping_add(r3.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+                let c1 = t1.wrapping_sub(t2);
+                let t1b = r1.wrapping_add(r1.wrapping_mul(COSPI8_SQRT2_MINUS1) >> 16);
+                let t2b = r3.wrapping_mul(SINPI8_SQRT2) >> 16;
+                let d1 = t1b.wrapping_add(t2b);
+                out[base] = (a1.wrapping_add(d1).wrapping_add(4) >> 3) as i16;
+                out[base + 3] = (a1.wrapping_sub(d1).wrapping_add(4) >> 3) as i16;
+                out[base + 1] = (b1.wrapping_add(c1).wrapping_add(4) >> 3) as i16;
+                out[base + 2] = (b1.wrapping_sub(c1).wrapping_add(4) >> 3) as i16;
+            }
+            out
+        }
+
+        let hostile = [
+            [i16::MAX; 16],
+            [i16::MIN; 16],
+            [
+                i16::MAX,
+                i16::MIN,
+                i16::MAX,
+                i16::MIN,
+                i16::MIN,
+                i16::MAX,
+                i16::MIN,
+                i16::MAX,
+                i16::MAX,
+                i16::MIN,
+                i16::MAX,
+                i16::MIN,
+                i16::MIN,
+                i16::MAX,
+                i16::MIN,
+                i16::MAX,
+            ],
+            [
+                -32768, 32767, -1, 12345, -30000, 32767, -32768, 9999, 32767, -32768, 32767,
+                -32768, 1, -2, 3, -4,
+            ],
+        ];
+        for input in &hostile {
+            let mut output = [0i16; 16];
+            // Must not panic under debug assertions.
+            inverse_dct_4x4(input, &mut output);
+            assert_eq!(
+                output,
+                wrapping_reference(input),
+                "IDCT must match the 32-bit wrapping reference on {input:?}"
+            );
+        }
     }
 
     #[test]

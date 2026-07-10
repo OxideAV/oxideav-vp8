@@ -2745,3 +2745,45 @@ already dominated by the token descent itself.
 | 2 | `inverse_transform::inverse_dct_4x4_add_into` | r294 DC-only fast path landed |
 | 3 | per-frame reference-slot plane copy (`_platform_memmove`) | CoW slot representation, API-gated, own round (r308 sized the true headroom below the `shipped_*` floor) |
 | 4 | `coded_header::parse_token_prob_update` | r291 zipped loop, small fixed floor |
+
+## Round 409 — encoder profile refresh + trellis hoisting negative result (part 4)
+
+A fresh `sample(1)` PID-attach profile of `keyframe_encode` (12 s @ 1 ms,
+stable) re-ranked the encode side for the first time since the §13
+trellis landed. Top self-time symbols:
+
+| Symbol | Samples | Share |
+|---|---:|---:|
+| `encoder::trellis_quantize_block` | 7 396 | **≈ 80 %** |
+| `encoder::estimate_block_bits` | 418 | ≈ 4.5 % |
+| `encoder::treed_find_path::dfs` | 370 | ≈ 4.0 % |
+| `encoder::encode_mb_block_set_with_neighbors_strength` | 358 | ≈ 3.9 % |
+| `inverse_transform::inverse_dct_4x4_scalar` | 242 | ≈ 2.6 % |
+| `forward_transform::forward_dct_4x4` | 224 | ≈ 2.4 % |
+
+The §13 trellis — run per candidate mode × per block by the RD pickers —
+now dominates keyframe encode outright (the r170-era `log2` / malloc
+rows are long gone). The natural bit-identical restructure was attempted
+and **regressed ≈ +28 %**: hoisting the context-invariant work out of
+the per-(context, candidate) scan (distortion + token classification
+once per candidate, probability row + §13.2 start node once per
+context, the rate term assembled by a factored row-level helper with the
+identical f64 accumulation order) benched at 26.5 ms vs the unhoisted
+20.5 ms on `keyframe_encode/encode_keyframe_320x240_qi32`, reproducibly
+across interleaved pre/post pairs and with `#[inline(always)]` on the
+helper. A bisect showed the distortion-only hoist is neutral (≈ 21.0 ms,
+within the shared-box noise band) — the regression comes from the
+row/token hoisting itself, i.e. the current call shape (the
+per-call-site `coeff_token_bits` with everything resolved inside) is
+what LLVM already specialises best. Both variants were reverted; the
+shipped trellis is byte-for-byte untouched. Per the r274 precedent the
+negative result is recorded so the next encoder round does not re-walk
+this path.
+
+Ranked next encoder candidates (in resistance order): the
+`treed_find_path::dfs` per-emission tree search (a pure function of
+`(tree, leaf)` — memoisable per call site, ≈ 4 %), `estimate_block_bits`
+(same f64-order constraints as the trellis), and the trellis itself
+(resists hoisting; a genuinely different formulation — e.g. integer
+rate units — would change decisions and is barred by the bit-identity
+guard).

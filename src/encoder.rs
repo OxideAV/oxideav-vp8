@@ -312,17 +312,52 @@ impl BoolEncoder {
     }
 
     /// Encode `num_bits` flag bits MSB-first at the flat probability of
-    /// 128 (i.e. the §7.3 `L(n)` macro). Helper that iterates
-    /// [`write_bool`] but keeps the call sites at the layer above more
-    /// readable.
+    /// 128 (i.e. the §7.3 `L(n)` macro), exactly as `num_bits`
+    /// iterations of [`write_bool`]`(128, …)` would.
+    ///
+    /// Specialised register-local loop: at the fixed probability 128 the
+    /// §7.3 interval split collapses to a pure shift —
+    /// `1 + (((range - 1) * 128) >> 8)` is exactly
+    /// `1 + ((range - 1) >> 1)` (`* 2⁷ >> 8` ≡ `>> 1`, an algebraic
+    /// identity on the `1..=255` range domain) — and hoisting `range` /
+    /// `bottom` / `bit_count` into locals lets the whole loop run
+    /// without touching `self` except to emit bytes / propagate a
+    /// carry. State-for-state equality with the generic loop is pinned
+    /// by `write_literal_fast_matches_generic_loop` (the decoder-side
+    /// twin of this specialisation landed in round 306).
     pub fn write_literal(&mut self, value: u32, num_bits: u32) {
         debug_assert!(num_bits <= 32);
+        let mut range = self.range;
+        let mut bottom = self.bottom;
+        let mut bit_count = self.bit_count;
         // MSB-first, paired with `BoolDecoder::read_literal`.
         let mut i = num_bits;
         while i > 0 {
             i -= 1;
-            self.write_bool(128, ((value >> i) & 1) != 0);
+            let split = 1 + ((range - 1) >> 1);
+            if ((value >> i) & 1) != 0 {
+                bottom = bottom.wrapping_add(split);
+                range -= split;
+            } else {
+                range = split;
+            }
+            while range < 128 {
+                range <<= 1;
+                if (bottom >> 31) & 1 == 1 {
+                    add_one_to_output(&mut self.out);
+                }
+                bottom <<= 1;
+                bit_count -= 1;
+                if bit_count == 0 {
+                    self.out.push((bottom >> 24) as u8);
+                    bottom &= (1 << 24) - 1;
+                    bit_count = 8;
+                }
+            }
         }
+        self.range = range;
+        self.bottom = bottom;
+        self.bit_count = bit_count;
     }
 
     /// Encode a signed value as L(n) magnitude followed by L(1) sign,
@@ -14766,5 +14801,47 @@ mod tests {
         // The chroma table is shared between keyframe and interframe
         // pricing; cover the interframe probabilities too.
         check(&UV_MODE_TREE, &UV_MODE_PATHS, &IF_UV_MODE_PROB_DEFAULTS);
+    }
+
+    #[test]
+    fn write_literal_fast_matches_generic_loop() {
+        // The register-local fixed-prob-128 `write_literal` must be
+        // state-for-state the generic `num_bits x write_bool(128)` loop:
+        // identical emitted bytes AND identical (range, bottom,
+        // bit_count) after every literal, across the full width spread
+        // (including width 0) and enough volume to exercise the carry
+        // scan and the byte-emit cadence.
+        let mut fast = BoolEncoder::new();
+        let mut generic = BoolEncoder::new();
+        let mut x: u32 = 0x1234_5678;
+        for step in 0..4096u32 {
+            // xorshift32 value stream.
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let num_bits = step % 33; // 0..=32
+            let value = if num_bits == 32 {
+                x
+            } else {
+                x & ((1u32 << num_bits) - 1)
+            };
+            fast.write_literal(value, num_bits);
+            let mut i = num_bits;
+            while i > 0 {
+                i -= 1;
+                generic.write_bool(128, ((value >> i) & 1) != 0);
+            }
+            assert_eq!(fast.range, generic.range, "range diverged at step {step}");
+            assert_eq!(
+                fast.bottom, generic.bottom,
+                "bottom diverged at step {step}"
+            );
+            assert_eq!(
+                fast.bit_count, generic.bit_count,
+                "bit_count diverged at step {step}"
+            );
+            assert_eq!(fast.out, generic.out, "bytes diverged at step {step}");
+        }
+        assert_eq!(fast.finish(), generic.finish());
     }
 }

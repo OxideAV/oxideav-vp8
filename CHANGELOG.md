@@ -18,6 +18,12 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Changed
 
+- *(bool-encoder)* `BoolEncoder::write_literal` is ≈ 43 % faster
+  (byte-identical output): a register-local loop specialised to the
+  fixed probability 128, where the §7.3 interval split collapses to a
+  shift (`* 128 >> 8` ≡ `>> 1`). Pinned state-for-state against the
+  generic `write_bool(128)` loop across 4 096 mixed-width literals.
+
 - *(encoder)* keyframe encode is ≈ 4.5 % faster, bit-identically: the RD
   mode scorers price §11 mode-signalling bits against once-per-process
   precomputed tree-path tables instead of re-running the §8.1 tree DFS

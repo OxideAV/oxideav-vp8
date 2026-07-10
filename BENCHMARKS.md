@@ -2819,3 +2819,40 @@ lookup (a wrong `prob_index` would change the sum, not alias into it).
 Every keyframe post run sits below every pre run. The emission-side
 `BoolEncoder::write_treed` keeps its DFS (once per *winning* mode, not
 per candidate — off the hot path).
+
+## Round 409 — `write_literal` register-local fixed-prob-128 loop (profile-opt, part 6)
+
+The write-side twin of the round-306 `read_literal` specialisation,
+now measurable thanks to this round's `bool_encoder_write` harness.
+`BoolEncoder::write_literal` iterated the generic `write_bool(128)`
+per bit: each call reloaded `range` / `bottom` / `bit_count` from
+`self` and recomputed the §7.3 interval split with a 32-bit multiply.
+At the fixed probability 128 the split collapses to a pure shift —
+`1 + (((range - 1) * 128) >> 8)` is exactly `1 + ((range - 1) >> 1)` —
+and hoisting the three registers into locals lets the whole MSB-first
+loop run without touching `self` except to emit bytes / propagate a
+carry. `write_signed_literal` (the §9.3 magnitude+sign idiom) rides the
+same loop for its magnitude bits.
+
+### Bit-exactness
+
+`write_literal_fast_matches_generic_loop` drives 4 096 mixed-width
+literals (widths 0..=32, xorshift values) through the fast path and a
+reference encoder running the generic `num_bits × write_bool(128)`
+loop, asserting identical emitted bytes AND identical
+`(range, bottom, bit_count)` after every literal, plus equal
+`finish()` output. Full suite 810 tests green.
+
+### Measured A/B (interleaved pre/post, `--warm-up-time 2 --measurement-time 6`, Apple M4-class aarch64, stable)
+
+| Bench | Pre | Post | Δ |
+|---|---:|---:|---:|
+| `bool_encoder_write/write_literal_8b_8k` | 173.5 µs | **99.4 µs** | **−43 %** |
+| `bool_encoder_write/write_signed_literal_7b_8k` | 137.1 µs (baseline) | 123.0 µs | ≈ −9 % (sign bit still generic) |
+| `bool_encoder_write/write_bool_{skewed,balanced}_64k` | — | — | untouched code; run-to-run drift only |
+
+Whole-frame encode impact is negligible by design (literals carry
+headers / partition sizes / MV magnitudes, not the DCT-token hot loop)
+— this is a primitive-layer win in the same class as the r306 decoder
+change, but this time with an isolated harness that can actually
+resolve it.

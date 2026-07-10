@@ -18,6 +18,13 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Changed
 
+- *(encoder)* keyframe encode is ≈ 4.5 % faster, bit-identically: the RD
+  mode scorers price §11 mode-signalling bits against once-per-process
+  precomputed tree-path tables instead of re-running the §8.1 tree DFS
+  on every scored candidate. The replayed `(prob_index, bit)` step
+  sequence and f64 accumulation order are identical, pinned per leaf per
+  tree against the retained DFS-walk reference.
+
 - *(decoder)* whole-frame decode is ≈ 5–8 % faster on both the keyframe
   and inter paths, bit-identically: the §14.1 dequant multiply is fused
   into the §13.3 token-descent coefficient writes

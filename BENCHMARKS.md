@@ -2787,3 +2787,35 @@ Ranked next encoder candidates (in resistance order): the
 (resists hoisting; a genuinely different formulation — e.g. integer
 rate units — would change decisions and is barred by the bit-identity
 guard).
+
+## Round 409 — precomputed mode-tree paths for the RD scorers (profile-opt, part 5)
+
+The rank-3 encoder symbol from this round's profile
+(`treed_find_path::dfs`, ≈ 4 % of keyframe-encode self-time) was a
+depth-first search re-run on **every candidate mode scored**: `treed_bits`
+walked the compile-time-constant §8.1 mode tree from scratch to find the
+leaf's bit path, then chased the tree nodes again to derive the
+probability indices — per candidate, per sub-block, per macroblock (the
+§11.2/§11.4 B_PRED scorer alone prices ten `BMODE_TREE` walks per 4×4
+sub-block). The path is a pure function of `(tree, leaf)`, so the four
+priced trees (`KF_YMODE_TREE`, `UV_MODE_TREE` — shared by the keyframe
+and interframe chroma scorers — `BMODE_TREE`, `IF_YMODE_TREE`) now carry
+a once-per-process `LazyLock` table of per-leaf `(bit, prob_index)` step
+sequences, and `treed_bits_cached` replays the table row with the same
+`bool_bits` accumulation in the same step order — every priced `f64` is
+bit-for-bit the DFS-walk value, so no RD decision (and no emitted byte)
+can move. The DFS form is retained as the reference;
+`treed_bits_cached_matches_dfs_walk` pins every leaf of every table
+under both the real probability tables and a synthetic non-uniform
+lookup (a wrong `prob_index` would change the sum, not alias into it).
+
+### Measured A/B (interleaved pre/post pairs, `--warm-up-time 2 --measurement-time 8`, Apple M4-class aarch64, stable)
+
+| Bench | Pre (run medians) | Post (run medians) | Δ |
+|---|---:|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 21.57 / 21.67 ms | **20.63 / 20.69 ms** | **≈ −4.5 %** |
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 12.24 ms | 12.14 ms | within noise (B_PRED pricing is rare on the P-frame path) |
+
+Every keyframe post run sits below every pre run. The emission-side
+`BoolEncoder::write_treed` keeps its DFS (once per *winning* mode, not
+per candidate — off the hot path).

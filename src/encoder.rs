@@ -2099,8 +2099,11 @@ fn treed_find_path(tree: &[i8], leaf: u8, path: &mut [bool; 16]) -> usize {
 
 /// Cost in fractional bits of writing `value` through `tree` with the
 /// per-node probability `prob_lookup`, mirroring [`BoolEncoder::write_treed`]
-/// but accumulating `-log2(p)` instead of emitting. Used to price the
-/// §11.2 / §11.4 mode-signalling bits into the RD cost.
+/// but accumulating `-log2(p)` instead of emitting. The RD scorers now
+/// price against the precomputed [`treed_bits_cached`] tables; this
+/// DFS-walk form is retained as the reference the
+/// `treed_bits_cached_matches_dfs_walk` pin compares them to.
+#[cfg_attr(not(test), allow(dead_code))]
 fn treed_bits<F>(tree: &[i8], prob_lookup: F, leaf: u8) -> f64
 where
     F: Fn(usize) -> u8,
@@ -2112,6 +2115,77 @@ where
     for &bit in &path[..len] {
         bits += bool_bits(prob_lookup((i as usize) >> 1), bit);
         i = tree[i as usize + bit as usize];
+    }
+    bits
+}
+
+/// One leaf's precomputed §8.1 walk through a mode tree: the bit path
+/// [`treed_find_path`] discovers, plus the node-halved probability-index
+/// sequence [`treed_bits`] derives while replaying it. The trees the RD
+/// scorers price against are compile-time constants, so the DFS is a
+/// pure function of `(tree, leaf)` — precomputing it once per tree
+/// removes the per-candidate `treed_find_path::dfs` walk (≈ 4 % of
+/// keyframe-encode self-time on the round-409 profile) while replaying
+/// the identical `(prob_index, bit)` step sequence in the identical
+/// order, so every priced `f64` is bit-for-bit the DFS-walk value
+/// (`treed_bits_cached_matches_dfs_walk` pins all four tables).
+#[derive(Clone, Copy)]
+struct TreedLeafPath {
+    /// Number of valid steps in `bits` / `prob_index`.
+    len: u8,
+    /// The bit at each step of the root-to-leaf path.
+    bits: [bool; 16],
+    /// The node-halved probability index consumed at each step.
+    prob_index: [u8; 16],
+}
+
+/// Build the per-leaf path table for a mode tree whose leaves are
+/// numbered `0..N` (true for every §8.1 mode tree this crate prices).
+fn precompute_treed_paths<const N: usize>(tree: &[i8]) -> [TreedLeafPath; N] {
+    core::array::from_fn(|leaf| {
+        let mut bits = [false; 16];
+        let len = treed_find_path(tree, leaf as u8, &mut bits);
+        let mut prob_index = [0u8; 16];
+        let mut i: i8 = 0;
+        for (s, &bit) in bits[..len].iter().enumerate() {
+            prob_index[s] = ((i as usize) >> 1) as u8;
+            i = tree[i as usize + bit as usize];
+        }
+        TreedLeafPath {
+            len: len as u8,
+            bits,
+            prob_index,
+        }
+    })
+}
+
+/// Precomputed paths for the §11.2 keyframe luma mode tree.
+static KF_YMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 5]> =
+    std::sync::LazyLock::new(|| precompute_treed_paths(&KF_YMODE_TREE));
+/// Precomputed paths for the §11.2 chroma mode tree (shared by the
+/// keyframe and interframe chroma scorers — the tree is the same, only
+/// the probability tables differ).
+static UV_MODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 4]> =
+    std::sync::LazyLock::new(|| precompute_treed_paths(&UV_MODE_TREE));
+/// Precomputed paths for the §11.2 / §11.4 4×4 sub-block mode tree.
+static BMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 10]> =
+    std::sync::LazyLock::new(|| precompute_treed_paths(&BMODE_TREE));
+/// Precomputed paths for the §11.3 interframe intra luma mode tree.
+static IF_YMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 5]> =
+    std::sync::LazyLock::new(|| precompute_treed_paths(&IF_YMODE_TREE));
+
+/// [`treed_bits`] against a precomputed path table: the same
+/// `bool_bits(prob_lookup(node >> 1), bit)` accumulation in the same
+/// step order, with the DFS and the node-chasing replay replaced by the
+/// table row. Bit-for-bit the DFS-walk sum.
+fn treed_bits_cached<F>(paths: &[TreedLeafPath], prob_lookup: F, leaf: u8) -> f64
+where
+    F: Fn(usize) -> u8,
+{
+    let p = &paths[leaf as usize];
+    let mut bits = 0.0;
+    for s in 0..p.len as usize {
+        bits += bool_bits(prob_lookup(p.prob_index[s] as usize), p.bits[s]);
     }
     bits
 }
@@ -3023,7 +3097,7 @@ fn pick_y16x16_mode(
         let recon = reconstruct_whole_block_luma(&pred, &y_quant, &y2_quant, rd.factors);
         let ssd = block_ssd(&recon, src) as f64;
         let token_bits = estimate_whole_block_luma_bits(rd.coeff_probs, &y_quant, &y2_quant);
-        let mode_bits = treed_bits(&KF_YMODE_TREE, |i| KF_YMODE_PROB[i], mode.leaf());
+        let mode_bits = treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mode.leaf());
         let rd_cost = ssd + rd.lambda * (token_bits + mode_bits);
 
         if best.as_ref().map(|b| rd_cost < b.rd_cost).unwrap_or(true) {
@@ -3184,7 +3258,7 @@ fn pick_uv8x8_mode(
                 &mut left,
             );
         }
-        let mode_bits = treed_bits(&UV_MODE_TREE, |i| KF_UV_MODE_PROB[i], mode.leaf());
+        let mode_bits = treed_bits_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mode.leaf());
         let cost = ssd + rd.lambda * (token_bits + mode_bits);
 
         if cost < best_cost {
@@ -3406,7 +3480,7 @@ fn encode_bpred_luma(
                     tok_left.nonzero[i],
                     &scan,
                 );
-                let mode_bits = treed_bits(&BMODE_TREE, |k| prob_row[k], mode.idx() as u8);
+                let mode_bits = treed_bits_cached(&*BMODE_PATHS, |k| prob_row[k], mode.idx() as u8);
                 let cost = ssd + rd.lambda * (token_bits + mode_bits);
                 if cost < best_cost {
                     best_cost = cost;
@@ -3629,7 +3703,8 @@ pub fn encode_mb_block_set_with_neighbors_strength(
     //          `encode_bpred_luma`'s RD cost). B_PRED wins iff its total
     //          RD cost is strictly lower.
     let bpred = encode_bpred_luma(&pixels.y, neighbors, &rd);
-    let bpred_flag_bits = treed_bits(&KF_YMODE_TREE, |i| KF_YMODE_PROB[i], IntraYMode::B.leaf());
+    let bpred_flag_bits =
+        treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], IntraYMode::B.leaf());
     let bpred_total_cost = bpred.rd_cost + rd.lambda * bpred_flag_bits;
     let use_bpred = bpred_total_cost < whole.rd_cost;
     let y_mode = if use_bpred { IntraYMode::B } else { whole.mode };
@@ -7072,14 +7147,18 @@ struct IntraMbPick {
 /// at its no-update gate, so the wire table stays at the defaults the
 /// decoder's `InterFrameIntraProbs::defaults` exposes).
 fn if_ymode_tree_bits(mode: IntraYMode) -> f64 {
-    treed_bits(&IF_YMODE_TREE, |i| IF_YMODE_PROB_DEFAULTS[i], mode.leaf())
+    treed_bits_cached(&*IF_YMODE_PATHS, |i| IF_YMODE_PROB_DEFAULTS[i], mode.leaf())
 }
 
 /// `-log2 P` cost in fractional bits of the §11.4 / §16.1 interframe
 /// `UV_MODE_TREE` path for one whole-block chroma intra mode, against
 /// the §16.1 default `uv_mode_prob` table.
 fn if_uv_mode_tree_bits(mode: IntraUvMode) -> f64 {
-    treed_bits(&UV_MODE_TREE, |i| IF_UV_MODE_PROB_DEFAULTS[i], mode.leaf())
+    treed_bits_cached(
+        &*UV_MODE_PATHS,
+        |i| IF_UV_MODE_PROB_DEFAULTS[i],
+        mode.leaf(),
+    )
 }
 
 /// Score one (y_mode, uv_mode) whole-block intra candidate for a
@@ -14649,5 +14728,43 @@ mod tests {
             ..Vp8TwoPassConfig::default()
         };
         assert!(two_pass_qindices_for_bitrate(&bad, &busy_clip(3), 176, 144).is_err());
+    }
+
+    #[test]
+    fn treed_bits_cached_matches_dfs_walk() {
+        // The RD scorers price mode bits through the precomputed
+        // per-tree path tables; every priced value must be f64
+        // bit-for-bit the DFS-walk `treed_bits` sum, for every leaf of
+        // every table and under both the real probability tables and a
+        // synthetic non-uniform lookup (so a wrong prob_index would
+        // change the sum, not alias into it).
+        fn check<const N: usize>(
+            tree: &'static [i8],
+            paths: &[TreedLeafPath; N],
+            real_probs: &'static [u8],
+        ) {
+            let synthetic = |i: usize| -> u8 { (37 * i + 11) as u8 };
+            for leaf in 0..N as u8 {
+                for lookup in [
+                    Box::new(|i: usize| real_probs[i]) as Box<dyn Fn(usize) -> u8>,
+                    Box::new(synthetic),
+                ] {
+                    let reference = treed_bits(tree, &lookup, leaf);
+                    let cached = treed_bits_cached(paths, &lookup, leaf);
+                    assert_eq!(
+                        cached.to_bits(),
+                        reference.to_bits(),
+                        "tree {tree:?} leaf {leaf}"
+                    );
+                }
+            }
+        }
+        check(&KF_YMODE_TREE, &KF_YMODE_PATHS, &KF_YMODE_PROB);
+        check(&UV_MODE_TREE, &UV_MODE_PATHS, &KF_UV_MODE_PROB);
+        check(&BMODE_TREE, &BMODE_PATHS, &KF_BMODE_PROB[0][0]);
+        check(&IF_YMODE_TREE, &IF_YMODE_PATHS, &IF_YMODE_PROB_DEFAULTS);
+        // The chroma table is shared between keyframe and interframe
+        // pricing; cover the interframe probabilities too.
+        check(&UV_MODE_TREE, &UV_MODE_PATHS, &IF_UV_MODE_PROB_DEFAULTS);
     }
 }

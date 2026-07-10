@@ -20,6 +20,21 @@ All notable changes to `oxideav-vp8` are recorded here.
   malformed key frame; a regression seed is committed under
   `fuzz/corpus/panic_free_keyframe_reconstruct/seeds/`.
 
+### Added
+
+- *(decoder)* §9.1 declared-frame-size DoS cap — `decode_vp8_with_max_pixels`
+  and `Vp8DecoderState::with_max_pixels_per_frame` reject a key frame whose
+  declared `width × height` exceeds a caller-configured cap
+  (`DecodeError::FrameTooLarge`) *before* any macroblock-grid allocation. The
+  registry `make_decoder` now threads `CodecParameters::limits.max_pixels_per_frame`
+  into the decoder (mapped to `Error::ResourceExhausted`), so a tightened cap
+  is honoured on every key frame; the default (`DEFAULT_MAX_PIXELS_PER_FRAME`,
+  32 768²) never rejects a legal 14-bit VP8 frame.
+- *(fuzz)* `decode_pixel_cap_enforcement` structure-aware target driving the
+  cap boundary directly (reject leg asserts `FrameTooLarge` with no
+  allocation even at the wire-legal 268-Mpx extreme; accept leg constrains the
+  `Ok` shape), seeded from the fixture key frames.
+
 ## [0.2.5](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.4...v0.2.5) - 2026-07-03
 
 ### Fixed

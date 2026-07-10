@@ -361,6 +361,17 @@ pub struct Vp8DecoderState {
     /// picture to the presentation sequence. `None` before any frame
     /// has been decoded successfully.
     last_frame_shown: Option<bool>,
+    /// DoS guard: the §9.1 declared `width × height` a key frame may
+    /// carry before decode refuses it with
+    /// [`DecodeError::FrameTooLarge`](crate::decoder::DecodeError::FrameTooLarge).
+    /// Defaults to
+    /// [`DEFAULT_MAX_PIXELS_PER_FRAME`](crate::decoder::DEFAULT_MAX_PIXELS_PER_FRAME)
+    /// (generous enough to never reject a legal VP8 frame); tightened via
+    /// [`with_max_pixels_per_frame`](Self::with_max_pixels_per_frame). Only
+    /// key frames re-transmit dimensions, so this is checked on the
+    /// key-frame path; interframes inherit the (already-capped) grid of the
+    /// key frame that installed the reference slots.
+    max_pixels_per_frame: u64,
 }
 
 impl Default for Vp8DecoderState {
@@ -387,7 +398,21 @@ impl Vp8DecoderState {
             visible_width: None,
             visible_height: None,
             last_frame_shown: None,
+            max_pixels_per_frame: crate::decoder::DEFAULT_MAX_PIXELS_PER_FRAME,
         }
+    }
+
+    /// Tighten the §9.1 declared-frame-size DoS cap.
+    ///
+    /// A key frame whose declared `width × height` exceeds
+    /// `max_pixels_per_frame` is refused with
+    /// [`DecodeError::FrameTooLarge`](crate::decoder::DecodeError::FrameTooLarge)
+    /// before the decoder allocates its macroblock grid, so a tiny header
+    /// declaring an enormous frame cannot drive a large allocation. Builder
+    /// form: `Vp8DecoderState::new().with_max_pixels_per_frame(cap)`.
+    pub fn with_max_pixels_per_frame(mut self, max_pixels_per_frame: u64) -> Self {
+        self.max_pixels_per_frame = max_pixels_per_frame;
+        self
     }
 
     /// Decode one VP8 frame end-to-end, threading reference frames and
@@ -458,6 +483,10 @@ impl Vp8DecoderState {
         if width == 0 || height == 0 {
             return Err(DecodeError::ZeroDimension);
         }
+
+        // DoS guard: refuse an oversized declared frame before the first
+        // macroblock-grid allocation below.
+        crate::decoder::check_pixel_cap(width, height, self.max_pixels_per_frame)?;
 
         let mb_cols = width.div_ceil(16) as usize;
         let mb_rows = height.div_ceil(16) as usize;
@@ -1518,6 +1547,43 @@ mod tests {
                 "{name} stateful key-frame decode must be bit-exact"
             );
         }
+    }
+
+    /// The stateful driver honours a tightened `max_pixels_per_frame`: the
+    /// 64×64 (4096-px) fixture decodes under the default cap and under a cap
+    /// of exactly 4096, but a cap of 4095 refuses the key frame with the DoS
+    /// error and leaves the reference slots untouched (no partial state).
+    #[test]
+    fn stateful_pixel_cap_rejects_oversized_key_frame() {
+        const IVF: &[u8] = include_bytes!("../tests/fixtures/i-only-64x64/input.ivf");
+        let frames = iter_ivf_frames(IVF);
+        let frame = frames[0];
+
+        // Default cap: decodes and installs the reference slots.
+        let mut ok_state = Vp8DecoderState::new();
+        let d = ok_state.decode_frame(frame).expect("default cap decodes");
+        assert_eq!((d.width, d.height), (64, 64));
+        assert!(ok_state.last.is_some(), "LAST installed under default cap");
+
+        // Inclusive boundary: 4096-px cap still decodes.
+        let mut at_cap = Vp8DecoderState::new().with_max_pixels_per_frame(4096);
+        assert!(at_cap.decode_frame(frame).is_ok());
+
+        // One below: refused before allocation, slots stay empty.
+        let mut tight = Vp8DecoderState::new().with_max_pixels_per_frame(4095);
+        let err = tight
+            .decode_frame(frame)
+            .expect_err("a 4095-px cap must reject a 4096-px frame");
+        assert!(matches!(
+            err,
+            DecodeError::FrameTooLarge {
+                pixels: 4096,
+                cap: 4095
+            }
+        ));
+        assert!(tight.last.is_none(), "no reference slot on a refused frame");
+        assert!(tight.golden.is_none());
+        assert!(tight.altref.is_none());
     }
 
     /// The end-to-end multi-frame test: feed the

@@ -591,6 +591,26 @@ cargo-fuzz = true
 #                                     decoded entry per macroblock and
 #                                     every decoded `segment_id` inside the
 #                                     documented 0..=3 envelope.
+#   * `decode_pixel_cap_enforcement` — the §9.1 declared-frame-size DoS cap
+#                                     (`decode_vp8_with_max_pixels` /
+#                                     `Vp8DecoderState::with_max_pixels_per_frame`,
+#                                     round 405). Every other target uses
+#                                     either the fixed `accept_dimensions`
+#                                     gate (never touching the cap surface)
+#                                     or the default cap (which by
+#                                     construction never fires on a legal
+#                                     14-bit VP8 frame). This target drives
+#                                     the cap boundary directly: a reject leg
+#                                     sets the cap one pixel below the
+#                                     declared size and asserts
+#                                     `FrameTooLarge { pixels, cap }` with no
+#                                     allocation (safe even at the wire-legal
+#                                     268-Mpx extreme), and an accept leg —
+#                                     gated on the fuzz alloc budget — sets
+#                                     the cap at the declared size and asserts
+#                                     any `Ok` decode's visible dimensions
+#                                     stay within it, cross-driving the
+#                                     stateful builder for panic-freedom.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -814,5 +834,11 @@ doc = false
 [[bin]]
 name = "altref_stream_encode_decode"
 path = "fuzz_targets/altref_stream_encode_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode_pixel_cap_enforcement"
+path = "fuzz_targets/decode_pixel_cap_enforcement.rs"
 test = false
 doc = false

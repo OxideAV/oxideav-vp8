@@ -12,5 +12,8 @@ corpus/ivf_demux_decode_walk/*
 !corpus/panic_free_keyframe_reconstruct/
 corpus/panic_free_keyframe_reconstruct/*
 !corpus/panic_free_keyframe_reconstruct/seeds/
+!corpus/decode_pixel_cap_enforcement/
+corpus/decode_pixel_cap_enforcement/*
+!corpus/decode_pixel_cap_enforcement/seeds/
 artifacts
 coverage

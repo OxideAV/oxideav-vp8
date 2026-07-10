@@ -105,6 +105,46 @@ pub enum DecodeError {
     /// `width` or `height` from the §9.1 key-frame size words was zero —
     /// a valid VP8 key frame describes at least one pixel.
     ZeroDimension,
+    /// The §9.1 key-frame `width × height` product exceeds the caller's
+    /// configured pixel cap. Raised *before* any plane / macroblock-grid
+    /// allocation so a tiny header declaring an enormous frame is rejected
+    /// without the decoder ever attempting the allocation. `pixels` is the
+    /// declared product (`width as u64 * height as u64`), `cap` the
+    /// configured maximum.
+    FrameTooLarge {
+        /// Declared `width as u64 * height as u64`.
+        pixels: u64,
+        /// Configured `max_pixels_per_frame` cap.
+        cap: u64,
+    },
+}
+
+/// Default per-frame pixel cap the stateless [`decode_vp8`] entry point and
+/// a freshly-constructed [`Vp8DecoderState`](crate::state::Vp8DecoderState)
+/// enforce when the caller does not tighten it.
+///
+/// Set to `32_768 × 32_768 = 1_073_741_824` — deliberately generous. VP8's
+/// §9.1 size words are 14 bits each, so a legal frame never exceeds
+/// `16_383 × 16_383 ≈ 268 M` pixels and this default therefore rejects no
+/// real key frame; it exists so callers processing untrusted input can
+/// *tighten* the cap (via [`decode_vp8_with_max_pixels`] or
+/// [`Vp8DecoderState::with_max_pixels_per_frame`](crate::state::Vp8DecoderState::with_max_pixels_per_frame))
+/// and have a huge declared frame refused before allocation instead of
+/// OOM-ing. Numerically matches `oxideav_core::DecoderLimits::default()`'s
+/// `max_pixels_per_frame` so the two layers agree.
+pub const DEFAULT_MAX_PIXELS_PER_FRAME: u64 = 32_768 * 32_768;
+
+/// Check the §9.1 declared `width × height` against a pixel cap.
+///
+/// Computed in `u64` so the `16_383 × 16_383` worst case (or any wider
+/// value a future caller might pass) cannot overflow. Returns
+/// [`DecodeError::FrameTooLarge`] when the product exceeds `cap`.
+pub(crate) fn check_pixel_cap(width: u32, height: u32, cap: u64) -> Result<(), DecodeError> {
+    let pixels = width as u64 * height as u64;
+    if pixels > cap {
+        return Err(DecodeError::FrameTooLarge { pixels, cap });
+    }
+    Ok(())
 }
 
 impl core::fmt::Display for DecodeError {
@@ -139,6 +179,10 @@ impl core::fmt::Display for DecodeError {
             DecodeError::ZeroDimension => {
                 f.write_str("vp8 decode: zero width or height in key-frame header")
             }
+            DecodeError::FrameTooLarge { pixels, cap } => write!(
+                f,
+                "vp8 decode: declared frame size {pixels} px exceeds configured cap {cap} px"
+            ),
         }
     }
 }
@@ -220,6 +264,23 @@ pub struct Vp8DecodedFrame {
 /// the `registry` feature), which wraps this entry point in the
 /// [`oxideav_core::Decoder`] trait.
 pub fn decode_vp8(bytes: &[u8]) -> Result<Vp8DecodedFrame, DecodeError> {
+    decode_vp8_with_max_pixels(bytes, DEFAULT_MAX_PIXELS_PER_FRAME)
+}
+
+/// Decode one VP8 key frame, rejecting a declared `width × height` larger
+/// than `max_pixels_per_frame` before any allocation.
+///
+/// Identical to [`decode_vp8`] except the pixel cap is caller-chosen rather
+/// than [`DEFAULT_MAX_PIXELS_PER_FRAME`]. Callers processing untrusted input
+/// (e.g. a server decoding uploads) pass a tight cap so a malformed header
+/// declaring an enormous frame returns [`DecodeError::FrameTooLarge`]
+/// instead of driving a multi-hundred-megabyte plane allocation. The check
+/// fires immediately after the §9.1 size words are parsed and before the
+/// first macroblock-grid `Vec` is reserved.
+pub fn decode_vp8_with_max_pixels(
+    bytes: &[u8],
+    max_pixels_per_frame: u64,
+) -> Result<Vp8DecodedFrame, DecodeError> {
     let header = Vp8FrameHeader::parse(bytes)?;
     if !header.key_frame {
         return Err(DecodeError::Unsupported(
@@ -236,6 +297,11 @@ pub fn decode_vp8(bytes: &[u8]) -> Result<Vp8DecodedFrame, DecodeError> {
     if width == 0 || height == 0 {
         return Err(DecodeError::ZeroDimension);
     }
+
+    // DoS guard: refuse a declared frame larger than the configured cap
+    // *before* the first grid allocation (`parse_key_frame_macroblock_modes`
+    // reserves `mb_rows * mb_cols` entries a few lines below).
+    check_pixel_cap(width, height, max_pixels_per_frame)?;
 
     // §4 / §9.1: macroblock dimensions round up to whole 16-pixel blocks.
     let mb_cols = width.div_ceil(16) as usize;
@@ -552,7 +618,7 @@ mod registry {
     use oxideav_core::frame::VideoPlane;
     use oxideav_core::{
         CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
-        Error, Frame, Packet, PixelFormat, Result, RuntimeContext, VideoFrame,
+        DecoderLimits, Error, Frame, Packet, PixelFormat, Result, RuntimeContext, VideoFrame,
     };
 
     use super::{DecodeError, Vp8DecodedFrame};
@@ -565,6 +631,10 @@ mod registry {
         fn from(value: DecodeError) -> Self {
             match value {
                 DecodeError::Unsupported(msg) => Error::unsupported(msg),
+                // A tripped pixel cap is a DoS-guard rejection, not a
+                // malformed stream — surface it as the framework's
+                // resource-exhaustion error so callers can distinguish it.
+                DecodeError::FrameTooLarge { .. } => Error::resource_exhausted(value.to_string()),
                 DecodeError::FrameHeader(_)
                 | DecodeError::CodedHeader(_)
                 | DecodeError::Macroblock(_)
@@ -634,6 +704,23 @@ mod registry {
                 state: crate::state::Vp8DecoderState::new(),
             }
         }
+
+        /// Build a decoder that enforces `limits.max_pixels_per_frame` as
+        /// the §9.1 declared-frame-size cap. Any key frame whose declared
+        /// `width × height` exceeds the cap is refused with
+        /// [`Error::ResourceExhausted`] before the decoder allocates its
+        /// macroblock grid. Constructed by [`make_decoder`] from the
+        /// [`CodecParameters::limits`](oxideav_core::CodecParameters) the
+        /// registry threads in.
+        pub fn with_limits(codec_id: CodecId, limits: DecoderLimits) -> Self {
+            Self {
+                codec_id,
+                pending: VecDeque::new(),
+                eof: false,
+                state: crate::state::Vp8DecoderState::new()
+                    .with_max_pixels_per_frame(limits.max_pixels_per_frame),
+            }
+        }
     }
 
     impl std::fmt::Debug for Vp8Decoder {
@@ -686,7 +773,12 @@ mod registry {
     /// `make_decoder` factory plugged into the registry. Required by the
     /// `DecoderFactory` function-pointer type.
     pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-        Ok(Box::new(Vp8Decoder::new(params.codec_id.clone())))
+        // Thread the caller's DoS caps into the decoder so a tightened
+        // `max_pixels_per_frame` is enforced on every key frame.
+        Ok(Box::new(Vp8Decoder::with_limits(
+            params.codec_id.clone(),
+            params.limits,
+        )))
     }
 
     /// Register the VP8 codec into the supplied [`CodecRegistry`] under the
@@ -909,6 +1001,52 @@ mod tests {
         let buf = [0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x00, 0x00, 0x00, 0x00];
         let res = decode_vp8(&buf);
         assert!(matches!(res, Err(DecodeError::ZeroDimension)));
+    }
+
+    #[test]
+    fn check_pixel_cap_boundary() {
+        // Exactly at the cap is allowed; one over is refused.
+        assert!(check_pixel_cap(16, 16, 256).is_ok());
+        assert!(matches!(
+            check_pixel_cap(16, 17, 256),
+            Err(DecodeError::FrameTooLarge {
+                pixels: 272,
+                cap: 256
+            })
+        ));
+        // u32::MAX × u32::MAX must not overflow the u64 product.
+        assert!(matches!(
+            check_pixel_cap(u32::MAX, u32::MAX, DEFAULT_MAX_PIXELS_PER_FRAME),
+            Err(DecodeError::FrameTooLarge { .. })
+        ));
+    }
+
+    /// A real 16×16 key frame decodes under the default cap but is refused
+    /// (before any allocation) once the caller tightens the cap below its
+    /// 256-pixel declared size. Guards the DoS entry point end-to-end.
+    #[test]
+    fn tight_pixel_cap_rejects_before_alloc() {
+        const IVF: &[u8] = include_bytes!("../tests/fixtures/tiny-i-only-16x16/input.ivf");
+        let frame = strip_single_ivf_frame(IVF);
+
+        // Default cap: decodes to the full 16×16 picture.
+        let ok = decode_vp8(frame).expect("default cap decodes the 16x16 key frame");
+        assert_eq!((ok.width, ok.height), (16, 16));
+
+        // Exactly 256 px is still allowed (cap is inclusive).
+        assert!(decode_vp8_with_max_pixels(frame, 256).is_ok());
+
+        // 255 px cap: the 256-px frame is refused with the DoS error and no
+        // partial decode.
+        let err = decode_vp8_with_max_pixels(frame, 255)
+            .expect_err("a 255-px cap must reject a 256-px frame");
+        assert!(matches!(
+            err,
+            DecodeError::FrameTooLarge {
+                pixels: 256,
+                cap: 255
+            }
+        ));
     }
 
     /// The tiny-i-only-16x16 fixture is a single-keyframe VP8 elementary
@@ -1213,6 +1351,37 @@ mod tests {
                 assert_eq!(v.planes[0].stride, 64);
                 assert_eq!(v.planes[1].stride, 32);
                 assert_eq!(v.planes[2].stride, 32);
+            }
+        }
+
+        /// `make_decoder` threads `CodecParameters::limits` into the
+        /// decoder: a tightened `max_pixels_per_frame` refuses an oversized
+        /// key frame with `Error::ResourceExhausted` through the trait API,
+        /// while the default limits decode the same frame unchanged.
+        #[test]
+        fn make_decoder_honours_pixel_cap_from_params() {
+            use oxideav_core::{CodecParameters, DecoderLimits};
+            const IVF: &[u8] = include_bytes!("../tests/fixtures/tiny-i-only-16x16/input.ivf");
+            let frame_bytes = strip_single_ivf_frame(IVF).to_vec();
+            let id = CodecId::new(VP8_CODEC_ID);
+
+            // Default params: the 256-px frame decodes.
+            let mut dec = make_decoder(&CodecParameters::video(id.clone()))
+                .expect("factory builds a decoder");
+            let pkt = Packet::new(0, TimeBase::new(1, 1000), frame_bytes.clone());
+            dec.send_packet(&pkt).expect("queue");
+            assert!(matches!(dec.receive_frame(), Ok(Frame::Video(_))));
+
+            // Tightened to 255 px: the 256-px frame is refused as a
+            // resource-exhaustion (DoS-cap) error, not a decode error.
+            let params = CodecParameters::video(id)
+                .with_limits(DecoderLimits::default().with_max_pixels_per_frame(255));
+            let mut dec = make_decoder(&params).expect("factory builds a decoder");
+            let pkt = Packet::new(0, TimeBase::new(1, 1000), frame_bytes);
+            dec.send_packet(&pkt).expect("queue");
+            match dec.receive_frame() {
+                Err(Error::ResourceExhausted(_)) => {}
+                other => panic!("expected ResourceExhausted, got {other:?}"),
             }
         }
 

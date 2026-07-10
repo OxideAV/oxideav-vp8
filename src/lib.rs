@@ -394,7 +394,10 @@ pub use dct_tokens::{
     DctTokenError, MbCoeffError, MbEntropyCtx, COEFF_BANDS, DEFAULT_COEFF_PROBS,
     MB_ENTROPY_CTX_LEN, ZIGZAG,
 };
-pub use decoder::{decode_vp8, DecodeError, Vp8DecodedFrame};
+pub use decoder::{
+    decode_vp8, decode_vp8_with_max_pixels, DecodeError, Vp8DecodedFrame,
+    DEFAULT_MAX_PIXELS_PER_FRAME,
+};
 
 /// 0.1.13 alias for [`decoder::Vp8DecodedFrame`] — the per-frame
 /// reconstructed I420 picture is now named `Vp8Frame` at the crate root

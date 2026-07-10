@@ -379,11 +379,14 @@ of `cargo-fuzz` panic-freedom / round-trip targets under
 * The `fuzz/` targets cover the public encode / decode surface plus the
   per-stage primitive layers (bool coder, token coding, transforms,
   dequant, intra prediction, motion search / sub-pixel interpolation,
-  inter-MB reconstruction, mode-info decode, the IVF demux loop, and
-  the stream encoders) for panic-freedom and, where a target carries an
-  equivalence leg, byte-exact agreement between paired surfaces. A
-  scheduled `Fuzz` workflow runs every target under ASan. See
-  [`fuzz/README.md`](./fuzz/README.md) for caps and run instructions.
+  inter-MB reconstruction, mode-info decode, the IVF demux loop *and*
+  writer, the stream encoders including the caller-driven §9.7 refresh /
+  §9.4 lf-deltas P-frame family, the ARNR altref synthesiser, and the
+  framework `Encoder` / `Decoder` trait adapters) for panic-freedom
+  and, where a target carries an equivalence leg, byte-exact agreement
+  between paired surfaces. A scheduled `Fuzz` workflow runs every
+  target under ASan. See [`fuzz/README.md`](./fuzz/README.md) for caps
+  and run instructions.
 
 ## License
 

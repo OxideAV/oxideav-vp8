@@ -27,5 +27,17 @@ corpus/ivf_write_parse_roundtrip/*
 !corpus/inter_stream_refresh_lf_deltas_drive/
 corpus/inter_stream_refresh_lf_deltas_drive/*
 !corpus/inter_stream_refresh_lf_deltas_drive/seeds/
+!corpus/silent_keyframe_encode_decode/
+corpus/silent_keyframe_encode_decode/*
+!corpus/silent_keyframe_encode_decode/seeds/
+!corpus/segment_lf_deltas_encode_decode_lockstep/
+corpus/segment_lf_deltas_encode_decode_lockstep/*
+!corpus/segment_lf_deltas_encode_decode_lockstep/seeds/
+!corpus/mv_bitstream_write_read_roundtrip/
+corpus/mv_bitstream_write_read_roundtrip/*
+!corpus/mv_bitstream_write_read_roundtrip/seeds/
+!corpus/inter_intra_modes_bitstream_decode/
+corpus/inter_intra_modes_bitstream_decode/*
+!corpus/inter_intra_modes_bitstream_decode/seeds/
 artifacts
 coverage

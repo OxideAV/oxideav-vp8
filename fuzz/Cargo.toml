@@ -673,6 +673,47 @@ cargo-fuzz = true
 #                                     sibling, the two-pass fitter
 #                                     siblings, and a stateful decode
 #                                     lockstep on every emitted frame.
+#   * `silent_keyframe_encode_decode`
+#                                  — the §9.1 silent-keyframe writer
+#                                     (`encode_silent_keyframe` /
+#                                     `SilentKeyframeEncoder`, round
+#                                     432): raw-knob rejection
+#                                     envelope, out-of-range §9.1
+#                                     dimension probes, self-decode
+#                                     dimension oracle, and
+#                                     handle-vs-direct wire
+#                                     equivalence.
+#   * `segment_lf_deltas_encode_decode_lockstep`
+#                                  — the §10 per-segment loop-filter
+#                                     feature keyframe writers
+#                                     (`..._with_segment_lf_deltas`
+#                                     `[_and_trellis]`, round 432):
+#                                     pixel-exact encode→decode
+#                                     lockstep with both §9.3 feature
+#                                     arrays populated, the ±63 delta
+#                                     rejection probe, and the
+#                                     `quality_to_qindex` /
+#                                     `quality_to_trellis_strength`
+#                                     mapping helpers.
+#   * `mv_bitstream_write_read_roundtrip`
+#                                  — the §17 MV component codec
+#                                     (`write_mv` / `read_mv` /
+#                                     `mv_bits`, round 432) under
+#                                     fully attacker-chosen 38-byte
+#                                     `MvContexts`: exact multi-vector
+#                                     roundtrip, finite-cost mirror,
+#                                     and a component-range envelope
+#                                     on arbitrary decode-only bytes.
+#   * `inter_intra_modes_bitstream_decode`
+#                                  — the §16.1 interframe intra-mode
+#                                     parser
+#                                     (`parse_inter_frame_intra_macroblock_modes`,
+#                                     round 432) under degenerate
+#                                     probability tables: B_PRED
+#                                     sub-block walk totality, the
+#                                     subblock-modes-iff-B invariant,
+#                                     and the segment-id / skip
+#                                     forwarding contract.
 #
 # The harness is a panic-freedom sweep over the public surface.
 
@@ -926,5 +967,29 @@ doc = false
 [[bin]]
 name = "inter_stream_refresh_lf_deltas_drive"
 path = "fuzz_targets/inter_stream_refresh_lf_deltas_drive.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "silent_keyframe_encode_decode"
+path = "fuzz_targets/silent_keyframe_encode_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "segment_lf_deltas_encode_decode_lockstep"
+path = "fuzz_targets/segment_lf_deltas_encode_decode_lockstep.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mv_bitstream_write_read_roundtrip"
+path = "fuzz_targets/mv_bitstream_write_read_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "inter_intra_modes_bitstream_decode"
+path = "fuzz_targets/inter_intra_modes_bitstream_decode.rs"
 test = false
 doc = false

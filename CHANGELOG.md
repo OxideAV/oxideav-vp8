@@ -30,6 +30,23 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Added
 
+- four fuzz targets closing the last un-fuzzed public entry points
+  (round-432 coverage audit of the harness against the crate surface):
+  `silent_keyframe_encode_decode` (the §9.1 silent-keyframe writer —
+  raw-knob rejection envelope, out-of-range dimension probes,
+  self-decode oracle, handle-vs-direct wire equivalence),
+  `segment_lf_deltas_encode_decode_lockstep` (the §10 per-segment
+  loop-filter feature keyframe writers in pixel-exact encode→decode
+  lockstep with both §9.3 feature arrays populated, plus the
+  `quality_to_qindex` / `quality_to_trellis_strength` mapping helpers),
+  `mv_bitstream_write_read_roundtrip` (the §17 MV component codec under
+  fully attacker-chosen probability tables — exact multi-vector
+  roundtrip, finite `mv_bits` mirror, component-range envelope on
+  arbitrary bytes), and `inter_intra_modes_bitstream_decode` (the §16.1
+  interframe intra-mode parser under degenerate probability tables —
+  B_PRED walk totality, structural and forwarding invariants). Each
+  ships a committed seed corpus.
+
 - two criterion benches for public hot layers that had no isolated
   harness: `arnr_build_altref` (the motion-compensated temporal filter
   behind the §9.7 altref anchor — static-noise window, translating

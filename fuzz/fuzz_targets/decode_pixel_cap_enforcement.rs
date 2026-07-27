@@ -61,7 +61,10 @@ fuzz_target!(|data: &[u8]| {
         // ever allocated, so a 268-Mpx declared frame is safe here.
         let cap = declared - 1; // declared >= 1 (w, h >= 1)
         match decode_vp8_with_max_pixels(rest, cap) {
-            Err(DecodeError::FrameTooLarge { pixels, cap: got_cap }) => {
+            Err(DecodeError::FrameTooLarge {
+                pixels,
+                cap: got_cap,
+            }) => {
                 assert_eq!(pixels, declared, "reported pixels must equal declared");
                 assert_eq!(got_cap, cap, "reported cap must equal configured cap");
             }

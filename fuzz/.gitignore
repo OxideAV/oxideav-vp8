@@ -39,5 +39,14 @@ corpus/mv_bitstream_write_read_roundtrip/*
 !corpus/inter_intra_modes_bitstream_decode/
 corpus/inter_intra_modes_bitstream_decode/*
 !corpus/inter_intra_modes_bitstream_decode/seeds/
+!corpus/panic_free_decode_keyframe/
+corpus/panic_free_decode_keyframe/*
+!corpus/panic_free_decode_keyframe/seeds/
+!corpus/panic_free_decoder_state/
+corpus/panic_free_decoder_state/*
+!corpus/panic_free_decoder_state/seeds/
+!corpus/parse_headers/
+corpus/parse_headers/*
+!corpus/parse_headers/seeds/
 artifacts
 coverage

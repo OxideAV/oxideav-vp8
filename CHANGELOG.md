@@ -4,6 +4,35 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- four fuzz targets closing the last un-fuzzed public entry points
+  (round-432 coverage audit of the harness against the crate surface):
+  `silent_keyframe_encode_decode` (the §9.1 silent-keyframe writer —
+  raw-knob rejection envelope, out-of-range dimension probes,
+  self-decode oracle, handle-vs-direct wire equivalence),
+  `segment_lf_deltas_encode_decode_lockstep` (the §10 per-segment
+  loop-filter feature keyframe writers in pixel-exact encode→decode
+  lockstep with both §9.3 feature arrays populated, plus the
+  `quality_to_qindex` / `quality_to_trellis_strength` mapping helpers),
+  `mv_bitstream_write_read_roundtrip` (the §17 MV component codec under
+  fully attacker-chosen probability tables — exact multi-vector
+  roundtrip, finite `mv_bits` mirror, component-range envelope on
+  arbitrary bytes), and `inter_intra_modes_bitstream_decode` (the §16.1
+  interframe intra-mode parser under degenerate probability tables —
+  B_PRED walk totality, structural and forwarding invariants). Each
+  ships a committed seed corpus.
+
+- committed seed corpora for the three wire-decode fuzz targets that
+  had none (`panic_free_decode_keyframe`, `panic_free_decoder_state`,
+  `parse_headers`), derived from the existing
+  `decode_stream_token_descent` stream seeds. A round-432 campaign
+  measurement showed the unseeded targets fuzzing blind behind the
+  §9.1 start-code barrier (edge coverage frozen at the reject path —
+  49 / 90 edges over >100 M executions); the seeds lift entry
+  coverage to 1 608 / 2 428 / 369 edges so the daily scheduled runs
+  explore the actual decode pipeline.
+
 ## [0.2.6](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.5...v0.2.6) - 2026-07-10
 
 ### Added
@@ -29,23 +58,6 @@ All notable changes to `oxideav-vp8` are recorded here.
 - add CI / crates.io / docs.rs / MIT-license badges
 
 ### Added
-
-- four fuzz targets closing the last un-fuzzed public entry points
-  (round-432 coverage audit of the harness against the crate surface):
-  `silent_keyframe_encode_decode` (the §9.1 silent-keyframe writer —
-  raw-knob rejection envelope, out-of-range dimension probes,
-  self-decode oracle, handle-vs-direct wire equivalence),
-  `segment_lf_deltas_encode_decode_lockstep` (the §10 per-segment
-  loop-filter feature keyframe writers in pixel-exact encode→decode
-  lockstep with both §9.3 feature arrays populated, plus the
-  `quality_to_qindex` / `quality_to_trellis_strength` mapping helpers),
-  `mv_bitstream_write_read_roundtrip` (the §17 MV component codec under
-  fully attacker-chosen probability tables — exact multi-vector
-  roundtrip, finite `mv_bits` mirror, component-range envelope on
-  arbitrary bytes), and `inter_intra_modes_bitstream_decode` (the §16.1
-  interframe intra-mode parser under degenerate probability tables —
-  B_PRED walk totality, structural and forwarding invariants). Each
-  ships a committed seed corpus.
 
 - two criterion benches for public hot layers that had no isolated
   harness: `arnr_build_altref` (the motion-compensated temporal filter

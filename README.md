@@ -376,17 +376,21 @@ of `cargo-fuzz` panic-freedom / round-trip targets under
   (our encode → external decode, PSNR-Y ≥ 30 dB; external encode → our
   decode via `ivf::parse_header`, PSNR-Y ≥ 25 dB). Skips cleanly when
   the validator binary isn't on `$PATH`.
-* The `fuzz/` targets cover the public encode / decode surface plus the
-  per-stage primitive layers (bool coder, token coding, transforms,
+* The 40 `fuzz/` targets cover the public encode / decode surface plus
+  the per-stage primitive layers (bool coder, token coding, transforms,
   dequant, intra prediction, motion search / sub-pixel interpolation,
-  inter-MB reconstruction, mode-info decode, the IVF demux loop *and*
-  writer, the stream encoders including the caller-driven §9.7 refresh /
-  §9.4 lf-deltas P-frame family, the ARNR altref synthesiser, and the
-  framework `Encoder` / `Decoder` trait adapters) for panic-freedom
-  and, where a target carries an equivalence leg, byte-exact agreement
-  between paired surfaces. A scheduled `Fuzz` workflow runs every
-  target under ASan. See [`fuzz/README.md`](./fuzz/README.md) for caps
-  and run instructions.
+  inter-MB reconstruction, mode-info decode — key-frame *and*
+  interframe intra variants, the §17 MV component codec under raw
+  probability tables, the IVF demux loop *and* writer, the stream
+  encoders including the caller-driven §9.7 refresh / §9.4 lf-deltas
+  P-frame family, the silent-keyframe and per-segment loop-filter
+  keyframe writers, the ARNR altref synthesiser, and the framework
+  `Encoder` / `Decoder` trait adapters) for panic-freedom and, where a
+  target carries an equivalence leg, byte-exact agreement between
+  paired surfaces. The wire-gated decode targets run from committed
+  fixture-derived seed corpora. A scheduled `Fuzz` workflow runs every
+  target under ASan on a 60-minute daily budget. See
+  [`fuzz/README.md`](./fuzz/README.md) for caps and run instructions.
 
 ## License
 

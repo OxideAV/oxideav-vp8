@@ -47,6 +47,10 @@ debug-arithmetic overflow, or out-of-bounds index.
 | `encoder_trait_frame_lifecycle` | `make_encoder` / `make_encoder_with_qindex` / `make_encoder_with_quality` / `encoder::make_encoder_with_config` and the two `oxideav_core::Encoder` trait impls behind them (`send_frame` / `receive_packet` / `flush` / `output_params`) | The framework *encode* adapters driven through their full lifecycle, landed in round 408 — the encode-side sibling of `decoder_trait_packet_lifecycle`. Drives the `CodecParameters` validation gate (missing / zero / 15-bit dimensions, wrong pixel format — each asserted `Err`), raw `qindex` bytes (> 127 asserted rejected), arbitrary f32 `quality` bit patterns (NaN / ±inf — documented as clamped, asserted accepted), and the full `Vp8EncoderConfig` knob envelope (lf modes, golden / altref / lookahead intervals, trellis) feeding the lagged lookahead impl. Each iteration then interleaves well-formed sends (benign stride padding included) with **hostile `VideoFrame` shapes** — too few planes, `stride < row width`, short buffers, `stride × rows` usize-overflow probes, zero-stride chroma — each asserted `Err` without wedging the stream, and drains packets into a long-lived `Vp8DecoderState` decode-lockstep leg (every packet must decode at the negotiated dimensions; ≥ 1 packet must come out when ≥ 1 well-formed frame went in; post-flush drain must end in `Eof`, never `NeedMore`). **Found a real out-of-bounds slice panic on its first session**: `repack_plane` trusted `data.len() >= stride * h`, which a `stride < width` plane satisfies while the last row read `off .. off + w` runs past the buffer (and the unchecked `stride * h` product could itself wrap). Fixed in the same round by per-plane geometry validation (stride ≥ row width; exact `stride·(rows−1)+row_w` footprint via checked arithmetic); regression tests in `tests/public_factory_surface.rs`, witness seed committed under `corpus/encoder_trait_frame_lifecycle/seeds/`. Post-fix campaign: 25 493 executions in 481 s; zero findings. |
 | `ivf_write_parse_roundtrip` | `ivf::write_header`, `ivf::write_frame`, `IvfHeader::vp8` locked against `ivf::parse_header`, `ivf::parse_frame_header` | The IVF *writer* half and its round-trip contract, landed in round 408. `parse_headers` and `ivf_demux_decode_walk` throw attacker bytes at the parse half only; the writer had no coverage, and a self-consistent field-offset or endianness skew in write+parse pairs is invisible to parse-only fuzzing. Three legs: (1) header round-trip — attacker 16-bit dimensions (the IVF wire fields are 16-bit; every §9.1-legal VP8 dimension fits) + raw 32-bit framerate / frame-count words serialised and re-parsed, every field asserted equal, buffer length and the declared header-length word asserted; (2) frame-record round-trip — up to 8 records with cliff pts values (0 / `u64::MAX`) and payload slices carved from the input, re-walked with a cursor asserting size / pts / payload byte equality and exact landing on the buffer end; (3) a single-byte-mutation demux walk over the assembled file with checked cursor arithmetic (any outcome but a panic is fine). Round-408 campaign: 59 243 005 executions in 281 s (~211 K exec/s); zero findings. |
 | `inter_stream_refresh_lf_deltas_drive` | `Vp8InterStreamEncoder::encode_p_frame_with_refresh` + its six `…_and_intra_pick` / `…_and_lf_deltas` / `…_and_lf_deltas_and_token_updates` / `…_and_lf_deltas_and_intra_pick` / `…_and_lf_deltas_and_fitted_token_prob_updates` / `…_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates` siblings, `carried_ref_deltas` / `carried_mode_deltas`, each frame decoded through `Vp8DecoderState::decode_frame` | The caller-driven §9.7 / §9.8 refresh + §9.4 lf-deltas P-frame family, landed in round 408. `inter_stream_encode_decode_sequence` drives the scheduler front door only; the seven explicit-refresh entry points were reachable by no fuzz target, and they own the caller-supplied refresh ladder (every `refresh` / copy-selector combination, including `refresh_last = false` so later P-frames predict off a deliberately stale LAST, honouring the §9.7 wire rule that a copy selector is only coded when its refresh flag is 0), the across-frame §9.4 carried-delta state machine, and the §13.4 token-updates plumbing (sparse attacker `TokenProbUpdates` grids with raw 0..=255 probability bytes on the `_token_updates` sibling; the two-pass fitter on the `_fitted_` siblings). Per iteration: one seed keyframe, then ≤ 8 P-frames each dispatched to a fuzz-chosen sibling under a fuzz-shaped `RefreshControls` + `LoopFilterDeltas` (`Some`/`None` per-slot mixes, both signs, in-range magnitudes). Oracles beyond panic-freedom (panic on violation): a P-frame call before the first frame must surface `NoLastReference`; copy selectors > 2 and `|Δ| > 63` must surface `Frame(_)` *without* advancing `frame_count` or the carry; every accepted frame must decode in the long-lived stateful decoder at locked dimensions with `FrameKind::InterZeroMv`; and the `carried_ref_deltas()` / `carried_mode_deltas()` accessors must track a shadow model resolved through the public `LoopFilterDeltas::effective` on every frame. Round-408 campaign: 16 266 executions in 481 s; zero findings (one harness-side fix: the §9.7 refresh-flag/copy-selector exclusivity rule). |
+| `silent_keyframe_encode_decode` | `encode_silent_keyframe`, `SilentKeyframeParams`, `SilentKeyframeEncoder::encode_keyframe`, `make_silent_keyframe_encoder` | The §9.1 silent-keyframe writer, landed in round 432. Every other keyframe target routes through `encode_keyframe(&I420Frame, ..)`; the silent path assembles its wire independently (§9.1 tag + extension, §19.2 first partition at every skip setting, per-MB `mb_skip_coeff = 1` records, §9.5 partition table, per-partition §7.3 flush trailers) and back-patches `first_partition_size`, so its writer and validation envelope had no fuzz coverage. Three legs: raw-knob rejection envelope (all six params fed raw; `Ok`/`Err` must match the documented §9.1 / §9.4 / §9.5 / §9.6 legality predicate exactly, plus a dedicated out-of-range dimension probe for the 0 / > 0x3FFF axes), a self-decode oracle (`decode_vp8` must accept every emitted frame at the requested dimensions, all plane bytes FNV-folded), and handle-vs-direct wire equivalence (`SilentKeyframeEncoder::encode_keyframe` must emit byte-identical wire to `encode_silent_keyframe(SilentKeyframeParams::new(w, h))`). Dims up to 1023 × 1023 (≈ 4 096 MBs — the silent writer emits a handful of booleans per MB, so the wide envelope stays cheap). Round-432 campaign: 1 948 448 executions in 546 s (~3.6 K exec/s); zero findings. |
+| `segment_lf_deltas_encode_decode_lockstep` | `encode_keyframe_adaptive_quant_with_segment_lf_deltas` / `..._and_trellis`, `quality_to_qindex`, `quality_to_trellis_strength` → `decode_vp8` (pixel differential) | The §10 per-segment **loop-filter feature** writers in pixel-exact lockstep, landed in round 432. `adaptive_quant_encode_decode_lockstep` drives the plain adaptive-quant writer whose §9.3 `update_segmentation()` block carries only the quantizer deltas; the `_with_segment_lf_deltas` variants additionally emit the four `loop_filter_update` values and resolve each MB's §15 level through the same segment override the decoder applies (§20.6 clamp) — wire and encoder-side resolution that had no fuzz pressure. Same oracle as the sibling lockstep targets (in-range encode must succeed, emitted bytes must decode, decoded planes must equal the encoder's post-§15 reconstruction byte-for-byte), plus a ±63 delta rejection probe and first coverage of the two WebP-canonical quality-mapping helpers (the qindex result asserted in `0..=127`). Round-432 campaign: 39 363 executions in 546 s; zero findings. |
+| `mv_bitstream_write_read_roundtrip` | `write_mv` / `write_mv_component`, `read_mv` / `read_mv_component`, `mv_bits` | The §17 MV component codec under fully attacker-chosen probability tables, landed in round 432. The stream targets reach `read_mv` only against §17.2-resolved tables (defaults mutated through the F-gated update path), so degenerate per-position probabilities (0, 255) never hit the component codec, and the encode side plus the `mv_bits` costing mirror had no coverage at all. Three oracles per iteration against a raw 38-byte `MvContexts`: up to 32 vectors (components mapped into the §17 legal ±1023) written with `write_mv` must read back exactly via `read_mv` in order; `mv_bits` must stay finite and non-negative on every vector; and arbitrary tail bytes pumped through `read_mv` must never produce a component outside ±1023 (§17.1 bounds the long form at 10 bits plus the implicit bit-3 rule). Round-432 campaign: 27 731 384 executions in 546 s (~51 K exec/s); zero findings. |
+| `inter_intra_modes_bitstream_decode` | `parse_inter_frame_intra_macroblock_modes`, `InterFrameIntraProbs` | The §16.1 interframe intra-mode parser under degenerate probability tables, landed in round 432. The stateful decoder reaches this parser only through real interframe headers (resolved probabilities, never 0 / 255 per node), and the key-frame twin has its own harness (`panic_free_kf_mb_mode_decode`) — the interframe variant's distinct Y-mode tree layout, the context-free `IF_BMODE_PROB` sub-block walk, and the caller-forwarded `segment_id` / `mb_skip_coeff` plumbing were never fuzzed directly. Per parsed record: totality (no panic across the probability × bitstream product space), the §16.1 structural invariant (`subblock_modes` is `Some` iff `y_mode == B`), and the forwarding contract (caller-supplied §10 / §11.1 sideband comes back verbatim). Round-432 campaign: 43 132 037 executions in 546 s (~79 K exec/s); zero findings. |
 
 The contract these harnesses enforce is **panic-freedom on the
 public API surface** — plus, where a target carries an equivalence
@@ -161,7 +165,18 @@ seeds for its four new targets (`panic_free_arnr_altref`,
 `encoder_trait_frame_lifecycle` — including the `repack_plane`
 out-of-bounds witness and the single-row huge-stride acceptance case —
 `ivf_write_parse_roundtrip`, and
-`inter_stream_refresh_lf_deltas_drive`). libFuzzer reads corpus directories
+`inter_stream_refresh_lf_deltas_drive`). Round 432 added structured
+seeds for its four new targets **and seeded the three wire-decode
+targets that previously ran from empty** (`panic_free_decode_keyframe`,
+`panic_free_decoder_state`, `parse_headers`): campaign telemetry showed
+the unseeded pair frozen at the §9.1 start-code reject path (49 / 90
+edges across > 100 M executions each — the mutation engine does not
+cross the 3-byte start-code + tag barrier from scratch), while the
+committed seeds (the leading key frame of each
+`decode_stream_token_descent` stream extracted raw, the streams copied
+verbatim for the stateful target, plus one interframe packet each for
+the §19.2 inter-only header blocks) lift a same-length campaign to
+2 191 / 3 516 edges. libFuzzer reads corpus directories
 recursively, so the committed `seeds/` subdirectory is picked up on
 every run, while newly-discovered corpus entries land in the
 top-level target directory — which stays gitignored, keeping the
@@ -172,10 +187,14 @@ before any §13 token descent runs, and inter-frame coverage
 additionally needs a previously-decoded reference frame — neither of
 which libFuzzer discovers from empty input in useful time.
 
-Every other target ships no seeds: libFuzzer starts from empty
-and discovers structure on its own; the targets each converge
-on coverage of their respective surface within a few minutes on a
-single core. A 20-second smoke run on `panic_free_two_pass_stream`
+Every other target ships no seeds: those targets are
+parameter-driven (structured headers decoded from the front of the
+input rather than wire-gated bitstreams), so libFuzzer discovers
+their structure from empty and converges on coverage of the
+respective surface within a few minutes on a single core — the
+round-432 whole-suite campaign confirmed healthy corpus growth on
+every unseeded target while exposing the wire-gated trio above as
+the exception. A 20-second smoke run on `panic_free_two_pass_stream`
 landed `cov: 3672, ft: 19072` across 6244 iterations at round 213.
 A 21-second smoke run on `panic_free_loopfilter_segment` landed
 `cov: 202, ft: 475, corp: 157/2944b` across 5 819 579 iterations at
@@ -215,6 +234,20 @@ ASan at 75 s each (~174 M combined iterations, from
 down to ~8.4 K `encode_decode_pixel_lockstep`), zero findings — the
 first whole-suite sweep on the `simd`-default build.
 
+The round-432 whole-suite campaign ran all 40 targets under ASan
+(nightly + default `simd`, built against the then-current published
+`oxideav-core`) at ~545 s wall-clock each — ~6.7 CPU-hours and
+≈ 1.1 billion combined executions (from ~175 M
+`panic_free_decode_keyframe` / 127 M each
+`panic_free_decoder_state` + `panic_free_loopfilter_segment` /
+107 M `ivf_write_parse_roundtrip` down to ~19 K
+`inter_stream_refresh_lf_deltas_drive`), plus a second seeded 545 s
+leg for the two previously-blind wire-decode targets after their
+corpora landed (49 → 2 191 and 90 → 3 516 edges). Zero crashes,
+leaks, OOMs, or oracle violations across the whole campaign, and
+both stale crash artifacts from earlier rounds replay clean on the
+current tree.
+
 ## CI
 
 The fuzz crate is intentionally a separate nested workspace
@@ -223,7 +256,9 @@ pulled into the umbrella's `crates/*` glob. The umbrella CI does
 not run fuzz iterations. Since round 284 the repo's scheduled
 `Fuzz` workflow (`.github/workflows/fuzz.yml`, daily +
 `workflow_dispatch`) runs every target under ASan via the shared
-`crate-fuzz` reusable workflow, splitting a 30-minute budget across
-the discovered targets and persisting the libFuzzer corpus across
-runs; the committed `decode_stream_token_descent` seeds are picked
-up from the checkout on every run.
+`crate-fuzz` reusable workflow, splitting a wall-clock budget across
+the discovered targets (30 minutes originally; doubled to 60 in
+round 432 when the suite reached 40 targets, restoring ~90 s per
+target) and persisting the libFuzzer corpus across runs; every
+committed `fuzz/corpus/<target>/seeds/` set is picked up from the
+checkout on every run.

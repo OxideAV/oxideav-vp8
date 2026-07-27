@@ -1,12 +1,13 @@
 name: Fuzz
 
 # Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Auto-discovers
-# every target in fuzz/fuzz_targets/ and splits the 30-minute budget
-# across them (21 targets as of round 287 → ~85 s each), running under
-# ASan on nightly. The committed decode_stream_token_descent seed corpus
-# (fixture-derived keyframe + inter-frame packet streams) ships in the
-# checkout; libFuzzer-discovered corpus entries persist across runs via
-# the reusable workflow's cache.
+# every target in fuzz/fuzz_targets/ and splits the 60-minute budget
+# across them (40 targets as of round 432 → ~90 s each; the budget was
+# doubled from 30 min in round 432 when the suite outgrew it), running
+# under ASan on nightly. The committed seed corpora under
+# fuzz/corpus/<target>/seeds/ ship in the checkout;
+# libFuzzer-discovered corpus entries persist across runs via the
+# reusable workflow's cache.
 
 on:
   schedule:
@@ -17,5 +18,5 @@ jobs:
   fuzz:
     uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
     with:
-      time_budget_seconds: 1800
+      time_budget_seconds: 3600
     secrets: inherit

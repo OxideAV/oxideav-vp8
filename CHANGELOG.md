@@ -33,6 +33,16 @@ All notable changes to `oxideav-vp8` are recorded here.
   coverage to 1 608 / 2 428 / 369 edges so the daily scheduled runs
   explore the actual decode pipeline.
 
+### Changed
+
+- the scheduled `Fuzz` workflow budget doubles from 30 to 60 minutes:
+  the suite has grown from 21 targets (when the budget was set) to 40,
+  which had thinned the per-target slice to ~45 s; 3 600 s restores
+  ~90 s per target. Documented alongside a round-432 whole-suite ASan
+  campaign record in `fuzz/README.md` (~545 s per target, ≈ 1.1 billion
+  combined executions, zero findings) and a refreshed fuzz-coverage
+  summary in the crate README.
+
 ## [0.2.6](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.5...v0.2.6) - 2026-07-10
 
 ### Added

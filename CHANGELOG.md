@@ -6,8 +6,9 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Changed
 
-- *(encoder)* whole-frame encode is ≈ 53 % faster on the keyframe path
-  and ≈ 31 % faster on the inter path, byte-identically: the §13 trellis
+- *(encoder)* whole-frame encode is ≈ 67 % faster on the keyframe path
+  (19.9 → 6.5 ms on the 320×240 bench) and ≈ 43 % faster on the inter
+  path (12.1 → 6.9 ms), byte-identically, in two steps. First: the §13 trellis
   (measured at ≈ 81 % of keyframe-encode self-time) now prices the
   extra-bit-free token levels (`abs 0..=4`) and the EOB branch from
   per-frame `TrellisRateTables` — filled once per frame by the reference
@@ -18,7 +19,14 @@ All notable changes to `oxideav-vp8` are recorded here.
   call. Pinned by a bitwise table-vs-direct sweep, a 6 912-case
   level-for-level stress against the retained pre-change trellis, and a
   54-entry decode/encode/roundtrip golden-hash harness
-  (`BENCHMARKS.md` §Round 441).
+  (`BENCHMARKS.md` §Round 441). Second: the Viterbi scan stops at the
+  last scan position whose rounded candidate magnitude is non-zero
+  (later positions admit only the level-0 candidate — provably dead
+  work whose drop-to-zero distortion every termination cost already
+  prices via the suffix array), and the per-candidate distortion term
+  is computed once per candidate instead of per (context, candidate)
+  pair, reusing the cached drop-to-zero f64 bit-for-bit
+  (`BENCHMARKS.md` §Round 441 part 2).
 
 ### Added
 

@@ -2920,3 +2920,40 @@ Two output-invariant changes to `trellis_quantize_block`:
 The pre numbers sit on the r409 recorded band (20.5–21.6 ms keyframe),
 so the baseline is credible despite the shared box. Keyframe throughput
 moves from ≈ 3.9 to ≈ **8.3 Mpx/s**.
+
+## Round 441 — trellis scan truncation + hoisted candidate distortion (part 2)
+
+The post-part-1 re-profile still ranks `trellis_quantize_block` #1
+(6 582 of ≈ 11 540 self-samples, ≈ 57 %). Two further output-invariant
+cuts to the Viterbi scan itself:
+
+* **Scan truncation.** Positions past the last scan slot whose rounded
+  candidate magnitude is non-zero admit only the level-0 candidate:
+  they can never become a terminating (non-zero last-coded) slot, the
+  traceback never starts past `best_term_pos`, and their drop-to-zero
+  distortion is already priced into every termination cost via
+  `suffix_zero_dist`. The loop now stops at `last_cand_nonzero` — on
+  typical energy-compact blocks that skips most of the 16 positions
+  (the survivor updates it skips are provably dead work).
+* **Hoisted candidate distortion.** The per-candidate distortion term
+  depends only on the magnitude, not the carried context; it was being
+  recomputed per `(in_ctx, candidate)` pair (up to 3× each). It is now
+  computed once per candidate, with the `m = 0` slot reusing the
+  drop-to-zero value already produced for `suffix_zero_dist` —
+  bit-for-bit the same f64s, consumed in the same iteration order (the
+  `in_ctx × candidate` scan order, and therefore strict-`<` tie
+  behaviour, is untouched).
+
+### Bit-exactness
+
+Same three-layer pin as part 1: the 6 912-case
+`trellis_lut_and_early_exit_match_reference` stress against the
+retained pre-r441 reference (which never truncates), the 54-entry
+golden-hash harness (unchanged hash-for-hash), full suite 812 green.
+
+### Measured A/B (`--warm-up-time 2 --measurement-time 8`, Apple M4-class aarch64, stable, shared box)
+
+| Bench | Part-1 | Part-2 | Δ (part) | Δ (cumulative vs 19.92 / 12.11 ms pre) |
+|---|---:|---:|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 9.14–9.39 ms | **6.53 ms** | **≈ −29 %** | **≈ −67 %** |
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 8.12–8.39 ms | **6.92 ms** | **≈ −15 %** | **≈ −43 %** |

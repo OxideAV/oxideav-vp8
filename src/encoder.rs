@@ -2660,13 +2660,15 @@ fn trellis_quantize_block(
     let mut scan_x = [0i32; 16];
     let mut step = [0i32; 16];
     let mut m_rounds = [0i64; 16];
-    let mut any_nonzero = false;
+    let mut last_cand_nonzero: i32 = -1;
     for k in 0..16 {
         scan_x[k] = block[crate::dct_tokens::ZIGZAG[k]] as i32;
         step[k] = if k == 0 { dc as i32 } else { ac as i32 };
         let q = step[k] as i64;
         m_rounds[k] = (scan_x[k].unsigned_abs() as i64 + q / 2) / q;
-        any_nonzero |= k >= first_coeff && m_rounds[k] != 0;
+        if k >= first_coeff && m_rounds[k] != 0 {
+            last_cand_nonzero = k as i32;
+        }
     }
 
     // Sub-threshold early exit: when every in-scan coefficient rounds to
@@ -2674,7 +2676,7 @@ fn trellis_quantize_block(
     // so every survivor carries level 0, no terminating position ever
     // qualifies (`cell.level != 0` never holds), and the traceback below
     // provably writes an all-zero block. Emit that block directly.
-    if !any_nonzero {
+    if last_cand_nonzero < 0 {
         *block = [0i16; 16];
         return;
     }
@@ -2706,8 +2708,10 @@ fn trellis_quantize_block(
     // the energy of the dropped tail and the trellis would zero
     // everything. `suffix_zero_dist[16] = 0`.
     let mut suffix_zero_dist = [0f64; 17];
+    let mut zero_dist = [0f64; 16];
     for k in (first_coeff..16).rev() {
-        suffix_zero_dist[k] = suffix_zero_dist[k + 1] + dist(k, 0);
+        zero_dist[k] = dist(k, 0);
+        suffix_zero_dist[k] = suffix_zero_dist[k + 1] + zero_dist[k];
     }
 
     // Forward Viterbi. State = carried `ctx3 ∈ {0,1,2}`. `cells[k]` holds
@@ -2768,7 +2772,13 @@ fn trellis_quantize_block(
     let mut best_term_pos: i32 = -1; // -1 ⇒ all-zero
     let mut best_term_ctx = entry_ctx3;
 
-    for k in first_coeff..16 {
+    // Positions past `last_cand_nonzero` admit only the level-0 candidate:
+    // they can never become a terminating (non-zero last-coded) slot, the
+    // traceback never starts past `best_term_pos` (which needs a non-zero
+    // level), and the tail's drop-to-zero distortion is already priced by
+    // `suffix_zero_dist` in every termination cost — so the scan over them
+    // is dead work and stops here, with identical output.
+    for k in first_coeff..=(last_cand_nonzero as usize) {
         let m_round = m_rounds[k];
         let band = COEFF_BANDS[k];
         // Candidate magnitudes: round and round-1 (≥0), deduplicated, plus
@@ -2792,13 +2802,20 @@ fn trellis_quantize_block(
             prev_ctx: 0,
         }; 3];
 
+        // Distortion depends only on the candidate magnitude, not on the
+        // carried context — compute each candidate's term once (the m = 0
+        // slot reuses the cached drop-to-zero value bit-for-bit).
+        let mut cand_dist = [0f64; 3];
+        for (slot, &m) in cand_dist.iter_mut().zip(&cands[..ncand]) {
+            *slot = if m == 0 { zero_dist[k] } else { dist(k, m) };
+        }
+
         for (in_ctx, &s) in surv.iter().enumerate() {
             if s.cost >= INF {
                 continue;
             }
-            for &m in &cands[..ncand] {
+            for (&m, &d) in cands[..ncand].iter().zip(&cand_dist[..ncand]) {
                 let abs = m as u16;
-                let d = dist(k, m);
                 let r = match small_rates {
                     Some(t) if abs <= TRELLIS_SMALL_LEVEL_MAX => {
                         t[band][in_ctx][s.prev_was_zero as usize][abs as usize]

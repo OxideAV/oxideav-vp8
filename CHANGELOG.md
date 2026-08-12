@@ -4,6 +4,22 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- *(encoder)* whole-frame encode is ≈ 53 % faster on the keyframe path
+  and ≈ 31 % faster on the inter path, byte-identically: the §13 trellis
+  (measured at ≈ 81 % of keyframe-encode self-time) now prices the
+  extra-bit-free token levels (`abs 0..=4`) and the EOB branch from
+  per-frame `TrellisRateTables` — filled once per frame by the reference
+  rate functions themselves, so every lookup is the bit-for-bit `f64`
+  the direct call would produce — and skips the Viterbi scan entirely
+  for sub-threshold blocks (every candidate magnitude rounds to zero, so
+  the all-zero output is forced). Levels ≥ 5 keep the direct cat-token
+  call. Pinned by a bitwise table-vs-direct sweep, a 6 912-case
+  level-for-level stress against the retained pre-change trellis, and a
+  54-entry decode/encode/roundtrip golden-hash harness
+  (`BENCHMARKS.md` §Round 441).
+
 ### Added
 
 - four fuzz targets closing the last un-fuzzed public entry points

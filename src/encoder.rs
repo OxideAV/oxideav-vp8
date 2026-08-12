@@ -2516,6 +2516,68 @@ fn level_ctx3(abs_level: u16) -> usize {
     }
 }
 
+/// Largest absolute level whose §13.3 token carries **no** cat extra
+/// bits (`DCT_0` … `DCT_4`). For these the token rate is a pure function
+/// of `(plane, band, ctx3, prev_was_zero, abs_level)` — the domain the
+/// per-frame [`TrellisRateTables`] covers.
+const TRELLIS_SMALL_LEVEL_MAX: u16 = 4;
+
+/// Per-frame precomputed §13.3 token-rate tables for the trellis hot
+/// loop. `coeff_probs` is fixed for a whole frame, so every
+/// [`coeff_token_bits`] / [`eob_token_bits`] value the Viterbi scan asks
+/// for at the extra-bit-free levels (`0..=4`, the overwhelming majority
+/// of candidates at the working quantisers) is a pure per-frame constant.
+/// Each entry is filled by calling the reference functions themselves, so
+/// a table lookup returns the **bit-for-bit identical** `f64` the direct
+/// call would have produced — the trellis costs, and therefore every
+/// chosen level and every emitted byte, cannot move.
+///
+/// Levels `≥ 5` (cat1–cat6, value-dependent extra bits) always take the
+/// direct [`coeff_token_bits`] path.
+struct TrellisRateTables {
+    /// `small[plane][band][ctx3][prev_was_zero][abs_level]` — the exact
+    /// [`coeff_token_bits`] value for `abs_level ∈ 0..=4`.
+    small: [[[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
+    /// `eob[plane][band][ctx3]` — the exact [`eob_token_bits`] value.
+    eob: [[[f64; 3]; 8]; 4],
+}
+
+impl TrellisRateTables {
+    /// Build the tables for one frame's resolved `coeff_probs` by
+    /// evaluating the reference rate functions at every covered point
+    /// (≈ 1k calls — noise next to a single macroblock's mode search).
+    fn for_probs(coeff_probs: &CoeffProbs) -> Self {
+        // First scan position of each §13.3 band. `coeff_token_bits`
+        // depends on the position only through `COEFF_BANDS[i]`, so any
+        // representative position per band yields the identical value.
+        let mut band_pos = [0usize; 8];
+        for (band, pos) in band_pos.iter_mut().enumerate() {
+            *pos = COEFF_BANDS
+                .iter()
+                .position(|&b| b == band)
+                .expect("every §13.3 band has at least one scan position");
+        }
+        let mut tables = TrellisRateTables {
+            small: [[[[[0.0; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
+            eob: [[[0.0; 3]; 8]; 4],
+        };
+        for plane in 0..4 {
+            for (band, &i) in band_pos.iter().enumerate() {
+                for ctx3 in 0..3 {
+                    tables.eob[plane][band][ctx3] = eob_token_bits(coeff_probs, plane, i, ctx3);
+                    for (pwz, slot) in tables.small[plane][band][ctx3].iter_mut().enumerate() {
+                        for (abs, cell) in slot.iter_mut().enumerate() {
+                            *cell =
+                                coeff_token_bits(coeff_probs, plane, i, ctx3, pwz == 1, abs as u16);
+                        }
+                    }
+                }
+            }
+        }
+        tables
+    }
+}
+
 /// One Viterbi survivor at a scan position: the minimal accumulated
 /// `J = D + lambda·R` to *reach and code through* this position landing in
 /// the carried context, the chosen absolute level, and a back-pointer to
@@ -2568,6 +2630,7 @@ fn trellis_quantize_block(
     block: &mut [i16; 16],
     spec: TrellisBlockSpec,
     coeff_probs: &CoeffProbs,
+    tables: Option<&TrellisRateTables>,
     lambda: f64,
 ) {
     let TrellisBlockSpec {
@@ -2592,15 +2655,38 @@ fn trellis_quantize_block(
         return;
     }
 
-    // Scan-order view of the unquantised coefficients + per-position step.
+    // Scan-order view of the unquantised coefficients + per-position step
+    // + the round-half-away-from-zero candidate magnitude per position.
     let mut scan_x = [0i32; 16];
     let mut step = [0i32; 16];
+    let mut m_rounds = [0i64; 16];
+    let mut any_nonzero = false;
     for k in 0..16 {
         scan_x[k] = block[crate::dct_tokens::ZIGZAG[k]] as i32;
         step[k] = if k == 0 { dc as i32 } else { ac as i32 };
+        let q = step[k] as i64;
+        m_rounds[k] = (scan_x[k].unsigned_abs() as i64 + q / 2) / q;
+        any_nonzero |= k >= first_coeff && m_rounds[k] != 0;
+    }
+
+    // Sub-threshold early exit: when every in-scan coefficient rounds to
+    // magnitude 0 the candidate set at every position is exactly `{0}`,
+    // so every survivor carries level 0, no terminating position ever
+    // qualifies (`cell.level != 0` never holds), and the traceback below
+    // provably writes an all-zero block. Emit that block directly.
+    if !any_nonzero {
+        *block = [0i16; 16];
+        return;
     }
 
     let norms = &*IDCT_BASIS_NORM_SQ;
+
+    // Per-frame rate LUT views for this block's `plane` (see
+    // [`TrellisRateTables`] — lookups are bit-for-bit the direct-call
+    // values, so costs and decisions cannot move; `None` falls back to
+    // the direct reference calls).
+    let small_rates = tables.map(|t| &t.small[plane]);
+    let eob_rates = tables.map(|t| &t.eob[plane]);
 
     // Distortion of coding scan position `k` at absolute level `m`
     // (transform-domain squared error scaled by the basis norm). `m` is a
@@ -2671,9 +2757,11 @@ fn trellis_quantize_block(
         let mut c = INF;
         let s = &surv[entry_ctx3];
         if s.cost < INF {
-            c = s.cost
-                + lambda * eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3)
-                + suffix_zero_dist[first_coeff];
+            let eob_r = match eob_rates {
+                Some(e) => e[COEFF_BANDS[first_coeff]][entry_ctx3],
+                None => eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3),
+            };
+            c = s.cost + lambda * eob_r + suffix_zero_dist[first_coeff];
         }
         c
     };
@@ -2681,12 +2769,8 @@ fn trellis_quantize_block(
     let mut best_term_ctx = entry_ctx3;
 
     for k in first_coeff..16 {
-        let m_round = {
-            let q = step[k] as i64;
-            // round-half-away-from-zero magnitude
-            let num = scan_x[k].unsigned_abs() as i64;
-            (num + q / 2) / q
-        };
+        let m_round = m_rounds[k];
+        let band = COEFF_BANDS[k];
         // Candidate magnitudes: round and round-1 (≥0), deduplicated, plus
         // a forced 0 so a non-trivial coefficient can still be dropped.
         let mut cands = [0i64; 3];
@@ -2715,7 +2799,12 @@ fn trellis_quantize_block(
             for &m in &cands[..ncand] {
                 let abs = m as u16;
                 let d = dist(k, m);
-                let r = coeff_token_bits(coeff_probs, plane, k, in_ctx, s.prev_was_zero, abs);
+                let r = match small_rates {
+                    Some(t) if abs <= TRELLIS_SMALL_LEVEL_MAX => {
+                        t[band][in_ctx][s.prev_was_zero as usize][abs as usize]
+                    }
+                    _ => coeff_token_bits(coeff_probs, plane, k, in_ctx, s.prev_was_zero, abs),
+                };
                 let cost = s.cost + d + lambda * r;
                 let out_ctx = level_ctx3(abs);
                 if cost < next[out_ctx].cost {
@@ -2746,9 +2835,11 @@ fn trellis_quantize_block(
             // `cell.cost` covers coding first..=k; add the EOB token (if
             // any remain) plus the distortion of dropping positions k+1..16.
             let term_cost = if k + 1 < 16 {
-                cell.cost
-                    + lambda * eob_token_bits(coeff_probs, plane, k + 1, out_ctx)
-                    + suffix_zero_dist[k + 1]
+                let eob_r = match eob_rates {
+                    Some(e) => e[COEFF_BANDS[k + 1]][out_ctx],
+                    None => eob_token_bits(coeff_probs, plane, k + 1, out_ctx),
+                };
+                cell.cost + lambda * eob_r + suffix_zero_dist[k + 1]
             } else {
                 cell.cost // implicit EOB after the last coefficient
             };
@@ -2813,6 +2904,12 @@ fn enc_quantize_block_range(block: &mut [i16; 16], dc: i16, ac: i16, first_coeff
 struct MbRdCtx<'a> {
     factors: &'a crate::dequant::MbDequantFactors,
     coeff_probs: &'a CoeffProbs,
+    /// Per-frame precomputed §13.3 trellis rate tables for `coeff_probs`
+    /// (see [`TrellisRateTables`]). `None` routes the trellis to the
+    /// direct reference rate calls — the values (and therefore the
+    /// bytes) are identical either way; frame-level drivers pass
+    /// `Some` so the cost of the tree walks is paid once per frame.
+    rate_tables: Option<&'a TrellisRateTables>,
     lambda: f64,
     /// §13 trellis aggressiveness — multiplies the calibrated
     /// [`TRELLIS_LAMBDA_SCALE`] base. Decoupled from the mode-decision
@@ -2951,6 +3048,7 @@ fn transform_whole_block_luma_rd(
                     plane: BlockType::Y2.plane_index(),
                 },
                 rd.coeff_probs,
+                rd.rate_tables,
                 tlambda,
             );
             for blk in y.iter_mut() {
@@ -2964,6 +3062,7 @@ fn transform_whole_block_luma_rd(
                         plane: BlockType::YAfterY2.plane_index(),
                     },
                     rd.coeff_probs,
+                    rd.rate_tables,
                     tlambda,
                 );
             }
@@ -3193,6 +3292,7 @@ fn transform_chroma_plane_rd(
                         plane: BlockType::UV.plane_index(),
                     },
                     rd.coeff_probs,
+                    rd.rate_tables,
                     rd.trellis_lambda(),
                 ),
                 _ => enc_quantize_block(&mut coeffs, factors.uv_dc, factors.uv_ac),
@@ -3499,6 +3599,7 @@ fn encode_bpred_luma(
                             plane: BlockType::YNoY2.plane_index(),
                         },
                         rd.coeff_probs,
+                        rd.rate_tables,
                         rd.trellis_lambda(),
                     );
                 } else {
@@ -3696,6 +3797,30 @@ pub fn encode_mb_block_set_with_neighbors_strength(
     coeff_probs: &crate::dct_tokens::CoeffProbs,
     trellis: TrellisStrength,
 ) -> Result<EncodedMb, TokenEncodeError> {
+    encode_mb_block_set_with_neighbors_strength_rates(
+        pixels,
+        neighbors,
+        yac_qi,
+        coeff_probs,
+        None,
+        trellis,
+    )
+}
+
+/// [`encode_mb_block_set_with_neighbors_strength`] with an optional
+/// per-frame [`TrellisRateTables`] built for `coeff_probs`. The
+/// frame-level drivers pass `Some` so the §13 trellis prices tokens from
+/// the precomputed tables (bit-for-bit the same values the direct calls
+/// produce — the emitted bytes are identical either way); the public
+/// per-MB entry above passes `None` and keeps its call cost unchanged.
+fn encode_mb_block_set_with_neighbors_strength_rates(
+    pixels: &MbPixels,
+    neighbors: &crate::reconstruct::MbNeighbors,
+    yac_qi: u8,
+    coeff_probs: &crate::dct_tokens::CoeffProbs,
+    rate_tables: Option<&TrellisRateTables>,
+    trellis: TrellisStrength,
+) -> Result<EncodedMb, TokenEncodeError> {
     // ---- 1. Build the §14.1 dequant factors + derive the RD lambda.
     // The encoder's quantisation step is the inverse — divide by these.
     let factors =
@@ -3703,6 +3828,7 @@ pub fn encode_mb_block_set_with_neighbors_strength(
     let rd = MbRdCtx {
         factors: &factors,
         coeff_probs,
+        rate_tables,
         lambda: rd_lambda(&factors),
         trellis,
     };
@@ -5001,6 +5127,12 @@ fn encode_keyframe_inner_lf(
         Some(u) => crate::dct_tokens::merge_default_token_probs(u),
         None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
     };
+    // Per-frame §13 trellis rate tables for the resolved `coeff_probs`
+    // (see `TrellisRateTables`) — built once here so the per-MB mode
+    // search prices tokens from lookups instead of re-walking the §13.2
+    // tree per candidate. Values (and bytes) are identical either way.
+    let trellis_rate_tables =
+        (params.trellis_strength.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -5037,11 +5169,12 @@ fn encode_keyframe_inner_lf(
 
             // Mode pick + forward transform/quant against the genuine
             // reconstructed neighbours.
-            let encoded = encode_mb_block_set_with_neighbors_strength(
+            let encoded = encode_mb_block_set_with_neighbors_strength_rates(
                 &pixels,
                 &neighbors,
                 params.y_ac_qi,
                 &coeff_probs,
+                trellis_rate_tables.as_ref(),
                 params.trellis_strength,
             )
             .map_err(EncodeError::Token)?;
@@ -5595,6 +5728,11 @@ fn encode_keyframe_adaptive_quant_inner_lf(
     let mb_rows = height.div_ceil(16) as usize;
 
     let coeff_probs = crate::dct_tokens::DEFAULT_COEFF_PROBS;
+    // Per-frame §13 trellis rate tables (see `TrellisRateTables`); the
+    // tables depend only on `coeff_probs`, not on the per-segment
+    // quantiser factors, so one build serves every segment.
+    let trellis_rate_tables =
+        (trellis.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
 
     // §10 per-segment effective qindex + the matching §14.1 dequant
     // factors. Delta mode: q_seg = clamp(base + delta, 0, 127). The
@@ -5636,11 +5774,12 @@ fn encode_keyframe_adaptive_quant_inner_lf(
             let seg = classify_segment(variance, &config.variance_boundaries);
             let q = seg_qindex[seg as usize];
 
-            let encoded = encode_mb_block_set_with_neighbors_strength(
+            let encoded = encode_mb_block_set_with_neighbors_strength_rates(
                 &pixels,
                 &neighbors,
                 q,
                 &coeff_probs,
+                trellis_rate_tables.as_ref(),
                 trellis,
             )
             .map_err(EncodeError::Token)?;
@@ -6614,6 +6753,7 @@ fn transform_split_mv_mb_rd(
                         plane: BlockType::YNoY2.plane_index(),
                     },
                     rd.coeff_probs,
+                    rd.rate_tables,
                     rd.trellis_lambda(),
                 ),
                 _ => enc_quantize_block(&mut coeffs, factors.y1_dc, factors.y1_ac),
@@ -6848,6 +6988,7 @@ fn pick_mb_for_ref(
     filters: &[[i32; 6]; 8],
     factors: &crate::dequant::MbDequantFactors,
     coeff_probs: Option<&CoeffProbs>,
+    rate_tables: Option<&TrellisRateTables>,
     trellis_strength: TrellisStrength,
 ) -> PickedMbForRef {
     // §13 trellis RD context for the inter residual emit, available once
@@ -6856,6 +6997,7 @@ fn pick_mb_for_ref(
     let trellis_rd = coeff_probs.map(|cp| MbRdCtx {
         factors,
         coeff_probs: cp,
+        rate_tables,
         lambda,
         trellis: trellis_strength,
     });
@@ -7222,6 +7364,7 @@ fn score_intra_mb_candidate(
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
     coeff_probs: Option<&CoeffProbs>,
+    rate_tables: Option<&TrellisRateTables>,
     trellis_strength: TrellisStrength,
 ) -> IntraMbPick {
     debug_assert!(
@@ -7235,6 +7378,7 @@ fn score_intra_mb_candidate(
     let trellis_rd = coeff_probs.map(|cp| MbRdCtx {
         factors,
         coeff_probs: cp,
+        rate_tables,
         lambda,
         trellis: trellis_strength,
     });
@@ -7383,6 +7527,7 @@ fn pick_intra_mb_all(
     factors: &crate::dequant::MbDequantFactors,
     lambda: f64,
     coeff_probs: Option<&CoeffProbs>,
+    rate_tables: Option<&TrellisRateTables>,
     trellis_strength: TrellisStrength,
 ) -> IntraMbPick {
     const Y_MODES: [IntraYMode; 4] = [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
@@ -7403,6 +7548,7 @@ fn pick_intra_mb_all(
                 factors,
                 lambda,
                 coeff_probs,
+                rate_tables,
                 trellis_strength,
             );
             match best.as_ref() {
@@ -8913,6 +9059,10 @@ fn encode_p_frame_multi_ref_inner_full(
         Some(u) => crate::dct_tokens::merge_default_token_probs(u),
         None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
     };
+    // Per-frame §13 trellis rate tables (see `TrellisRateTables`): one
+    // build per frame, shared by every per-ref / intra-in-P mode pick.
+    let trellis_rate_tables =
+        (inter_trellis_strength.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -9149,6 +9299,7 @@ fn encode_p_frame_multi_ref_inner_full(
                     filters,
                     mb_factors,
                     Some(&coeff_probs),
+                    trellis_rate_tables.as_ref(),
                     inter_trellis_strength,
                 );
                 let ref_bits = ref_frame_tree_bits(*ref_frame, prob_last_pick, prob_gf_pick);
@@ -9202,6 +9353,7 @@ fn encode_p_frame_multi_ref_inner_full(
                     mb_factors,
                     mb_lambda,
                     Some(&coeff_probs),
+                    trellis_rate_tables.as_ref(),
                     inter_trellis_strength,
                 );
                 let prob_intra_pick: u8 = 128;
@@ -11840,10 +11992,404 @@ pub const SEGMENT_VARIANCE_THRESHOLDS: [u32; 4] = [64, 256, 1_024, 4_096];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-round-441 §13 trellis, retained verbatim as the byte-level
+    /// reference for the per-frame rate-table + sub-threshold-early-exit
+    /// rewrite. It prices every candidate through the direct
+    /// [`super::coeff_token_bits`] / [`super::eob_token_bits`] calls and
+    /// never takes the all-zero shortcut, so
+    /// `trellis_lut_and_early_exit_match_reference` below can pin the
+    /// shipped fast paths against it level-for-level.
+    #[allow(clippy::needless_range_loop)]
+    fn trellis_quantize_block_reference(
+        block: &mut [i16; 16],
+        spec: super::TrellisBlockSpec,
+        coeff_probs: &super::CoeffProbs,
+        lambda: f64,
+    ) {
+        let super::TrellisBlockSpec {
+            dc,
+            ac,
+            first_coeff,
+            entry_ctx3,
+            plane,
+        } = spec;
+        // `lambda` is the **effective** coefficient-level price the caller has
+        // already scaled down from the mode-decision multiplier (coefficient
+        // RDO spends `lambda` far more effectively than the mode-granular
+        // picker — it can drop one trailing coefficient rather than a whole
+        // mode — so the raw mode lambda over-trades quality for rate). The
+        // scale is resolved by [`MbRdCtx::trellis_lambda`] from the
+        // [`TrellisStrength`] knob; this entry consumes the resolved value
+        // directly so callers can dial the rate/quality trade per stream.
+
+        // Baseline rounding for the lossless / no-trade path.
+        if lambda <= 0.0 {
+            super::enc_quantize_block_range(block, dc, ac, first_coeff);
+            return;
+        }
+
+        // Scan-order view of the unquantised coefficients + per-position step.
+        let mut scan_x = [0i32; 16];
+        let mut step = [0i32; 16];
+        for k in 0..16 {
+            scan_x[k] = block[crate::dct_tokens::ZIGZAG[k]] as i32;
+            step[k] = if k == 0 { dc as i32 } else { ac as i32 };
+        }
+
+        let norms = &*super::IDCT_BASIS_NORM_SQ;
+
+        // Distortion of coding scan position `k` at absolute level `m`
+        // (transform-domain squared error scaled by the basis norm). `m` is a
+        // magnitude (≥ 0); the dequantised coefficient carries `scan_x[k]`'s
+        // sign, so the error is computed on absolute magnitudes.
+        let dist = |k: usize, m: i64| -> f64 {
+            let q = step[k] as i64;
+            let recon = m * q;
+            let err = (scan_x[k] as i64).abs() - recon;
+            norms[k] * (err * err) as f64
+        };
+
+        // Suffix distortion of *dropping* every position k..16 to level 0 —
+        // the distortion the §13.3 implicit/explicit EOB tail pays for the
+        // coefficients past the last coded one. `suffix_zero_dist[k]` =
+        // Σ_{j=k}^{15} dist(j, 0). Without this, terminating early would hide
+        // the energy of the dropped tail and the trellis would zero
+        // everything. `suffix_zero_dist[16] = 0`.
+        let mut suffix_zero_dist = [0f64; 17];
+        for k in (first_coeff..16).rev() {
+            suffix_zero_dist[k] = suffix_zero_dist[k + 1] + dist(k, 0);
+        }
+
+        // Forward Viterbi. State = carried `ctx3 ∈ {0,1,2}`. `cells[k]` holds
+        // the best survivor *ending at* scan position `k` with each carried
+        // context, where "ending" means position `k` holds the last coded
+        // (possibly non-zero) coefficient so far. We also separately track the
+        // running all-zero-prefix cost so a block can terminate with EOB at
+        // `first_coeff` (entirely zero) for free of trailing-token bits.
+        //
+        // `prev[ctx]` is the best (cost, level, prev_ctx, prev_was_zero) to
+        // arrive at the *current* position carrying `ctx`.
+        const INF: f64 = f64::INFINITY;
+
+        // survivor reaching position `k` with carried ctx — initialised at the
+        // virtual "before first_coeff" boundary: a single state carrying
+        // `entry_ctx3`, cost 0, prev_was_zero = false (the first token may emit
+        // EOB).
+        #[derive(Clone, Copy)]
+        struct Surv {
+            cost: f64,
+            prev_was_zero: bool,
+            // back-pointer chain stored in `choice` below
+        }
+        let mut surv = [Surv {
+            cost: INF,
+            prev_was_zero: false,
+        }; 3];
+        surv[entry_ctx3] = Surv {
+            cost: 0.0,
+            prev_was_zero: false,
+        };
+
+        // Decision record per (position, carried-ctx): the level chosen at this
+        // position and which predecessor ctx it came from, for traceback.
+        let mut choice = [[super::TrellisCell {
+            cost: INF,
+            level: 0,
+            prev_ctx: 0,
+        }; 3]; 16];
+
+        // Best terminating survivor: code positions first..=t, then EOB after
+        // t (if t+1 < 16) or implicit EOB. `best_end_pos = first_coeff - 1`
+        // (sentinel `usize::MAX` meaning "all zero") seeds the all-zero block.
+        let mut best_term_cost = {
+            // All-zero block: EOB token at `first_coeff` against the entry ctx,
+            // plus the distortion of dropping every coefficient to zero.
+            let mut c = INF;
+            let s = &surv[entry_ctx3];
+            if s.cost < INF {
+                c = s.cost
+                    + lambda * super::eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3)
+                    + suffix_zero_dist[first_coeff];
+            }
+            c
+        };
+        let mut best_term_pos: i32 = -1; // -1 ⇒ all-zero
+        let mut best_term_ctx = entry_ctx3;
+
+        for k in first_coeff..16 {
+            let m_round = {
+                let q = step[k] as i64;
+                // round-half-away-from-zero magnitude
+                let num = scan_x[k].unsigned_abs() as i64;
+                (num + q / 2) / q
+            };
+            // Candidate magnitudes: round and round-1 (≥0), deduplicated, plus
+            // a forced 0 so a non-trivial coefficient can still be dropped.
+            let mut cands = [0i64; 3];
+            let mut ncand = 0usize;
+            for cand in [m_round, m_round - 1, 0] {
+                if cand >= 0 && !cands[..ncand].contains(&cand) {
+                    cands[ncand] = cand;
+                    ncand += 1;
+                }
+            }
+
+            let mut next = [Surv {
+                cost: INF,
+                prev_was_zero: false,
+            }; 3];
+            let mut next_choice = [super::TrellisCell {
+                cost: INF,
+                level: 0,
+                prev_ctx: 0,
+            }; 3];
+
+            for (in_ctx, &s) in surv.iter().enumerate() {
+                if s.cost >= INF {
+                    continue;
+                }
+                for &m in &cands[..ncand] {
+                    let abs = m as u16;
+                    let d = dist(k, m);
+                    let r = super::coeff_token_bits(
+                        coeff_probs,
+                        plane,
+                        k,
+                        in_ctx,
+                        s.prev_was_zero,
+                        abs,
+                    );
+                    let cost = s.cost + d + lambda * r;
+                    let out_ctx = super::level_ctx3(abs);
+                    if cost < next[out_ctx].cost {
+                        next[out_ctx] = Surv {
+                            cost,
+                            prev_was_zero: abs == 0,
+                        };
+                        next_choice[out_ctx] = super::TrellisCell {
+                            cost,
+                            level: abs,
+                            prev_ctx: in_ctx,
+                        };
+                    }
+                }
+            }
+
+            choice[k] = next_choice;
+
+            // Consider terminating *after* position k: position k must hold a
+            // non-zero coefficient to be a meaningful last-coded slot (a zero
+            // last slot is dominated by terminating one position earlier). The
+            // EOB after position k lands at k+1 (if any) against k's out-ctx;
+            // at k = 15 the implicit EOB costs nothing.
+            for (out_ctx, &cell) in next_choice.iter().enumerate() {
+                if cell.cost >= INF || cell.level == 0 {
+                    continue;
+                }
+                // `cell.cost` covers coding first..=k; add the EOB token (if
+                // any remain) plus the distortion of dropping positions k+1..16.
+                let term_cost = if k + 1 < 16 {
+                    cell.cost
+                        + lambda * super::eob_token_bits(coeff_probs, plane, k + 1, out_ctx)
+                        + suffix_zero_dist[k + 1]
+                } else {
+                    cell.cost // implicit EOB after the last coefficient
+                };
+                if term_cost < best_term_cost {
+                    best_term_cost = term_cost;
+                    best_term_pos = k as i32;
+                    best_term_ctx = out_ctx;
+                }
+            }
+
+            surv = next;
+        }
+
+        // Traceback from the best terminating position, writing scan-order
+        // levels then permuting back to raster.
+        let mut scan_levels = [0i32; 16];
+        if best_term_pos >= 0 {
+            let mut k = best_term_pos as usize;
+            let mut ctx = best_term_ctx;
+            loop {
+                let cell = choice[k][ctx];
+                let lvl = cell.level as i32;
+                let signed = if scan_x[k] < 0 { -lvl } else { lvl };
+                scan_levels[k] = signed;
+                if k == first_coeff {
+                    break;
+                }
+                ctx = cell.prev_ctx;
+                k -= 1;
+            }
+        }
+
+        // Permute scan levels back into the raster `block`.
+        for v in block.iter_mut() {
+            *v = 0;
+        }
+        for (k, &lvl) in scan_levels.iter().enumerate() {
+            block[crate::dct_tokens::ZIGZAG[k]] = lvl as i16;
+        }
+    }
     use crate::bool_decoder::BoolDecoder;
     use crate::coded_header::Vp8CodedHeader;
     use crate::decode_vp8;
     use crate::frame_header::Vp8FrameHeader;
+
+    /// Every point of the per-frame [`TrellisRateTables`] domain must be
+    /// **bit-for-bit** the value the direct reference rate call returns —
+    /// under the §13.5 default table AND a deterministically perturbed
+    /// non-uniform table (a wrong band/context/level slot would change the
+    /// f64, not alias into it). Together with
+    /// `trellis_lut_and_early_exit_match_reference` this pins the r441
+    /// lookup path: identical rates ⇒ identical Viterbi costs ⇒ identical
+    /// chosen levels ⇒ identical emitted bytes.
+    #[test]
+    fn trellis_rate_tables_match_direct_calls() {
+        let mut perturbed = crate::DEFAULT_COEFF_PROBS;
+        let mut st = 0x1357_9BDFu32;
+        for plane in perturbed.iter_mut() {
+            for band in plane.iter_mut() {
+                for ctx in band.iter_mut() {
+                    for prob in ctx.iter_mut() {
+                        st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        *prob = ((st >> 24) as u8).max(1);
+                    }
+                }
+            }
+        }
+        for probs in [&crate::DEFAULT_COEFF_PROBS, &perturbed] {
+            let t = TrellisRateTables::for_probs(probs);
+            for plane in 0..4 {
+                for (i, &band) in COEFF_BANDS.iter().enumerate() {
+                    for ctx3 in 0..3 {
+                        assert_eq!(
+                            t.eob[plane][band][ctx3].to_bits(),
+                            eob_token_bits(probs, plane, i, ctx3).to_bits(),
+                            "eob: plane {plane} pos {i} ctx {ctx3}"
+                        );
+                        for pwz in 0..2usize {
+                            for abs in 0..=TRELLIS_SMALL_LEVEL_MAX {
+                                assert_eq!(
+                                    t.small[plane][band][ctx3][pwz][abs as usize].to_bits(),
+                                    coeff_token_bits(probs, plane, i, ctx3, pwz == 1, abs)
+                                        .to_bits(),
+                                    "plane {plane} pos {i} ctx {ctx3} pwz {pwz} abs {abs}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shipped trellis (per-frame rate LUT + sub-threshold early
+    /// exit) must produce **level-for-level identical** output to the
+    /// retained pre-r441 reference implementation — with and without the
+    /// tables — across block types, entry contexts, quantisers, lambdas,
+    /// probability tables, and residual magnitudes from far-sub-threshold
+    /// (the early-exit path) through cat-token territory (the `abs > 4`
+    /// direct-call fallback).
+    #[test]
+    fn trellis_lut_and_early_exit_match_reference() {
+        let mut perturbed = crate::DEFAULT_COEFF_PROBS;
+        let mut st = 0xA5A5_1234u32;
+        for plane in perturbed.iter_mut() {
+            for band in plane.iter_mut() {
+                for ctx in band.iter_mut() {
+                    for prob in ctx.iter_mut() {
+                        st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        *prob = ((st >> 24) as u8).max(1);
+                    }
+                }
+            }
+        }
+
+        let block_specs = [
+            (BlockType::Y2, 0usize),
+            (BlockType::YAfterY2, 0),
+            (BlockType::YNoY2, 1),
+            (BlockType::UV, 2),
+        ];
+
+        let mut cases = 0usize;
+        for probs in [&crate::DEFAULT_COEFF_PROBS, &perturbed] {
+            let tables = TrellisRateTables::for_probs(probs);
+            for qi in [8i32, 40, 100] {
+                let factors =
+                    crate::dequant::MbDequantFactors::from_base_and_deltas(qi, 0, 0, 0, 0, 0);
+                let base_lambda = rd_lambda(&factors) * TRELLIS_LAMBDA_SCALE;
+                for (block_type, entry_ctx3) in block_specs {
+                    let (dc, ac) = match block_type {
+                        BlockType::Y2 => (factors.y2_dc, factors.y2_ac),
+                        BlockType::UV => (factors.uv_dc, factors.uv_ac),
+                        _ => (factors.y1_dc, factors.y1_ac),
+                    };
+                    let spec = TrellisBlockSpec {
+                        dc,
+                        ac,
+                        first_coeff: block_type.first_coeff(),
+                        entry_ctx3,
+                        plane: block_type.plane_index(),
+                    };
+                    // Magnitude regimes: far sub-threshold (all-zero early
+                    // exit), around-threshold, working range, cat-token
+                    // range (levels > 4 hit the direct-call fallback).
+                    for (scale, offset) in [
+                        (1i32, 0i32),
+                        (ac as i32, 0),
+                        (ac as i32 * 3, 8),
+                        (ac as i32 * 24, 64),
+                    ] {
+                        for seed in 0u32..12 {
+                            let mut lcg = 0xC0FF_EE00u32
+                                .wrapping_add(seed)
+                                .wrapping_mul(2_891_336_453);
+                            let mut next = move || {
+                                lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                                (lcg >> 16) as i32
+                            };
+                            let mut base = [0i16; 16];
+                            for (k, c) in base.iter_mut().enumerate() {
+                                // Roughly zig-zag-decaying magnitudes with
+                                // both signs, like real DCT output.
+                                let mag = (next() % (scale + offset + 1)) / (1 + k as i32 / 4);
+                                let sign = if next() % 2 == 0 { 1 } else { -1 };
+                                *c = (sign * mag).clamp(-2048, 2047) as i16;
+                            }
+                            for lambda in [base_lambda * 0.25, base_lambda, base_lambda * 6.0] {
+                                let mut want = base;
+                                trellis_quantize_block_reference(&mut want, spec, probs, lambda);
+                                let mut got_direct = base;
+                                trellis_quantize_block(&mut got_direct, spec, probs, None, lambda);
+                                let mut got_lut = base;
+                                trellis_quantize_block(
+                                    &mut got_lut,
+                                    spec,
+                                    probs,
+                                    Some(&tables),
+                                    lambda,
+                                );
+                                assert_eq!(
+                                    want, got_direct,
+                                    "direct path drifted: qi {qi} type {block_type:?} scale {scale} seed {seed} lambda {lambda}"
+                                );
+                                assert_eq!(
+                                    want, got_lut,
+                                    "LUT path drifted: qi {qi} type {block_type:?} scale {scale} seed {seed} lambda {lambda}"
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases >= 3000, "stress matrix shrank: {cases} cases");
+    }
 
     /// Re-read a §9.3 `update_segmentation()` block from raw bits the
     /// same way the decoder's `parse_update_segmentation` does, so a
@@ -12761,6 +13307,7 @@ mod tests {
                     plane: BlockType::UV.plane_index(),
                 },
                 &probs,
+                None,
                 // `trellis_quantize_block` now consumes the **effective**
                 // (already-scaled) coefficient lambda — the same `lambda`
                 // the cost helper above prices J against.
@@ -14313,6 +14860,7 @@ mod tests {
             &factors,
             lambda,
             None,
+            None,
             TrellisStrength::DEFAULT,
         );
         assert_eq!(
@@ -14358,6 +14906,7 @@ mod tests {
             &make_neighbors(),
             &factors,
             lambda,
+            None,
             None,
             TrellisStrength::DEFAULT,
         );
@@ -14412,6 +14961,7 @@ mod tests {
             &factors,
             lambda,
             None,
+            None,
             TrellisStrength::DEFAULT,
         );
         assert_eq!(
@@ -14446,6 +14996,7 @@ mod tests {
             &MbNeighbors::default(),
             &factors,
             lambda,
+            None,
             None,
             TrellisStrength::DEFAULT,
         );

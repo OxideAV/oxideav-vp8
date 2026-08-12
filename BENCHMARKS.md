@@ -2856,3 +2856,67 @@ headers / partition sizes / MV magnitudes, not the DCT-token hot loop)
 — this is a primitive-layer win in the same class as the r306 decoder
 change, but this time with an isolated harness that can actually
 resolve it.
+
+## Round 441 — per-frame §13 trellis rate tables + sub-threshold early exit (profile-opt round)
+
+A fresh `sample(1)` PID-attach profile of `keyframe_encode` (15 s @ 1 ms,
+stable) confirmed the r409 ranking unchanged: `trellis_quantize_block`
+at **9 328 of ≈ 11 540 self-samples (≈ 81 %)**, with
+`encode_mb_block_set_with_neighbors_strength` (8 %),
+`estimate_block_bits` (3.4 %), the §14.4/§14.3 transform pair (≈ 5 %
+combined) trailing far behind. r409 recorded that hoisting work *inside*
+the per-candidate rate call regresses (+28 %); this round removes the
+per-candidate rate call instead.
+
+Two output-invariant changes to `trellis_quantize_block`:
+
+* **Per-frame rate tables.** `coeff_probs` is constant for a whole
+  frame, and for the extra-bit-free levels (`abs ∈ 0..=4` — every
+  candidate the Viterbi scan generates until `m_round ≥ 5`) the §13.3
+  token rate is a pure function of
+  `(plane, band, ctx3, prev_was_zero, abs)`. A `TrellisRateTables`
+  (960 + 96 `f64`s) is built **once per frame** by calling the reference
+  `coeff_token_bits` / `eob_token_bits` themselves, so a hot-loop lookup
+  returns the bit-for-bit identical `f64` the direct call would have
+  produced — costs, chosen levels, and emitted bytes cannot move. Levels
+  ≥ 5 (cat extra bits, value-dependent) keep the direct call. The tables
+  ride `MbRdCtx` through every trellis site (whole-block luma, Y2,
+  B_PRED sub-blocks, chroma, inter residual, SPLITMV); the per-MB public
+  entry keeps a `None` fallback that routes to the unchanged direct
+  calls.
+* **Sub-threshold early exit.** When every in-scan coefficient rounds to
+  magnitude 0 the candidate set at every position is exactly `{0}`, no
+  terminating position can qualify (it needs a non-zero level), and the
+  traceback provably writes an all-zero block — so the scan is skipped
+  and the zero block emitted directly. At working quantisers this fires
+  constantly (chroma + smooth-area luma candidates during the RD mode
+  fan-out).
+
+### Bit-exactness
+
+* `trellis_rate_tables_match_direct_calls` — every table slot bitwise
+  (`f64::to_bits`) equal to the direct reference call, across all
+  4 planes × 16 scan positions × 3 contexts × 2 EOB-skip states ×
+  5 levels + EOB, under the §13.5 defaults AND a deterministically
+  perturbed non-uniform table.
+* `trellis_lut_and_early_exit_match_reference` — the pre-r441 trellis is
+  retained verbatim as `trellis_quantize_block_reference`; 6 912 cases
+  (2 probability tables × 3 quantisers × 4 block types × 4 magnitude
+  regimes from far-sub-threshold to cat-token range × 12 seeds ×
+  3 lambdas) assert level-for-level identical output for both the
+  `Some(tables)` and `None` paths.
+* A 54-entry golden-hash harness (decode of the 13 stream fixtures +
+  keyframe/inter/altref encode matrices + their self-decodes + raw ARNR
+  output) pinned before the change matches after it, hash for hash.
+* Full suite 812 tests green.
+
+### Measured A/B (`--warm-up-time 2 --measurement-time 8`, Apple M4-class aarch64, stable, shared box)
+
+| Bench | Pre | Post (2 runs) | Δ |
+|---|---:|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 19.92 ms | **9.39 / 9.14 ms** | **≈ −53 %** |
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 12.11 ms | **8.39 / 8.12 ms** | **≈ −31 %** |
+
+The pre numbers sit on the r409 recorded band (20.5–21.6 ms keyframe),
+so the baseline is credible despite the shared box. Keyframe throughput
+moves from ≈ 3.9 to ≈ **8.3 Mpx/s**.

@@ -2957,3 +2957,34 @@ golden-hash harness (unchanged hash-for-hash), full suite 812 green.
 |---|---:|---:|---:|---:|
 | `keyframe_encode/encode_keyframe_320x240_qi32` | 9.14–9.39 ms | **6.53 ms** | **≈ −29 %** | **≈ −67 %** |
 | `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 8.12–8.39 ms | **6.92 ms** | **≈ −15 %** | **≈ −43 %** |
+
+## Round 441 — DC-only / all-zero fast path in the RD reconstruct leaf (part 3)
+
+The part-2 re-profile puts `inverse_dct_4x4_scalar` at ≈ 12 % of
+keyframe-encode self-time — almost all of it under
+`reconstruct_block_4x4`, the per-candidate RD leaf that dequantises and
+reconstructs every scored block exactly as the decoder will. The
+decoder's fused kernel (`inverse_dct_4x4_add_into`, r286/r294) already
+carries a DC-only shortcut; the encoder leaf now gets its twin: after
+the dequant multiplies, if every AC coefficient is zero both §14.4
+passes carry only the DC term, all sixteen residue outputs are
+`(dq[0] + 4) >> 3`, and the reconstruction collapses to one uniform
+add-clamp — or a pure predictor copy when that value is 0, which also
+covers the all-zero blocks the RD fan-out and the §13 trellis produce
+constantly. The shortcut reads the *truncated* `i16` DC exactly as the
+transform would, so the wrap-around edge behaves identically.
+
+### Bit-exactness
+
+`reconstruct_block_4x4_dc_only_matches_general` — 4 096 cases (all-zero
+/ small-DC / huge-DC `i16`-truncation-edge / general-block regimes ×
+random predictors × random `(dc, ac)` factors) against the pre-shortcut
+chain kept verbatim in the test; 54-entry golden-hash harness unchanged
+hash-for-hash; full suite 813 green.
+
+### Measured A/B (`--warm-up-time 2 --measurement-time 8`, Apple M4-class aarch64, stable, shared box)
+
+| Bench | Part-2 | Part-3 | Δ (part) | Δ (cumulative vs pre) |
+|---|---:|---:|---:|---:|
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 6.53 ms | **5.88 ms** | **≈ −10 %** | **≈ −70 %** |
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 6.92 ms | **6.69 ms** | ≈ −3.4 % | **≈ −45 %** |

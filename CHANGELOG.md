@@ -6,9 +6,9 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Changed
 
-- *(encoder)* whole-frame encode is ≈ 67 % faster on the keyframe path
-  (19.9 → 6.5 ms on the 320×240 bench) and ≈ 43 % faster on the inter
-  path (12.1 → 6.9 ms), byte-identically, in two steps. First: the §13 trellis
+- *(encoder)* whole-frame encode is ≈ 70 % faster on the keyframe path
+  (19.9 → 5.9 ms on the 320×240 bench) and ≈ 45 % faster on the inter
+  path (12.1 → 6.7 ms), byte-identically, in three steps. First: the §13 trellis
   (measured at ≈ 81 % of keyframe-encode self-time) now prices the
   extra-bit-free token levels (`abs 0..=4`) and the EOB branch from
   per-frame `TrellisRateTables` — filled once per frame by the reference
@@ -26,7 +26,13 @@ All notable changes to `oxideav-vp8` are recorded here.
   prices via the suffix array), and the per-candidate distortion term
   is computed once per candidate instead of per (context, candidate)
   pair, reusing the cached drop-to-zero f64 bit-for-bit
-  (`BENCHMARKS.md` §Round 441 part 2).
+  (`BENCHMARKS.md` §Round 441 part 2). Third: the per-candidate RD
+  reconstruct leaf gains the decoder kernel's DC-only shortcut — when
+  every dequantised AC coefficient is zero the §14.4 residue is the
+  uniform `(dc + 4) >> 3`, so the reconstruction is one add-clamp (or a
+  predictor copy at zero), pinned by a 4 096-case equivalence test
+  including the `i16`-truncation edge (`BENCHMARKS.md` §Round 441
+  part 3). Cumulative: keyframe ≈ −70 %, inter ≈ −45 %.
 
 ### Added
 

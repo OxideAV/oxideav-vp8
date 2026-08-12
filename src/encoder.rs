@@ -2984,6 +2984,25 @@ fn reconstruct_block_4x4(pred: &[u8; 16], quant: &[i16; 16], dc: i16, ac: i16) -
     for c in dq.iter_mut().skip(1) {
         *c = (*c as i32 * ac as i32) as i16;
     }
+    // §14.4 DC-only fast path (the per-candidate twin of the fused
+    // decoder kernel's shortcut — see `inverse_dct_4x4_add_into`): with
+    // every AC coefficient zero both separable passes carry only the DC
+    // term and all sixteen residue outputs are `(dq[0] + 4) >> 3`, so the
+    // reconstruction is one uniform add-clamp — and a pure predictor copy
+    // when that value is 0 (which also covers the all-zero blocks the RD
+    // fan-out and the §13 trellis produce constantly). Bit-exact against
+    // the general path (`reconstruct_block_4x4_dc_only_matches_general`).
+    if dq[1..].iter().all(|&c| c == 0) {
+        let d = ((dq[0] as i32) + 4) >> 3;
+        if d == 0 {
+            return *pred;
+        }
+        let mut recon = [0u8; 16];
+        for (r, &p) in recon.iter_mut().zip(pred.iter()) {
+            *r = (p as i32 + d).clamp(0, 255) as u8;
+        }
+        return recon;
+    }
     let mut residue = [0i16; 16];
     inverse_dct_4x4(&dq, &mut residue);
     let mut recon = [0u8; 16];
@@ -12009,6 +12028,53 @@ pub const SEGMENT_VARIANCE_THRESHOLDS: [u32; 4] = [64, 256, 1_024, 4_096];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The r441 DC-only / all-zero shortcut in [`reconstruct_block_4x4`]
+    /// must be byte-for-byte the general dequant → §14.4 IDCT → §14.5
+    /// add-clamp chain, including the dequant multiply's `i16`
+    /// truncation (the shortcut reads the truncated DC exactly as the
+    /// transform would) and the clamp at both rails.
+    #[test]
+    fn reconstruct_block_4x4_dc_only_matches_general() {
+        let mut st = 0x5EED_0441u32;
+        let mut next = move || {
+            st = st.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (st >> 16) as i32
+        };
+        for case in 0..4096 {
+            let mut pred = [0u8; 16];
+            for p in pred.iter_mut() {
+                *p = (next() & 0xFF) as u8;
+            }
+            let (dc, ac) = (4 + (next() % 280) as i16, 4 + (next() % 280) as i16);
+            let mut quant = [0i16; 16];
+            // Regimes: all-zero, small DC, huge DC (i16-truncation edge),
+            // and (as a control) a genuinely general block.
+            match case % 4 {
+                0 => {}
+                1 => quant[0] = (next() % 9 - 4) as i16,
+                2 => quant[0] = (next() % 60_000 - 30_000) as i16,
+                _ => {
+                    for c in quant.iter_mut() {
+                        *c = (next() % 41 - 20) as i16;
+                    }
+                }
+            }
+            // Reference: the pre-shortcut chain, verbatim.
+            let mut dq = quant;
+            dq[0] = (dq[0] as i32 * dc as i32) as i16;
+            for c in dq.iter_mut().skip(1) {
+                *c = (*c as i32 * ac as i32) as i16;
+            }
+            let mut residue = [0i16; 16];
+            inverse_dct_4x4(&dq, &mut residue);
+            let mut want = [0u8; 16];
+            add_residue_4x4(&pred, &residue, &mut want);
+
+            let got = reconstruct_block_4x4(&pred, &quant, dc, ac);
+            assert_eq!(want, got, "case {case} dc {dc} ac {ac} quant {quant:?}");
+        }
+    }
 
     /// The pre-round-441 §13 trellis, retained verbatim as the byte-level
     /// reference for the per-frame rate-table + sub-threshold-early-exit

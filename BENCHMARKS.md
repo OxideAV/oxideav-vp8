@@ -2988,3 +2988,28 @@ hash-for-hash; full suite 813 green.
 |---|---:|---:|---:|---:|
 | `keyframe_encode/encode_keyframe_320x240_qi32` | 6.53 ms | **5.88 ms** | **≈ −10 %** | **≈ −70 %** |
 | `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 6.92 ms | **6.69 ms** | ≈ −3.4 % | **≈ −45 %** |
+
+## Round 441 — bounded early-abandon whole-pixel SAD (negative result, part 4)
+
+Attempted and **reverted**. The inter profile's #2/#3 self-time symbols
+(`group_sad_at_whole_mv` ≈ 20 %, with `sixtap_mb_luma` at ≈ 24 %) are
+fed by the §17.1 whole-pixel diamond descents, whose selection is pure
+strict-`<` on the SAD — so a bounded scorer (abandon a candidate once
+its row-partial reaches the incumbent best; a winner always returns its
+exact full SAD because partials are monotone) is provably
+decision-identical, the same trick the r409 ARNR refinement search
+lands. Both descents were routed through bounded variants
+(per-16-pixel-row abandon for the whole-MB scorer, per-sub-block for
+the SPLITMV group scorer), contract + verbatim-descent-replica
+equivalence tests green, 54-entry golden hashes unchanged.
+
+It measured **flat to slightly negative**:
+`inter_encode_short_clip` 6.69 ms (part-3) → 6.73–6.78 ms over three
+runs. On the descent workloads these benches drive, neighbouring
+candidates sit close in SAD, so the abandon threshold is rarely crossed
+before the final rows — while the per-row `acc >= limit` compare taxes
+every scored candidate. Reverted per the r274 flat-candidate doctrine;
+recorded so the next inter round doesn't re-walk it. (If a future
+corpus shows large-displacement content where hopeless candidates
+dominate, the shape to revive is the bounded scorer pair + strict-`<`
+contract as described here.)

@@ -3013,3 +3013,101 @@ recorded so the next inter round doesn't re-walk it. (If a future
 corpus shows large-displacement content where hopeless candidates
 dominate, the shape to revive is the bounded scorer pair + strict-`<`
 contract as described here.)
+
+## Round 451 — §18.3 identity-pass elision + §16.4 rectangle group SAD (profile round)
+
+Round 451 (2026-08-24) profiled both whole-frame encode paths afresh
+(`sample(1)` PID-attach, 12–15 s @ 1 ms, stable, Apple M4-class
+aarch64). Keyframe encode still ranks `trellis_quantize_block` #1
+(≈ 48 % post-r441, down from 81 % pre-r441), with the RD driver
+(≈ 15 %), `estimate_block_bits` (≈ 14 %) and the §14 transform pair
+(≈ 10 %) behind it. Inter encode ranked `sixtap_mb_luma` #1 (≈ 23 %),
+`group_sad_at_whole_mv` #2 (≈ 20 %), the trellis #3 (≈ 18 %). The
+decode side is saturated (token core ≈ 28 %, fused IDCT ≈ 13 %,
+plane-copy memmove ≈ 8 % — all previously ground or API-bound). Two
+optimisations landed, both gated on a 200-entry whole-corpus
+golden-hash harness (13 fixture stream decodes frame-by-frame, a
+36-point keyframe-encode matrix + self-decodes, keyframe/inter/altref
+stream drives ×3 encode-frame variants + stateful self-decodes, raw
+ARNR at three strengths) that was byte-identical before/after every
+step, plus the full 816-test suite.
+
+### Landed: identity-pass elision in the scalar six-tap dispatchers
+
+The §18.3 whole-pixel filter row `{0,0,128,0,0,0}` makes a §20.14 pass
+the exact identity (`clamp255((128·p + 64) >> 7) = p`), so a fraction
+pair with one zero component only ever needed one pass. The stable
+`sixtap_2d` / `sixtap_mb_luma` / `sixtap_mb_chroma` dispatchers now
+gate on the resolved tap values and run only the surviving pass
+(monomorphic widened-`i32`-row loops); other pairs take the unchanged
+two-pass listing. The §17 half-pixel refinement probes four such
+shapes per center; decode hits them on every inter MV with exactly one
+whole-pixel axis.
+
+| Bench | Two-pass (3,5) | Elided | Δ |
+|---|---:|---:|---:|
+| `mb_luma_batched_16x16_horiz_only_3x0` (new) | 158 ns | **67 ns** | **−58 %** |
+| `mb_luma_batched_16x16_vert_only_0x5` (new) | 158 ns | **92 ns** | **−41 %** |
+
+### Landed: row-merged rectangle SAD for the SPLITMV group descents
+
+Every §20.13 partition group is a rectangle of sub-blocks, but the
+in-bounds group-SAD fast path accumulated one 4-byte member row at a
+time. `PartitionGroups` now precomputes each group's pixel rectangle at
+compile time and the §16.4 diamond descent + `sub_mv_ref` scorer route
+through a shaped evaluator whose in-bounds path SADs the rectangle's
+contiguous 16/8/4-byte pixel rows, dispatched once per call onto a
+constant-width kernel (row-merging reorders an exact non-overflowing
+`u32` sum only). Border candidates keep the per-member edge-replicating
+fallback.
+
+### Whole-frame A/B (criterion saved-baseline, `--warm-up-time 2 --measurement-time 8`, stable)
+
+| Bench | r451 pre | post (both commits) | Δ |
+|---|---:|---:|---:|
+| `inter_encode_short_clip/inter_encode_4f_128x128_qi32` | 6.971 ms | **6.706 ms** | **−4.2 %** |
+| `keyframe_encode/encode_keyframe_320x240_qi32` | 6.07 ms | 6.08–6.25 ms | unchanged (no MC/SAD on this path) |
+| `keyframe_decode` / `inter_decode_short_clip` | 120.8 / 107.3 µs | — | unchanged (bench streams carry whole-pixel MVs; the elide pays off only on single-axis sub-pel content) |
+
+### Negative results (recorded per the r274 flat-candidate doctrine)
+
+* **Widened-row restructure of the general two-pass scalar kernels** —
+  rewriting the two-pass luma/chroma scalar listings as widened
+  `i32`-row loops benched −5 % on `mb_luma_batched_16x16` but **+26 %**
+  on `mb_chroma_batched_8x8` (43.4 → 54.7 ns): LLVM already
+  auto-vectorises the shipped listings well, and the chroma geometry
+  regressed outright. Reverted; only the single-pass elision arms keep
+  the widened-row shape.
+* **Per-call rectangle detection inside `group_sad_at_whole_mv`** —
+  detecting the bounding box + ascending-members gate per call (and
+  dispatching per row) measured **+19 %** on `inter_encode_short_clip`:
+  the extra body destroyed the inlined descent loop. The shipped form
+  moves the geometry to compile time and leaves the original function
+  intact as the fallback.
+* **Per-step rate-table replay in `estimate_block_bits`** — extending
+  the r441 `TrellisRateTables` with per-(plane, band, ctx3,
+  prev-was-zero, level) sequences of the individual `bool_bits` step
+  values (replayed one add at a time in emission order, so the running
+  `f64` is bit-for-bit the direct walk's) built + threaded + pinned
+  clean, but benched **flat** (p = 0.52) on `keyframe_encode`: the
+  estimator's cost is the `f64` adds and table traffic themselves, not
+  the token classification/dispatch around them. Reverted; recorded so
+  the next encoder round does not re-walk it. (A summed-subtotal LUT —
+  the shape that IS a win inside the trellis — is barred here: the
+  estimator's reference accumulates per-step into one running `f64`, so
+  subtotal grouping changes ulps and could flip RD near-ties.)
+* **Super-halo fused refinement scorer** — prefetching one in-bounds
+  22×22 window per §17 refinement center and scoring all 9 candidates
+  through a strided fused sixtap+SAD kernel (skipping the 8 per-probe
+  21×21 halo fetches and the 256-byte prediction materialisation)
+  measured **+7.6 %** on `inter_encode_short_clip`: the strided
+  reimplementation loses more to codegen than the fetch amortisation
+  recovers — the contiguous-halo monomorphic kernels + `block_sad_16x16`
+  are simply better compiled. Reverted (equivalence pin and all) — the
+  shape to revive, if ever, is contiguous per-probe sub-halo copies,
+  not strided reads.
+
+Fuzz: a bounded ASan session over the five touched-path targets
+(≈ 31 M combined executions) found nothing; 226 session-discovered
+coverage inputs were folded into committed seed sets (see
+`fuzz/README.md`).

@@ -6,6 +6,21 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ### Changed
 
+- *(perf)* the §17 sub-pixel refinement and §18.3 sub-pixel decode
+  paths elide the identity §20.14 pass on single-axis fractions (the
+  whole-pixel filter row `{0,0,128,0,0,0}` is the exact per-sample
+  identity, so one convolution pass suffices) — the elided probe shapes
+  run −58 % / −41 % on the new single-axis micro-bench workloads — and
+  the §16.4 SPLITMV group descents SAD each partition group's
+  compile-time-precomputed pixel rectangle as contiguous 16/8/4-byte
+  rows instead of 4-byte member-sub-block runs. Byte-identical by
+  construction (identity proof + exact reassociation of non-overflowing
+  integer sums), pinned by all-fraction dispatcher-vs-listing stress
+  tests, a per-subblock-fetch group-SAD reference sweep, and a
+  200-entry whole-corpus golden-hash harness; whole-frame
+  `inter_encode_short_clip` −4.2 % (`BENCHMARKS.md` §Round 451, which
+  also records four reverted flat/negative candidates so later rounds
+  do not re-walk them).
 - *(encoder)* whole-frame encode is ≈ 70 % faster on the keyframe path
   (19.9 → 5.9 ms on the 320×240 bench) and ≈ 45 % faster on the inter
   path (12.1 → 6.7 ms), byte-identically, in three steps. First: the §13 trellis

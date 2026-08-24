@@ -106,9 +106,12 @@ exposed as the **`TrellisStrength`** quality/size knob on
 bytes, `OFF` reverts to plain round-quantisation; a strength of `4.0`
 shrinks a coarse-quantised keyframe ~24–40 % below the no-trellis wire for
 ~0.3 dB), performance tuning (SIMD primitives, profile-guided fast paths;
-the trellis prices tokens from per-frame precomputed rate tables and the
+the trellis prices tokens from per-frame precomputed rate tables, the
 whole-frame encode benches run ≈ 3× faster than the pre-r441 wire at
-byte-identical output), and bench / fuzz coverage — see `BENCHMARKS.md`.
+byte-identical output, and the r451 pass added §18.3 identity-pass
+elision on single-axis sub-pel fractions plus rectangle-row SPLITMV
+group SAD — a further −4 % on the inter-encode bench), and bench / fuzz
+coverage — see `BENCHMARKS.md`.
 
 ## Install
 

@@ -248,6 +248,21 @@ leaks, OOMs, or oracle violations across the whole campaign, and
 both stale crash artifacts from earlier rounds replay clean on the
 current tree.
 
+The round-451 touched-path session ran the five targets covering that
+round's §18.3 / §17 motion-compensation and §16.4 group-SAD changes
+under ASan (nightly + default `simd`) at 150–180 s each:
+`panic_free_sixtap_subpel` (24.1 M executions),
+`panic_free_mb_batch_motion_comp` (5.3 M),
+`panic_free_motion_search_descent` (1.8 M),
+`inter_stream_encode_decode_sequence` (25 K, cov 4776) and
+`decode_stream_token_descent` (262 K, cov 4073 — including the
+scalar↔SIMD sixtap differential probes over the new identity-elide
+dispatch). Zero crashes, leaks, OOMs, or oracle violations. The 226
+session-discovered coverage inputs were folded into the committed
+seed sets (`corpus/<target>/seeds/r451_*`), giving
+`inter_stream_encode_decode_sequence`, `panic_free_motion_search_descent`
+and `panic_free_mb_batch_motion_comp` their first committed seeds.
+
 ## CI
 
 The fuzz crate is intentionally a separate nested workspace

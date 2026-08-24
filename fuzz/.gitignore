@@ -48,5 +48,14 @@ corpus/panic_free_decoder_state/*
 !corpus/parse_headers/
 corpus/parse_headers/*
 !corpus/parse_headers/seeds/
+!corpus/inter_stream_encode_decode_sequence/
+corpus/inter_stream_encode_decode_sequence/*
+!corpus/inter_stream_encode_decode_sequence/seeds/
+!corpus/panic_free_motion_search_descent/
+corpus/panic_free_motion_search_descent/*
+!corpus/panic_free_motion_search_descent/seeds/
+!corpus/panic_free_mb_batch_motion_comp/
+corpus/panic_free_mb_batch_motion_comp/*
+!corpus/panic_free_mb_batch_motion_comp/seeds/
 artifacts
 coverage

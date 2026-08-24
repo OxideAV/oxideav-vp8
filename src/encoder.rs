@@ -6382,6 +6382,85 @@ fn group_sad_at_whole_mv(
     sad
 }
 
+/// Contiguous-row SAD over one in-bounds group rectangle, monomorphised
+/// on the pixel row width `PXW` ∈ {4, 8, 16}. `x0` / `y0` are the
+/// in-plane pixel origin of the MB-extent source region (already offset
+/// by the candidate MV). The per-row array conversion gives the
+/// compiler a constant-length reduction; `u32` addition of non-negative
+/// per-pixel terms (bounded by 256·255) is exact and order-free, so the
+/// row-merged sum equals the per-member-sub-block sum term for term.
+#[inline]
+fn group_rect_rows_sad<const PXW: usize>(
+    plane: &[u8],
+    stride: usize,
+    x0: usize,
+    y0: usize,
+    src_y: &[u8; 256],
+    shape: GroupShape,
+) -> u32 {
+    let mut sad = 0u32;
+    for r in shape.row0..shape.row0 + shape.h_px {
+        let pred_start = (y0 + r) * stride + x0 + shape.col0;
+        let pred: &[u8; PXW] = plane[pred_start..pred_start + PXW]
+            .try_into()
+            .expect("row width");
+        let src: &[u8; PXW] = src_y[r * 16 + shape.col0..r * 16 + shape.col0 + PXW]
+            .try_into()
+            .expect("row width");
+        for i in 0..PXW {
+            sad += src[i].abs_diff(pred[i]) as u32;
+        }
+    }
+    sad
+}
+
+/// [`group_sad_at_whole_mv`] with the group's precomputed §20.13
+/// rectangle ([`PartitionGroups::shape`]): the in-bounds fast path SADs
+/// the rectangle's contiguous pixel rows (4·`w_sb` bytes each) instead
+/// of one 4-byte run per member sub-block row, dispatched once per call
+/// onto a constant-width kernel. Row-merging reorders an exact
+/// (non-overflowing, non-negative) `u32` sum only, so the result is
+/// bit-for-bit the per-member value — pinned against the per-subblock
+/// fetch reference for every partition shape, group, and border/interior
+/// candidate by `group_sad_shaped_matches_per_subblock_fetch`.
+///
+/// `shape` MUST be the exact rectangle decomposition of
+/// `group_subblocks` (every [`PartitionGroups`] group is one — see
+/// `partition_group_shapes_are_exact_rectangles`); the member list is
+/// still consumed by the border-straddling fallback, which is the
+/// unchanged per-member §20.14 edge-replicating path.
+#[allow(clippy::too_many_arguments)] // mirrors group_sad_at_whole_mv + shape.
+fn group_sad_at_whole_mv_shaped(
+    luma_ref: crate::motion_search::LumaRef<'_>,
+    mb_col: usize,
+    mb_row: usize,
+    src_y: &[u8; 256],
+    group_subblocks: &[usize],
+    shape: GroupShape,
+    mv: crate::motion_vector::Mv,
+) -> u32 {
+    let mv_eighth = crate::motion_comp::stored_luma_mv(mv);
+    let mb_x0 = mb_col * 16;
+    let mb_y0 = mb_row * 16;
+    let src_x0 = mb_x0 as isize + (mv_eighth.col >> 3) as isize;
+    let src_y0 = mb_y0 as isize + (mv_eighth.row >> 3) as isize;
+    if src_x0 >= 0
+        && src_y0 >= 0
+        && src_x0 + 16 <= luma_ref.width as isize
+        && src_y0 + 16 <= luma_ref.height as isize
+    {
+        let x0 = src_x0 as usize;
+        let y0 = src_y0 as usize;
+        return match shape.w_px {
+            16 => group_rect_rows_sad::<16>(luma_ref.plane, luma_ref.stride, x0, y0, src_y, shape),
+            8 => group_rect_rows_sad::<8>(luma_ref.plane, luma_ref.stride, x0, y0, src_y, shape),
+            _ => group_rect_rows_sad::<4>(luma_ref.plane, luma_ref.stride, x0, y0, src_y, shape),
+        };
+    }
+    // Border-straddling candidate: identical per-member fallback.
+    group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group_subblocks, mv)
+}
+
 /// Small whole-pixel diamond search for ONE SPLITMV partition group —
 /// per-sub-block analogue of [`crate::motion_search::small_diamond_search_luma`].
 ///
@@ -6394,12 +6473,14 @@ fn group_sad_at_whole_mv(
 /// Each step clamps candidates to §17.1's `[MV_MIN, MV_MAX]`; SPLITMV
 /// sub-block MVs themselves are not §18.1-secondary-clamped per §18.1
 /// page 114.
+#[allow(clippy::too_many_arguments)] // mirrors the search entry + shape.
 fn group_small_diamond_search(
     luma_ref: crate::motion_search::LumaRef<'_>,
     mb_col: usize,
     mb_row: usize,
     src_y: &[u8; 256],
     group_subblocks: &[usize],
+    shape: GroupShape,
     center: crate::motion_vector::Mv,
     max_iters: u32,
 ) -> (crate::motion_vector::Mv, u32) {
@@ -6413,8 +6494,15 @@ fn group_small_diamond_search(
         row: snap(center.row),
         col: snap(center.col),
     };
-    let mut best_sad =
-        group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group_subblocks, best_mv);
+    let mut best_sad = group_sad_at_whole_mv_shaped(
+        luma_ref,
+        mb_col,
+        mb_row,
+        src_y,
+        group_subblocks,
+        shape,
+        best_mv,
+    );
     let offsets: [(i16, i16); 4] = [
         (-WHOLE_PIXEL_STEP, 0),
         (WHOLE_PIXEL_STEP, 0),
@@ -6433,8 +6521,15 @@ fn group_small_diamond_search(
             if cand_mv == best_mv {
                 continue;
             }
-            let cand_sad =
-                group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group_subblocks, cand_mv);
+            let cand_sad = group_sad_at_whole_mv_shaped(
+                luma_ref,
+                mb_col,
+                mb_row,
+                src_y,
+                group_subblocks,
+                shape,
+                cand_mv,
+            );
             if cand_sad < best_sad {
                 best_sad = cand_sad;
                 best_mv = cand_mv;
@@ -6465,8 +6560,28 @@ struct PartitionGroups {
     members: [[usize; 16]; 16],
     /// Per-group member count.
     len: [usize; 16],
+    /// Per-group pixel-space rectangle. Every §20.13 partition group is
+    /// a rectangle of sub-blocks (16×8 / 8×16 / 8×8 / 4×4 pixels), so
+    /// its member sub-blocks tile the bounding box exactly — pinned for
+    /// all four tables by `partition_group_shapes_are_exact_rectangles`.
+    shapes: [GroupShape; 16],
     /// Number of groups in this partition (2 / 2 / 4 / 16).
     num_groups: usize,
+}
+
+/// Pixel-space rectangle of one §20.13 partition group inside its
+/// 16×16 MB: top-left pixel `(row0, col0)`, extent `w_px × h_px`
+/// (multiples of 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GroupShape {
+    /// Top pixel row of the group inside the MB (0, 4, 8 or 12).
+    row0: usize,
+    /// Left pixel column of the group inside the MB (0, 4, 8 or 12).
+    col0: usize,
+    /// Pixel width (4, 8 or 16).
+    w_px: usize,
+    /// Pixel height (4, 8 or 16).
+    h_px: usize,
 }
 
 impl PartitionGroups {
@@ -6487,9 +6602,48 @@ impl PartitionGroups {
             }
             idx += 1;
         }
+        // Per-group pixel bounding box. The §20.13 groups are exact
+        // rectangles (their members tile the box), asserted for all
+        // four tables by `partition_group_shapes_are_exact_rectangles`.
+        let mut shapes = [GroupShape {
+            row0: 0,
+            col0: 0,
+            w_px: 0,
+            h_px: 0,
+        }; 16];
+        let mut g = 0usize;
+        while g < num_groups {
+            let (mut min_r, mut max_r, mut min_c, mut max_c) = (3usize, 0usize, 3usize, 0usize);
+            let mut m = 0usize;
+            while m < len[g] {
+                let b = members[g][m];
+                let (sb_r, sb_c) = (b >> 2, b & 3);
+                if sb_r < min_r {
+                    min_r = sb_r;
+                }
+                if sb_r > max_r {
+                    max_r = sb_r;
+                }
+                if sb_c < min_c {
+                    min_c = sb_c;
+                }
+                if sb_c > max_c {
+                    max_c = sb_c;
+                }
+                m += 1;
+            }
+            shapes[g] = GroupShape {
+                row0: min_r * 4,
+                col0: min_c * 4,
+                w_px: (max_c + 1 - min_c) * 4,
+                h_px: (max_r + 1 - min_r) * 4,
+            };
+            g += 1;
+        }
         PartitionGroups {
             members,
             len,
+            shapes,
             num_groups,
         }
     }
@@ -6498,6 +6652,12 @@ impl PartitionGroups {
     #[inline]
     fn group(&self, g: usize) -> &[usize] {
         &self.members[g][..self.len[g]]
+    }
+
+    /// The pixel-space rectangle of group `g` (`g < num_groups`).
+    #[inline]
+    fn shape(&self, g: usize) -> GroupShape {
+        self.shapes[g]
     }
 
     /// Iterate the groups in partition-id order.
@@ -6616,12 +6776,14 @@ fn score_split_partition(
         // only mode that costs bits for a custom vector). The diamond
         // descents from the clamped near.mvs[0] "best" predictor — same
         // base the decoder's NEW4X4 will add the differential onto.
+        let shape = groups.shape(g_idx);
         let (search_mv, search_sad) = group_small_diamond_search(
             luma_ref,
             mb_col,
             mb_row,
             src_y,
             group,
+            shape,
             best_predictor,
             SPLIT_MV_MAX_DIAMOND_ITERS,
         );
@@ -6640,7 +6802,9 @@ fn score_split_partition(
                             mv: crate::motion_vector::Mv,
                             diff: crate::motion_vector::Mv,
                             diff_bits: f64| {
-            let sad = group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group, mv) as f64;
+            let sad =
+                group_sad_at_whole_mv_shaped(luma_ref, mb_col, mb_row, src_y, group, shape, mv)
+                    as f64;
             let mode_bits = submv_ref_bits(probs, mode);
             let j = sad + lambda * (mode_bits + diff_bits);
             if j < best_group_j {
@@ -6709,8 +6873,15 @@ fn score_split_partition(
         // and accumulate its SAD into the partition total. The SAD
         // re-evaluation uses the same evaluator each candidate scored
         // against, so the total matches the picker's running sum.
-        let group_sad =
-            group_sad_at_whole_mv(luma_ref, mb_col, mb_row, src_y, group, best_group_mv);
+        let group_sad = group_sad_at_whole_mv_shaped(
+            luma_ref,
+            mb_col,
+            mb_row,
+            src_y,
+            group,
+            shape,
+            best_group_mv,
+        );
         for &b in group {
             split_mvs[b] = best_group_mv;
         }
@@ -12739,6 +12910,131 @@ mod tests {
                             "fused group SAD diverged: {p:?} group {g} \
                              MB({mb_col},{mb_row}) mv={mv:?}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every §20.13 partition group must be an exact rectangle: each
+    /// member lies inside the precomputed [`GroupShape`] and the member
+    /// count equals the shape's sub-block area — the contract the
+    /// r451 row-merged [`group_sad_at_whole_mv_shaped`] fast path
+    /// relies on.
+    #[test]
+    fn partition_group_shapes_are_exact_rectangles() {
+        use crate::near_mv::MvPartition;
+        for p in [
+            MvPartition::TopBottom,
+            MvPartition::LeftRight,
+            MvPartition::Quarters,
+            MvPartition::Mv16,
+        ] {
+            let groups = partition_groups(p);
+            for g in 0..groups.num_groups {
+                let shape = groups.shape(g);
+                let members = groups.group(g);
+                assert_eq!(
+                    members.len() * 16,
+                    shape.w_px * shape.h_px,
+                    "{p:?} group {g}: members must tile the shape"
+                );
+                for &b in members {
+                    let (r0, c0) = ((b >> 2) * 4, (b & 3) * 4);
+                    assert!(
+                        r0 >= shape.row0
+                            && r0 + 4 <= shape.row0 + shape.h_px
+                            && c0 >= shape.col0
+                            && c0 + 4 <= shape.col0 + shape.w_px,
+                        "{p:?} group {g}: member {b} outside shape {shape:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Equivalence proof for the r451 row-merged shaped group SAD: for
+    /// every §16.4 partition shape, every group (with its precomputed
+    /// rectangle), and a candidate sweep spanning in-bounds and
+    /// border-straddling whole-pixel MVs, the shaped evaluator must
+    /// equal the per-member assembly (`fetch_block_whole_pixel` +
+    /// `extract_src_subblock_4x4` + `sub_block_sad_4x4`) bit-for-bit.
+    #[test]
+    fn group_sad_shaped_matches_per_subblock_fetch() {
+        use crate::motion_vector::Mv;
+        use crate::near_mv::MvPartition;
+
+        let width = 48usize;
+        let height = 48usize;
+        let mut plane = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                plane[y * width + x] = ((x * 11 + y * 17) % 251) as u8;
+            }
+        }
+        let luma = crate::motion_search::LumaRef {
+            plane: &plane,
+            stride: width,
+            width,
+            height,
+        };
+        let mut src_y = [0u8; 256];
+        for (i, slot) in src_y.iter_mut().enumerate() {
+            *slot = ((i * 3 + 41) % 249) as u8;
+        }
+
+        let per_subblock_reference =
+            |mb_col: usize, mb_row: usize, group_subblocks: &[usize], mv: Mv| -> u32 {
+                let mv_eighth = crate::motion_comp::stored_luma_mv(mv);
+                let mut sad: u32 = 0;
+                for &b in group_subblocks {
+                    let patch = crate::motion_comp::fetch_block_whole_pixel(
+                        luma.plane,
+                        luma.stride,
+                        luma.width,
+                        luma.height,
+                        mb_col * 16 + (b & 3) * 4,
+                        mb_row * 16 + (b >> 2) * 4,
+                        mv_eighth,
+                    );
+                    let src_sb = extract_src_subblock_4x4(&src_y, b);
+                    sad += sub_block_sad_4x4(&src_sb, &patch);
+                }
+                sad
+            };
+
+        let candidates: [Mv; 9] = [
+            Mv { row: 0, col: 0 },
+            Mv { row: 4, col: -4 },
+            Mv { row: -8, col: 12 },
+            Mv { row: 16, col: 16 },
+            Mv { row: -16, col: -16 },
+            Mv { row: 64, col: -64 },
+            Mv { row: -1020, col: 0 },
+            Mv { row: 0, col: 1020 },
+            Mv {
+                row: -1020,
+                col: 1020,
+            },
+        ];
+
+        for p in [
+            MvPartition::TopBottom,
+            MvPartition::LeftRight,
+            MvPartition::Quarters,
+            MvPartition::Mv16,
+        ] {
+            let groups = partition_groups(p);
+            for (mb_col, mb_row) in [(0usize, 0usize), (1, 1), (2, 2)] {
+                for g in 0..groups.num_groups {
+                    let members = groups.group(g);
+                    let shape = groups.shape(g);
+                    for mv in candidates {
+                        let expected = per_subblock_reference(mb_col, mb_row, members, mv);
+                        let got = group_sad_at_whole_mv_shaped(
+                            luma, mb_col, mb_row, &src_y, members, shape, mv,
+                        );
+                        assert_eq!(got, expected, "{p:?} group {g} mv {mv:?}");
                     }
                 }
             }

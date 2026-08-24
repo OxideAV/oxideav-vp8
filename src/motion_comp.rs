@@ -494,7 +494,8 @@ pub fn sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8])
     }
     #[cfg(not(feature = "simd"))]
     {
-        sixtap_2d_scalar(halo, mx, my, filters)
+        sixtap_identity_elide::<9, 4, 81, 16>(halo, mx, my, filters)
+            .unwrap_or_else(|| sixtap_2d_scalar(halo, mx, my, filters))
     }
 }
 
@@ -720,8 +721,137 @@ pub fn sixtap_mb_luma(
     }
     #[cfg(not(feature = "simd"))]
     {
-        sixtap_mb_luma_scalar(halo, mx, my, filters)
+        sixtap_identity_elide::<21, 16, { 21 * 21 }, 256>(halo, mx, my, filters)
+            .unwrap_or_else(|| sixtap_mb_luma_scalar(halo, mx, my, filters))
     }
+}
+
+/// The §18.3 whole-pixel filter row `{0, 0, 128, 0, 0, 0}` — the one tap
+/// set for which a §20.14 convolution pass is the exact identity:
+/// `clamp255((128·p + 64) >> 7) = clamp255(p) = p` for every 8-bit
+/// sample `p` (both [`SIXTAP_FILTERS`]`[0]` and [`BILINEAR_FILTERS`]`[0]`
+/// are this row — §18.3 assigns the whole-pixel position no filtering in
+/// either set).
+#[cfg_attr(feature = "simd", allow(dead_code))] // simd builds route around the scalar elide.
+const IDENTITY_TAPS: [i32; 6] = [0, 0, 128, 0, 0, 0];
+
+/// Identity-pass elision for the scalar §20.14 two-pass six-tap
+/// convolution over one `OW×OW` block with its
+/// `HW×HW = (OW+5)×(OW+5)` edge-replicated halo (block origin at
+/// `halo[(2, 2)]`) — the shared fast-path gate in front of the
+/// stable-build [`sixtap_2d`] / [`sixtap_mb_luma`] /
+/// [`sixtap_mb_chroma`] scalar listings.
+///
+/// A §20.14 pass whose tap row equals [`IDENTITY_TAPS`] computes
+/// `clamp255((128·p + 64) >> 7)`, which is exactly `p` for every
+/// `p ∈ 0..=255` — the pass changes no sample. When one pass is the
+/// identity this runs **only the other pass**, as the identical
+/// [`sixtap_horiz`] / [`sixtap_vert`] reference listing reading the
+/// halo directly (the elided pass's output *is* its input); when both
+/// are, the block is the plain halo core copy. Any other tap pair
+/// returns `None` and the caller runs the unmodified two-pass listing.
+/// The gate compares the resolved tap *values*, not the fraction index,
+/// so a caller-supplied table without an identity row is unaffected
+/// (`sixtap_identity_elide_gates_on_tap_values`).
+///
+/// This fires constantly in the §17 sub-pixel refinement searches —
+/// half the probed candidates around a whole-pixel center have one
+/// whole-pixel component — and on every decoded inter MB whose MV has
+/// exactly one whole-pixel axis.
+///
+/// Byte-equivalence across all 64 `(mx, my)` fraction pairs × both
+/// shipped filter sets × the stress-halo matrix is pinned by the
+/// dispatcher-driven `sixtap_2d_simd_matches_scalar_on_stress_inputs` /
+/// `sixtap_mb_luma_simd_matches_scalar_on_stress_inputs` /
+/// `sixtap_mb_chroma_simd_matches_scalar_on_stress_inputs` tests (the
+/// scalar side of those comparisons is the retained un-elided listing).
+#[cfg_attr(feature = "simd", allow(dead_code))] // simd builds route around the scalar elide.
+#[inline]
+fn sixtap_identity_elide<const HW: usize, const OW: usize, const HN: usize, const ON: usize>(
+    halo: &[u8; HN],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> Option<[u8; ON]> {
+    debug_assert_eq!(HW, OW + 5);
+    debug_assert_eq!(HN, HW * HW);
+    debug_assert_eq!(ON, OW * OW);
+
+    let ident_h = filters[mx] == IDENTITY_TAPS;
+    let ident_v = filters[my] == IDENTITY_TAPS;
+    if !ident_h && !ident_v {
+        return None;
+    }
+    let mut out = [0u8; ON];
+
+    if ident_h && ident_v {
+        // Both passes are the identity: the output is the OW×OW core of
+        // the halo at block origin (2, 2).
+        for r in 0..OW {
+            let base = (r + 2) * HW + 2;
+            out[r * OW..r * OW + OW].copy_from_slice(&halo[base..base + OW]);
+        }
+    } else if ident_h {
+        // Horizontal pass is the identity: its §20.14 intermediate
+        // equals the halo samples, so run the vertical §18.3 dot
+        // product directly over the halo at block-origin column 2
+        // (output row r, tap k reads halo row r + k — the same rows the
+        // intermediate would hold). The six support rows are widened
+        // into per-row `i32` buffers so the inner column loop is six
+        // constant-bound multiply-accumulates over fixed-size arrays;
+        // seeding the accumulator with the `+64` rounding term
+        // reassociates exact (non-overflowing) `i32` adds only, so
+        // every sample equals the [`interp`] value.
+        let [f0, f1, f2, f3, f4, f5] = filters[my];
+        let mut hi = [[0i32; HW]; HW];
+        for (row, src) in hi.iter_mut().zip(halo.chunks_exact(HW)) {
+            for (dst, &s) in row.iter_mut().zip(src) {
+                *dst = s as i32;
+            }
+        }
+        for r in 0..OW {
+            let (r0, r1, r2, r3, r4, r5) = (
+                &hi[r],
+                &hi[r + 1],
+                &hi[r + 2],
+                &hi[r + 3],
+                &hi[r + 4],
+                &hi[r + 5],
+            );
+            for c in 0..OW {
+                let a = 64
+                    + r0[c + 2] * f0
+                    + r1[c + 2] * f1
+                    + r2[c + 2] * f2
+                    + r3[c + 2] * f3
+                    + r4[c + 2] * f4
+                    + r5[c + 2] * f5;
+                out[r * OW + c] = clamp255(a >> 7);
+            }
+        }
+    } else {
+        // Vertical pass is the identity: the output rows are the
+        // horizontal §18.3 dot product over halo rows 2..2+OW, with the
+        // same widened-row / reassociated-`i32` shape as above.
+        let [f0, f1, f2, f3, f4, f5] = filters[mx];
+        for r in 0..OW {
+            let mut rowi = [0i32; HW];
+            for (dst, &s) in rowi.iter_mut().zip(&halo[(r + 2) * HW..(r + 3) * HW]) {
+                *dst = s as i32;
+            }
+            for c in 0..OW {
+                let a = 64
+                    + rowi[c] * f0
+                    + rowi[c + 1] * f1
+                    + rowi[c + 2] * f2
+                    + rowi[c + 3] * f3
+                    + rowi[c + 4] * f4
+                    + rowi[c + 5] * f5;
+                out[r * OW + c] = clamp255(a >> 7);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Scalar MB-scale §20.14 `sixtap_2d` over a 16×16 luma block.
@@ -945,7 +1075,8 @@ pub fn sixtap_mb_chroma(
     }
     #[cfg(not(feature = "simd"))]
     {
-        sixtap_mb_chroma_scalar(halo, mx, my, filters)
+        sixtap_identity_elide::<13, 8, { 13 * 13 }, 64>(halo, mx, my, filters)
+            .unwrap_or_else(|| sixtap_mb_chroma_scalar(halo, mx, my, filters))
     }
 }
 
@@ -3180,6 +3311,73 @@ mod tests {
                 let sy = (r as isize - 2).clamp(0, h as isize - 1) as usize;
                 let sx = (c as isize - 2).clamp(0, w as isize - 1) as usize;
                 assert_eq!(mb_halo[r * 21 + c], plane[sy * w + sx], "({r},{c})");
+            }
+        }
+    }
+
+    #[test]
+    fn sixtap_identity_elide_gates_on_tap_values() {
+        // The identity-pass elision gates on the resolved tap VALUES,
+        // not on the fraction index: a synthetic table whose index-0 row
+        // is not `{0,0,128,0,0,0}` must never elide (every fraction pair
+        // runs the unmodified two-pass listing), while the shipped
+        // tables elide exactly the fraction pairs with a zero component
+        // — and the elided result is sample-for-sample the two-pass
+        // listing's output.
+        let mut table = SIXTAP_FILTERS;
+        table[0] = [1, 0, 127, 0, 0, 0]; // taps still sum to 128, not identity
+        let halos: Vec<[u8; 21 * 21]> = (0..4).map(|s| rand_mb_halo(s * 131 + 17)).collect();
+        for halo in &halos {
+            for mx in 0..8 {
+                for my in 0..8 {
+                    assert!(
+                        sixtap_identity_elide::<21, 16, { 21 * 21 }, 256>(halo, mx, my, &table)
+                            .is_none(),
+                        "non-identity table must never elide (mx={mx} my={my})"
+                    );
+                    for set in [&SIXTAP_FILTERS, &BILINEAR_FILTERS] {
+                        let got =
+                            sixtap_identity_elide::<21, 16, { 21 * 21 }, 256>(halo, mx, my, set);
+                        assert_eq!(
+                            got.is_some(),
+                            mx == 0 || my == 0,
+                            "shipped tables elide exactly the zero-fraction pairs"
+                        );
+                        if let Some(fast) = got {
+                            let want = sixtap_mb_luma_scalar(halo, mx, my, set);
+                            assert_eq!(fast, want, "mx={mx} my={my}");
+                        }
+                    }
+                }
+            }
+        }
+        // And the 4×4 / 8×8 geometries against their scalar listings.
+        let halo4 = rand_halo(99);
+        let mut halo8 = [0u8; 13 * 13];
+        for (i, px) in halo8.iter_mut().enumerate() {
+            let v = (i as u64).wrapping_mul(2654435761).wrapping_add(97);
+            *px = (v >> 7) as u8;
+        }
+        for mx in 0..8 {
+            for my in 0..8 {
+                if let Some(fast) =
+                    sixtap_identity_elide::<9, 4, 81, 16>(&halo4, mx, my, &SIXTAP_FILTERS)
+                {
+                    assert_eq!(
+                        fast,
+                        sixtap_2d_scalar(&halo4, mx, my, &SIXTAP_FILTERS),
+                        "2d mx={mx} my={my}"
+                    );
+                }
+                if let Some(fast) =
+                    sixtap_identity_elide::<13, 8, { 13 * 13 }, 64>(&halo8, mx, my, &SIXTAP_FILTERS)
+                {
+                    assert_eq!(
+                        fast,
+                        sixtap_mb_chroma_scalar(&halo8, mx, my, &SIXTAP_FILTERS),
+                        "chroma mx={mx} my={my}"
+                    );
+                }
             }
         }
     }

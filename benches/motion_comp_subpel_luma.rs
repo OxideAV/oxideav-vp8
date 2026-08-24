@@ -121,6 +121,24 @@ fn bench_mb_luma_batched(c: &mut Criterion) {
             black_box(out[0])
         });
     });
+    // Single-axis fractions: the §18.3 whole-pixel filter row on the
+    // other axis is the exact identity, so the r451 identity-pass
+    // elision runs only one §20.14 pass. Same call shape as the (3, 5)
+    // workload; the delta against it is the elided pass's cost. These
+    // are the shapes the §17 half-pixel refinement probes four times
+    // per center (axis-aligned candidates).
+    g.bench_function("mb_luma_batched_16x16_horiz_only_3x0", |b| {
+        b.iter(|| {
+            let out = sixtap_mb_luma(black_box(&mb_halo), 3, 0, black_box(filters));
+            black_box(out[0])
+        });
+    });
+    g.bench_function("mb_luma_batched_16x16_vert_only_0x5", |b| {
+        b.iter(|| {
+            let out = sixtap_mb_luma(black_box(&mb_halo), 0, 5, black_box(filters));
+            black_box(out[0])
+        });
+    });
     // Per-sub-block partner on the same workload: 16 sixtap_2d calls.
     g.bench_function("mb_luma_per_subblock_16x16", |b| {
         b.iter(|| {

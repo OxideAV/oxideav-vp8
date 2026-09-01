@@ -4,6 +4,23 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.6...v0.2.7) - 2026-08-24
+
+### Other
+
+- round-451 profile round — elide + rectangle-SAD A/B, four recorded negative results
+- r451 touched-path session + fold 226 session-discovered seeds
+- *(encoder)* row-merged rectangle SAD for the §16.4 partition-group descents
+- *(motion-comp)* elide the identity §18.3 pass on single-axis sub-pel fractions
+- note the per-frame trellis rate tables in the perf summary
+- record the bounded early-abandon SAD negative result
+- *(encoder)* DC-only / all-zero fast path in the RD reconstruct leaf
+- *(trellis)* stop the scan at the last candidate-nonzero position
+- *(encoder)* per-frame trellis rate tables + sub-threshold early exit
+- double the scheduled campaign budget; record the round-432 whole-suite sweep
+- seed the three blind wire-decode targets from the stream fixtures
+- four targets closing the last un-fuzzed public entry points
+
 ### Changed
 
 - *(perf)* the §17 sub-pixel refinement and §18.3 sub-pixel decode

@@ -140,6 +140,8 @@ GOLDEN / ALTREF reference slots:
 
 ```rust
 use oxideav_vp8::{decode_vp8, Vp8DecoderState};
+# let vp8_keyframe_bytes: Vec<u8> = std::fs::read("key.vp8")?;
+# let vp8_frame_packets: Vec<&[u8]> = vec![&vp8_keyframe_bytes];
 
 // One-shot single-frame decode of a VP8 keyframe.
 let frame = decode_vp8(&vp8_keyframe_bytes)?;
@@ -153,7 +155,9 @@ let mut state = Vp8DecoderState::new();
 for packet in vp8_frame_packets {
     let frame = state.decode_frame(packet)?;
     // consume frame.y / frame.u / frame.v (8-bit I420, tightly packed)
+    let _ = frame;
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `Vp8DecodedFrame` (also re-exported as `Vp8Frame`) carries the visible
@@ -163,10 +167,15 @@ for packet in vp8_frame_packets {
 
 ```rust
 use oxideav_vp8::{encode_keyframe, I420Frame, KeyframeParams};
+# let (width, height) = (64u32, 48u32);
+# let y_plane = vec![128u8; (width * height) as usize];
+# let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+# let v_plane = u_plane.clone();
 
 let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
-let params = KeyframeParams::new(width, height);
+let params = KeyframeParams::default();        // y_ac_qi 32; dimensions come from the frame
 let vp8_bytes: Vec<u8> = encode_keyframe(&frame, &params)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 The output is a raw VP8 keyframe bitstream (3-byte tag + 7-byte start
@@ -179,6 +188,12 @@ as needed. For multi-frame inter encoding use `Vp8Encoder` +
 
 ```rust
 use oxideav_vp8::encoder::{two_pass_qindices, Vp8TwoPassConfig, Vp8TwoPassEncoder};
+# use oxideav_vp8::I420Frame;
+# let (width, height) = (64u32, 48u32);
+# let y_plane = vec![128u8; (width * height) as usize];
+# let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+# let v_plane = u_plane.clone();
+# let i420_frames = vec![I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane); 4];
 
 let config = Vp8TwoPassConfig::default();              // wraps a base Vp8EncoderConfig
 let mut encoder = Vp8TwoPassEncoder::new(config);
@@ -193,6 +208,7 @@ let mut packets = Vec::new();
 for (frame, stat) in i420_frames.iter().zip(stats.iter()) {
     packets.push(encoder.encode_frame(frame, *stat)?);   // first frame is a keyframe
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 In **constant-quality** mode (the default — no bitrate target) the
@@ -207,6 +223,7 @@ Set `target_bitrate_bps` **and** a frame rate (`fps_num` / `fps_den`) and
 the second pass becomes a closed-loop bitrate controller:
 
 ```rust
+# use oxideav_vp8::encoder::Vp8TwoPassConfig;
 let config = Vp8TwoPassConfig {
     target_bitrate_bps: 600_000,   // 600 kbps
     fps_num: 30, fps_den: 1,
@@ -236,6 +253,11 @@ P-frames:
 ```rust
 use oxideav_vp8::{AltrefStreamConfig, I420Frame, Vp8AltrefStreamEncoder, Vp8DecoderState};
 
+# let (width, height) = (64u32, 48u32);
+# let y_plane = vec![128u8; (width * height) as usize];
+# let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+# let v_plane = u_plane.clone();
+# let i420_frames = vec![I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane); 4];
 let config = AltrefStreamConfig::default();   // window 8, ARNR 3, scene-cut on
 let mut enc = Vp8AltrefStreamEncoder::new(config).unwrap();
 
@@ -252,8 +274,10 @@ for p in &packets {
     let picture = dec.decode_frame(&p.bytes)?;
     if p.is_visible() {
         // present `picture`
+        let _ = picture;
     } // else: reference-slot side effects only — drop the picture
 }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `AltrefStreamConfig` knobs: `altref_window` (group size), `arnr`
@@ -270,10 +294,15 @@ historical `Vp8Encoder` via `encode_sequence(&frames)`, which maps
 
 ```rust
 use oxideav_vp8::{encode_keyframe_adaptive_quant, AdaptiveQuantConfig, I420Frame};
+# let (width, height) = (64u32, 48u32);
+# let y_plane = vec![128u8; (width * height) as usize];
+# let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+# let v_plane = u_plane.clone();
 
 let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
 let config = AdaptiveQuantConfig::default();   // base qi 32, flat→coarser / busy→finer
 let vp8_bytes = encode_keyframe_adaptive_quant(&frame, &config)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 `encode_keyframe_adaptive_quant` sorts each macroblock into one of four
@@ -291,6 +320,8 @@ case of `*.ivf` fixtures:
 
 ```rust
 use oxideav_vp8::ivf::{IvfHeader, parse_header, write_header, write_frame};
+# let (width, height, fps_num, fps_den) = (64u32, 48u32, 30u32, 1u32);
+# let timed_packets: Vec<(u64, Vec<u8>)> = Vec::new();
 
 let mut out = Vec::new();
 let hdr = IvfHeader::vp8(width, height, fps_num, fps_den);
@@ -344,8 +375,12 @@ oxideav_vp8::register(&mut ctx);
 
 // Or directly call the factories:
 use oxideav_vp8::encoder::{make_encoder_with_quality, make_encoder_with_qindex};
+# let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new(CODEC_ID_STR));
+# params.width = Some(64);
+# params.height = Some(48);
 let enc = make_encoder_with_quality(&params, 75.0)?;   // Box<dyn Encoder>
 let enc = make_encoder_with_qindex(&params, 32)?;
+# Ok::<(), oxideav_core::Error>(())
 ```
 
 Both factories return `Box<dyn oxideav_core::Encoder>` and integrate

@@ -4,6 +4,12 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.7...v0.2.8) - 2026-10-04
+
+### Other
+
+- README examples use the current registry API
+
 ## [0.2.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.6...v0.2.7) - 2026-08-24
 
 ### Other

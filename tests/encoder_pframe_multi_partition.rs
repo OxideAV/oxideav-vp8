@@ -39,8 +39,8 @@
 //! [`Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref, EncodeError, I420Frame,
-    KeyframeParams, Vp8DecodedFrame, Vp8DecoderState,
+    EncodeError, I420Frame, KeyframeParams, Vp8DecodedFrame, Vp8DecoderState,
+    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref,
 };
 
 /// Whole-Y-plane PSNR (8-bit peak = 255). Both planes must have the

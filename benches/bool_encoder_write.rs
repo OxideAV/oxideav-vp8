@@ -38,7 +38,7 @@
 //! [`BoolDecoder`], asserting exact round-trip — the measured loop is
 //! always a proven-valid partition build.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{BoolDecoder, BoolEncoder};
 

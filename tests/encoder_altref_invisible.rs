@@ -37,8 +37,8 @@
 //! [`Vp8DecoderState`]; no external codec is consulted.
 
 use oxideav_vp8::{
-    encode_invisible_altref_update, encode_keyframe_with_reconstruction, encode_p_frame_multi_ref,
     I420Frame, KeyframeParams, KeyframePlanes, Vp8DecoderState, Vp8FrameHeader,
+    encode_invisible_altref_update, encode_keyframe_with_reconstruction, encode_p_frame_multi_ref,
 };
 
 const W: usize = 64;

@@ -30,8 +30,8 @@
 //! Black-box: encoder output feeds the crate's own decoder only.
 
 use oxideav_vp8::{
-    encode_p_frame_multi_ref, AltrefPacketKind, AltrefStreamConfig, ArnrConfig, I420Frame,
-    KeyframeParams, Vp8AltrefStreamEncoder, Vp8DecoderState,
+    AltrefPacketKind, AltrefStreamConfig, ArnrConfig, I420Frame, KeyframeParams,
+    Vp8AltrefStreamEncoder, Vp8DecoderState, encode_p_frame_multi_ref,
 };
 
 const W: usize = 64;
@@ -497,7 +497,9 @@ fn vp8_encoder_encode_sequence_honours_the_config_knobs() {
     });
     let plain_packets = plain.encode_sequence(&frames).expect("plain encodes");
     assert_eq!(plain_packets.len(), 10);
-    assert!(plain_packets
-        .iter()
-        .all(|p| p.kind != AltrefPacketKind::AltrefUpdate));
+    assert!(
+        plain_packets
+            .iter()
+            .all(|p| p.kind != AltrefPacketKind::AltrefUpdate)
+    );
 }

@@ -392,10 +392,10 @@ fn round_div2_simd(
     one: core::simd::Simd<i32, 4>,
     zero: core::simd::Simd<i32, 4>,
 ) -> core::simd::Simd<i32, 4> {
-    use core::simd::cmp::SimdOrd;
-    use core::simd::cmp::SimdPartialOrd;
     use core::simd::Select;
     use core::simd::Simd;
+    use core::simd::cmp::SimdOrd;
+    use core::simd::cmp::SimdPartialOrd;
 
     let pos = (v + one) >> Simd::<i32, 4>::splat(1);
     let neg = zero - (((zero - v) + one) >> Simd::<i32, 4>::splat(1));

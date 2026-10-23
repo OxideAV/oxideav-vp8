@@ -4,9 +4,9 @@
 //! with `keyframe_decode` so the two benches measure complementary
 //! halves of the same picture's roundtrip cost.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_vp8::{encode_keyframe, I420Frame, KeyframeParams};
+use oxideav_vp8::{I420Frame, KeyframeParams, encode_keyframe};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;

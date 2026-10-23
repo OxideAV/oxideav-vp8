@@ -362,7 +362,7 @@ pub mod inter {
 pub mod bool_encoder {
     pub use crate::encoder::BoolEncoder;
     pub use crate::encoder::{
-        classify_coeff_token, encode_coeff_block, TokenEncodeError, TokenEncoder,
+        TokenEncodeError, TokenEncoder, classify_coeff_token, encode_coeff_block,
     };
 }
 
@@ -378,25 +378,25 @@ pub mod tables {
     pub use crate::macroblock::{IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS};
     pub use crate::motion_comp::{BILINEAR_FILTERS, SIXTAP_FILTERS};
     pub use crate::near_mv::{
-        MV_COUNTS_TO_PROBS, MV_PARTITIONS, MV_PARTITION_PROBS, MV_PARTITION_TREE, MV_REF_TREE,
+        MV_COUNTS_TO_PROBS, MV_PARTITION_PROBS, MV_PARTITION_TREE, MV_PARTITIONS, MV_REF_TREE,
         SUBMV_REF_PROBS, SUBMV_REF_TREE,
     };
 }
 
-pub use arnr::{build_arnr_altref, ArnrConfig, ArnrPicture};
+pub use arnr::{ArnrConfig, ArnrPicture, build_arnr_altref};
 pub use bool_decoder::{BoolDecoder, BoolDecoderError};
 pub use coded_header::{
-    CodedHeaderError, MbLfAdjustments, MvProbUpdates, QuantIndices, TokenProbUpdates,
-    UpdateSegmentation, Vp8CodedHeader, DEFAULT_MV_CONTEXT, MV_PROB_COUNT,
+    CodedHeaderError, DEFAULT_MV_CONTEXT, MV_PROB_COUNT, MbLfAdjustments, MvProbUpdates,
+    QuantIndices, TokenProbUpdates, UpdateSegmentation, Vp8CodedHeader,
 };
 pub use dct_tokens::{
-    decode_block, decode_mb_coeffs, merge_default_token_probs, BlockType, CoeffProbs, DctToken,
-    DctTokenError, MbCoeffError, MbEntropyCtx, COEFF_BANDS, DEFAULT_COEFF_PROBS,
-    MB_ENTROPY_CTX_LEN, ZIGZAG,
+    BlockType, COEFF_BANDS, CoeffProbs, DEFAULT_COEFF_PROBS, DctToken, DctTokenError,
+    MB_ENTROPY_CTX_LEN, MbCoeffError, MbEntropyCtx, ZIGZAG, decode_block, decode_mb_coeffs,
+    merge_default_token_probs,
 };
 pub use decoder::{
-    decode_vp8, decode_vp8_with_max_pixels, DecodeError, Vp8DecodedFrame,
-    DEFAULT_MAX_PIXELS_PER_FRAME,
+    DEFAULT_MAX_PIXELS_PER_FRAME, DecodeError, Vp8DecodedFrame, decode_vp8,
+    decode_vp8_with_max_pixels,
 };
 
 /// 0.1.13 alias for [`decoder::Vp8DecodedFrame`] — the per-frame
@@ -421,13 +421,17 @@ pub fn decode_frame(
 ) -> core::result::Result<oxideav_core::VideoFrame, decoder::DecodeError> {
     decode_vp8(bytes).map(Into::into)
 }
-pub use dequant::{decode_and_dequantize_mb, MbDequantFactors, UV_DC_MAX, Y2_AC_MIN};
+pub use dequant::{MbDequantFactors, UV_DC_MAX, Y2_AC_MIN, decode_and_dequantize_mb};
 pub use encoder::{
-    classify_coeff_token, count_block_branches, count_inter_frame_branches,
-    count_keyframe_branches, count_mb_branches, empty_branch_counts, encode_coeff_block,
-    encode_invisible_altref_update, encode_invisible_altref_update_with_coding_options,
-    encode_keyframe, encode_keyframe_adaptive_quant,
-    encode_keyframe_adaptive_quant_with_reconstruction,
+    AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector, EncodeError, EncodedMb,
+    I420Frame, InterCodingOptions, InterSegmentationConfig, KeyframeCodingOptions, KeyframeParams,
+    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
+    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
+    TokenEncoder, TrellisStrength, UpdateSegmentationLayer, classify_coeff_token,
+    count_block_branches, count_inter_frame_branches, count_keyframe_branches, count_mb_branches,
+    empty_branch_counts, encode_coeff_block, encode_invisible_altref_update,
+    encode_invisible_altref_update_with_coding_options, encode_keyframe,
+    encode_keyframe_adaptive_quant, encode_keyframe_adaptive_quant_with_reconstruction,
     encode_keyframe_adaptive_quant_with_reconstruction_and_trellis,
     encode_keyframe_adaptive_quant_with_segment_lf_deltas,
     encode_keyframe_adaptive_quant_with_segment_lf_deltas_and_trellis,
@@ -454,12 +458,7 @@ pub use encoder::{
     quality_to_qindex, quality_to_trellis_strength, write_frame_tag, write_loop_filter,
     write_loop_filter_with_deltas, write_mb_no_skip_coeff, write_no_token_prob_updates,
     write_quant_indices, write_segment_update_flags, write_token_partition_count,
-    write_token_prob_updates, write_update_segmentation, AdaptiveQuantConfig, BoolEncoder,
-    BranchCounts, CopyBufferSelector, EncodeError, EncodedMb, I420Frame, InterCodingOptions,
-    InterSegmentationConfig, KeyframeCodingOptions, KeyframeParams, LoopFilterDeltaSlot,
-    LoopFilterDeltas, MbPixels, RefreshControls, ScaleCode as EncoderScaleCode,
-    SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError, TokenEncoder, TrellisStrength,
-    UpdateSegmentationLayer,
+    write_token_prob_updates, write_update_segmentation,
 };
 
 /// Framework `make_encoder` / `make_encoder_with_qindex` /
@@ -470,61 +469,61 @@ pub use encoder::{
 #[cfg(feature = "registry")]
 pub use encoder::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
 pub use forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
-pub use frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
+pub use frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
 pub use frame_header::{
-    FrameHeaderError, LoopFilterPolicy, ReconstructionFilter, ScaleCode, Vp8FrameHeader,
-    KEY_FRAME_START_CODE,
+    FrameHeaderError, KEY_FRAME_START_CODE, LoopFilterPolicy, ReconstructionFilter, ScaleCode,
+    Vp8FrameHeader,
 };
 pub use intra_predict::{
-    predict_b4x4, predict_uv8x8, predict_uv8x8_dc, predict_uv8x8_h, predict_uv8x8_tm,
-    predict_uv8x8_v, predict_y16x16, predict_y16x16_dc, predict_y16x16_h, predict_y16x16_tm,
-    predict_y16x16_v, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, DEFAULT_TOPLEFT_DC,
+    DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, DEFAULT_TOPLEFT_DC, predict_b4x4, predict_uv8x8,
+    predict_uv8x8_dc, predict_uv8x8_h, predict_uv8x8_tm, predict_uv8x8_v, predict_y16x16,
+    predict_y16x16_dc, predict_y16x16_h, predict_y16x16_tm, predict_y16x16_v,
 };
 pub use inverse_transform::{
-    add_residue, add_residue_4x4, clamp255, clamp_qindex, dequant_block, inverse_dct_4x4,
-    inverse_dct_4x4_add_into, inverse_wht_4x4, inverse_wht_4x4_dc_only, Y1DequantFactors,
-    AC_QLOOKUP, DC_QLOOKUP, QINDEX_RANGE,
+    AC_QLOOKUP, DC_QLOOKUP, QINDEX_RANGE, Y1DequantFactors, add_residue, add_residue_4x4,
+    clamp_qindex, clamp255, dequant_block, inverse_dct_4x4, inverse_dct_4x4_add_into,
+    inverse_wht_4x4, inverse_wht_4x4_dc_only,
 };
 pub use loop_filter::{
+    FrameFilterConfig, LoopFilterParams, MAX_MB_SEGMENTS, MAX_MODE_LF_DELTAS, MAX_REF_LF_DELTAS,
     calculate_mb_filter_level, clamp_s8, common_adjust, filter_frame, mb_filter, s2u,
-    simple_segment, subblock_filter, u2s, FrameFilterConfig, LoopFilterParams, MAX_MB_SEGMENTS,
-    MAX_MODE_LF_DELTAS, MAX_REF_LF_DELTAS,
+    simple_segment, subblock_filter, u2s,
 };
 pub use macroblock::{
+    IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS, InterFrameIntraProbs,
+    IntraBmode, IntraUvMode, IntraYMode, MacroblockError, MacroblockModes,
     parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
-    InterFrameIntraProbs, IntraBmode, IntraUvMode, IntraYMode, MacroblockError, MacroblockModes,
-    IF_BMODE_PROB, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS,
 };
 pub use motion_comp::{
+    BILINEAR_FILTERS, FilterSet, MotionCompError, RefFrame, ReferencePlanes, SIXTAP_FILTERS,
     apply_full_pixel, chroma_idx_for_luma_subblock, chroma_mv, fetch_block_halo,
     fetch_block_whole_pixel, filter_block_4x4, filter_set_for_version, interp, predict_inter_mb,
     predict_inter_mb_whole_pixel, predict_split_mv, reconstruct_inter_mb,
     reconstruct_inter_mb_whole_pixel, reconstruct_split_mv_mb, select_ref_frame, sixtap_2d,
-    split_chroma_mvs, stored_luma_mv, whole_pixel_fraction_is_zero, FilterSet, MotionCompError,
-    RefFrame, ReferencePlanes, BILINEAR_FILTERS, SIXTAP_FILTERS,
+    split_chroma_mvs, stored_luma_mv, whole_pixel_fraction_is_zero,
 };
 pub use motion_search::{
+    HALF_PIXEL_STEP, LumaRef, MV_MAX, MV_MIN, QUARTER_PIXEL_STEP, SearchResult, WHOLE_PIXEL_STEP,
     block_sad_16x16, half_pixel_refine_luma, mb_luma_sad_at_mv, mb_luma_sad_at_whole_mv,
-    quarter_pixel_refine_luma, small_diamond_search_luma, LumaRef, SearchResult, HALF_PIXEL_STEP,
-    MV_MAX, MV_MIN, QUARTER_PIXEL_STEP, WHOLE_PIXEL_STEP,
+    quarter_pixel_refine_luma, small_diamond_search_luma,
 };
 pub use motion_vector::{
-    default_mv_contexts, mv_bits, mv_component_bits, read_mv, read_mv_component,
-    resolve_mv_contexts, write_mv, write_mv_component, Mv, MvContext, MvContexts, SMALL_MVTREE,
+    Mv, MvContext, MvContexts, SMALL_MVTREE, default_mv_contexts, mv_bits, mv_component_bits,
+    read_mv, read_mv_component, resolve_mv_contexts, write_mv, write_mv_component,
 };
 pub use near_mv::{
-    above_block_mv, clamp_mv, decode_inter_mb, decode_split_mv, decode_split_mv_mb, find_near_mvs,
-    left_block_mv, mv_ref_probs, partition_id, read_inter_mode, read_mv_partition,
-    resolve_inter_mb_mv, submv_ref, submv_ref_context, InterMbError, InterMode, MbInfo,
-    MvClampRect, MvPartition, NearMvs, ResolvedInterMode, SignBias, SplitMvResult, SubMvRefMode,
-    MV_COUNTS_TO_PROBS, MV_PARTITIONS, MV_PARTITION_PROBS, MV_PARTITION_TREE, MV_REF_TREE,
-    SUBMV_REF_PROBS, SUBMV_REF_TREE,
+    InterMbError, InterMode, MV_COUNTS_TO_PROBS, MV_PARTITION_PROBS, MV_PARTITION_TREE,
+    MV_PARTITIONS, MV_REF_TREE, MbInfo, MvClampRect, MvPartition, NearMvs, ResolvedInterMode,
+    SUBMV_REF_PROBS, SUBMV_REF_TREE, SignBias, SplitMvResult, SubMvRefMode, above_block_mv,
+    clamp_mv, decode_inter_mb, decode_split_mv, decode_split_mv_mb, find_near_mvs, left_block_mv,
+    mv_ref_probs, partition_id, read_inter_mode, read_mv_partition, resolve_inter_mb_mv, submv_ref,
+    submv_ref_context,
 };
 pub use reconstruct::{
-    decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
-    ReconstructedMb,
+    MbNeighbors, ReconstructError, ReconstructedMb, decode_keyframe_mb_bpred,
+    decode_keyframe_mb_non_bpred,
 };
-pub use state::{bench_rotate_reference_slots, RefFrameSlot, Vp8DecoderState};
+pub use state::{RefFrameSlot, Vp8DecoderState, bench_rotate_reference_slots};
 pub use stream::{
     AltrefPacketKind, AltrefStreamConfig, AltrefStreamPacket, EncodedStreamFrame, FrameKind,
     StreamEncodeError, Vp8AltrefStreamEncoder, Vp8InterStreamEncoder, Vp8KeyframeStreamEncoder,
@@ -565,7 +564,7 @@ pub use error::Result;
 
 // ── 0.1.13 frame_header / frame_tag re-exports ──
 pub use frame_tag::{
-    parse_header, parse_keyframe_header, FrameTag, FrameType, KeyframeHeader, ParsedHeader,
+    FrameTag, FrameType, KeyframeHeader, ParsedHeader, parse_header, parse_keyframe_header,
 };
 
 /// 0.1.13 alias of [`frame_header::Vp8FrameHeader`] under the historical
@@ -574,21 +573,21 @@ pub type FrameHeader = frame_header::Vp8FrameHeader;
 
 // ── 0.1.13 encoder surface re-exports ──
 pub use encoder::{
-    first_pass_analyze, make_encoder_typed_with_config, make_two_pass_encoder,
-    two_pass_qindex_for_frame, two_pass_qindices, FrameComplexity, LoopFilterMode, Vp8Encoder,
-    Vp8EncoderConfig, Vp8EncoderStats, Vp8TwoPassConfig, Vp8TwoPassEncoder, AQ_QINDEX_RANGE_MAX,
-    DEFAULT_ADAPTIVE_SEGMENT_THRESHOLDS, DEFAULT_ALT_REF_INTERVAL, DEFAULT_AQ_QINDEX_RANGE,
-    DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256, DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256,
-    DEFAULT_GOLDEN_INTERVAL, DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS,
-    DEFAULT_KMEANS_CONVERGENCE_THRESHOLD, DEFAULT_KMEANS_SPATIAL_ALPHA_X256,
-    DEFAULT_LAMBDA_LONG_REF_SCALE_X256, DEFAULT_LOOKAHEAD_WINDOW, DEFAULT_NLM_H2,
-    DEFAULT_PSY_RD_STRENGTH, DEFAULT_QINDEX, DEFAULT_SCENE_CUT_BOOST_FRAMES,
-    DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD, DEFAULT_SEGMENT_LF_DELTAS,
-    DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL, DEFAULT_SPATIAL_LF_N_COL_BANDS,
-    DEFAULT_SPATIAL_LF_N_ROW_BANDS, DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES,
-    INTRA_IN_P_BPRED_VARIANCE_THRESHOLD, JOINT_R44R49_PICKER_MAX_ITERS_MAX,
-    KMEANS_SPATIAL_MAX_ITERS, LAMBDA_SCALE_DEFAULT, QP_SENSITIVITY_X8, SCENE_CUT_ABS_FLOOR,
-    SEGMENT_VARIANCE_THRESHOLDS, SPLIT_MV_JOINT_REFINE_PASSES_MAX,
+    AQ_QINDEX_RANGE_MAX, DEFAULT_ADAPTIVE_SEGMENT_THRESHOLDS, DEFAULT_ALT_REF_INTERVAL,
+    DEFAULT_AQ_QINDEX_RANGE, DEFAULT_CHROMA_AWARE_SPATIAL_CHROMA_WEIGHT_X256,
+    DEFAULT_CHROMA_AWARE_SPATIAL_LUMA_WEIGHT_X256, DEFAULT_GOLDEN_INTERVAL,
+    DEFAULT_JOINT_R44R49_PICKER_MAX_ITERS, DEFAULT_KMEANS_CONVERGENCE_THRESHOLD,
+    DEFAULT_KMEANS_SPATIAL_ALPHA_X256, DEFAULT_LAMBDA_LONG_REF_SCALE_X256,
+    DEFAULT_LOOKAHEAD_WINDOW, DEFAULT_NLM_H2, DEFAULT_PSY_RD_STRENGTH, DEFAULT_QINDEX,
+    DEFAULT_SCENE_CUT_BOOST_FRAMES, DEFAULT_SCENE_CUT_QUANT_BOOST, DEFAULT_SCENE_CUT_THRESHOLD,
+    DEFAULT_SEGMENT_LF_DELTAS, DEFAULT_SEGMENT_QUANT_DELTAS, DEFAULT_SIMPLE_LF_MAX_LEVEL,
+    DEFAULT_SPATIAL_LF_N_COL_BANDS, DEFAULT_SPATIAL_LF_N_ROW_BANDS,
+    DEFAULT_SPLIT_MV_JOINT_REFINE_PASSES, FrameComplexity, INTRA_IN_P_BPRED_VARIANCE_THRESHOLD,
+    JOINT_R44R49_PICKER_MAX_ITERS_MAX, KMEANS_SPATIAL_MAX_ITERS, LAMBDA_SCALE_DEFAULT,
+    LoopFilterMode, QP_SENSITIVITY_X8, SCENE_CUT_ABS_FLOOR, SEGMENT_VARIANCE_THRESHOLDS,
+    SPLIT_MV_JOINT_REFINE_PASSES_MAX, Vp8Encoder, Vp8EncoderConfig, Vp8EncoderStats,
+    Vp8TwoPassConfig, Vp8TwoPassEncoder, first_pass_analyze, make_encoder_typed_with_config,
+    make_two_pass_encoder, two_pass_qindex_for_frame, two_pass_qindices,
 };
 
 #[cfg(feature = "registry")]

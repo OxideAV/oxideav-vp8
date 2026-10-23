@@ -30,10 +30,10 @@
 //! intended blocks — so the measured loop is a proven-valid bitstream
 //! walk, never an error path.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::dct_tokens::{
-    decode_mb_coeffs, BlockType, MbEntropyCtx, DEFAULT_COEFF_PROBS, ZIGZAG,
+    BlockType, DEFAULT_COEFF_PROBS, MbEntropyCtx, ZIGZAG, decode_mb_coeffs,
 };
 use oxideav_vp8::encoder::TokenEncoder;
 use oxideav_vp8::{BoolDecoder, I420Frame, KeyframeParams, Vp8DecoderState, Vp8InterStreamEncoder};
@@ -92,7 +92,7 @@ fn dense_block(rng: &mut u32, first: usize) -> [i16; 16] {
 fn sparse_block(rng: &mut u32, first: usize) -> [i16; 16] {
     let mut out = [0i16; 16];
     let r = xorshift(rng);
-    if r % 4 == 0 {
+    if r.is_multiple_of(4) {
         return out; // immediate EOB
     }
     let v1 = 1 + (r % 3) as i16;
@@ -112,7 +112,7 @@ fn build_mbs(dense: bool) -> Vec<MbScanCoeffs> {
     let mut rng = if dense { 0x2853_77c5 } else { 0x11d2_85f1 };
     (0..NUM_MBS)
         .map(|_| {
-            let gen = |rng: &mut u32, first: usize| {
+            let make_block = |rng: &mut u32, first: usize| {
                 if dense {
                     dense_block(rng, first)
                 } else {
@@ -120,10 +120,10 @@ fn build_mbs(dense: bool) -> Vec<MbScanCoeffs> {
                 }
             };
             MbScanCoeffs {
-                y2: gen(&mut rng, 0),
-                y: core::array::from_fn(|_| gen(&mut rng, 1)),
-                u: core::array::from_fn(|_| gen(&mut rng, 0)),
-                v: core::array::from_fn(|_| gen(&mut rng, 0)),
+                y2: make_block(&mut rng, 0),
+                y: core::array::from_fn(|_| make_block(&mut rng, 1)),
+                u: core::array::from_fn(|_| make_block(&mut rng, 0)),
+                v: core::array::from_fn(|_| make_block(&mut rng, 0)),
             }
         })
         .collect()

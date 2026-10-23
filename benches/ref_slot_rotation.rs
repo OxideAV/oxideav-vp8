@@ -74,11 +74,11 @@
 //! `RefFrameSlot` surface (its fields are `pub`); the whole-stream path
 //! exercises the shipped `decode_frame` rotation unmodified.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{
-    bench_rotate_reference_slots, I420Frame, KeyframeParams, RefFrameSlot, RefreshControls,
-    Vp8DecoderState, Vp8InterStreamEncoder,
+    I420Frame, KeyframeParams, RefFrameSlot, RefreshControls, Vp8DecoderState,
+    Vp8InterStreamEncoder, bench_rotate_reference_slots,
 };
 
 // A mid-size frame: 320×240 = 20×15 MBs — the same resolution the

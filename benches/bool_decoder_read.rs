@@ -56,7 +56,7 @@
 //! equals the intended one — so the measured loop is always a
 //! proven-valid bitstream walk, never an error path.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{BoolDecoder, BoolEncoder};
 
@@ -198,11 +198,7 @@ fn build_signed_literals() -> Vec<i32> {
         .map(|_| {
             let r = xorshift(&mut rng);
             let mag = (r & mag_mask) as i32;
-            if (r >> 16) & 1 == 1 {
-                -1 - mag
-            } else {
-                mag
-            }
+            if (r >> 16) & 1 == 1 { -1 - mag } else { mag }
         })
         .collect()
 }

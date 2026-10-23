@@ -4,7 +4,7 @@
 //! reference + §17 motion vectors + §15.1 inter-frame loop filter) on
 //! top of the keyframe path the `keyframe_encode` bench measures.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{I420Frame, KeyframeParams, Vp8InterStreamEncoder};
 

@@ -21,9 +21,9 @@
 //! same numbers + Mpx/s throughput are tabulated in `BENCHMARKS.md`
 //! under "Round 194 — rate-control qi sweep".
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_vp8::{encode_keyframe, I420Frame, KeyframeParams};
+use oxideav_vp8::{I420Frame, KeyframeParams, encode_keyframe};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;

@@ -1510,7 +1510,7 @@ const COEFF_UPDATE_PROBS: [[[[u8; 11]; 3]; 8]; 4] = [
 
 // ───────────────────────── Phase 2: §13 DCT-token encoder ─────────────────────
 
-use crate::dct_tokens::{BlockType, CoeffProbs, DctToken, COEFF_BANDS};
+use crate::dct_tokens::{BlockType, COEFF_BANDS, CoeffProbs, DctToken};
 
 /// §13.2 `coeff_tree` — duplicated here for the encoder's tree walk so
 /// the inverse mapping (`token -> bit path`) can be computed against
@@ -1944,13 +1944,13 @@ use crate::dct_tokens::MbEntropyCtx;
 use crate::forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 use crate::frame::MbCoeffs;
 use crate::intra_predict::{
-    predict_b4x4, predict_uv8x8, predict_y16x16, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL,
+    DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, predict_b4x4, predict_uv8x8, predict_y16x16,
 };
 use crate::inverse_transform::{add_residue_4x4, inverse_dct_4x4, inverse_wht_4x4};
 use crate::macroblock::{
-    IntraBmode, IntraUvMode, IntraYMode, MacroblockModes, BMODE_TREE, IF_UV_MODE_PROB_DEFAULTS,
-    IF_YMODE_PROB_DEFAULTS, IF_YMODE_TREE, KF_BMODE_PROB, KF_UV_MODE_PROB, KF_YMODE_PROB,
-    KF_YMODE_TREE, UV_MODE_TREE,
+    BMODE_TREE, IF_UV_MODE_PROB_DEFAULTS, IF_YMODE_PROB_DEFAULTS, IF_YMODE_TREE, IntraBmode,
+    IntraUvMode, IntraYMode, KF_BMODE_PROB, KF_UV_MODE_PROB, KF_YMODE_PROB, KF_YMODE_TREE,
+    MacroblockModes, UV_MODE_TREE,
 };
 
 /// Round-half-away-from-zero integer division — the natural inverse of
@@ -5752,12 +5752,12 @@ fn encode_keyframe_adaptive_quant_inner_lf(
     }
     // §9.3: the loop-filter feature value is a signed 6-bit magnitude —
     // reject anything outside ±63 before the walk runs.
-    if let Some(d) = segment_lf_deltas {
-        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
-            return Err(EncodeError::LoopFilterLevelOutOfRange {
-                value: bad.unsigned_abs(),
-            });
-        }
+    if let Some(d) = segment_lf_deltas
+        && let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63)
+    {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: bad.unsigned_abs(),
+        });
     }
 
     let mb_cols = width.div_ceil(16) as usize;
@@ -7357,13 +7357,13 @@ fn pick_mb_for_ref(
         }
     }
     let mut chosen_split: Option<SplitMvCandidate> = None;
-    if let Some(cand) = best_split {
-        if cand.j < chosen_j {
-            chosen_mode = crate::near_mv::InterMode::Split;
-            chosen_mv = cand.split_mvs[15];
-            chosen_j = cand.j;
-            chosen_split = Some(cand);
-        }
+    if let Some(cand) = best_split
+        && cand.j < chosen_j
+    {
+        chosen_mode = crate::near_mv::InterMode::Split;
+        chosen_mv = cand.split_mvs[15];
+        chosen_j = cand.j;
+        chosen_split = Some(cand);
     }
 
     // ---- §18 / §14 prediction + residual + reconstruction at the
@@ -8868,12 +8868,12 @@ pub fn encode_p_frame_multi_ref_adaptive_quant(
     segmentation: &InterSegmentationConfig,
     options: &InterCodingOptions,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
-    if let Some(d) = segmentation.lf_delta {
-        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
-            return Err(EncodeError::LoopFilterLevelOutOfRange {
-                value: bad.unsigned_abs(),
-            });
-        }
+    if let Some(d) = segmentation.lf_delta
+        && let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63)
+    {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: bad.unsigned_abs(),
+        });
     }
     encode_p_frame_options_and_segmentation(
         frame,
@@ -8903,12 +8903,12 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     // §9.3: the loop-filter feature value is a signed 6-bit magnitude.
-    if let Some(d) = segmentation.and_then(|s| s.lf_delta) {
-        if let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63) {
-            return Err(EncodeError::LoopFilterLevelOutOfRange {
-                value: bad.unsigned_abs(),
-            });
-        }
+    if let Some(d) = segmentation.and_then(|s| s.lf_delta)
+        && let Some(&bad) = d.iter().find(|v| v.unsigned_abs() > 63)
+    {
+        return Err(EncodeError::LoopFilterLevelOutOfRange {
+            value: bad.unsigned_abs(),
+        });
     }
 
     if !options.fitted_token_prob_updates {
@@ -9229,21 +9229,21 @@ fn encode_p_frame_multi_ref_inner_full(
             reference: ((last.mb_cols * 16) as u32, (last.mb_rows * 16) as u32),
         });
     }
-    if let Some(g) = golden {
-        if g.mb_cols != mb_cols || g.mb_rows != mb_rows {
-            return Err(EncodeError::ReferenceDimensionsMismatch {
-                source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
-                reference: ((g.mb_cols * 16) as u32, (g.mb_rows * 16) as u32),
-            });
-        }
+    if let Some(g) = golden
+        && (g.mb_cols != mb_cols || g.mb_rows != mb_rows)
+    {
+        return Err(EncodeError::ReferenceDimensionsMismatch {
+            source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+            reference: ((g.mb_cols * 16) as u32, (g.mb_rows * 16) as u32),
+        });
     }
-    if let Some(a) = altref {
-        if a.mb_cols != mb_cols || a.mb_rows != mb_rows {
-            return Err(EncodeError::ReferenceDimensionsMismatch {
-                source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
-                reference: ((a.mb_cols * 16) as u32, (a.mb_rows * 16) as u32),
-            });
-        }
+    if let Some(a) = altref
+        && (a.mb_cols != mb_cols || a.mb_rows != mb_rows)
+    {
+        return Err(EncodeError::ReferenceDimensionsMismatch {
+            source: ((mb_cols * 16) as u32, (mb_rows * 16) as u32),
+            reference: ((a.mb_cols * 16) as u32, (a.mb_rows * 16) as u32),
+        });
     }
 
     // The decoder's inter path overlays the §13.4 update payload on top
@@ -9482,7 +9482,7 @@ fn encode_p_frame_multi_ref_inner_full(
             // prob_gf_pick)`.
             let mut best: Option<PickedMbForRef> = None;
             let mut best_total_j = f64::INFINITY;
-            for (ref_frame, ref ref_planes) in available_refs.iter() {
+            for (ref_frame, ref_planes) in available_refs.iter() {
                 let luma_ref = crate::motion_search::LumaRef {
                     plane: ref_planes.y,
                     stride: ref_planes.y_stride,
@@ -9739,11 +9739,11 @@ fn encode_p_frame_multi_ref_inner_full(
     // reference / mode deltas are the effective (carried + this-frame)
     // values resolved above.
     let mut seg_lf_level = [0i16; crate::loop_filter::MAX_MB_SEGMENTS];
-    if let Some((s, _, _)) = &seg_ctx {
-        if let Some(d) = s.lf_delta {
-            for (dst, &src) in seg_lf_level.iter_mut().zip(d.iter()) {
-                *dst = i16::from(src);
-            }
+    if let Some((s, _, _)) = &seg_ctx
+        && let Some(d) = s.lf_delta
+    {
+        for (dst, &src) in seg_lf_level.iter_mut().zip(d.iter()) {
+            *dst = i16::from(src);
         }
     }
     let mut lf_config = crate::loop_filter::FrameFilterConfig {
@@ -10464,7 +10464,7 @@ mod factory {
         VideoFrame,
     };
 
-    use super::{encode_keyframe, encode_keyframe_auto_loop_filter, I420Frame, KeyframeParams};
+    use super::{I420Frame, KeyframeParams, encode_keyframe, encode_keyframe_auto_loop_filter};
     use crate::decoder::VP8_CODEC_ID;
 
     /// Build a framework-side VP8 encoder bound to `params` with all
@@ -12790,7 +12790,7 @@ mod tests {
     /// once.
     #[test]
     fn partition_group_table_matches_mv_partitions() {
-        use crate::near_mv::{partition_id, MvPartition, MV_PARTITIONS};
+        use crate::near_mv::{MV_PARTITIONS, MvPartition, partition_id};
         for (p, expected_groups) in [
             (MvPartition::TopBottom, 2usize),
             (MvPartition::LeftRight, 2),
@@ -14169,7 +14169,7 @@ mod tests {
 
     // ───────── Phase 2 §13 token-encoder round-trip tests ─────────
 
-    use crate::dct_tokens::{decode_block, DEFAULT_COEFF_PROBS};
+    use crate::dct_tokens::{DEFAULT_COEFF_PROBS, decode_block};
 
     /// Encode one block with `encode_coeff_block`, then decode the
     /// emitted bytes with `decode_block`. Returns the recovered
@@ -14198,7 +14198,7 @@ mod tests {
         let expected_nz = coeffs
             .iter()
             .enumerate()
-            .filter(|(i, &v)| *i >= first && v != 0)
+            .filter(|&(i, &v)| i >= first && v != 0)
             .count();
         assert_eq!(nonzeros, expected_nz, "non-zero count mismatch");
         let bytes = enc.finish();
@@ -14496,7 +14496,7 @@ mod tests {
     use crate::dct_tokens::decode_mb_coeffs;
     use crate::dequant::MbDequantFactors;
     use crate::macroblock::{IntraBmode, IntraUvMode, IntraYMode};
-    use crate::reconstruct::{decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors};
+    use crate::reconstruct::{MbNeighbors, decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred};
 
     /// Encode a flat-color MB through `encode_mb_block_set`, decode the
     /// bytes back through the mode-aware helper (off-frame neighbours may
@@ -15682,9 +15682,11 @@ mod tests {
     #[test]
     fn two_pass_qindices_for_bitrate_empty_and_bad_base() {
         let config = Vp8TwoPassConfig::default();
-        assert!(two_pass_qindices_for_bitrate(&config, &[], 176, 144)
-            .unwrap()
-            .is_empty());
+        assert!(
+            two_pass_qindices_for_bitrate(&config, &[], 176, 144)
+                .unwrap()
+                .is_empty()
+        );
         let bad = Vp8TwoPassConfig {
             base: Vp8EncoderConfig {
                 qindex: 200,

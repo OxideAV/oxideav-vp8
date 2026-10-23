@@ -32,11 +32,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use oxideav_vp8::ivf::{
-    parse_frame_header, parse_header, write_frame, write_header, IvfHeader, IVF_FRAME_HEADER_LEN,
-    IVF_HEADER_LEN,
+    IVF_FRAME_HEADER_LEN, IVF_HEADER_LEN, IvfHeader, parse_frame_header, parse_header, write_frame,
+    write_header,
 };
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe, I420Frame, KeyframeParams, Vp8DecodedFrame, Vp8DecoderState,
+    I420Frame, KeyframeParams, Vp8DecodedFrame, Vp8DecoderState, decode_vp8, encode_keyframe,
 };
 
 // ───────────────────── ffmpeg availability + synthetic source ─────────────

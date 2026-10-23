@@ -63,6 +63,7 @@
 
 use crate::coded_header::TokenProbUpdates;
 use crate::encoder::{
+    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
     encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
@@ -70,7 +71,6 @@ use crate::encoder::{
     encode_p_frame_multi_ref_with_refresh_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
-    EncodeError, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls,
 };
 use crate::frame::KeyframePlanes;
 use crate::state::RefFrameSlot;
@@ -590,7 +590,7 @@ impl Vp8InterStreamEncoder {
         }
         // This call would emit P-frame number `p_frames_since_keyframe
         // + 1` since the last key frame.
-        (self.p_frames_since_keyframe + 1) % self.golden_interval == 0
+        (self.p_frames_since_keyframe + 1).is_multiple_of(self.golden_interval)
     }
 
     /// Decide whether the next [`Self::encode_frame`] call would emit
@@ -687,7 +687,7 @@ impl Vp8InterStreamEncoder {
         // the key frame) is a multiple of the interval.
         let refresh_golden = !emit_key
             && self.golden_interval != 0
-            && (self.p_frames_since_keyframe + 1) % self.golden_interval == 0;
+            && (self.p_frames_since_keyframe + 1).is_multiple_of(self.golden_interval);
 
         let (bytes, planes, kind) = if emit_key {
             let (b, p) = encode_keyframe_with_reconstruction(frame, &self.params)?;
@@ -2352,7 +2352,8 @@ impl Vp8AltrefStreamEncoder {
     /// Whether source frame `index` is scheduled as a key frame.
     fn is_key_index(&self, index: u64) -> bool {
         index == 0
-            || (self.config.keyframe_interval > 0 && index % self.config.keyframe_interval == 0)
+            || (self.config.keyframe_interval > 0
+                && index.is_multiple_of(self.config.keyframe_interval))
     }
 
     /// Feed one source frame; returns every packet the stream can emit

@@ -25,9 +25,9 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_adaptive_quant_with_reconstruction,
-    encode_keyframe_adaptive_quant_with_segment_lf_deltas, AdaptiveQuantConfig, EncodeError,
-    I420Frame, Vp8CodedHeader, Vp8FrameHeader,
+    AdaptiveQuantConfig, EncodeError, I420Frame, Vp8CodedHeader, Vp8FrameHeader, decode_vp8,
+    encode_keyframe_adaptive_quant_with_reconstruction,
+    encode_keyframe_adaptive_quant_with_segment_lf_deltas,
 };
 
 const W: usize = 96;

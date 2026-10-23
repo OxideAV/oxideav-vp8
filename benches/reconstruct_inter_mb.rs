@@ -24,9 +24,9 @@
 //! the benched MB sits at (1, 1), so the in-bounds fast paths engage —
 //! the dominant mid-frame case the profile measures.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use oxideav_vp8::motion_comp::{filter_set_for_version, reconstruct_inter_mb, ReferencePlanes};
+use oxideav_vp8::motion_comp::{ReferencePlanes, filter_set_for_version, reconstruct_inter_mb};
 use oxideav_vp8::motion_vector::Mv;
 
 const MB_COLS: usize = 4;

@@ -12,11 +12,11 @@
 //! encoder↔decoder lockstep through a stateful decode of I then P) and
 //! that it never increases distortion versus an unfiltered P-frame.
 
-use oxideav_vp8::loop_filter::{reconstruction_ssd, SourcePlanes};
+use oxideav_vp8::loop_filter::{SourcePlanes, reconstruction_ssd};
 use oxideav_vp8::{
+    I420Frame, KeyframeParams, RefreshControls, Vp8DecoderState,
     encode_keyframe_with_reconstruction, encode_p_frame_multi_ref_auto_loop_filter,
-    encode_p_frame_multi_ref_with_refresh_and_intra_pick, I420Frame, KeyframeParams,
-    RefreshControls, Vp8DecoderState,
+    encode_p_frame_multi_ref_with_refresh_and_intra_pick,
 };
 
 /// The two I420 source frames of a deterministic 48×48 pair.

@@ -8,7 +8,7 @@
 //! config flows through (output decodes; the auto path engages the filter
 //! on a blocky source).
 
-use oxideav_vp8::{decode_vp8, I420Frame, Vp8Encoder, Vp8EncoderConfig};
+use oxideav_vp8::{I420Frame, Vp8Encoder, Vp8EncoderConfig, decode_vp8};
 
 /// Blocky 80×64 I420 source matching the proven engagement case in
 /// `tests/encoder_auto_loop_filter.rs` (per-MB plateaus + a faint

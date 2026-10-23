@@ -27,11 +27,11 @@
 //! non-zero number of probes per stage. The MB is placed well inside
 //! the plane so the §20.14 edge-replication clamp stays cold.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::motion_search::{
-    block_sad_16x16, half_pixel_refine_luma, quarter_pixel_refine_luma, small_diamond_search_luma,
-    LumaRef,
+    LumaRef, block_sad_16x16, half_pixel_refine_luma, quarter_pixel_refine_luma,
+    small_diamond_search_luma,
 };
 use oxideav_vp8::motion_vector::Mv;
 

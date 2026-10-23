@@ -56,10 +56,10 @@
 
 use crate::coded_header::QuantIndices;
 use crate::dct_tokens::{
-    decode_mb_coeffs_dequant, CoeffProbs, MbCoeffError, MbDequantPairs, MbEntropyCtx,
+    CoeffProbs, MbCoeffError, MbDequantPairs, MbEntropyCtx, decode_mb_coeffs_dequant,
 };
 use crate::frame::MbCoeffs;
-use crate::inverse_transform::{clamp_qindex, AC_QLOOKUP, DC_QLOOKUP};
+use crate::inverse_transform::{AC_QLOOKUP, DC_QLOOKUP, clamp_qindex};
 
 /// `dc_q(q)` from RFC 6386 §20.4: `dc_qlookup[clamp_q(q)]`.
 #[inline]
@@ -308,8 +308,8 @@ fn dequant_block_scalar(block: &mut [i16; 16], dc_factor: i16, ac_factor: i16) {
 #[cfg(feature = "simd")]
 #[inline]
 fn dequant_block_simd(block: &mut [i16; 16], dc_factor: i16, ac_factor: i16) {
-    use core::simd::num::SimdInt;
     use core::simd::Simd;
+    use core::simd::num::SimdInt;
 
     // Per-lane factor vector: dc_factor for the DC coefficient (lane 0),
     // ac_factor for the fifteen AC coefficients (lanes 1..=15).
@@ -685,8 +685,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::bool_decoder::BoolDecoder;
-    use crate::dct_tokens::{decode_mb_coeffs, merge_default_token_probs, DEFAULT_COEFF_PROBS};
-    use crate::frame::{decode_keyframe, MbCoeffs};
+    use crate::dct_tokens::{DEFAULT_COEFF_PROBS, decode_mb_coeffs, merge_default_token_probs};
+    use crate::frame::{MbCoeffs, decode_keyframe};
     use crate::intra_predict::DEFAULT_TOPLEFT_DC;
     use crate::macroblock::{IntraUvMode, IntraYMode, MacroblockModes};
 

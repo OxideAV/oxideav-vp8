@@ -10,7 +10,7 @@
 //! per-pixel arithmetic (`clamp255(L_r + A_c - P)` over all 256 cells)
 //! — the A/B anchor for the `simd` feature's TM row kernel.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::intra_predict::{
     predict_y16x16_dc, predict_y16x16_h, predict_y16x16_tm, predict_y16x16_v,

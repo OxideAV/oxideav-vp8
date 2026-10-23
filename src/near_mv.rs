@@ -52,9 +52,9 @@
 
 use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
 use crate::motion_comp::{
-    reconstruct_inter_mb, reconstruct_split_mv_mb, RefFrame, ReferencePlanes,
+    RefFrame, ReferencePlanes, reconstruct_inter_mb, reconstruct_split_mv_mb,
 };
-use crate::motion_vector::{read_mv, Mv, MvContexts};
+use crate::motion_vector::{Mv, MvContexts, read_mv};
 use crate::reconstruct::ReconstructedMb;
 
 /// The whole-macroblock inter-prediction mode — RFC 6386 §16.2
@@ -1441,7 +1441,7 @@ mod tests {
         // above contributes weight 2 into the NEAREST slot.
         assert_eq!(near.cnt[CNT_NEAREST], 2);
         assert_eq!(near.mvs[1], v); // nearest
-                                    // best := nearest because cnt[NEAREST] (2) >= cnt[BEST] (0).
+        // best := nearest because cnt[NEAREST] (2) >= cnt[BEST] (0).
         assert_eq!(near.mvs[0], v);
     }
 

@@ -1175,7 +1175,7 @@ mod tests {
         enc.write_literal(0, 3); // sharpness
         enc.write_bool(128, true); // loop_filter_adj_enable = true
         enc.write_bool(128, true); // mode_ref_lf_delta_update = true
-                                   // ref_frame deltas: (+1, none, -2, +5)
+        // ref_frame deltas: (+1, none, -2, +5)
         enc.write_bool(128, true); // present
         enc.write_literal(1, 6);
         enc.write_bool(128, false); // sign +
@@ -1227,11 +1227,11 @@ mod tests {
         enc.write_bool(128, false); // color_space
         enc.write_bool(128, false); // clamping_type
         enc.write_bool(128, true); // segmentation_enabled = true
-                                   // update_segmentation():
+        // update_segmentation():
         enc.write_bool(128, true); // update_mb_segmentation_map = 1
         enc.write_bool(128, true); // update_segment_feature_data = 1
         enc.write_bool(128, true); // segment_feature_mode = 1 (absolute)
-                                   // quantizer_update[0..4]:
+        // quantizer_update[0..4]:
         enc.write_bool(128, true);
         enc.write_literal(10, 7);
         enc.write_bool(128, false); // +10
@@ -1240,7 +1240,7 @@ mod tests {
         enc.write_bool(128, true);
         enc.write_literal(20, 7);
         enc.write_bool(128, true); // -20
-                                   // loop_filter_update[0..4]:
+        // loop_filter_update[0..4]:
         enc.write_bool(128, false);
         enc.write_bool(128, true);
         enc.write_literal(5, 6);
@@ -1295,7 +1295,7 @@ mod tests {
         enc.write_bool(128, false); // lf_adj_enable
         enc.write_literal(0, 2); // log2_dct_parts
         enc.write_literal(64, 7); // y_ac_qi
-                                  // y_dc_delta = +1
+        // y_dc_delta = +1
         enc.write_bool(128, true);
         enc.write_literal(1, 4);
         enc.write_bool(128, false);
@@ -1355,7 +1355,7 @@ mod tests {
         enc.write_bool(128, false); // refresh_golden_frame = 0
         enc.write_bool(128, true); // refresh_alternate_frame = 1
         enc.write_literal(2, 2); // copy_buffer_to_golden = 2 (alt → gold)
-                                 // (no copy_buffer_to_alternate because refresh_alt = 1)
+        // (no copy_buffer_to_alternate because refresh_alt = 1)
         enc.write_bool(128, true); // sign_bias_golden
         enc.write_bool(128, false); // sign_bias_alternate
         enc.write_bool(128, false); // refresh_entropy_probs
@@ -1662,14 +1662,14 @@ mod tests {
         assert_eq!(DEFAULT_MV_CONTEXT[0][8], 156); // short tree [6]
         assert_eq!(DEFAULT_MV_CONTEXT[0][9], 128); // bit 0
         assert_eq!(DEFAULT_MV_CONTEXT[0][18], 254); // bit 9
-                                                    // Column component:
+        // Column component:
         assert_eq!(DEFAULT_MV_CONTEXT[1][0], 164); // is_short
         assert_eq!(DEFAULT_MV_CONTEXT[1][1], 128); // sign
         assert_eq!(DEFAULT_MV_CONTEXT[1][2], 204); // short tree [0]
         assert_eq!(DEFAULT_MV_CONTEXT[1][8], 228); // short tree [6]
         assert_eq!(DEFAULT_MV_CONTEXT[1][9], 128); // bit 0
         assert_eq!(DEFAULT_MV_CONTEXT[1][18], 254); // bit 9
-                                                    // Update-probs table sanity.
+        // Update-probs table sanity.
         assert_eq!(MV_UPDATE_PROBS[0][0], 237);
         assert_eq!(MV_UPDATE_PROBS[0][18], 254);
         assert_eq!(MV_UPDATE_PROBS[1][0], 231);
@@ -1717,7 +1717,7 @@ mod tests {
                     for (t, slot) in ctx.iter_mut().enumerate() {
                         salt = salt.wrapping_mul(1103515245).wrapping_add(12345);
                         // ~1 in 5 positions carries a replacement.
-                        if (i + j + k + t + (salt >> 16) as usize) % 5 == 0 {
+                        if (i + j + k + t + (salt >> 16) as usize).is_multiple_of(5) {
                             *slot = Some(((salt >> 8) & 0xFF) as u8);
                         }
                     }

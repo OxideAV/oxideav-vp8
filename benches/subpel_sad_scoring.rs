@@ -32,10 +32,10 @@
 //! `motion_search_descent` bench drives, MB at (1, 1) so the §20.14
 //! border clamp stays cold (the profiled mid-frame case).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::motion_comp::fetch_luma_mb_halo;
-use oxideav_vp8::motion_search::{mb_luma_sad_at_mv, LumaRef};
+use oxideav_vp8::motion_search::{LumaRef, mb_luma_sad_at_mv};
 use oxideav_vp8::motion_vector::Mv;
 
 fn make_plane(w: usize, h: usize, seed: u32) -> Vec<u8> {

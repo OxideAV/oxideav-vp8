@@ -6,7 +6,7 @@
 //! pattern so the filter actually runs (the §15.3 `filter_yes` gate
 //! passes and the §15.3 `hev` test trips into the wide adjustment).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::loop_filter::{simple_segment, subblock_filter};
 

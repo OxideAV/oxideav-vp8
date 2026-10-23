@@ -31,7 +31,7 @@ use oxideav_core::{
     VideoFrame,
 };
 use oxideav_vp8::{
-    make_encoder, make_encoder_with_config, make_encoder_with_quality, Vp8Decoder, Vp8EncoderConfig,
+    Vp8Decoder, Vp8EncoderConfig, make_encoder, make_encoder_with_config, make_encoder_with_quality,
 };
 
 const W: u32 = 64;

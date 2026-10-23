@@ -26,7 +26,7 @@
 //! * [`parse_header`] — top-level parser; one call returns either form.
 
 use crate::error::{Result, Vp8Error};
-use crate::frame_header::{ScaleCode, Vp8FrameHeader, KEY_FRAME_START_CODE};
+use crate::frame_header::{KEY_FRAME_START_CODE, ScaleCode, Vp8FrameHeader};
 
 /// VP8 frame-type discriminator (the §9.1 `frame_type` bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

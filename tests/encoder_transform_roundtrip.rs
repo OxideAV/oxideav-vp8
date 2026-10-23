@@ -26,9 +26,9 @@
 //! per-block primitive chain.
 
 use oxideav_vp8::{
-    add_residue_4x4, dequant_block, forward_dct_4x4, forward_wht_4x4, inverse_dct_4x4,
-    inverse_wht_4x4, raster_to_scan, BlockType, BoolDecoder, TokenEncoder, Y1DequantFactors,
-    AC_QLOOKUP, DC_QLOOKUP, DEFAULT_COEFF_PROBS, ZIGZAG,
+    AC_QLOOKUP, BlockType, BoolDecoder, DC_QLOOKUP, DEFAULT_COEFF_PROBS, TokenEncoder,
+    Y1DequantFactors, ZIGZAG, add_residue_4x4, dequant_block, forward_dct_4x4, forward_wht_4x4,
+    inverse_dct_4x4, inverse_wht_4x4, raster_to_scan,
 };
 
 /// Reorder a decoder-produced scan-order block back into raster order
@@ -249,9 +249,9 @@ fn end_to_end_psnr_target_meets_round131_goal() {
     // / quant / encoder / decoder / dequant / IDCT chain, not the
     // §11 / §12 prediction layer.
     let residual_in = [0i16; 16]; // a zero-residual block is the trivial
-                                  // success case; the meaningful PSNR
-                                  // test uses a non-zero residual to
-                                  // actually exercise the token path.
+    // success case; the meaningful PSNR
+    // test uses a non-zero residual to
+    // actually exercise the token path.
     let recovered_residual = fdct_token_roundtrip(&residual_in, BlockType::YNoY2, 32, 0);
     let mut recovered_pixels = [0u8; 16];
     add_residue_4x4(&prediction, &recovered_residual, &mut recovered_pixels);

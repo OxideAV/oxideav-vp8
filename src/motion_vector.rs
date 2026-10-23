@@ -51,7 +51,7 @@
 //! §18.1 range clamp belong to the inter-prediction layer.
 
 use crate::bool_decoder::{BoolDecoder, BoolDecoderError};
-use crate::coded_header::{MvProbUpdates, DEFAULT_MV_CONTEXT, MV_PROB_COUNT};
+use crate::coded_header::{DEFAULT_MV_CONTEXT, MV_PROB_COUNT, MvProbUpdates};
 use crate::encoder::BoolEncoder;
 
 /// A decoded motion vector — RFC 6386 §17.2 `MV` (`{ int16 row, col; }`).

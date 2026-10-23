@@ -400,8 +400,8 @@ pub fn mb_filter(
 #[cfg(feature = "simd")]
 #[inline]
 fn clamp_s8_v(v: core::simd::Simd<i32, 4>) -> core::simd::Simd<i32, 4> {
-    use core::simd::cmp::SimdOrd;
     use core::simd::Simd;
+    use core::simd::cmp::SimdOrd;
     v.simd_clamp(Simd::splat(-128), Simd::splat(127))
 }
 
@@ -463,9 +463,9 @@ fn subblock_filter_v(
     edge_limit: u8,
     seg: &mut [core::simd::Simd<i32, 4>; 8],
 ) {
-    use core::simd::cmp::SimdPartialOrd;
     use core::simd::Select;
     use core::simd::Simd;
+    use core::simd::cmp::SimdPartialOrd;
 
     let i = Simd::splat(interior_limit as i32);
     let e = Simd::splat(edge_limit as i32);
@@ -531,9 +531,9 @@ fn mb_filter_v(
     edge_limit: u8,
     seg: &mut [core::simd::Simd<i32, 4>; 8],
 ) {
-    use core::simd::cmp::SimdPartialOrd;
     use core::simd::Select;
     use core::simd::Simd;
+    use core::simd::cmp::SimdPartialOrd;
 
     let i = Simd::splat(interior_limit as i32);
     let e = Simd::splat(edge_limit as i32);
@@ -621,9 +621,9 @@ fn simple_segment_v(
     q0: core::simd::Simd<i32, 4>,
     q1: core::simd::Simd<i32, 4>,
 ) -> (core::simd::Simd<i32, 4>, core::simd::Simd<i32, 4>) {
-    use core::simd::cmp::SimdPartialOrd;
     use core::simd::Select;
     use core::simd::Simd;
+    use core::simd::cmp::SimdPartialOrd;
 
     let limit = Simd::splat(edge_limit as i32);
     // §15.2 edge metric on unsigned pixels.
@@ -773,15 +773,15 @@ impl FrameFilterConfig {
     pub fn keyframe(header: &crate::Vp8CodedHeader) -> Self {
         let mut segment_lf_level = [0i16; MAX_MB_SEGMENTS];
         let mut segment_abs = false;
-        if header.segmentation_enabled {
-            if let Some(seg) = header.update_segmentation {
-                segment_abs = seg.segment_feature_mode_absolute;
-                for (dst, src) in segment_lf_level
-                    .iter_mut()
-                    .zip(seg.loop_filter_update.iter())
-                {
-                    *dst = src.unwrap_or(0);
-                }
+        if header.segmentation_enabled
+            && let Some(seg) = header.update_segmentation
+        {
+            segment_abs = seg.segment_feature_mode_absolute;
+            for (dst, src) in segment_lf_level
+                .iter_mut()
+                .zip(seg.loop_filter_update.iter())
+            {
+                *dst = src.unwrap_or(0);
             }
         }
 
@@ -834,15 +834,15 @@ impl FrameFilterConfig {
     ) -> Self {
         let mut segment_lf_level = [0i16; MAX_MB_SEGMENTS];
         let mut segment_abs = false;
-        if header.segmentation_enabled {
-            if let Some(seg) = header.update_segmentation {
-                segment_abs = seg.segment_feature_mode_absolute;
-                for (dst, src) in segment_lf_level
-                    .iter_mut()
-                    .zip(seg.loop_filter_update.iter())
-                {
-                    *dst = src.unwrap_or(0);
-                }
+        if header.segmentation_enabled
+            && let Some(seg) = header.update_segmentation
+        {
+            segment_abs = seg.segment_feature_mode_absolute;
+            for (dst, src) in segment_lf_level
+                .iter_mut()
+                .zip(seg.loop_filter_update.iter())
+            {
+                *dst = src.unwrap_or(0);
             }
         }
 

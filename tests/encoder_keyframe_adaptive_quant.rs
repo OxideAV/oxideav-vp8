@@ -24,8 +24,9 @@
 //! points are consulted; no external codec.
 
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_adaptive_quant, encode_keyframe_adaptive_quant_with_reconstruction,
-    encode_keyframe_adaptive_quant_with_trellis, AdaptiveQuantConfig, I420Frame, TrellisStrength,
+    AdaptiveQuantConfig, I420Frame, TrellisStrength, decode_vp8, encode_keyframe_adaptive_quant,
+    encode_keyframe_adaptive_quant_with_reconstruction,
+    encode_keyframe_adaptive_quant_with_trellis,
 };
 
 struct Source {

@@ -17,7 +17,7 @@
 //! residue pass (16 luma at stride 16 + 4 U + 4 V at stride 8) over a
 //! fresh predictor copy.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::inverse_transform::{add_residue_4x4, inverse_dct_4x4, inverse_dct_4x4_add_into};
 

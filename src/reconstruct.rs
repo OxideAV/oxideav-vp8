@@ -122,7 +122,7 @@
 //! the wasted WHT / DCT / summation cycles for skip MBs.
 
 use crate::intra_predict::{
-    predict_b4x4, predict_uv8x8, predict_y16x16, DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL,
+    DEFAULT_ABOVE_PIXEL, DEFAULT_LEFT_PIXEL, predict_b4x4, predict_uv8x8, predict_y16x16,
 };
 use crate::inverse_transform::{add_residue_4x4, inverse_dct_4x4, inverse_wht_4x4};
 use crate::macroblock::{IntraBmode, IntraUvMode, IntraYMode};
@@ -290,7 +290,7 @@ fn insert_4x4(plane: &mut [u8], plane_stride: usize, by: usize, bx: usize, src: 
 /// A fully reconstructed macroblock — the predictor-plus-residue sum
 /// with `clamp255` saturation, before loop filtering.
 #[allow(clippy::too_many_arguments)] // each parameter is a distinct §14.2 input;
-                                     // bundling them into a struct would obscure the spec mapping.
+// bundling them into a struct would obscure the spec mapping.
 pub fn decode_keyframe_mb_non_bpred(
     y_mode: IntraYMode,
     uv_mode: IntraUvMode,

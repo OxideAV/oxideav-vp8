@@ -48,13 +48,13 @@
 
 use crate::bool_decoder::BoolDecoder;
 use crate::coded_header::{CodedHeaderError, Vp8CodedHeader};
-use crate::dct_tokens::{merge_default_token_probs, CoeffProbs, MbCoeffError, MbEntropyCtx};
-use crate::dequant::{decode_and_dequantize_mb, MbDequantFactors};
-use crate::frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
+use crate::dct_tokens::{CoeffProbs, MbCoeffError, MbEntropyCtx, merge_default_token_probs};
+use crate::dequant::{MbDequantFactors, decode_and_dequantize_mb};
+use crate::frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
 use crate::frame_header::{FrameHeaderError, Vp8FrameHeader};
-use crate::loop_filter::{filter_frame, FrameFilterConfig, MAX_MB_SEGMENTS};
+use crate::loop_filter::{FrameFilterConfig, MAX_MB_SEGMENTS, filter_frame};
 use crate::macroblock::{
-    parse_key_frame_macroblock_modes, IntraYMode, MacroblockError, MacroblockModes,
+    IntraYMode, MacroblockError, MacroblockModes, parse_key_frame_macroblock_modes,
 };
 
 /// Errors surfaced by [`decode_vp8`].
@@ -437,16 +437,16 @@ pub(crate) fn carve_dct_partitions(
 fn resolve_segment_dequant_factors(coded: &Vp8CodedHeader) -> [MbDequantFactors; MAX_MB_SEGMENTS] {
     let base = MbDequantFactors::from_quant_indices(&coded.quant_indices);
     let mut out = [base; MAX_MB_SEGMENTS];
-    if coded.segmentation_enabled {
-        if let Some(seg) = coded.update_segmentation {
-            for (i, slot) in out.iter_mut().enumerate() {
-                let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
-                *slot = MbDequantFactors::for_segment(
-                    &coded.quant_indices,
-                    qval,
-                    seg.segment_feature_mode_absolute,
-                );
-            }
+    if coded.segmentation_enabled
+        && let Some(seg) = coded.update_segmentation
+    {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
+            *slot = MbDequantFactors::for_segment(
+                &coded.quant_indices,
+                qval,
+                seg.segment_feature_mode_absolute,
+            );
         }
     }
     out
@@ -817,7 +817,7 @@ mod registry {
 
 #[cfg(feature = "registry")]
 pub use registry::{
-    make_decoder, output_pixel_format, register, register_codecs, Vp8Decoder, VP8_CODEC_ID,
+    VP8_CODEC_ID, Vp8Decoder, make_decoder, output_pixel_format, register, register_codecs,
 };
 
 // ───────────────────────────── tests ────────────────────────────────

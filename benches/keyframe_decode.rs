@@ -3,9 +3,9 @@
 //! Pairs with `keyframe_encode` so the two halves of a roundtrip are
 //! measured independently.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_vp8::{decode_vp8, encode_keyframe, I420Frame, KeyframeParams};
+use oxideav_vp8::{I420Frame, KeyframeParams, decode_vp8, encode_keyframe};
 
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;

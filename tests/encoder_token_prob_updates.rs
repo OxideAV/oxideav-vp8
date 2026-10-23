@@ -34,9 +34,9 @@
 //!      writer's contract without breaking the trivial path.
 
 use oxideav_vp8::{
+    BoolEncoder, I420Frame, KeyframeParams, TokenProbUpdates, Vp8CodedHeader, Vp8FrameHeader,
     decode_vp8, encode_keyframe, encode_keyframe_with_token_prob_updates,
-    write_no_token_prob_updates, write_token_prob_updates, BoolEncoder, I420Frame, KeyframeParams,
-    TokenProbUpdates, Vp8CodedHeader, Vp8FrameHeader,
+    write_no_token_prob_updates, write_token_prob_updates,
 };
 
 /// Build a small synthetic I420 picture exercising both the whole-block

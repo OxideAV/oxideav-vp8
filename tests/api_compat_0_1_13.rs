@@ -26,17 +26,18 @@ use oxideav_vp8::{FrameHeader, Vp8FrameHeader};
 
 // ── Crate-root frame_tag re-exports ──
 use oxideav_vp8::{
-    parse_header, parse_keyframe_header, FrameTag, FrameType, KeyframeHeader, ParsedHeader,
+    FrameTag, FrameType, KeyframeHeader, ParsedHeader, parse_header, parse_keyframe_header,
 };
 
 // ── Crate-root decoder re-exports ──
-use oxideav_vp8::{decode_vp8, DecodeError};
+use oxideav_vp8::{DecodeError, decode_vp8};
 
 // ── Crate-root encoder surface ──
 use oxideav_vp8::{
-    encode_vp8_keyframe, first_pass_analyze, make_encoder_typed_with_config, make_two_pass_encoder,
-    two_pass_qindex_for_frame, two_pass_qindices, FrameComplexity, LoopFilterMode, Vp8Encoder,
-    Vp8EncoderConfig, Vp8EncoderStats, Vp8TwoPassConfig, Vp8TwoPassEncoder,
+    FrameComplexity, LoopFilterMode, Vp8Encoder, Vp8EncoderConfig, Vp8EncoderStats,
+    Vp8TwoPassConfig, Vp8TwoPassEncoder, encode_vp8_keyframe, first_pass_analyze,
+    make_encoder_typed_with_config, make_two_pass_encoder, two_pass_qindex_for_frame,
+    two_pass_qindices,
 };
 
 // ── Crate-root encoder constants ──
@@ -63,7 +64,7 @@ use oxideav_vp8::{
 
 // ── registry-gated entries ──
 #[cfg(feature = "registry")]
-use oxideav_vp8::{decode_frame, make_encoder_with_config, register, registry, Vp8Decoder};
+use oxideav_vp8::{Vp8Decoder, decode_frame, make_encoder_with_config, register, registry};
 
 #[test]
 fn api_compat_0_1_13_crate_root_constant_value() {

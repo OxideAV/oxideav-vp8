@@ -8,7 +8,7 @@
 //! filter all run per iteration. Pairs with `keyframe_decode` the same
 //! way `inter_encode_short_clip` pairs with `keyframe_encode`.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{I420Frame, KeyframeParams, Vp8DecoderState, Vp8InterStreamEncoder};
 

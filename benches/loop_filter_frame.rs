@@ -13,12 +13,12 @@
 //! The filter mutates the planes in place, so each measured iteration
 //! runs on a fresh clone via `iter_batched` (the clone is unmeasured).
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::loop_filter::filter_inter_frame;
 use oxideav_vp8::{
-    filter_frame, FrameFilterConfig, InterMode, IntraUvMode, IntraYMode, KeyframePlanes,
-    MacroblockModes, MbCoeffs, RefFrame,
+    FrameFilterConfig, InterMode, IntraUvMode, IntraYMode, KeyframePlanes, MacroblockModes,
+    MbCoeffs, RefFrame, filter_frame,
 };
 
 const MB_COLS: usize = 20;

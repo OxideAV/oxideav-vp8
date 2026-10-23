@@ -485,8 +485,8 @@ fn inverse_dct_4x4_add_into_simd(
     sub_row: usize,
     sub_col: usize,
 ) {
-    use core::simd::cmp::SimdOrd;
     use core::simd::Simd;
+    use core::simd::cmp::SimdOrd;
 
     let row0 = Simd::<i32, 4>::from_array([
         input[0] as i32,

@@ -32,10 +32,10 @@
 //! [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    decode_split_mv, default_mv_contexts, encode_keyframe_with_reconstruction,
-    encode_p_frame_zero_mv, find_near_mvs, mv_ref_probs, read_inter_mode, read_mv, BoolDecoder,
-    I420Frame, InterMode, KeyframeParams, MbInfo, Mv, RefFrame, SignBias, Vp8CodedHeader,
-    Vp8DecoderState, Vp8FrameHeader,
+    BoolDecoder, I420Frame, InterMode, KeyframeParams, MbInfo, Mv, RefFrame, SignBias,
+    Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader, decode_split_mv, default_mv_contexts,
+    encode_keyframe_with_reconstruction, encode_p_frame_zero_mv, find_near_mvs, mv_ref_probs,
+    read_inter_mode, read_mv,
 };
 
 fn plane_psnr(src: &[u8], rec: &[u8]) -> f64 {

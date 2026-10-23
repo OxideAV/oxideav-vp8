@@ -47,10 +47,10 @@
 //! Black-box self-decode — no external codec consulted.
 
 use oxideav_vp8::{
+    FrameKind, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls, StreamEncodeError,
+    Vp8CodedHeader, Vp8DecodedFrame, Vp8DecoderState, Vp8FrameHeader, Vp8InterStreamEncoder,
     encode_keyframe_with_reconstruction,
-    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick, FrameKind, I420Frame,
-    KeyframeParams, LoopFilterDeltas, RefreshControls, StreamEncodeError, Vp8CodedHeader,
-    Vp8DecodedFrame, Vp8DecoderState, Vp8FrameHeader, Vp8InterStreamEncoder,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick,
 };
 
 fn flat_color(width: usize, height: usize, v: u8) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

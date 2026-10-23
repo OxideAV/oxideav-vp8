@@ -23,10 +23,10 @@
 //! `avg3` / `clamp255` arithmetic of the directional modes cannot be
 //! constant-folded away. No fixture files; no behaviour change.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use oxideav_vp8::intra_predict::predict_b4x4;
 use oxideav_vp8::IntraBmode;
+use oxideav_vp8::intra_predict::predict_b4x4;
 
 /// The full §12.3 sub-block mode set, in spec order.
 const ALL_MODES: [IntraBmode; 10] = [

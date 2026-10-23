@@ -41,7 +41,7 @@
 //! A second `mb_filter` variant with `hev_threshold = 0` forces the
 //! `hev=true` path so the simple-inner-window fallback is also benched.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::loop_filter::{common_adjust, mb_filter, subblock_filter};
 

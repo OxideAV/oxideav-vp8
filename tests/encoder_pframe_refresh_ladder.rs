@@ -36,8 +36,8 @@
 //! own [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    encode_p_frame_multi_ref_with_refresh, FrameKind, I420Frame, KeyframeParams, RefreshControls,
-    Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader, Vp8InterStreamEncoder,
+    FrameKind, I420Frame, KeyframeParams, RefreshControls, Vp8CodedHeader, Vp8DecoderState,
+    Vp8FrameHeader, Vp8InterStreamEncoder, encode_p_frame_multi_ref_with_refresh,
 };
 
 fn plane_psnr(src: &[u8], rec: &[u8]) -> f64 {

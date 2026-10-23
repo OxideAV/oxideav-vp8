@@ -30,11 +30,11 @@
 //!      decodes through the in-tree decoder state machine.
 
 use oxideav_vp8::{
-    encode_keyframe_with_reconstruction, encode_p_frame_multi_ref,
+    I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls, TokenProbUpdates, Vp8CodedHeader,
+    Vp8DecoderState, Vp8FrameHeader, Vp8InterStreamEncoder, encode_keyframe_with_reconstruction,
+    encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_token_updates,
-    encode_p_frame_multi_ref_with_token_updates, I420Frame, KeyframeParams, LoopFilterDeltas,
-    RefreshControls, TokenProbUpdates, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader,
-    Vp8InterStreamEncoder,
+    encode_p_frame_multi_ref_with_token_updates,
 };
 
 /// Build a 32×32 I420 picture with a smooth gradient — repeatable,

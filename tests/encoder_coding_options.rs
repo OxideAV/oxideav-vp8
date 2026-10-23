@@ -22,7 +22,9 @@
 //! Black-box: encoder output feeds the crate's own decoder only.
 
 use oxideav_vp8::{
-    encode_invisible_altref_update, encode_invisible_altref_update_with_coding_options,
+    I420Frame, InterCodingOptions, KeyframeCodingOptions, KeyframeParams, LoopFilterDeltas,
+    RefreshControls, Vp8DecoderState, encode_invisible_altref_update,
+    encode_invisible_altref_update_with_coding_options,
     encode_keyframe_auto_loop_filter_with_reconstruction, encode_keyframe_with_reconstruction,
     encode_keyframe_with_reconstruction_and_coding_options,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
@@ -30,8 +32,6 @@ use oxideav_vp8::{
     encode_p_frame_multi_ref_with_refresh_and_coding_options,
     encode_p_frame_multi_ref_with_refresh_and_intra_pick,
     encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
-    I420Frame, InterCodingOptions, KeyframeCodingOptions, KeyframeParams, LoopFilterDeltas,
-    RefreshControls, Vp8DecoderState,
 };
 
 const W: usize = 64;

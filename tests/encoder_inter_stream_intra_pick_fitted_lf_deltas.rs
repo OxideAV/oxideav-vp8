@@ -49,10 +49,9 @@
 //! Black-box self-decode — no external codec consulted.
 
 use oxideav_vp8::{
-    encode_keyframe_with_reconstruction,
-    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
     FrameKind, I420Frame, KeyframeParams, LoopFilterDeltas, RefreshControls, StreamEncodeError,
-    Vp8DecodedFrame, Vp8DecoderState, Vp8InterStreamEncoder,
+    Vp8DecodedFrame, Vp8DecoderState, Vp8InterStreamEncoder, encode_keyframe_with_reconstruction,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fitted_token_prob_updates,
 };
 
 /// Build a `frame_idx`-parameterised synthetic I420 picture with enough

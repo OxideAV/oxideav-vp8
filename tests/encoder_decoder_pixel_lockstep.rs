@@ -29,8 +29,8 @@
 //!   band the in-tree fitter emits.
 
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_with_reconstruction_and_token_updates, I420Frame, KeyframeParams,
-    TokenProbUpdates,
+    I420Frame, KeyframeParams, TokenProbUpdates, decode_vp8,
+    encode_keyframe_with_reconstruction_and_token_updates,
 };
 
 /// Deterministic synthetic I420 source (mixed gradients + a diagonal

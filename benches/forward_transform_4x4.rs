@@ -23,7 +23,7 @@
 //! uses so successive measurements on the forward and inverse passes
 //! compare directly.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{forward_dct_4x4, forward_wht_4x4};
 

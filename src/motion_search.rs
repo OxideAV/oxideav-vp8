@@ -190,9 +190,9 @@ fn block_sad_16x16_scalar(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
 // `block_sad_simd_matches_scalar_on_stress_inputs`.
 #[inline]
 fn block_sad_16x16_simd(src: &[u8; 256], pred: &[u8; 256]) -> u32 {
+    use core::simd::Simd;
     use core::simd::cmp::SimdOrd;
     use core::simd::num::SimdUint;
-    use core::simd::Simd;
 
     let mut acc: Simd<u16, 16> = Simd::splat(0);
     for row in 0..16 {

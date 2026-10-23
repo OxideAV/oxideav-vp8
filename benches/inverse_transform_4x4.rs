@@ -9,7 +9,7 @@
 //! The input is a fixed quantised 4×4 block (a representative high-AC
 //! pattern) so successive measurements compare apples-to-apples.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::{inverse_dct_4x4, inverse_wht_4x4};
 

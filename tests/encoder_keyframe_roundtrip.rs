@@ -12,7 +12,7 @@
 //! This is a fully self-contained black-box check: no external codec is
 //! consulted, only the crate's own encode + decode entry points.
 
-use oxideav_vp8::{decode_vp8, encode_keyframe, I420Frame, KeyframeParams};
+use oxideav_vp8::{I420Frame, KeyframeParams, decode_vp8, encode_keyframe};
 
 /// A source I420 picture with tightly-packed planes.
 struct Source {

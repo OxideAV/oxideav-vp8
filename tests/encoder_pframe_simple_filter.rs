@@ -37,8 +37,8 @@
 //!      (round-153 wire compatibility).
 
 use oxideav_vp8::{
-    encode_keyframe_with_reconstruction, encode_p_frame_zero_mv, I420Frame, KeyframeParams,
-    Vp8DecoderState,
+    I420Frame, KeyframeParams, Vp8DecoderState, encode_keyframe_with_reconstruction,
+    encode_p_frame_zero_mv,
 };
 
 /// Build a 32×32 I420 frame with a deliberately MB-seam-crossing Y

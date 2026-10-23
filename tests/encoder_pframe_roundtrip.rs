@@ -29,8 +29,8 @@
 //!     side matching the decoder's interpretation of ZEROMV/LAST.
 
 use oxideav_vp8::{
-    encode_keyframe_with_reconstruction, encode_p_frame_zero_mv, I420Frame, KeyframeParams,
-    Vp8DecoderState,
+    I420Frame, KeyframeParams, Vp8DecoderState, encode_keyframe_with_reconstruction,
+    encode_p_frame_zero_mv,
 };
 
 /// Build a 64×64 I420 frame with a smooth Y gradient and gently

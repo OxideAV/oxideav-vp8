@@ -30,11 +30,11 @@
 //! block (every lane non-zero, the worst case) — so the per-coefficient
 //! cost and the loop overhead are both visible.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
+use oxideav_vp8::MbDequantFactors;
 use oxideav_vp8::coded_header::QuantIndices;
 use oxideav_vp8::frame::MbCoeffs;
-use oxideav_vp8::MbDequantFactors;
 
 /// A mid-range §9.6 quantiser header with every per-plane delta present —
 /// the worst case for `from_quant_indices` (all six factors take the full

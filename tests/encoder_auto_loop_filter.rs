@@ -19,11 +19,10 @@
 //!     picks a non-zero level (filtering genuinely reduces block-edge
 //!     error), demonstrating the search is live and not a no-op.
 
-use oxideav_vp8::loop_filter::{reconstruction_ssd, SourcePlanes};
+use oxideav_vp8::loop_filter::{SourcePlanes, reconstruction_ssd};
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_auto_loop_filter,
+    I420Frame, KeyframeParams, decode_vp8, encode_keyframe_auto_loop_filter,
     encode_keyframe_auto_loop_filter_with_reconstruction, encode_keyframe_with_reconstruction,
-    I420Frame, KeyframeParams,
 };
 
 /// Deterministic blocky I420 source: each 16×16 macroblock is a near-flat

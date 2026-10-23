@@ -14,7 +14,7 @@
 //! DCT-partition carve leaves a consumed partition shorter than 2 bytes.
 //! Both entry points must accept it and produce byte-identical planes.
 
-use oxideav_vp8::{decode_vp8, Vp8DecoderState};
+use oxideav_vp8::{Vp8DecoderState, decode_vp8};
 
 /// Fuzz-found 16×16 key frame (57 bytes) whose consumed DCT partition is
 /// shorter than the 2-byte bool-decoder priming read.

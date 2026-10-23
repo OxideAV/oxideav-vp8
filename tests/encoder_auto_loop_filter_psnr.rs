@@ -19,10 +19,10 @@
 //!    lighter filtering on frames that refresh a long-lived reference).
 
 use oxideav_vp8::{
+    I420Frame, KeyframeParams, RefreshControls, Vp8DecodedFrame, Vp8DecoderState,
     encode_keyframe_auto_loop_filter_with_reconstruction, encode_keyframe_with_reconstruction,
     encode_p_frame_multi_ref_auto_loop_filter,
-    encode_p_frame_multi_ref_with_refresh_and_intra_pick, I420Frame, KeyframeParams,
-    RefreshControls, Vp8DecodedFrame, Vp8DecoderState,
+    encode_p_frame_multi_ref_with_refresh_and_intra_pick,
 };
 
 struct Src {

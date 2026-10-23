@@ -26,11 +26,11 @@
 //!   replacements scattered across the table, exercising the
 //!   `read_literal(8)` replacement-value branch on top of the flag walk.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_vp8::coded_header::bench_parse_token_prob_update;
 use oxideav_vp8::encoder::{
-    write_no_token_prob_updates, write_token_prob_updates, BoolEncoder, COEFF_UPDATE_PROBS_FLAT,
+    BoolEncoder, COEFF_UPDATE_PROBS_FLAT, write_no_token_prob_updates, write_token_prob_updates,
 };
 use oxideav_vp8::{BoolDecoder, TokenProbUpdates};
 

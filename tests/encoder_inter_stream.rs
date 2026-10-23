@@ -160,7 +160,7 @@ fn ten_frame_inter_stream_mid_quant_meets_30db_per_frame() {
 
     // Confirm the expected K/P interleave: 0,4,8 are K; rest are P.
     for (i, e) in encoded.iter().enumerate() {
-        let expected = if i as u64 % keyframe_interval == 0 {
+        let expected = if (i as u64).is_multiple_of(keyframe_interval) {
             FrameKind::Key
         } else {
             FrameKind::InterZeroMv

@@ -26,8 +26,8 @@
 //!   scene-cut boost.
 
 use oxideav_vp8::{
-    decode_vp8, first_pass_analyze, two_pass_qindex_for_frame, two_pass_qindices, FrameComplexity,
-    I420Frame, Vp8DecoderState, Vp8TwoPassConfig, Vp8TwoPassEncoder,
+    FrameComplexity, I420Frame, Vp8DecoderState, Vp8TwoPassConfig, Vp8TwoPassEncoder, decode_vp8,
+    first_pass_analyze, two_pass_qindex_for_frame, two_pass_qindices,
 };
 
 /// Build a 32×32 solid-grey Yuv420P frame.  Lowest complexity test

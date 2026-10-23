@@ -26,10 +26,10 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 use oxideav_vp8::{
+    EncodeError, I420Frame, InterCodingOptions, InterSegmentationConfig, KeyframeParams,
+    KeyframePlanes, RefreshControls, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader,
     encode_keyframe_with_reconstruction, encode_p_frame_multi_ref_adaptive_quant,
-    encode_p_frame_multi_ref_with_refresh, EncodeError, I420Frame, InterCodingOptions,
-    InterSegmentationConfig, KeyframeParams, KeyframePlanes, RefreshControls, Vp8CodedHeader,
-    Vp8DecoderState, Vp8FrameHeader,
+    encode_p_frame_multi_ref_with_refresh,
 };
 
 const W: usize = 96;
@@ -49,7 +49,7 @@ fn source(dx: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
                 (80 + (cc / 2) % 100) as u8
             } else {
                 let t = ((r * 13 + cc * 7) % 61) as i32 * 3 - 90;
-                let e = if (cc / 4) % 2 == 0 { 50 } else { -50 };
+                let e = if (cc / 4).is_multiple_of(2) { 50 } else { -50 };
                 (128 + t / 2 + e).clamp(0, 255) as u8
             };
             y[r * W + c] = v;

@@ -29,9 +29,9 @@
 //! Inputs are synthesised in-bench (no committed fixtures) from a
 //! deterministic LCG so successive runs measure the identical work.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_vp8::{build_arnr_altref, ArnrConfig, I420Frame};
+use oxideav_vp8::{ArnrConfig, I420Frame, build_arnr_altref};
 
 const WIDTH: usize = 128;
 const HEIGHT: usize = 128;

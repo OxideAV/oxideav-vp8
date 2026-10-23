@@ -10,16 +10,16 @@
 //! is exercised (a whole-pel vector would short-circuit to the
 //! `fetch_block_whole_pixel` copy path).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
+use oxideav_vp8::ReconstructedMb;
 use oxideav_vp8::motion_comp::{
-    fetch_block_whole_pixel, fetch_chroma_mb_halo, fetch_chroma_mb_whole_pixel, fetch_luma_mb_halo,
-    fetch_luma_mb_whole_pixel, filter_block_4x4, filter_block_4x4_into, filter_set_for_version,
-    sixtap_2d, sixtap_mb_chroma, sixtap_mb_luma, split_chroma_mvs, stored_luma_mv, FilterSet,
-    ReferencePlanes,
+    FilterSet, ReferencePlanes, fetch_block_whole_pixel, fetch_chroma_mb_halo,
+    fetch_chroma_mb_whole_pixel, fetch_luma_mb_halo, fetch_luma_mb_whole_pixel, filter_block_4x4,
+    filter_block_4x4_into, filter_set_for_version, sixtap_2d, sixtap_mb_chroma, sixtap_mb_luma,
+    split_chroma_mvs, stored_luma_mv,
 };
 use oxideav_vp8::motion_vector::Mv;
-use oxideav_vp8::ReconstructedMb;
 
 /// Build a 64×64 8-bit luma plane with a deterministic gradient
 /// pattern. The plane is bigger than the MB so the §20.14 edge-replication

@@ -34,11 +34,11 @@
 //!      the thin-wrapper entry-point byte-for-byte (the wrapper proof).
 
 use oxideav_vp8::{
+    I420Frame, IntraUvMode, IntraYMode, KeyframeParams, LoopFilterDeltas, MacroblockModes,
+    MbCoeffs, RefreshControls, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader,
     count_inter_frame_branches, empty_branch_counts, encode_keyframe_with_reconstruction,
     encode_p_frame_multi_ref, encode_p_frame_multi_ref_with_fitted_token_prob_updates,
-    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates, I420Frame,
-    IntraUvMode, IntraYMode, KeyframeParams, LoopFilterDeltas, MacroblockModes, MbCoeffs,
-    RefreshControls, Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_fitted_token_prob_updates,
 };
 
 /// Build a 32×32 I420 picture with a smooth gradient — repeatable,

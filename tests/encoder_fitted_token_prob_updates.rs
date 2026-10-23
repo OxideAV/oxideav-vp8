@@ -38,9 +38,9 @@
 //!      slot-for-slot.
 
 use oxideav_vp8::{
-    count_keyframe_branches, decode_vp8, empty_branch_counts, encode_keyframe,
-    encode_keyframe_with_fitted_token_prob_updates, fit_token_prob_updates, I420Frame,
-    KeyframeParams, Vp8CodedHeader, Vp8FrameHeader,
+    I420Frame, KeyframeParams, Vp8CodedHeader, Vp8FrameHeader, count_keyframe_branches, decode_vp8,
+    empty_branch_counts, encode_keyframe, encode_keyframe_with_fitted_token_prob_updates,
+    fit_token_prob_updates,
 };
 
 /// Synthetic 32×32 I420 picture with a deliberately non-flat luma so
@@ -380,9 +380,9 @@ fn fit_token_prob_updates_emits_at_high_bias_slots() {
 #[test]
 fn fitted_keyframe_reverts_carried_probs_so_fitted_p_frame_stays_lockstep() {
     use oxideav_vp8::{
-        encode_keyframe_with_reconstruction,
+        Vp8DecoderState, encode_keyframe_with_reconstruction,
         encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
-        encode_p_frame_multi_ref_with_fitted_token_prob_updates, Vp8DecoderState,
+        encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     };
 
     let (w, h) = (64usize, 64usize);

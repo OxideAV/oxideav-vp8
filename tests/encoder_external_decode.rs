@@ -21,7 +21,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use oxideav_vp8::{encode_silent_keyframe, SilentKeyframeParams};
+use oxideav_vp8::{SilentKeyframeParams, encode_silent_keyframe};
 
 /// Build a single-frame IVF container around `vp8_frame`. IVF is the
 /// standard raw-VP8 wrapper: 32-byte DKIF header + per-frame (4-byte

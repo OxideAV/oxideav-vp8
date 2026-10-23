@@ -218,9 +218,9 @@ fn predict_tm_scalar(out: &mut [u8], n: usize, above: &[u8], left: &[u8], p: u8)
 #[cfg(feature = "simd")]
 #[inline]
 fn predict_tm_simd<const N: usize>(out: &mut [u8], above: &[u8], left: &[u8], p: u8) {
+    use core::simd::Simd;
     use core::simd::cmp::SimdOrd;
     use core::simd::num::{SimdInt, SimdUint};
-    use core::simd::Simd;
 
     debug_assert_eq!(out.len(), N * N);
     debug_assert_eq!(above.len(), N);
@@ -324,8 +324,8 @@ fn dc_edge_sum_scalar(edge: &[u8]) -> u32 {
 #[cfg(feature = "simd")]
 #[inline]
 fn dc_edge_sum_simd<const N: usize>(edge: &[u8]) -> u32 {
-    use core::simd::num::SimdUint;
     use core::simd::Simd;
+    use core::simd::num::SimdUint;
 
     debug_assert_eq!(edge.len(), N);
     let widened: Simd<u16, N> = Simd::<u8, N>::from_slice(edge).cast::<u16>();

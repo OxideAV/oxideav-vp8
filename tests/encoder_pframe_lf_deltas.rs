@@ -46,9 +46,9 @@
 //! own [`oxideav_vp8::Vp8DecoderState`] — no external codec consulted.
 
 use oxideav_vp8::{
-    encode_p_frame_multi_ref_with_refresh_and_lf_deltas, FrameKind, I420Frame, KeyframeParams,
-    LoopFilterDeltaSlot, LoopFilterDeltas, RefreshControls, Vp8CodedHeader, Vp8DecoderState,
-    Vp8FrameHeader, Vp8InterStreamEncoder,
+    FrameKind, I420Frame, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas, RefreshControls,
+    Vp8CodedHeader, Vp8DecoderState, Vp8FrameHeader, Vp8InterStreamEncoder,
+    encode_p_frame_multi_ref_with_refresh_and_lf_deltas,
 };
 
 fn stripe_frame(width: usize, height: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {

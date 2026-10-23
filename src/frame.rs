@@ -83,8 +83,8 @@
 use crate::intra_predict::DEFAULT_LEFT_PIXEL;
 use crate::macroblock::{IntraYMode, MacroblockModes};
 use crate::reconstruct::{
-    decode_keyframe_mb_bpred, decode_keyframe_mb_non_bpred, MbNeighbors, ReconstructError,
-    ReconstructedMb,
+    MbNeighbors, ReconstructError, ReconstructedMb, decode_keyframe_mb_bpred,
+    decode_keyframe_mb_non_bpred,
 };
 
 /// Pre-dequantized coefficient bundle for one macroblock, in the layout

@@ -38,24 +38,24 @@
 
 use crate::bool_decoder::BoolDecoder;
 use crate::coded_header::Vp8CodedHeader;
-use crate::dct_tokens::{merge_default_token_probs, CoeffProbs, MbEntropyCtx};
+use crate::dct_tokens::{CoeffProbs, MbEntropyCtx, merge_default_token_probs};
 use crate::decoder::{DecodeError, Vp8DecodedFrame};
-use crate::dequant::{decode_and_dequantize_mb, MbDequantFactors};
-use crate::frame::{decode_keyframe, FrameError, KeyframePlanes, MbCoeffs};
+use crate::dequant::{MbDequantFactors, decode_and_dequantize_mb};
+use crate::frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
 use crate::frame_header::Vp8FrameHeader;
-use crate::loop_filter::{filter_frame, FrameFilterConfig, MAX_MB_SEGMENTS};
+use crate::loop_filter::{FrameFilterConfig, MAX_MB_SEGMENTS, filter_frame};
 use crate::macroblock::{
-    parse_inter_frame_intra_macroblock_modes, parse_key_frame_macroblock_modes,
-    InterFrameIntraProbs, IntraYMode, MacroblockModes,
+    InterFrameIntraProbs, IntraYMode, MacroblockModes, parse_inter_frame_intra_macroblock_modes,
+    parse_key_frame_macroblock_modes,
 };
 use crate::motion_comp::{
-    filter_set_for_version, reconstruct_inter_mb, reconstruct_split_mv_mb, select_ref_frame,
-    RefFrame, ReferencePlanes,
+    RefFrame, ReferencePlanes, filter_set_for_version, reconstruct_inter_mb,
+    reconstruct_split_mv_mb, select_ref_frame,
 };
-use crate::motion_vector::{default_mv_contexts, resolve_mv_contexts, Mv, MvContexts};
+use crate::motion_vector::{Mv, MvContexts, default_mv_contexts, resolve_mv_contexts};
 use crate::near_mv::{
-    clamp_mv, decode_split_mv, find_near_mvs, mv_ref_probs, read_inter_mode, InterMbError,
-    InterMode, MbInfo, MvClampRect, ResolvedInterMode, SignBias, SplitMvResult,
+    InterMbError, InterMode, MbInfo, MvClampRect, ResolvedInterMode, SignBias, SplitMvResult,
+    clamp_mv, decode_split_mv, find_near_mvs, mv_ref_probs, read_inter_mode,
 };
 use crate::reconstruct::ReconstructedMb;
 
@@ -1168,16 +1168,16 @@ fn read_segment_id(
 fn resolve_segment_dequant_factors(coded: &Vp8CodedHeader) -> [MbDequantFactors; MAX_MB_SEGMENTS] {
     let base = MbDequantFactors::from_quant_indices(&coded.quant_indices);
     let mut out = [base; MAX_MB_SEGMENTS];
-    if coded.segmentation_enabled {
-        if let Some(seg) = coded.update_segmentation {
-            for (i, slot) in out.iter_mut().enumerate() {
-                let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
-                *slot = MbDequantFactors::for_segment(
-                    &coded.quant_indices,
-                    qval,
-                    seg.segment_feature_mode_absolute,
-                );
-            }
+    if coded.segmentation_enabled
+        && let Some(seg) = coded.update_segmentation
+    {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let qval = seg.quantizer_update[i].unwrap_or(0) as i32;
+            *slot = MbDequantFactors::for_segment(
+                &coded.quant_indices,
+                qval,
+                seg.segment_feature_mode_absolute,
+            );
         }
     }
     out

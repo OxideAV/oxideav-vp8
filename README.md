@@ -12,7 +12,11 @@ Decoder and encoder are both at production status.
   against the reference output on a multi-frame fixture corpus
   (mid-GOP golden refresh, multi-frame auto-alt-ref, ARNR).
   `Vp8DecoderState::last_frame_shown()` surfaces the §9.1 `show_frame`
-  bit so players can suppress invisible altref-update frames.
+  bit so players can suppress invisible altref-update frames; the
+  framework `Vp8Decoder` never returns them. The framework decoder
+  states its output shape through `output_params()` and announces
+  mid-stream size switches with one `Frame::StreamParams` event each
+  (see below).
 * **Encode** — full encoder with SPLITMV, GOLDEN / ALTREF,
   multi-partition output, refresh controls, loop-filter deltas, the
   §11 intra mode picker, **§13 trellis coefficient-level RDO
@@ -386,6 +390,35 @@ let enc = make_encoder_with_qindex(&params, 32)?;
 Both factories return `Box<dyn oxideav_core::Encoder>` and integrate
 with the OxideAV pipeline through `send_frame` / `receive_packet`.
 
+### Stream parameters
+
+The framework `Vp8Decoder` answers `output_params()` with the §9.1
+visible `width` / `height` of the pictures it returns, `Yuv420P`, and
+the §9.2 `color_space` as the colour signal's matrix (value 0 → the
+BT.601 matrix; §9.2 states no range, primaries or transfer, so those
+stay unspecified). Before the first picture it answers from the first
+queued key frame's headers.
+
+Only a key frame can change that description. When the first **shown**
+picture of a new size is about to come out, the decoder bumps
+`output_params_generation()` and returns one `Frame::StreamParams`
+event carrying the new `output_params()`, then the picture. No event
+for the first shape, for a key frame repeating the current one, or for
+an invisible (§9.1 `show_frame = 0`) key frame — the event waits for
+the first shown picture of the new size. `reset()` keeps the
+description of the last picture returned, so a seek into a
+different-size segment is announced the same way. The §9.1 upscale
+codes and §9.2 `clamping_type` do not change the emitted planes;
+`Vp8Decoder::upscale()` / `clamping_type()` expose them. The decoder
+runs serially and ignores `set_execution_context`.
+
+Both framework encoders accept a `Frame::StreamParams` event that
+changes the input size: the keyframe-only adapter encodes the next
+picture at the new size, and the lagged adapter closes its pending
+lookahead group at the old size and restarts with a key frame. An
+event naming a non-`Yuv420P` format, a non-video stream, or a size
+outside the §9.1 14-bit range is `Error::Unsupported`.
+
 ## Clean-room sources
 
 The implementation is derived entirely from the public format spec:
@@ -416,6 +449,15 @@ of `cargo-fuzz` panic-freedom / round-trip targets under
   (our encode → external decode, PSNR-Y ≥ 30 dB; external encode → our
   decode via `ivf::parse_header`, PSNR-Y ≥ 25 dB). Skips cleanly when
   the validator binary isn't on `$PATH`.
+* [`tests/stream_params_event.rs`](./tests/stream_params_event.rs) —
+  the `output_params()` / generation / `Frame::StreamParams` contract
+  (switches, flush drain, reset, invisible frames, the 13 staged
+  vectors byte-identical with no event, the encoders' answer to the
+  event); [`tests/blackbox_resolution_switch.rs`](./tests/blackbox_resolution_switch.rs)
+  splices black-box-encoded segments of different sizes (including a
+  two-pass auto-alt-ref leg with hidden frames) and checks every shown
+  picture byte-identical to the validator's per-segment decode with
+  exactly one change per switch.
 * The 40 `fuzz/` targets cover the public encode / decode surface plus
   the per-stage primitive layers (bool coder, token coding, transforms,
   dequant, intra prediction, motion search / sub-pixel interpolation,

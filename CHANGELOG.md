@@ -4,9 +4,46 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Stream-parameter contract on the framework `Vp8Decoder`.**
+  `output_params()` answers the §9.1 visible width / height, `Yuv420P`
+  and the §9.2 `color_space` as the colour-signal matrix (0 → BT.601;
+  range / primaries / transfer unspecified — §9.2 states none), from the
+  first queued key frame's headers before the first picture.
+  `output_params_generation()` bumps once per mid-stream change, and
+  `receive_frame` returns one `Frame::StreamParams` event (payload ==
+  `output_params()`) immediately before the first **shown** picture of
+  a new size — none for the first shape, a same-size key frame, or an
+  invisible key frame. `reset()` compares against the last picture
+  returned; the flush drain keeps old pictures → event → new pictures.
+- `Vp8Decoder::upscale()` / `clamping_type()` and
+  `Vp8DecoderState::upscale()` / `color_space()` / `clamping_type()` /
+  `max_pixels_per_frame()` expose the key-frame §9.1 / §9.2 fields.
+- Both framework encoders accept a size-changing `Frame::StreamParams`
+  event: the keyframe adapter encodes the next picture at the new size,
+  the lagged adapter closes its pending lookahead group and restarts
+  with a key frame. Non-`Yuv420P`, non-video or out-of-range events are
+  `Error::Unsupported`.
+- `tests/stream_params_event.rs` (13 tests) and
+  `tests/blackbox_resolution_switch.rs` (3 black-box `ffmpeg` splices,
+  byte-identical to the validator's per-segment decode, exactly one
+  change per switch).
+
 ### Changed
 
 - edition 2024, MSRV 1.95
+- The framework `Vp8Decoder` no longer returns §9.1 `show_frame = 0`
+  pictures (they are decoded for their reference-slot effects, then
+  skipped; `receive_frame` moves on to the next queued packet or
+  answers `NeedMore`). Callers that counted one picture per packet on
+  auto-altref streams now see only the shown ones, matching the
+  validator's frame count.
+
+### Fixed
+
+- `Vp8Decoder::reset()` dropped the `DecoderLimits::max_pixels_per_frame`
+  cap set at construction; it now survives the reset.
 
 ## [0.2.7](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.6...v0.2.7) - 2026-08-24
 

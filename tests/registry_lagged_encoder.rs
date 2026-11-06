@@ -14,7 +14,9 @@
 //!   3. **stream shape** — more packets than source frames (one
 //!      invisible anchor per completed multi-frame group);
 //!   4. **full framework loop** — every emitted packet decodes through
-//!      the registry-side [`Vp8Decoder`] in emission order;
+//!      the registry-side [`Vp8Decoder`] in emission order, which returns
+//!      a picture for each visible packet and none for the §9.1
+//!      `show_frame = 0` anchors;
 //!   5. **zero-lag mode** — `alt_ref_interval = 0` restores immediate
 //!      per-frame packet availability (K/P streaming, no anchors);
 //!   6. the zero-latency still-image doors (`make_encoder`,
@@ -153,20 +155,26 @@ fn config_path_lags_groups_and_flushes_the_tail() {
         "only the key frame sets flags.keyframe"
     );
 
-    // Full framework decode loop.
+    // Full framework decode loop. The §9.1 show_frame = 0 anchors are
+    // decoded (they install ALTREF) but return no picture, so only the
+    // six visible packets yield a frame — in source pts order.
     let mut dec = Vp8Decoder::new(CodecId::new("vp8"));
+    let mut shown_pts = Vec::new();
     for (i, p) in packets.iter().enumerate() {
         dec.send_packet(p).expect("send_packet");
-        let frame = dec
-            .receive_frame()
-            .unwrap_or_else(|e| panic!("packet {i} must decode: {e:?}"));
-        match frame {
-            Frame::Video(v) => {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => {
+                assert!(p.pts.is_some(), "packet {i}: only visible packets show");
                 assert_eq!(v.planes.len(), 3, "packet {i}: I420 output");
+                shown_pts.push(v.pts.expect("visible frame keeps its pts"));
             }
-            _ => panic!("packet {i}: video frame expected"),
+            Err(Error::NeedMore) => {
+                assert!(p.pts.is_none(), "packet {i}: only anchors are hidden");
+            }
+            other => panic!("packet {i}: unexpected {other:?}"),
         }
     }
+    assert_eq!(shown_pts, visible_pts, "decoder shows the visible packets");
 }
 
 #[test]

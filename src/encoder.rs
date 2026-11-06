@@ -10634,6 +10634,7 @@ mod factory {
             output_params,
             width,
             height,
+            stream_config,
             stream,
             time_base,
             pts_queue: VecDeque::new(),
@@ -10658,6 +10659,10 @@ mod factory {
         output_params: CodecParameters,
         width: u32,
         height: u32,
+        /// The configuration `stream` was built from — re-used to start
+        /// a fresh stream (opening with a key frame) when a
+        /// [`Frame::StreamParams`] event changes the input size.
+        stream_config: crate::stream::AltrefStreamConfig,
         stream: crate::stream::Vp8AltrefStreamEncoder,
         time_base: TimeBase,
         /// pts of pushed source frames not yet emitted as visible
@@ -10715,6 +10720,27 @@ mod factory {
             }
             let v = match frame {
                 Frame::Video(v) => v,
+                Frame::StreamParams(p) => {
+                    let (width, height) = reconfigure_target(p, self.width, self.height)?;
+                    if (width, height) != (self.width, self.height) {
+                        // Close the current lookahead group(s) at the old
+                        // size, then open a fresh stream: its first frame
+                        // is a §9.1 key frame carrying the new size.
+                        let emitted = self
+                            .stream
+                            .finish()
+                            .map_err(|e| Error::invalid(e.to_string()))?;
+                        self.enqueue(emitted);
+                        self.stream =
+                            crate::stream::Vp8AltrefStreamEncoder::new(self.stream_config)
+                                .expect("the config already built a stream");
+                        self.width = width;
+                        self.height = height;
+                        self.output_params.width = Some(width);
+                        self.output_params.height = Some(height);
+                    }
+                    return Ok(());
+                }
                 _ => return Err(Error::invalid("vp8 encoder: video frames only")),
             };
             let (y, u, vv) = packed_planes_from_video_frame(v, self.width, self.height)?;
@@ -10829,6 +10855,16 @@ mod factory {
         fn send_frame(&mut self, frame: &Frame) -> Result<()> {
             let v = match frame {
                 Frame::Video(v) => v,
+                Frame::StreamParams(p) => {
+                    // Every packet of this adapter is a key frame, so a
+                    // new size takes effect cleanly on the next frame.
+                    let (width, height) = reconfigure_target(p, self.width, self.height)?;
+                    self.width = width;
+                    self.height = height;
+                    self.output_params.width = Some(width);
+                    self.output_params.height = Some(height);
+                    return Ok(());
+                }
                 _ => return Err(Error::invalid("vp8 encoder: video frames only")),
             };
             let bytes =
@@ -10855,6 +10891,38 @@ mod factory {
             self.eof = true;
             Ok(())
         }
+    }
+
+    /// Resolve a [`Frame::StreamParams`] event into the new input size.
+    ///
+    /// VP8 re-states the frame size on every §9.1 key frame, so a size
+    /// change is accepted (the adapters re-key on it); anything the
+    /// encoder cannot follow — a non-video description, a pixel format
+    /// other than [`PixelFormat::Yuv420P`], a size outside the §9.1
+    /// 14-bit fields — is [`Error::Unsupported`]. Fields the event leaves
+    /// `None` keep their current value.
+    fn reconfigure_target(params: &CodecParameters, width: u32, height: u32) -> Result<(u32, u32)> {
+        if params.media_type != MediaType::Video {
+            return Err(Error::unsupported(
+                "vp8 encoder: stream-params event does not describe video",
+            ));
+        }
+        if params
+            .pixel_format
+            .is_some_and(|pf| pf != PixelFormat::Yuv420P)
+        {
+            return Err(Error::unsupported(
+                "vp8 encoder: cannot switch away from PixelFormat::Yuv420P mid-stream",
+            ));
+        }
+        let width = params.width.unwrap_or(width);
+        let height = params.height.unwrap_or(height);
+        if width == 0 || height == 0 || width > 0x3FFF || height > 0x3FFF {
+            return Err(Error::unsupported(
+                "vp8 encoder: stream-params size outside the §9.1 14-bit range (1..=16383)",
+            ));
+        }
+        Ok((width, height))
     }
 
     /// Pull the three I420 planes out of `frame` as tightly-packed

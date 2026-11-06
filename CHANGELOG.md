@@ -4,6 +4,18 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.7...v0.2.8) - 2026-11-06
+
+### Added
+
+- *(decoder)* output_params / generation / Frame::StreamParams contract
+
+### Other
+
+- output_params answers from an already-decoded (invisible) leading key frame
+- edition 2024, MSRV 1.95
+- README examples use the current registry API
+
 ### Added
 
 - **Stream-parameter contract on the framework `Vp8Decoder`.**

@@ -288,6 +288,23 @@ fn output_params_is_known_before_the_first_frame() {
 }
 
 #[test]
+fn a_leading_invisible_key_frame_resolves_the_first_shape_without_an_event() {
+    let b = kp_stream(B, 3, 0);
+    let mut dec = new_decoder();
+    dec.send_packet(&hide(&b[0])).unwrap();
+    assert!(matches!(dec.receive_frame(), Err(Error::NeedMore)));
+    // Nothing queued any more: the answer comes from the decoded key frame.
+    let p = dec
+        .output_params()
+        .expect("known from the decoded key frame");
+    assert_eq!((p.width, p.height), (Some(B.0), Some(B.1)));
+    let mut h = Harness::new(dec);
+    h.feed(&b[1..]);
+    assert_eq!(h.out, pics(B, 1..3));
+    assert_eq!(h.dec.output_params_generation(), 0);
+}
+
+#[test]
 fn constant_stream_emits_no_event_even_across_a_same_size_key_frame() {
     let mut packets = kp_stream(A, 4, 0);
     packets.extend(kp_stream(A, 3, 4)); // second key frame, same size

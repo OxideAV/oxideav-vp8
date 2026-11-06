@@ -697,7 +697,8 @@ mod registry {
     /// `height` (the cropped size of the emitted planes, not the
     /// macroblock-aligned one), [`PixelFormat::Yuv420P`], and the §9.2
     /// `color_space` as the colour signal's matrix. Before the first
-    /// picture it answers from the first queued key frame's headers.
+    /// picture it answers from the key frame already decoded, else from
+    /// the first queued key frame's headers.
     ///
     /// Only a key frame can change that description (§9.1 / §9.2 are
     /// key-frame-only fields). When the first **shown** picture of a new
@@ -944,11 +945,17 @@ mod registry {
         }
 
         fn output_params(&self) -> Option<CodecParameters> {
-            let shape = self.shape.or_else(|| {
-                self.pending
-                    .iter()
-                    .find_map(|p| OutputShape::peek_key_frame(&p.data))
-            })?;
+            // The last picture returned; before the first one, the key
+            // frame already decoded (an invisible one returns no picture),
+            // else the first queued key frame's headers.
+            let shape = self
+                .shape
+                .or_else(|| OutputShape::from_state(&self.state))
+                .or_else(|| {
+                    self.pending
+                        .iter()
+                        .find_map(|p| OutputShape::peek_key_frame(&p.data))
+                })?;
             Some(shape.to_params(&self.codec_id))
         }
 

@@ -10,7 +10,7 @@ All notable changes to `oxideav-vp8` are recorded here.
   `output_params()` answers the §9.1 visible width / height, `Yuv420P`
   and the §9.2 `color_space` as the colour-signal matrix (0 → BT.601;
   range / primaries / transfer unspecified — §9.2 states none), from the
-  first queued key frame's headers before the first picture.
+  already-decoded key frame, else the first queued one, before the first picture.
   `output_params_generation()` bumps once per mid-stream change, and
   `receive_frame` returns one `Frame::StreamParams` event (payload ==
   `output_params()`) immediately before the first **shown** picture of
@@ -25,7 +25,7 @@ All notable changes to `oxideav-vp8` are recorded here.
   the lagged adapter closes its pending lookahead group and restarts
   with a key frame. Non-`Yuv420P`, non-video or out-of-range events are
   `Error::Unsupported`.
-- `tests/stream_params_event.rs` (13 tests) and
+- `tests/stream_params_event.rs` (14 tests) and
   `tests/blackbox_resolution_switch.rs` (3 black-box `ffmpeg` splices,
   byte-identical to the validator's per-segment decode, exactly one
   change per switch).

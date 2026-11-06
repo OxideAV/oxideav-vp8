@@ -396,8 +396,8 @@ The framework `Vp8Decoder` answers `output_params()` with the §9.1
 visible `width` / `height` of the pictures it returns, `Yuv420P`, and
 the §9.2 `color_space` as the colour signal's matrix (value 0 → the
 BT.601 matrix; §9.2 states no range, primaries or transfer, so those
-stay unspecified). Before the first picture it answers from the first
-queued key frame's headers.
+stay unspecified). Before the first picture it answers from the key
+frame already decoded, else from the first queued key frame's headers.
 
 Only a key frame can change that description. When the first **shown**
 picture of a new size is about to come out, the decoder bumps

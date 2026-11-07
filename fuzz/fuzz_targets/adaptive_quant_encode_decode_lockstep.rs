@@ -46,7 +46,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_adaptive_quant_with_reconstruction, AdaptiveQuantConfig, I420Frame,
+    AdaptiveQuantConfig, I420Frame, decode_vp8, encode_keyframe_adaptive_quant_with_reconstruction,
 };
 use oxideav_vp8_fuzz::accept_dimensions;
 
@@ -73,23 +73,22 @@ fuzz_target!(|data: &[u8]| {
         v.clamp(-120, 120)
     };
 
-    let config = AdaptiveQuantConfig {
-        base_y_ac_qi: data[2] % 128,
-        loop_filter_level: data[3] % 64,
-        sharpness_level: data[4] % 8,
-        filter_type: (data[5] & 0x01) != 0,
-        quant_delta: [
+    let config = AdaptiveQuantConfig::default()
+        .with_base_y_ac_qi(data[2] % 128)
+        .with_loop_filter_level(data[3] % 64)
+        .with_sharpness_level(data[4] % 8)
+        .with_filter_type((data[5] & 0x01) != 0)
+        .with_quant_delta([
             clamp_delta(data[6]),
             clamp_delta(data[7]),
             clamp_delta(data[8]),
             clamp_delta(data[9]),
-        ],
-        variance_boundaries: [
+        ])
+        .with_variance_boundaries([
             u32::from(data[10]) * 32,
             u32::from(data[11]) * 32,
             u32::from(data[12]) * 32,
-        ],
-    };
+        ]);
 
     // I420 plane payload, tiled from the input tail (tight strides).
     let w = width as usize;

@@ -446,11 +446,10 @@ fn standalone_two_pass_empty_input_is_quiet() {
 #[test]
 fn standalone_two_pass_single_frame_schedule() {
     let config = Vp8TwoPassConfig::default();
-    let fc = FrameComplexity {
-        frame_index: 0,
-        bits_per_mb: 100.0,
-        scene_cut: false,
-    };
+    let fc = FrameComplexity::default()
+        .with_frame_index(0)
+        .with_bits_per_mb(100.0)
+        .with_scene_cut(false);
     let schedule = two_pass_qindices(&config, &[fc]).expect("schedule");
     assert_eq!(schedule.len(), 1);
     assert!(schedule[0] <= 127);

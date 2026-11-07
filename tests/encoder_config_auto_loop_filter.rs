@@ -53,12 +53,10 @@ fn typed_encoder_auto_loop_filter_engages_and_decodes() {
     let (w, h, y, u, v) = blocky();
     let frame = I420Frame::packed(w, h, &y, &u, &v);
 
-    let cfg = Vp8EncoderConfig {
-        qindex: 110,
-        lf_level: 0,
-        auto_loop_filter: true,
-        ..Vp8EncoderConfig::default()
-    };
+    let cfg = Vp8EncoderConfig::default()
+        .with_qindex(110)
+        .with_lf_level(0)
+        .with_auto_loop_filter(true);
     let mut enc = Vp8Encoder::new(cfg);
     let bytes = enc
         .encode_keyframe(&frame)
@@ -86,12 +84,10 @@ fn typed_encoder_fixed_lf_level_reaches_wire() {
     // With auto off, the config's lf_level is written verbatim.
     let (w, h, y, u, v) = blocky();
     let frame = I420Frame::packed(w, h, &y, &u, &v);
-    let cfg = Vp8EncoderConfig {
-        qindex: 48,
-        lf_level: 24,
-        auto_loop_filter: false,
-        ..Vp8EncoderConfig::default()
-    };
+    let cfg = Vp8EncoderConfig::default()
+        .with_qindex(48)
+        .with_lf_level(24)
+        .with_auto_loop_filter(false);
     let mut enc = Vp8Encoder::new(cfg);
     let bytes = enc
         .encode_keyframe(&frame)
@@ -120,12 +116,10 @@ fn make_encoder_with_config_auto_loop_filter_flows_through() {
     params.height = Some(h);
     params.pixel_format = Some(PixelFormat::Yuv420P);
 
-    let cfg = Vp8EncoderConfig {
-        qindex: 110,
-        lf_level: 0,
-        auto_loop_filter: true,
-        ..Vp8EncoderConfig::default()
-    };
+    let cfg = Vp8EncoderConfig::default()
+        .with_qindex(110)
+        .with_lf_level(0)
+        .with_auto_loop_filter(true);
     let mut enc = make_encoder_with_config(&params, cfg).expect("build encoder");
 
     let uvw = w.div_ceil(2) as usize;

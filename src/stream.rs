@@ -83,6 +83,7 @@ use crate::state::RefFrameSlot;
 /// for *another* key frame but which most container clients treat as
 /// a stream split — we reject it here to keep the contract explicit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamEncodeError {
     /// A frame after the first was supplied with different dimensions
     /// than the first. The driver treats the dimensions as locked at
@@ -381,6 +382,7 @@ pub enum FrameKind {
 /// the bytes into a container while logging or asserting the
 /// scheduling pattern.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedStreamFrame {
     /// Raw VP8 elementary-stream bytes for this frame (one packet =
     /// one frame). Suitable for IVF muxing or for
@@ -392,6 +394,38 @@ pub struct EncodedStreamFrame {
     /// 0-based frame index inside this stream — equal to the encoder's
     /// `frame_count()` at the moment this frame was emitted minus one.
     pub frame_index: u64,
+}
+
+impl EncodedStreamFrame {
+    /// Build a `EncodedStreamFrame` from every field.
+    pub fn new(bytes: Vec<u8>, kind: FrameKind, frame_index: u64) -> Self {
+        Self {
+            bytes,
+            kind,
+            frame_index,
+        }
+    }
+
+    /// Set `bytes`.
+    #[must_use]
+    pub fn with_bytes(mut self, v: Vec<u8>) -> Self {
+        self.bytes = v;
+        self
+    }
+
+    /// Set `kind`.
+    #[must_use]
+    pub fn with_kind(mut self, v: FrameKind) -> Self {
+        self.kind = v;
+        self
+    }
+
+    /// Set `frame_index`.
+    #[must_use]
+    pub fn with_frame_index(mut self, v: u64) -> Self {
+        self.frame_index = v;
+        self
+    }
 }
 
 impl EncodedStreamFrame {
@@ -2073,6 +2107,7 @@ fn ref_slot_to_keyframe_planes(slot: &RefFrameSlot) -> KeyframePlanes {
 
 /// Configuration for [`Vp8AltrefStreamEncoder`].
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct AltrefStreamConfig {
     /// Per-frame encode parameters (§9.6 quantiser, §9.4 loop filter,
     /// §13 trellis strength, …) applied to every emitted frame.
@@ -2146,6 +2181,78 @@ pub struct AltrefStreamConfig {
     pub segmentation: Option<crate::encoder::InterSegmentationConfig>,
 }
 
+impl AltrefStreamConfig {
+    /// Set `params`.
+    #[must_use]
+    pub fn with_params(mut self, v: KeyframeParams) -> Self {
+        self.params = v;
+        self
+    }
+
+    /// Set `keyframe_interval`.
+    #[must_use]
+    pub fn with_keyframe_interval(mut self, v: u64) -> Self {
+        self.keyframe_interval = v;
+        self
+    }
+
+    /// Set `altref_window`.
+    #[must_use]
+    pub fn with_altref_window(mut self, v: usize) -> Self {
+        self.altref_window = v;
+        self
+    }
+
+    /// Set `arnr`.
+    #[must_use]
+    pub fn with_arnr(mut self, v: crate::arnr::ArnrConfig) -> Self {
+        self.arnr = v;
+        self
+    }
+
+    /// Set `golden_promotion`.
+    #[must_use]
+    pub fn with_golden_promotion(mut self, v: bool) -> Self {
+        self.golden_promotion = v;
+        self
+    }
+
+    /// Set `scene_cut_mad_threshold`.
+    #[must_use]
+    pub fn with_scene_cut_mad_threshold(mut self, v: f64) -> Self {
+        self.scene_cut_mad_threshold = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `fitted_token_prob_updates`.
+    #[must_use]
+    pub fn with_fitted_token_prob_updates(mut self, v: bool) -> Self {
+        self.fitted_token_prob_updates = v;
+        self
+    }
+
+    /// Set `intra_pick`.
+    #[must_use]
+    pub fn with_intra_pick(mut self, v: bool) -> Self {
+        self.intra_pick = v;
+        self
+    }
+
+    /// Set `segmentation`.
+    #[must_use]
+    pub fn with_segmentation(mut self, v: Option<crate::encoder::InterSegmentationConfig>) -> Self {
+        self.segmentation = v;
+        self
+    }
+}
+
 impl Default for AltrefStreamConfig {
     /// Key the first frame only, 8-frame lookahead groups, default
     /// ARNR strength, GOLDEN promotion on, scene-cut keying at MAD 40.
@@ -2167,6 +2274,7 @@ impl Default for AltrefStreamConfig {
 
 /// Classification of one packet emitted by [`Vp8AltrefStreamEncoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AltrefPacketKind {
     /// §9.1 key frame (visible; refreshes all three slots).
     Key,
@@ -2184,6 +2292,7 @@ pub enum AltrefPacketKind {
 /// lookahead group); `source_index` ties visible packets back to their
 /// source frame.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AltrefStreamPacket {
     /// Raw VP8 elementary-stream bytes (one packet = one frame; feed to
     /// [`crate::state::Vp8DecoderState::decode_frame`] in emission
@@ -2194,6 +2303,38 @@ pub struct AltrefStreamPacket {
     /// 0-based index of the source frame this packet displays, or
     /// `None` for an invisible anchor (which displays nothing).
     pub source_index: Option<u64>,
+}
+
+impl AltrefStreamPacket {
+    /// Build a `AltrefStreamPacket` from every field.
+    pub fn new(bytes: Vec<u8>, kind: AltrefPacketKind, source_index: Option<u64>) -> Self {
+        Self {
+            bytes,
+            kind,
+            source_index,
+        }
+    }
+
+    /// Set `bytes`.
+    #[must_use]
+    pub fn with_bytes(mut self, v: Vec<u8>) -> Self {
+        self.bytes = v;
+        self
+    }
+
+    /// Set `kind`.
+    #[must_use]
+    pub fn with_kind(mut self, v: AltrefPacketKind) -> Self {
+        self.kind = v;
+        self
+    }
+
+    /// Set `source_index`.
+    #[must_use]
+    pub fn with_source_index(mut self, v: Option<u64>) -> Self {
+        self.source_index = v;
+        self
+    }
 }
 
 impl AltrefStreamPacket {

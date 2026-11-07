@@ -354,7 +354,7 @@ fuzz_target!(|data: &[u8]| {
                         // consumed; the panic-freedom claim still
                         // holds.
                         Err(BoolDecoderError::EndOfStream) => break,
-                        Err(BoolDecoderError::InputTooShort) => unreachable!(),
+                        Err(_) => unreachable!(),
                     }
                 }
                 Op::Literal { value, num_bits } => match dec.read_literal(num_bits) {
@@ -365,7 +365,7 @@ fuzz_target!(|data: &[u8]| {
                         );
                     }
                     Err(BoolDecoderError::EndOfStream) => break,
-                    Err(BoolDecoderError::InputTooShort) => unreachable!(),
+                    Err(_) => unreachable!(),
                 },
                 Op::Signed { value, num_bits } => {
                     // `write_signed_literal` writes `num_bits` magnitude
@@ -380,12 +380,12 @@ fuzz_target!(|data: &[u8]| {
                     let mag = match dec.read_literal(num_bits) {
                         Ok(m) => m,
                         Err(BoolDecoderError::EndOfStream) => break,
-                        Err(BoolDecoderError::InputTooShort) => unreachable!(),
+                        Err(_) => unreachable!(),
                     };
                     let sign = match dec.read_bool(128) {
                         Ok(s) => s,
                         Err(BoolDecoderError::EndOfStream) => break,
-                        Err(BoolDecoderError::InputTooShort) => unreachable!(),
+                        Err(_) => unreachable!(),
                     };
                     let got = if sign { -(mag as i32) } else { mag as i32 };
                     assert_eq!(

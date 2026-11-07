@@ -77,19 +77,16 @@ fn encode_stream(config: AltrefStreamConfig) -> Vec<AltrefStreamPacket> {
 }
 
 fn base_config() -> AltrefStreamConfig {
-    AltrefStreamConfig {
-        params: KeyframeParams {
+    AltrefStreamConfig::default()
+        .with_params(KeyframeParams {
             y_ac_qi: 44,
             ..KeyframeParams::default()
-        },
-        keyframe_interval: 0,
-        altref_window: 4,
-        arnr: ArnrConfig::default(),
-        // Keep scene-cut detection out of the way — the drift source
+        })
+        .with_keyframe_interval(0)
+        .with_altref_window(4)
+        .with_arnr(ArnrConfig::default()) // Keep scene-cut detection out of the way — the drift source
         // is continuous.
-        scene_cut_mad_threshold: 0.0,
-        ..AltrefStreamConfig::default()
-    }
+        .with_scene_cut_mad_threshold(0.0)
 }
 
 /// Decode every packet in order, asserting the visibility mirror, and
@@ -134,12 +131,10 @@ fn luma_psnr(a: &[u8], b: &[u8]) -> f64 {
 
 #[test]
 fn fully_toggled_stream_keeps_structure_and_decodes_lockstep() {
-    let config = AltrefStreamConfig {
-        auto_loop_filter: true,
-        fitted_token_prob_updates: true,
-        intra_pick: true,
-        ..base_config()
-    };
+    let config = base_config()
+        .with_auto_loop_filter(true)
+        .with_fitted_token_prob_updates(true)
+        .with_intra_pick(true);
     let packets = encode_stream(config);
 
     // 12 frames / window 4 → 3 groups → 1 K + 3 anchors + 11 P = 15.
@@ -169,13 +164,10 @@ fn fitted_prob_updates_shrink_the_stream() {
         .iter()
         .map(|p| p.bytes.len())
         .sum();
-    let fitted: usize = encode_stream(AltrefStreamConfig {
-        fitted_token_prob_updates: true,
-        ..base_config()
-    })
-    .iter()
-    .map(|p| p.bytes.len())
-    .sum();
+    let fitted: usize = encode_stream(base_config().with_fitted_token_prob_updates(true))
+        .iter()
+        .map(|p| p.bytes.len())
+        .sum();
     eprintln!("altref stream bytes: baseline {baseline}, fitted §13.4 updates {fitted}");
     assert!(
         fitted < baseline,
@@ -188,10 +180,7 @@ fn auto_loop_filter_writes_selected_levels_onto_the_wire() {
     // params ask for level 0 (no filtering); the RD selector must still
     // be free to pick per-frame non-zero levels — proving the header
     // value is chosen, not copied.
-    let packets = encode_stream(AltrefStreamConfig {
-        auto_loop_filter: true,
-        ..base_config()
-    });
+    let packets = encode_stream(base_config().with_auto_loop_filter(true));
     let mut nonzero_levels = 0usize;
     for p in &packets {
         // §9.1 frame tag: 3 bytes (+7 more on key frames). The §9.4
@@ -225,14 +214,14 @@ fn decode_lf_level(bytes: &[u8], is_key: bool) -> u8 {
 
 #[test]
 fn encode_sequence_batch_front_door_is_decodable_and_counted() {
-    let mut enc = Vp8Encoder::new(Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 4,
-        lookahead_window: 8,
-        golden_interval: 0, // key frame 0 only
-        auto_loop_filter: true,
-        ..Vp8EncoderConfig::default()
-    });
+    let mut enc = Vp8Encoder::new(
+        Vp8EncoderConfig::default()
+            .with_qindex(44)
+            .with_alt_ref_interval(4)
+            .with_lookahead_window(8)
+            .with_golden_interval(0) // key frame 0 only
+            .with_auto_loop_filter(true),
+    );
     let sources: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..FRAMES).map(source_frame).collect();
     let frames: Vec<I420Frame<'_>> = sources
         .iter()
@@ -292,12 +281,12 @@ fn ffmpeg_cross_decodes_fully_toggled_stream_byte_exact() {
         eprintln!("ffmpeg not on PATH — skipping black-box cross-decode");
         return;
     }
-    let packets = encode_stream(AltrefStreamConfig {
-        auto_loop_filter: true,
-        fitted_token_prob_updates: true,
-        intra_pick: true,
-        ..base_config()
-    });
+    let packets = encode_stream(
+        base_config()
+            .with_auto_loop_filter(true)
+            .with_fitted_token_prob_updates(true)
+            .with_intra_pick(true),
+    );
     let ivf = wrap_stream_in_ivf(&packets);
 
     // ffmpeg decodes the whole stream; invisible frames (show_frame=0)
@@ -365,15 +354,13 @@ fn segmented_stream_keeps_structure_and_decodes_lockstep() {
     // frame (anchors + P-frames) carries the §9.3 update_segmentation()
     // block with per-segment quantisers; the whole stream still
     // decodes packet-for-packet with the correct visibility mirror.
-    let config = AltrefStreamConfig {
-        segmentation: Some(oxideav_vp8::InterSegmentationConfig {
-            quant_delta: [10, 2, -4, -10],
-            lf_delta: Some([6, 2, -2, -6]),
-            ..oxideav_vp8::InterSegmentationConfig::default()
-        }),
-        intra_pick: true,
-        ..base_config()
-    };
+    let config = base_config()
+        .with_segmentation(Some(
+            oxideav_vp8::InterSegmentationConfig::default()
+                .with_quant_delta([10, 2, -4, -10])
+                .with_lf_delta(Some([6, 2, -2, -6])),
+        ))
+        .with_intra_pick(true);
     let packets = encode_stream(config);
     assert_eq!(packets.len(), 15, "packet structure preserved");
 

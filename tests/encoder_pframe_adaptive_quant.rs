@@ -77,11 +77,9 @@ fn keyed_reference() -> (Vec<u8>, KeyframePlanes) {
 }
 
 fn seg_config(lf: Option<[i8; 4]>) -> InterSegmentationConfig {
-    InterSegmentationConfig {
-        quant_delta: [10, 2, -4, -10],
-        lf_delta: lf,
-        ..InterSegmentationConfig::default()
-    }
+    InterSegmentationConfig::default()
+        .with_quant_delta([10, 2, -4, -10])
+        .with_lf_delta(lf)
 }
 
 /// Parse the coded header of an inter frame.
@@ -210,15 +208,11 @@ fn segmentation_composes_with_all_coding_options() {
     let (kf_bytes, kf) = keyed_reference();
     let (y, u, v) = source(3);
     let frame = I420Frame::packed(W as u32, H as u32, &y, &u, &v);
-    let options = InterCodingOptions {
-        intra_pick: true,
-        auto_loop_filter: true,
-        fitted_token_prob_updates: true,
-    };
-    let no_fit = InterCodingOptions {
-        fitted_token_prob_updates: false,
-        ..options
-    };
+    let options = InterCodingOptions::default()
+        .with_intra_pick(true)
+        .with_auto_loop_filter(true)
+        .with_fitted_token_prob_updates(true);
+    let no_fit = options.with_fitted_token_prob_updates(false);
 
     let (baseline, _) = encode_p_frame_multi_ref_adaptive_quant(
         &frame,

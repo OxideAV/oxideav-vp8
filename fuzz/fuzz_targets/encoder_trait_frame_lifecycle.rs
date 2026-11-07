@@ -47,10 +47,10 @@ use oxideav_core::frame::VideoPlane;
 use oxideav_core::{
     CodecId, CodecParameters, Encoder, Error, Frame, MediaType, PixelFormat, VideoFrame,
 };
-use oxideav_vp8::encoder::{make_encoder_with_config, Vp8EncoderConfig};
+use oxideav_vp8::encoder::{Vp8EncoderConfig, make_encoder_with_config};
 use oxideav_vp8::{
-    make_encoder, make_encoder_with_qindex, make_encoder_with_quality, LoopFilterMode,
-    TrellisStrength, Vp8DecoderState,
+    LoopFilterMode, TrellisStrength, Vp8DecoderState, make_encoder, make_encoder_with_qindex,
+    make_encoder_with_quality,
 };
 
 const MAX_INPUT_BYTES: usize = 4 * 1024;
@@ -161,25 +161,24 @@ fuzz_target!(|data: &[u8]| {
     let factory_pick = data[2] % 4;
     let qindex_raw = data[3];
     let quality_raw = f32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let config = Vp8EncoderConfig {
-        qindex: data[8] % 128,
-        lf_level: data[9] % 64,
-        lf_mode: match data[10] % 3 {
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(data[8] % 128)
+        .with_lf_level(data[9] % 64)
+        .with_lf_mode(match data[10] % 3 {
             0 => LoopFilterMode::Auto,
             1 => LoopFilterMode::Normal,
             _ => LoopFilterMode::Simple,
-        },
-        golden_interval: u32::from(data[11] % 8),
-        alt_ref_interval: u32::from(data[12] % 5),
-        lookahead_window: u32::from(data[13] % 5),
-        target_bitrate_bps: u32::from(data[14]) * 1024,
-        auto_loop_filter: (data[15] & 0x01) != 0,
-        trellis_strength: if (data[15] & 0x02) != 0 {
+        })
+        .with_golden_interval(u32::from(data[11] % 8))
+        .with_alt_ref_interval(u32::from(data[12] % 5))
+        .with_lookahead_window(u32::from(data[13] % 5))
+        .with_target_bitrate_bps(u32::from(data[14]) * 1024)
+        .with_auto_loop_filter((data[15] & 0x01) != 0)
+        .with_trellis_strength(if (data[15] & 0x02) != 0 {
             TrellisStrength::OFF
         } else {
             TrellisStrength::DEFAULT
-        },
-    };
+        });
     let payload = &data[HEADER_BYTES..];
 
     // ---- Hostile-parameter factory leg (no allocation, no encode) ----

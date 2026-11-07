@@ -196,6 +196,7 @@ impl Default for ReconstructedMb {
 
 /// Errors surfaced by the reconstruction orchestrator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReconstructError {
     /// [`decode_keyframe_mb_non_bpred`] was called with
     /// `y_mode == IntraYMode::B`. The 16×16 orchestrator handles only

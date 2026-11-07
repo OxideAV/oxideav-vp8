@@ -228,6 +228,7 @@ pub struct MacroblockModes {
 
 /// Errors surfaced by [`parse_key_frame_macroblock_modes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MacroblockError {
     /// The bool decoder ran out of input partway through decoding
     /// the macroblock layer. Wraps the underlying [`BoolDecoderError`].

@@ -25,6 +25,7 @@ use core::fmt;
 
 /// Out-of-band conditions surfaced by [`BoolDecoder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BoolDecoderError {
     /// Initialisation requested but fewer than two bytes of input are
     /// available. The decoder reads two bytes into `value` during

@@ -72,30 +72,24 @@ fuzz_target!(|data: &[u8]| {
         ..KeyframeParams::default()
     };
     let altref_window = usize::from(data[4] % 6);
-    let config = AltrefStreamConfig {
-        params,
-        keyframe_interval: u64::from(data[5] & 0x07),
-        altref_window,
-        arnr: ArnrConfig::new(data[6] & 0x0f),
-        golden_promotion: (data[7] & 0x01) != 0,
-        // High nibble of the strength byte drives the scene-cut
+    let config = AltrefStreamConfig::default()
+        .with_params(params)
+        .with_keyframe_interval(u64::from(data[5] & 0x07))
+        .with_altref_window(altref_window)
+        .with_arnr(ArnrConfig::new(data[6] & 0x0f))
+        .with_golden_promotion((data[7] & 0x01) != 0) // High nibble of the strength byte drives the scene-cut
         // threshold (0 disables; up to MAD 120 — fuzz fills routinely
         // jump whole flat levels, so cuts really fire).
-        scene_cut_mad_threshold: f64::from(data[6] >> 4) * 8.0,
-        // Round-387 per-frame feature toggles — all eight combinations
+        .with_scene_cut_mad_threshold(f64::from(data[6] >> 4) * 8.0) // Round-387 per-frame feature toggles — all eight combinations
         // must hold the same decode oracle.
-        auto_loop_filter: (data[5] & 0x10) != 0,
-        fitted_token_prob_updates: (data[5] & 0x20) != 0,
-        intra_pick: (data[5] & 0x40) != 0,
-        segmentation: if (data[5] & 0x80) != 0 {
-            Some(InterSegmentationConfig {
-                lf_delta: Some([4, 1, -1, -4]),
-                ..InterSegmentationConfig::default()
-            })
+        .with_auto_loop_filter((data[5] & 0x10) != 0)
+        .with_fitted_token_prob_updates((data[5] & 0x20) != 0)
+        .with_intra_pick((data[5] & 0x40) != 0)
+        .with_segmentation(if (data[5] & 0x80) != 0 {
+            Some(InterSegmentationConfig::default().with_lf_delta(Some([4, 1, -1, -4])))
         } else {
             None
-        },
-    };
+        });
 
     let mut enc = match Vp8AltrefStreamEncoder::new(config) {
         Some(e) => {

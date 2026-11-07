@@ -34,6 +34,7 @@ use core::fmt;
 
 /// Errors surfaced by [`Vp8FrameHeader::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameHeaderError {
     /// The input is shorter than 3 bytes (interframe) or 10 bytes
     /// (key frame) and so the uncompressed chunk cannot be read.
@@ -145,6 +146,7 @@ impl ScaleCode {
 /// `header_size` accounting for the start code + size words) shrink
 /// to "frame tag only" — three bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Vp8FrameHeader {
     /// `true` when this frame is a key frame (the §9.1 `frame_type`
     /// bit reads 0). On interframes this is `false`.
@@ -179,6 +181,115 @@ pub struct Vp8FrameHeader {
     /// amount to land at the start of the first (control)
     /// partition.
     pub header_bytes_consumed: usize,
+}
+
+impl Vp8FrameHeader {
+    /// Build a `Vp8FrameHeader` from every field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        key_frame: bool,
+        version: u8,
+        reconstruction_filter: ReconstructionFilter,
+        loop_filter_policy: LoopFilterPolicy,
+        show_frame: bool,
+        first_partition_size: u32,
+        width: Option<u16>,
+        height: Option<u16>,
+        horizontal_scale: Option<ScaleCode>,
+        vertical_scale: Option<ScaleCode>,
+        header_bytes_consumed: usize,
+    ) -> Self {
+        Self {
+            key_frame,
+            version,
+            reconstruction_filter,
+            loop_filter_policy,
+            show_frame,
+            first_partition_size,
+            width,
+            height,
+            horizontal_scale,
+            vertical_scale,
+            header_bytes_consumed,
+        }
+    }
+
+    /// Set `key_frame`.
+    #[must_use]
+    pub fn with_key_frame(mut self, v: bool) -> Self {
+        self.key_frame = v;
+        self
+    }
+
+    /// Set `version`.
+    #[must_use]
+    pub fn with_version(mut self, v: u8) -> Self {
+        self.version = v;
+        self
+    }
+
+    /// Set `reconstruction_filter`.
+    #[must_use]
+    pub fn with_reconstruction_filter(mut self, v: ReconstructionFilter) -> Self {
+        self.reconstruction_filter = v;
+        self
+    }
+
+    /// Set `loop_filter_policy`.
+    #[must_use]
+    pub fn with_loop_filter_policy(mut self, v: LoopFilterPolicy) -> Self {
+        self.loop_filter_policy = v;
+        self
+    }
+
+    /// Set `show_frame`.
+    #[must_use]
+    pub fn with_show_frame(mut self, v: bool) -> Self {
+        self.show_frame = v;
+        self
+    }
+
+    /// Set `first_partition_size`.
+    #[must_use]
+    pub fn with_first_partition_size(mut self, v: u32) -> Self {
+        self.first_partition_size = v;
+        self
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: Option<u16>) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: Option<u16>) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `horizontal_scale`.
+    #[must_use]
+    pub fn with_horizontal_scale(mut self, v: Option<ScaleCode>) -> Self {
+        self.horizontal_scale = v;
+        self
+    }
+
+    /// Set `vertical_scale`.
+    #[must_use]
+    pub fn with_vertical_scale(mut self, v: Option<ScaleCode>) -> Self {
+        self.vertical_scale = v;
+        self
+    }
+
+    /// Set `header_bytes_consumed`.
+    #[must_use]
+    pub fn with_header_bytes_consumed(mut self, v: usize) -> Self {
+        self.header_bytes_consumed = v;
+        self
+    }
 }
 
 impl Vp8FrameHeader {

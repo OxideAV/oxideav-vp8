@@ -180,34 +180,28 @@ fn adaptive_quant_pixel_lockstep_partial_mbs() {
 #[test]
 fn adaptive_quant_pixel_lockstep_with_loop_filter() {
     // §15.3 normal filter over the per-segment reconstruction.
-    let config = AdaptiveQuantConfig {
-        loop_filter_level: 24,
-        sharpness_level: 1,
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default()
+        .with_loop_filter_level(24)
+        .with_sharpness_level(1);
     assert_pixel_lockstep(64, 48, &config);
 }
 
 #[test]
 fn adaptive_quant_pixel_lockstep_simple_filter() {
     // §15.2 simple filter arm.
-    let config = AdaptiveQuantConfig {
-        loop_filter_level: 40,
-        sharpness_level: 3,
-        filter_type: true,
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default()
+        .with_loop_filter_level(40)
+        .with_sharpness_level(3)
+        .with_filter_type(true);
     assert_pixel_lockstep(48, 48, &config);
 }
 
 #[test]
 fn adaptive_quant_pixel_lockstep_absolute_style_deltas() {
     // A steeper quant gradient and a different base, still in delta mode.
-    let config = AdaptiveQuantConfig {
-        base_y_ac_qi: 48,
-        quant_delta: [20, 4, -10, -24],
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default()
+        .with_base_y_ac_qi(48)
+        .with_quant_delta([20, 4, -10, -24]);
     assert_pixel_lockstep(80, 64, &config);
 }
 
@@ -217,11 +211,9 @@ fn adaptive_quant_pixel_lockstep_uniform_deltas_equivalent_to_flat() {
     // segmentation block + per-MB ids are still emitted (and decoded), so
     // this proves the segment plumbing is a no-op on the pixels when the
     // features are uniform.
-    let config = AdaptiveQuantConfig {
-        base_y_ac_qi: 32,
-        quant_delta: [0, 0, 0, 0],
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default()
+        .with_base_y_ac_qi(32)
+        .with_quant_delta([0, 0, 0, 0]);
     assert_pixel_lockstep(64, 64, &config);
 }
 
@@ -248,10 +240,7 @@ fn adaptive_quant_gradient_differs_from_uniform() {
     // still self-decode (the lockstep tests above prove correctness); here
     // we only assert the segmentation is *doing something*.
     let src = Source::new(64, 64);
-    let uniform = AdaptiveQuantConfig {
-        quant_delta: [0, 0, 0, 0],
-        ..AdaptiveQuantConfig::default()
-    };
+    let uniform = AdaptiveQuantConfig::default().with_quant_delta([0, 0, 0, 0]);
     let gradient = AdaptiveQuantConfig::default(); // deltas [8, 0, -6, -12]
     let a = encode_keyframe_adaptive_quant(&src.frame(), &uniform).expect("uniform encode");
     let b = encode_keyframe_adaptive_quant(&src.frame(), &gradient).expect("gradient encode");
@@ -268,10 +257,7 @@ fn adaptive_quant_trellis_strength_trims_bytes_and_round_trips() {
     // frame versus OFF / DEFAULT, the DEFAULT entry matches the historical
     // bytes, and every strength still decodes.
     let src = Source::new(64, 64);
-    let config = AdaptiveQuantConfig {
-        base_y_ac_qi: 56,
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default().with_base_y_ac_qi(56);
 
     let off =
         encode_keyframe_adaptive_quant_with_trellis(&src.frame(), &config, TrellisStrength::OFF)
@@ -322,19 +308,13 @@ fn adaptive_quant_trellis_strength_trims_bytes_and_round_trips() {
 #[test]
 fn adaptive_quant_rejects_out_of_range_base_qindex() {
     let src = Source::new(32, 32);
-    let config = AdaptiveQuantConfig {
-        base_y_ac_qi: 200,
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default().with_base_y_ac_qi(200);
     assert!(encode_keyframe_adaptive_quant(&src.frame(), &config).is_err());
 }
 
 #[test]
 fn adaptive_quant_rejects_out_of_range_loop_filter_level() {
     let src = Source::new(32, 32);
-    let config = AdaptiveQuantConfig {
-        loop_filter_level: 64,
-        ..AdaptiveQuantConfig::default()
-    };
+    let config = AdaptiveQuantConfig::default().with_loop_filter_level(64);
     assert!(encode_keyframe_adaptive_quant(&src.frame(), &config).is_err());
 }

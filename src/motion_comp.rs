@@ -147,6 +147,7 @@ pub struct ReferencePlanes<'a> {
 
 /// Errors surfaced by the motion-compensation layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MotionCompError {
     /// The §18.1-adjusted motion vector has a non-zero fractional part,
     /// so §18.3 sub-pixel interpolation is required. Returned only by the

@@ -535,6 +535,7 @@ pub use stream::{
 /// [`decoder::DecodeError`]; this type now only backs the encoder stub,
 /// which is still scaffolded pending the §13 / §14 encode round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The requested operation is not wired up yet (currently: the
     /// encoder). The decode path is implemented for key frames — see

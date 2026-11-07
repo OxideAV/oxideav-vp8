@@ -59,6 +59,7 @@ use crate::macroblock::{
 
 /// Errors surfaced by [`decode_vp8`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// The §9.1 uncompressed header could not be parsed.
     FrameHeader(FrameHeaderError),
@@ -237,7 +238,7 @@ impl From<crate::near_mv::InterMbError> for DecodeError {
 /// (`uv_width = (width + 1) / 2`, `uv_height = (height + 1) / 2`). Decode
 /// pads internally to whole macroblocks; the §15 loop filter runs against
 /// that padded buffer, then this output is cropped to the visible area.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Vp8DecodedFrame {
     /// Visible width in luma pixels (the §9.1 key-frame `width`).
     pub width: u32,
@@ -249,6 +250,43 @@ pub struct Vp8DecodedFrame {
     pub u: Vec<u8>,
     /// V chroma plane — same dimensions as `u`.
     pub v: Vec<u8>,
+}
+
+impl Vp8DecodedFrame {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: Vec<u8>) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: Vec<u8>) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: Vec<u8>) -> Self {
+        self.v = v;
+        self
+    }
 }
 
 /// Decode one VP8 frame end-to-end and emit the reconstructed I420 picture.

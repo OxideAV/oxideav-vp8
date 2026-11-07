@@ -52,9 +52,10 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe_adaptive_quant_with_segment_lf_deltas,
+    AdaptiveQuantConfig, I420Frame, decode_vp8,
+    encode_keyframe_adaptive_quant_with_segment_lf_deltas,
     encode_keyframe_adaptive_quant_with_segment_lf_deltas_and_trellis, quality_to_qindex,
-    quality_to_trellis_strength, AdaptiveQuantConfig, I420Frame,
+    quality_to_trellis_strength,
 };
 use oxideav_vp8_fuzz::accept_dimensions;
 
@@ -86,23 +87,22 @@ fuzz_target!(|data: &[u8]| {
     let clamp_quant_delta = |b: u8| -> i8 { (b as i8).clamp(-120, 120) };
     let clamp_lf_delta = |b: u8| -> i8 { (b as i8).clamp(-63, 63) };
 
-    let config = AdaptiveQuantConfig {
-        base_y_ac_qi,
-        loop_filter_level: data[3] % 64,
-        sharpness_level: data[4] % 8,
-        filter_type: (data[5] & 0x01) != 0,
-        quant_delta: [
+    let config = AdaptiveQuantConfig::default()
+        .with_base_y_ac_qi(base_y_ac_qi)
+        .with_loop_filter_level(data[3] % 64)
+        .with_sharpness_level(data[4] % 8)
+        .with_filter_type((data[5] & 0x01) != 0)
+        .with_quant_delta([
             clamp_quant_delta(data[6]),
             clamp_quant_delta(data[7]),
             clamp_quant_delta(data[8]),
             clamp_quant_delta(data[9]),
-        ],
-        variance_boundaries: [
+        ])
+        .with_variance_boundaries([
             u32::from(data[14]) * 32,
             u32::from(data[15]) * 32,
             u32::from(data[16]) * 32,
-        ],
-    };
+        ]);
 
     let lf_deltas = [
         clamp_lf_delta(data[10]),

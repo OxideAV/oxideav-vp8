@@ -101,13 +101,11 @@ fn lagged_altref_stream_structure_decode_and_payoff() {
         y_ac_qi: 44,
         ..KeyframeParams::default()
     };
-    let config = AltrefStreamConfig {
-        params,
-        keyframe_interval: 0, // key only frame 0
-        altref_window: 4,
-        arnr: ArnrConfig::default(),
-        ..AltrefStreamConfig::default()
-    };
+    let config = AltrefStreamConfig::default()
+        .with_params(params)
+        .with_keyframe_interval(0) // key only frame 0
+        .with_altref_window(4)
+        .with_arnr(ArnrConfig::default());
 
     // ---- Drive the lagged encoder -----------------------------------
     let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
@@ -213,13 +211,11 @@ fn keyframe_cadence_closes_groups_early() {
     // keyframe_interval = 5 with window 4: frame 5 must open with a key
     // frame even though it lands mid-group-rhythm, and frame 10 again.
     let params = KeyframeParams::default();
-    let config = AltrefStreamConfig {
-        params,
-        keyframe_interval: 5,
-        altref_window: 4,
-        arnr: ArnrConfig::default(),
-        ..AltrefStreamConfig::default()
-    };
+    let config = AltrefStreamConfig::default()
+        .with_params(params)
+        .with_keyframe_interval(5)
+        .with_altref_window(4)
+        .with_arnr(ArnrConfig::default());
     let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
     let mut packets = Vec::new();
     for t in 0..11usize {
@@ -254,10 +250,7 @@ fn keyframe_cadence_closes_groups_early() {
 
 #[test]
 fn zero_window_is_rejected_and_dimension_lock_holds() {
-    let config = AltrefStreamConfig {
-        altref_window: 0,
-        ..AltrefStreamConfig::default()
-    };
+    let config = AltrefStreamConfig::default().with_altref_window(0);
     assert!(Vp8AltrefStreamEncoder::new(config).is_none());
 
     let mut enc = Vp8AltrefStreamEncoder::new(AltrefStreamConfig::default()).expect("default ok");
@@ -289,14 +282,12 @@ fn golden_promotion_installs_the_anchor_into_golden() {
         ..KeyframeParams::default()
     };
     for promotion in [true, false] {
-        let config = AltrefStreamConfig {
-            params,
-            keyframe_interval: 0,
-            altref_window: 4,
-            arnr: ArnrConfig::default(),
-            golden_promotion: promotion,
-            ..AltrefStreamConfig::default()
-        };
+        let config = AltrefStreamConfig::default()
+            .with_params(params)
+            .with_keyframe_interval(0)
+            .with_altref_window(4)
+            .with_arnr(ArnrConfig::default())
+            .with_golden_promotion(promotion);
         let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
         let mut packets = Vec::new();
         for t in 0..8usize {
@@ -380,14 +371,12 @@ fn scene_cut_closes_the_group_and_keys() {
         ..KeyframeParams::default()
     };
     for detect in [true, false] {
-        let config = AltrefStreamConfig {
-            params,
-            keyframe_interval: 0,
-            altref_window: 4,
-            arnr: ArnrConfig::default(),
-            scene_cut_mad_threshold: if detect { 40.0 } else { 0.0 },
-            ..AltrefStreamConfig::default()
-        };
+        let config = AltrefStreamConfig::default()
+            .with_params(params)
+            .with_keyframe_interval(0)
+            .with_altref_window(4)
+            .with_arnr(ArnrConfig::default())
+            .with_scene_cut_mad_threshold(if detect { 40.0 } else { 0.0 });
         let mut enc = Vp8AltrefStreamEncoder::new(config).expect("window > 0");
         let mut packets = Vec::new();
         for t in 0..10usize {
@@ -438,13 +427,12 @@ fn vp8_encoder_encode_sequence_honours_the_config_knobs() {
     use oxideav_vp8::encoder::{Vp8Encoder, Vp8EncoderConfig};
 
     let sources: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = (0..10).map(noisy_frame).collect();
-    let config = Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 5,
-        lookahead_window: 16,
-        golden_interval: 0, // key only frame 0 on this path
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(44)
+        .with_alt_ref_interval(5)
+        .with_lookahead_window(16)
+        .with_golden_interval(0) // key only frame 0 on this path
+    ;
     let mut enc = Vp8Encoder::new(config);
     let frames: Vec<I420Frame<'_>> = sources
         .iter()
@@ -489,12 +477,12 @@ fn vp8_encoder_encode_sequence_honours_the_config_knobs() {
 
     // alt_ref_interval = 0 → plain streaming: exactly one packet per
     // source frame, no anchors.
-    let mut plain = Vp8Encoder::new(Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 0,
-        golden_interval: 0,
-        ..Vp8EncoderConfig::default()
-    });
+    let mut plain = Vp8Encoder::new(
+        Vp8EncoderConfig::default()
+            .with_qindex(44)
+            .with_alt_ref_interval(0)
+            .with_golden_interval(0),
+    );
     let plain_packets = plain.encode_sequence(&frames).expect("plain encodes");
     assert_eq!(plain_packets.len(), 10);
     assert!(

@@ -53,7 +53,7 @@ use oxideav_vp8::bool_decoder::BoolDecoder;
 use oxideav_vp8::coded_header::{
     MbLfAdjustments, QuantIndices, UpdateSegmentation, Vp8CodedHeader,
 };
-use oxideav_vp8::macroblock::{parse_key_frame_macroblock_modes, IntraYMode};
+use oxideav_vp8::macroblock::{IntraYMode, parse_key_frame_macroblock_modes};
 
 /// Cap on the macroblock grid. 64 MBs (e.g. 8×8 or 1×64) keeps the
 /// returned `Vec<MacroblockModes>` tiny while still forcing multi-row /
@@ -148,48 +148,47 @@ fuzz_target!(|data: &[u8]| {
 
     // A key-frame coded header: only the fields the §11 mode walk reads
     // are attacker-shaped; the rest take inert key-frame values.
-    let header = Vp8CodedHeader {
-        color_space: Some(false),
-        clamping_type: Some(false),
-        segmentation_enabled,
-        update_segmentation,
-        filter_type: false,
-        loop_filter_level: 0,
-        sharpness_level: 0,
-        mb_lf_adjustments: MbLfAdjustments {
+    let header = Vp8CodedHeader::default()
+        .with_color_space(Some(false))
+        .with_clamping_type(Some(false))
+        .with_segmentation_enabled(segmentation_enabled)
+        .with_update_segmentation(update_segmentation)
+        .with_filter_type(false)
+        .with_loop_filter_level(0)
+        .with_sharpness_level(0)
+        .with_mb_lf_adjustments(MbLfAdjustments {
             loop_filter_adj_enable: false,
             mode_ref_lf_delta_update: false,
             ref_frame_delta_update: [None; 4],
             mb_mode_delta_update: [None; 4],
-        },
-        log2_nbr_of_dct_partitions: 0,
-        nbr_of_dct_partitions: 1,
-        quant_indices: QuantIndices {
+        })
+        .with_log2_nbr_of_dct_partitions(0)
+        .with_nbr_of_dct_partitions(1)
+        .with_quant_indices(QuantIndices {
             y_ac_qi: 0,
             y_dc_delta: None,
             y2_dc_delta: None,
             y2_ac_delta: None,
             uv_dc_delta: None,
             uv_ac_delta: None,
-        },
-        refresh_entropy_probs: false,
-        refresh_golden_frame: None,
-        refresh_alternate_frame: None,
-        copy_buffer_to_golden: None,
-        copy_buffer_to_alternate: None,
-        sign_bias_golden: None,
-        sign_bias_alternate: None,
-        refresh_last: None,
-        token_prob_updates: [[[[None; 11]; 3]; 8]; 4],
-        mb_no_skip_coeff,
-        prob_skip_false,
-        prob_intra: None,
-        prob_last: None,
-        prob_gf: None,
-        intra_y_mode_prob_update: None,
-        intra_uv_mode_prob_update: None,
-        mv_prob_update: None,
-    };
+        })
+        .with_refresh_entropy_probs(false)
+        .with_refresh_golden_frame(None)
+        .with_refresh_alternate_frame(None)
+        .with_copy_buffer_to_golden(None)
+        .with_copy_buffer_to_alternate(None)
+        .with_sign_bias_golden(None)
+        .with_sign_bias_alternate(None)
+        .with_refresh_last(None)
+        .with_token_prob_updates([[[[None; 11]; 3]; 8]; 4])
+        .with_mb_no_skip_coeff(mb_no_skip_coeff)
+        .with_prob_skip_false(prob_skip_false)
+        .with_prob_intra(None)
+        .with_prob_last(None)
+        .with_prob_gf(None)
+        .with_intra_y_mode_prob_update(None)
+        .with_intra_uv_mode_prob_update(None)
+        .with_mv_prob_update(None);
 
     // The §11 mode partition: the remaining attacker bytes. Use the
     // short-input-tolerant initialiser so a truncated / empty partition

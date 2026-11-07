@@ -139,6 +139,7 @@ pub struct KeyframePlanes {
 
 /// Errors surfaced by [`decode_keyframe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameError {
     /// The number of supplied [`MacroblockModes`] / [`MbCoeffs`] records
     /// did not equal `mb_cols * mb_rows`. Carries `(expected, got)`.

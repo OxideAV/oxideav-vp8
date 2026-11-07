@@ -92,24 +92,23 @@ fn synthesise_mb_records() -> (Vec<MacroblockModes>, Vec<MbCoeffs>) {
 }
 
 fn config(simple: bool, key_frame: bool) -> FrameFilterConfig {
-    FrameFilterConfig {
-        simple,
-        key_frame,
-        loop_filter_level: 26,
-        sharpness_level: 0,
-        segmentation_enabled: false,
-        segment_abs: false,
-        segment_lf_level: [0; 4],
-        delta_enabled: false,
-        ref_delta_current: 0,
-        bpred_mode_delta: 0,
-        ref_delta_last: 0,
-        ref_delta_golden: 0,
-        ref_delta_altref: 0,
-        zero_mv_mode_delta: 0,
-        other_mv_mode_delta: 0,
-        split_mv_mode_delta: 0,
-    }
+    FrameFilterConfig::default()
+        .with_simple(simple)
+        .with_key_frame(key_frame)
+        .with_loop_filter_level(26)
+        .with_sharpness_level(0)
+        .with_segmentation_enabled(false)
+        .with_segment_abs(false)
+        .with_segment_lf_level([0; 4])
+        .with_delta_enabled(false)
+        .with_ref_delta_current(0)
+        .with_bpred_mode_delta(0)
+        .with_ref_delta_last(0)
+        .with_ref_delta_golden(0)
+        .with_ref_delta_altref(0)
+        .with_zero_mv_mode_delta(0)
+        .with_other_mv_mode_delta(0)
+        .with_split_mv_mode_delta(0)
 }
 
 fn bench_loop_filter_frame(c: &mut Criterion) {

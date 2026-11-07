@@ -883,6 +883,7 @@ pub fn partition_id(p: MvPartition) -> usize {
 
 /// Errors surfaced by [`decode_inter_mb`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InterMbError {
     /// The bool decoder ran out of input during mode / MV decoding.
     BoolDecoder(BoolDecoderError),

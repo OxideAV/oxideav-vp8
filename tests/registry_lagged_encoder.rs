@@ -93,13 +93,12 @@ fn drain(enc: &mut Box<dyn Encoder>) -> Vec<Packet> {
 
 #[test]
 fn config_path_lags_groups_and_flushes_the_tail() {
-    let config = Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 4,
-        lookahead_window: 8,
-        golden_interval: 0, // key only frame 0
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(44)
+        .with_alt_ref_interval(4)
+        .with_lookahead_window(8)
+        .with_golden_interval(0) // key only frame 0
+    ;
     let mut enc = make_encoder_with_config(&vp8_params(), config).expect("build");
 
     let mut packets: Vec<Packet> = Vec::new();
@@ -179,12 +178,10 @@ fn config_path_lags_groups_and_flushes_the_tail() {
 
 #[test]
 fn zero_alt_ref_interval_restores_immediate_packets() {
-    let config = Vp8EncoderConfig {
-        qindex: 44,
-        alt_ref_interval: 0, // no anchors, group size 1 — zero lag
-        golden_interval: 0,
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(44)
+        .with_alt_ref_interval(0) // no anchors, group size 1 — zero lag
+        .with_golden_interval(0);
     let mut enc = make_encoder_with_config(&vp8_params(), config).expect("build");
 
     let mut sizes = Vec::new();
@@ -215,14 +212,9 @@ fn zero_alt_ref_interval_restores_immediate_packets() {
 
 #[test]
 fn send_frame_after_flush_is_rejected() {
-    let mut enc = make_encoder_with_config(
-        &vp8_params(),
-        Vp8EncoderConfig {
-            qindex: 44,
-            ..Vp8EncoderConfig::default()
-        },
-    )
-    .expect("build");
+    let mut enc =
+        make_encoder_with_config(&vp8_params(), Vp8EncoderConfig::default().with_qindex(44))
+            .expect("build");
     enc.send_frame(&Frame::Video(video_frame(0))).expect("send");
     enc.flush().expect("flush");
     assert!(

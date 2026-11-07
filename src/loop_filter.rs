@@ -697,7 +697,8 @@ pub const MAX_MB_SEGMENTS: usize = 4;
 /// current-frame slot. The geometry pass below therefore models exactly
 /// those two contributions; the remaining inter-frame mode/reference
 /// deltas are reserved for the §16 inter-prediction round.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct FrameFilterConfig {
     /// `filter_type` — `false` selects the §15.3 normal filter, `true`
     /// the §15.2 simple filter.
@@ -751,6 +752,120 @@ pub struct FrameFilterConfig {
     /// The mode delta applied to inter MBs whose `y_mode` is `SPLITMV` —
     /// `mode_delta[3]` in §20.6.
     pub split_mv_mode_delta: i16,
+}
+
+impl FrameFilterConfig {
+    /// Set `simple`.
+    #[must_use]
+    pub fn with_simple(mut self, v: bool) -> Self {
+        self.simple = v;
+        self
+    }
+
+    /// Set `key_frame`.
+    #[must_use]
+    pub fn with_key_frame(mut self, v: bool) -> Self {
+        self.key_frame = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `segmentation_enabled`.
+    #[must_use]
+    pub fn with_segmentation_enabled(mut self, v: bool) -> Self {
+        self.segmentation_enabled = v;
+        self
+    }
+
+    /// Set `segment_abs`.
+    #[must_use]
+    pub fn with_segment_abs(mut self, v: bool) -> Self {
+        self.segment_abs = v;
+        self
+    }
+
+    /// Set `segment_lf_level`.
+    #[must_use]
+    pub fn with_segment_lf_level(mut self, v: [i16; MAX_MB_SEGMENTS]) -> Self {
+        self.segment_lf_level = v;
+        self
+    }
+
+    /// Set `delta_enabled`.
+    #[must_use]
+    pub fn with_delta_enabled(mut self, v: bool) -> Self {
+        self.delta_enabled = v;
+        self
+    }
+
+    /// Set `ref_delta_current`.
+    #[must_use]
+    pub fn with_ref_delta_current(mut self, v: i16) -> Self {
+        self.ref_delta_current = v;
+        self
+    }
+
+    /// Set `bpred_mode_delta`.
+    #[must_use]
+    pub fn with_bpred_mode_delta(mut self, v: i16) -> Self {
+        self.bpred_mode_delta = v;
+        self
+    }
+
+    /// Set `ref_delta_last`.
+    #[must_use]
+    pub fn with_ref_delta_last(mut self, v: i16) -> Self {
+        self.ref_delta_last = v;
+        self
+    }
+
+    /// Set `ref_delta_golden`.
+    #[must_use]
+    pub fn with_ref_delta_golden(mut self, v: i16) -> Self {
+        self.ref_delta_golden = v;
+        self
+    }
+
+    /// Set `ref_delta_altref`.
+    #[must_use]
+    pub fn with_ref_delta_altref(mut self, v: i16) -> Self {
+        self.ref_delta_altref = v;
+        self
+    }
+
+    /// Set `zero_mv_mode_delta`.
+    #[must_use]
+    pub fn with_zero_mv_mode_delta(mut self, v: i16) -> Self {
+        self.zero_mv_mode_delta = v;
+        self
+    }
+
+    /// Set `other_mv_mode_delta`.
+    #[must_use]
+    pub fn with_other_mv_mode_delta(mut self, v: i16) -> Self {
+        self.other_mv_mode_delta = v;
+        self
+    }
+
+    /// Set `split_mv_mode_delta`.
+    #[must_use]
+    pub fn with_split_mv_mode_delta(mut self, v: i16) -> Self {
+        self.split_mv_mode_delta = v;
+        self
+    }
 }
 
 impl FrameFilterConfig {

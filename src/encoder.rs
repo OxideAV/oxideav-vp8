@@ -65,6 +65,7 @@ use crate::frame_header::KEY_FRAME_START_CODE;
 
 /// Errors surfaced by the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// Visible width or height is zero or exceeds the 14-bit VP8 field
     /// (`width > 0x3FFF` or `height > 0x3FFF`).
@@ -1103,6 +1104,7 @@ pub fn write_token_prob_updates(
 /// the §9.4 loop filter (default disabled via `loop_filter_level = 0`),
 /// and an optional override of the §9.6 `y_ac_qi` baseline (default 0).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SilentKeyframeParams {
     /// Visible width in pixels (1..=0x3FFF per §9.1).
     pub width: u32,
@@ -1121,6 +1123,50 @@ pub struct SilentKeyframeParams {
     pub y_ac_qi: u8,
     /// §9.5 DCT partition count. Must be one of 1 / 2 / 4 / 8.
     pub nbr_of_dct_partitions: u8,
+}
+
+impl SilentKeyframeParams {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `y_ac_qi`.
+    #[must_use]
+    pub fn with_y_ac_qi(mut self, v: u8) -> Self {
+        self.y_ac_qi = v;
+        self
+    }
+
+    /// Set `nbr_of_dct_partitions`.
+    #[must_use]
+    pub fn with_nbr_of_dct_partitions(mut self, v: u8) -> Self {
+        self.nbr_of_dct_partitions = v;
+        self
+    }
 }
 
 impl Default for SilentKeyframeParams {
@@ -1583,6 +1629,7 @@ pub fn classify_coeff_token(abs_value: u16) -> DctToken {
 
 /// Errors surfaced by the §13 token-block encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenEncodeError {
     /// A coefficient magnitude exceeded the §13.2 alphabet's largest
     /// representable value (`67 + (2^11 - 1) = 2114`). The encoder
@@ -4524,6 +4571,77 @@ pub struct I420Frame<'a> {
 }
 
 impl<'a> I420Frame<'a> {
+    /// Build an `I420Frame` from every field (explicit strides).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+        y_stride: usize,
+        uv_stride: usize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            y,
+            u,
+            v,
+            y_stride,
+            uv_stride,
+        }
+    }
+
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: &'a [u8]) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: &'a [u8]) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: &'a [u8]) -> Self {
+        self.v = v;
+        self
+    }
+
+    /// Set `y_stride`.
+    #[must_use]
+    pub fn with_y_stride(mut self, v: usize) -> Self {
+        self.y_stride = v;
+        self
+    }
+
+    /// Set `uv_stride`.
+    #[must_use]
+    pub fn with_uv_stride(mut self, v: usize) -> Self {
+        self.uv_stride = v;
+        self
+    }
+
     /// Construct a frame whose planes are tightly packed (`y_stride =
     /// width`, `uv_stride = (width + 1) / 2`).
     pub fn packed(width: u32, height: u32, y: &'a [u8], u: &'a [u8], v: &'a [u8]) -> Self {
@@ -4648,6 +4766,50 @@ pub struct KeyframeParams {
     /// uses the trellis-chosen levels, so encoder↔decoder pixel lockstep
     /// holds at every strength.
     pub trellis_strength: TrellisStrength,
+}
+
+impl KeyframeParams {
+    /// Set `y_ac_qi`.
+    #[must_use]
+    pub fn with_y_ac_qi(mut self, v: u8) -> Self {
+        self.y_ac_qi = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `nbr_of_dct_partitions`.
+    #[must_use]
+    pub fn with_nbr_of_dct_partitions(mut self, v: u8) -> Self {
+        self.nbr_of_dct_partitions = v;
+        self
+    }
+
+    /// Set `filter_type`.
+    #[must_use]
+    pub fn with_filter_type(mut self, v: bool) -> Self {
+        self.filter_type = v;
+        self
+    }
+
+    /// Set `trellis_strength`.
+    #[must_use]
+    pub fn with_trellis_strength(mut self, v: TrellisStrength) -> Self {
+        self.trellis_strength = v;
+        self
+    }
 }
 
 impl Default for KeyframeParams {
@@ -4994,6 +5156,22 @@ pub struct KeyframeCodingOptions {
     /// merged table, and the smaller wire ships — the
     /// [`encode_keyframe_with_fitted_token_prob_updates`] behaviour.
     pub fitted_token_prob_updates: bool,
+}
+
+impl KeyframeCodingOptions {
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `fitted_token_prob_updates`.
+    #[must_use]
+    pub fn with_fitted_token_prob_updates(mut self, v: bool) -> Self {
+        self.fitted_token_prob_updates = v;
+        self
+    }
 }
 
 /// Generic key-frame front door combining the §9.4 auto-loop-filter
@@ -5520,6 +5698,7 @@ fn encode_keyframe_inner_lf(
 /// segmentation is **delta-mode** (`segment_feature_mode = 0`): each
 /// segment's `quant_delta` is added to the §9.6 `base_y_ac_qi`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AdaptiveQuantConfig {
     /// §9.6 baseline `y_ac_qi` (0..=127). Each segment's effective qindex
     /// is `clamp(base_y_ac_qi + quant_delta[seg], 0, 127)`.
@@ -5542,6 +5721,50 @@ pub struct AdaptiveQuantConfig {
     pub sharpness_level: u8,
     /// §9.4 `filter_type`: false = §15.3 normal, true = §15.2 simple.
     pub filter_type: bool,
+}
+
+impl AdaptiveQuantConfig {
+    /// Set `base_y_ac_qi`.
+    #[must_use]
+    pub fn with_base_y_ac_qi(mut self, v: u8) -> Self {
+        self.base_y_ac_qi = v;
+        self
+    }
+
+    /// Set `variance_boundaries`.
+    #[must_use]
+    pub fn with_variance_boundaries(mut self, v: [u32; 3]) -> Self {
+        self.variance_boundaries = v;
+        self
+    }
+
+    /// Set `quant_delta`.
+    #[must_use]
+    pub fn with_quant_delta(mut self, v: [i8; 4]) -> Self {
+        self.quant_delta = v;
+        self
+    }
+
+    /// Set `loop_filter_level`.
+    #[must_use]
+    pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+        self.loop_filter_level = v;
+        self
+    }
+
+    /// Set `sharpness_level`.
+    #[must_use]
+    pub fn with_sharpness_level(mut self, v: u8) -> Self {
+        self.sharpness_level = v;
+        self
+    }
+
+    /// Set `filter_type`.
+    #[must_use]
+    pub fn with_filter_type(mut self, v: bool) -> Self {
+        self.filter_type = v;
+        self
+    }
 }
 
 impl Default for AdaptiveQuantConfig {
@@ -8740,6 +8963,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_lf_deltas_and_intra_pick_and_fi
 /// `_fitted_token_prob_updates` function-name ladder for callers (like
 /// the lagged stream driver) that need the features **combined**.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InterCodingOptions {
     /// §11 intra-within-inter picker: every MB additionally scores the
     /// 16 whole-block `(y_mode, uv_mode)` intra candidates against the
@@ -8755,6 +8979,29 @@ pub struct InterCodingOptions {
     /// Two-pass §13.4 `token_prob_update()` fit (defaults pass →
     /// [`fit_token_prob_updates`] → fitted pass → smaller wire ships).
     pub fitted_token_prob_updates: bool,
+}
+
+impl InterCodingOptions {
+    /// Set `intra_pick`.
+    #[must_use]
+    pub fn with_intra_pick(mut self, v: bool) -> Self {
+        self.intra_pick = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `fitted_token_prob_updates`.
+    #[must_use]
+    pub fn with_fitted_token_prob_updates(mut self, v: bool) -> Self {
+        self.fitted_token_prob_updates = v;
+        self
+    }
 }
 
 /// Generic §16.2 multi-reference P-frame front door combining the §11
@@ -8810,6 +9057,7 @@ pub fn encode_p_frame_multi_ref_with_refresh_and_coding_options(
 /// at its segment's quantiser, so flat segments genuinely code coarser
 /// and busy segments finer — activity-masking AQ on P-frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InterSegmentationConfig {
     /// Three ascending luma-variance boundaries splitting macroblocks
     /// into the four segments (see
@@ -8822,6 +9070,29 @@ pub struct InterSegmentationConfig {
     /// ≤ 63). `None` omits the §9.3 loop-filter feature entirely (every
     /// MB filters at the frame base level).
     pub lf_delta: Option<[i8; 4]>,
+}
+
+impl InterSegmentationConfig {
+    /// Set `variance_boundaries`.
+    #[must_use]
+    pub fn with_variance_boundaries(mut self, v: [u32; 3]) -> Self {
+        self.variance_boundaries = v;
+        self
+    }
+
+    /// Set `quant_delta`.
+    #[must_use]
+    pub fn with_quant_delta(mut self, v: [i8; 4]) -> Self {
+        self.quant_delta = v;
+        self
+    }
+
+    /// Set `lf_delta`.
+    #[must_use]
+    pub fn with_lf_delta(mut self, v: Option<[i8; 4]>) -> Self {
+        self.lf_delta = v;
+        self
+    }
 }
 
 impl Default for InterSegmentationConfig {
@@ -11057,6 +11328,7 @@ pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_qual
 /// enum is preserved on the surface so historical configs keep
 /// compiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum LoopFilterMode {
     /// Pick `Normal` for `lf_level < SIMPLE` thresholds, `Simple`
     /// otherwise. Default in 0.1.13.
@@ -11071,7 +11343,8 @@ pub enum LoopFilterMode {
 /// Per-frame complexity hint produced by [`first_pass_analyze`] and
 /// consumed by [`Vp8TwoPassEncoder`]. The 0.1.13 release used this as
 /// the carrier for the first-pass → second-pass rate-control hand-off.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
 pub struct FrameComplexity {
     /// Source-frame index inside the GOP.
     pub frame_index: u32,
@@ -11083,9 +11356,33 @@ pub struct FrameComplexity {
     pub scene_cut: bool,
 }
 
+impl FrameComplexity {
+    /// Set `frame_index`.
+    #[must_use]
+    pub fn with_frame_index(mut self, v: u32) -> Self {
+        self.frame_index = v;
+        self
+    }
+
+    /// Set `bits_per_mb`.
+    #[must_use]
+    pub fn with_bits_per_mb(mut self, v: f32) -> Self {
+        self.bits_per_mb = v;
+        self
+    }
+
+    /// Set `scene_cut`.
+    #[must_use]
+    pub fn with_scene_cut(mut self, v: bool) -> Self {
+        self.scene_cut = v;
+        self
+    }
+}
+
 /// Encoder statistics — emitted by every `encode` call so downstream
 /// muxers can keep running rate / quality counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Vp8EncoderStats {
     /// Number of frames the encoder has produced so far.
     pub frames_encoded: u64,
@@ -11093,6 +11390,29 @@ pub struct Vp8EncoderStats {
     pub bytes_emitted: u64,
     /// Number of key frames emitted so far.
     pub keyframes_emitted: u64,
+}
+
+impl Vp8EncoderStats {
+    /// Set `frames_encoded`.
+    #[must_use]
+    pub fn with_frames_encoded(mut self, v: u64) -> Self {
+        self.frames_encoded = v;
+        self
+    }
+
+    /// Set `bytes_emitted`.
+    #[must_use]
+    pub fn with_bytes_emitted(mut self, v: u64) -> Self {
+        self.bytes_emitted = v;
+        self
+    }
+
+    /// Set `keyframes_emitted`.
+    #[must_use]
+    pub fn with_keyframes_emitted(mut self, v: u64) -> Self {
+        self.keyframes_emitted = v;
+        self
+    }
 }
 
 /// Encoder configuration knobs — the 0.1.13 public struct.
@@ -11104,6 +11424,7 @@ pub struct Vp8EncoderStats {
 /// scene-cut detection, segment-aware QP) are persisted on the struct
 /// for forward-compat but not yet exercised by the encode body.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Vp8EncoderConfig {
     /// Base `y_ac_qi` quantiser index (§9.6, `0..=127`).
     pub qindex: u8,
@@ -11134,6 +11455,71 @@ pub struct Vp8EncoderConfig {
     /// trades PSNR for smaller output, [`TrellisStrength::OFF`] reverts to
     /// plain round-quantisation.
     pub trellis_strength: TrellisStrength,
+}
+
+impl Vp8EncoderConfig {
+    /// Set `qindex`.
+    #[must_use]
+    pub fn with_qindex(mut self, v: u8) -> Self {
+        self.qindex = v;
+        self
+    }
+
+    /// Set `lf_level`.
+    #[must_use]
+    pub fn with_lf_level(mut self, v: u8) -> Self {
+        self.lf_level = v;
+        self
+    }
+
+    /// Set `lf_mode`.
+    #[must_use]
+    pub fn with_lf_mode(mut self, v: LoopFilterMode) -> Self {
+        self.lf_mode = v;
+        self
+    }
+
+    /// Set `golden_interval`.
+    #[must_use]
+    pub fn with_golden_interval(mut self, v: u32) -> Self {
+        self.golden_interval = v;
+        self
+    }
+
+    /// Set `alt_ref_interval`.
+    #[must_use]
+    pub fn with_alt_ref_interval(mut self, v: u32) -> Self {
+        self.alt_ref_interval = v;
+        self
+    }
+
+    /// Set `lookahead_window`.
+    #[must_use]
+    pub fn with_lookahead_window(mut self, v: u32) -> Self {
+        self.lookahead_window = v;
+        self
+    }
+
+    /// Set `target_bitrate_bps`.
+    #[must_use]
+    pub fn with_target_bitrate_bps(mut self, v: u32) -> Self {
+        self.target_bitrate_bps = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
+
+    /// Set `trellis_strength`.
+    #[must_use]
+    pub fn with_trellis_strength(mut self, v: TrellisStrength) -> Self {
+        self.trellis_strength = v;
+        self
+    }
 }
 
 impl Default for Vp8EncoderConfig {
@@ -11313,6 +11699,7 @@ impl Vp8Encoder {
 /// alter the emitted bytes today. A future round may use them to clamp
 /// the per-frame qindex within a bitrate envelope.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Vp8TwoPassConfig {
     /// Underlying single-pass config used as the second-pass baseline.
     pub base: Vp8EncoderConfig,
@@ -11342,6 +11729,50 @@ pub struct Vp8TwoPassConfig {
     /// 6386 is silent on the level choice, so this is a clean-room
     /// encoder-quality knob.
     pub auto_loop_filter: bool,
+}
+
+impl Vp8TwoPassConfig {
+    /// Set `base`.
+    #[must_use]
+    pub fn with_base(mut self, v: Vp8EncoderConfig) -> Self {
+        self.base = v;
+        self
+    }
+
+    /// Set `target_bitrate_bps`.
+    #[must_use]
+    pub fn with_target_bitrate_bps(mut self, v: u32) -> Self {
+        self.target_bitrate_bps = v;
+        self
+    }
+
+    /// Set `overshoot_ratio`.
+    #[must_use]
+    pub fn with_overshoot_ratio(mut self, v: f32) -> Self {
+        self.overshoot_ratio = v;
+        self
+    }
+
+    /// Set `fps_num`.
+    #[must_use]
+    pub fn with_fps_num(mut self, v: u32) -> Self {
+        self.fps_num = v;
+        self
+    }
+
+    /// Set `fps_den`.
+    #[must_use]
+    pub fn with_fps_den(mut self, v: u32) -> Self {
+        self.fps_den = v;
+        self
+    }
+
+    /// Set `auto_loop_filter`.
+    #[must_use]
+    pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+        self.auto_loop_filter = v;
+        self
+    }
 }
 
 impl Default for Vp8TwoPassConfig {

@@ -48,10 +48,20 @@ const BLOCK_SAD_PER_PIXEL_CUTOFF: u32 = 12;
 /// pixels more aggressively at a given pixel difference. Values above
 /// [`ArnrConfig::MAX_STRENGTH`] are clamped by [`ArnrConfig::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ArnrConfig {
     /// Filter aggressiveness, `0..=6`. `0` = pass-through (center frame
     /// copied verbatim); `6` = strongest blending. Default `3`.
     pub strength: u8,
+}
+
+impl ArnrConfig {
+    /// Set `strength`.
+    #[must_use]
+    pub fn with_strength(mut self, v: u8) -> Self {
+        self.strength = v;
+        self
+    }
 }
 
 impl ArnrConfig {
@@ -75,7 +85,8 @@ impl Default for ArnrConfig {
 /// An owned I420 picture produced by [`build_arnr_altref`] — the
 /// synthetic altref anchor. Feed [`Self::as_i420`] to
 /// [`crate::encoder::encode_invisible_altref_update`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ArnrPicture {
     /// Visible width in luma pixels.
     pub width: u32,
@@ -87,6 +98,43 @@ pub struct ArnrPicture {
     pub u: Vec<u8>,
     /// V plane, same dimensions as `u`.
     pub v: Vec<u8>,
+}
+
+impl ArnrPicture {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: Vec<u8>) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: Vec<u8>) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: Vec<u8>) -> Self {
+        self.v = v;
+        self
+    }
 }
 
 impl ArnrPicture {

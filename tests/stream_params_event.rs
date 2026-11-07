@@ -86,12 +86,10 @@ fn drain(enc: &mut Box<dyn Encoder>) -> Vec<Packet> {
 /// One K + (n-1) P stream of `(w, h)` with no invisible frames; pts
 /// start at `pts0`.
 fn kp_stream((w, h): (u32, u32), n: usize, pts0: usize) -> Vec<Packet> {
-    let config = Vp8EncoderConfig {
-        qindex: 40,
-        alt_ref_interval: 0,
-        golden_interval: 0,
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(40)
+        .with_alt_ref_interval(0)
+        .with_golden_interval(0);
     let mut enc = make_encoder_with_config(&params(w, h), config).expect("encoder");
     let mut out = Vec::new();
     for f in 0..n {
@@ -448,13 +446,11 @@ fn invisible_anchor_frames_are_never_returned_and_never_announce() {
     // The lagged encoder ships one invisible ARNR anchor per completed
     // multi-frame group.
     let anchored = |shape: (u32, u32), pts0: usize| {
-        let config = Vp8EncoderConfig {
-            qindex: 40,
-            alt_ref_interval: 3,
-            lookahead_window: 3,
-            golden_interval: 0,
-            ..Vp8EncoderConfig::default()
-        };
+        let config = Vp8EncoderConfig::default()
+            .with_qindex(40)
+            .with_alt_ref_interval(3)
+            .with_lookahead_window(3)
+            .with_golden_interval(0);
         let mut enc = make_encoder_with_config(&params(shape.0, shape.1), config).unwrap();
         let mut out = Vec::new();
         for f in 0..6 {
@@ -594,13 +590,11 @@ fn keyframe_encoder_follows_a_size_event() {
 
 #[test]
 fn lagged_encoder_rekeys_on_a_size_event() {
-    let config = Vp8EncoderConfig {
-        qindex: 40,
-        alt_ref_interval: 4,
-        lookahead_window: 4,
-        golden_interval: 0,
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default()
+        .with_qindex(40)
+        .with_alt_ref_interval(4)
+        .with_lookahead_window(4)
+        .with_golden_interval(0);
     let mut enc = make_encoder_with_config(&params(A.0, A.1), config).unwrap();
     for f in 0..3 {
         enc.send_frame(&Frame::Video(picture(A.0, A.1, f))).unwrap();
@@ -635,10 +629,7 @@ fn lagged_encoder_rekeys_on_a_size_event() {
 
 #[test]
 fn encoders_reject_an_event_they_cannot_follow() {
-    let config = Vp8EncoderConfig {
-        alt_ref_interval: 0,
-        ..Vp8EncoderConfig::default()
-    };
+    let config = Vp8EncoderConfig::default().with_alt_ref_interval(0);
     let mut bad_fmt = params(B.0, B.1);
     bad_fmt.pixel_format = Some(PixelFormat::Rgb24);
     let too_big = params(0x4000, 16);

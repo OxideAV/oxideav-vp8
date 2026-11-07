@@ -4,6 +4,14 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on `Vp8CodedHeader`, `MbLfAdjustments`, `QuantIndices`, `Vp8DecodedFrame` and the other newly `#[non_exhaustive]` records whose fields all have one; full-field `new` on `Vp8FrameHeader`, `EncodedStreamFrame`, `AltrefStreamPacket` and `I420Frame`; `with_<field>` setters on all of them and on `KeyframeParams` / `KeyframeCodingOptions`. Tests, benches and fuzz targets build records through them.
+
+### Changed
+
+- API hygiene: the error enums `BoolDecoderError`, `CodedHeaderError`, `DctTokenError`, `MbCoeffError`, `DecodeError`, `EncodeError`, `TokenEncodeError`, `FrameError`, `FrameHeaderError`, `Error`, `MacroblockError`, `MotionCompError`, `InterMbError`, `ReconstructError` and `StreamEncodeError`, the option / output enums `LoopFilterMode` and `AltrefPacketKind`, and the records `ArnrConfig`, `ArnrPicture`, `Vp8CodedHeader`, `SilentKeyframeParams`, `AdaptiveQuantConfig`, `InterCodingOptions`, `InterSegmentationConfig`, `FrameComplexity`, `Vp8EncoderStats`, `Vp8EncoderConfig`, `Vp8TwoPassConfig`, `Vp8FrameHeader`, `FrameFilterConfig`, `EncodedStreamFrame`, `AltrefStreamConfig` and `AltrefStreamPacket` are now `#[non_exhaustive]`. RFC 6386 syntax enums (tokens, block types, prediction modes, MV partitions, frame type, scale codes, filter selections) and the fixed bitstream records stay exhaustive. `Vp8Error`, `Vp8DecodedFrame`, `I420Frame`, `KeyframeParams` and `KeyframeCodingOptions` stay exhaustive for now because sibling crates still build or match them.
+
 ## [0.2.8](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.7...v0.2.8) - 2026-11-06
 
 ### Added

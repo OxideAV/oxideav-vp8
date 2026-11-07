@@ -133,11 +133,10 @@ fn api_compat_0_1_13_encoder_constructors() {
         first_pass_analyze(&[], &two).expect("free-fn empty input must succeed");
     assert!(empty_free.is_empty());
 
-    let fake = FrameComplexity {
-        frame_index: 0,
-        bits_per_mb: 0.0,
-        scene_cut: false,
-    };
+    let fake = FrameComplexity::default()
+        .with_frame_index(0)
+        .with_bits_per_mb(0.0)
+        .with_scene_cut(false);
     let qi = two_pass_qindex_for_frame(&two, fake).expect("stateless picker must succeed");
     assert!(qi <= 127, "qindex must respect RFC 6386 §9.6 0..=127");
     let sched = two_pass_qindices(&two, &[fake]).expect("schedule must succeed");

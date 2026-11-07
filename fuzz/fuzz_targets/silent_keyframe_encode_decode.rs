@@ -57,7 +57,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp8::{
-    decode_vp8, encode_silent_keyframe, make_silent_keyframe_encoder, SilentKeyframeParams,
+    SilentKeyframeParams, decode_vp8, encode_silent_keyframe, make_silent_keyframe_encoder,
 };
 
 const INPUT_BYTES: usize = 9;
@@ -85,19 +85,15 @@ fuzz_target!(|data: &[u8]| {
     // shapes (zero and > 0x3FFF) on a fuzz-chosen axis.
     if flags & 0x01 != 0 {
         let bad = if flags & 0x02 != 0 { 0 } else { 0x4000 + width };
-        let params = SilentKeyframeParams {
-            width: bad,
-            height,
-            ..SilentKeyframeParams::default()
-        };
+        let params = SilentKeyframeParams::default()
+            .with_width(bad)
+            .with_height(height);
         if encode_silent_keyframe(params).is_ok() {
             panic!("encode_silent_keyframe accepted illegal width {bad}");
         }
-        let params = SilentKeyframeParams {
-            width,
-            height: bad,
-            ..SilentKeyframeParams::default()
-        };
+        let params = SilentKeyframeParams::default()
+            .with_width(width)
+            .with_height(bad);
         if encode_silent_keyframe(params).is_ok() {
             panic!("encode_silent_keyframe accepted illegal height {bad}");
         }
@@ -106,14 +102,13 @@ fuzz_target!(|data: &[u8]| {
 
     // Leg 1b — raw knob bytes; Ok/Err must match the documented
     // envelope exactly.
-    let params = SilentKeyframeParams {
-        width,
-        height,
-        loop_filter_level: data[4],
-        sharpness_level: data[5],
-        y_ac_qi: data[6],
-        nbr_of_dct_partitions: data[7],
-    };
+    let params = SilentKeyframeParams::default()
+        .with_width(width)
+        .with_height(height)
+        .with_loop_filter_level(data[4])
+        .with_sharpness_level(data[5])
+        .with_y_ac_qi(data[6])
+        .with_nbr_of_dct_partitions(data[7]);
     let legal = params.loop_filter_level <= 63
         && params.sharpness_level <= 7
         && params.y_ac_qi <= 127

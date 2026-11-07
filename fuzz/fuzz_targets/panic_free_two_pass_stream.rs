@@ -44,10 +44,10 @@
 //! per frame.
 
 use libfuzzer_sys::fuzz_target;
+use oxideav_vp8::I420Frame;
 use oxideav_vp8::encoder::{
     FrameComplexity, LoopFilterMode, Vp8EncoderConfig, Vp8TwoPassConfig, Vp8TwoPassEncoder,
 };
-use oxideav_vp8::I420Frame;
 
 const MAX_INPUT_BYTES: usize = 4 * 1024;
 const HEADER_BYTES: usize = 8;
@@ -77,27 +77,25 @@ fuzz_target!(|data: &[u8]| {
     let frame_count = 1 + (usize::from(data[6]) % MAX_FRAMES);
     let scene_cut_mask = data[7];
 
-    let cfg = Vp8TwoPassConfig {
-        base: Vp8EncoderConfig {
-            qindex,
-            lf_level,
-            lf_mode: LoopFilterMode::Auto,
-            golden_interval,
-            alt_ref_interval,
-            lookahead_window: 0,
-            target_bitrate_bps: 0,
-            // §13 trellis aggressiveness, fuzz-derived from the high nibble
-            // of `data[7]` (clamped `0..=8`, `0` = OFF / plain rounding) so
-            // the two-pass panic-freedom sweep exercises the whole knob.
-            trellis_strength: oxideav_vp8::TrellisStrength::new(f64::from(data[7] >> 4)),
-            ..Vp8EncoderConfig::default()
-        },
-        target_bitrate_bps: 0,
-        overshoot_ratio: 1.2,
-        fps_num: 0,
-        fps_den: 1,
-        ..Vp8TwoPassConfig::default()
-    };
+    let cfg = (Vp8TwoPassConfig::default())
+        // §13 trellis aggressiveness, fuzz-derived from the high nibble
+        // of `data[7]` (clamped `0..=8`, `0` = OFF / plain rounding) so
+        // the two-pass panic-freedom sweep exercises the whole knob.
+        .with_base(
+            Vp8EncoderConfig::default()
+                .with_qindex(qindex)
+                .with_lf_level(lf_level)
+                .with_lf_mode(LoopFilterMode::Auto)
+                .with_golden_interval(golden_interval)
+                .with_alt_ref_interval(alt_ref_interval)
+                .with_lookahead_window(0)
+                .with_target_bitrate_bps(0)
+                .with_trellis_strength(oxideav_vp8::TrellisStrength::new(f64::from(data[7] >> 4))),
+        )
+        .with_target_bitrate_bps(0)
+        .with_overshoot_ratio(1.2)
+        .with_fps_num(0)
+        .with_fps_den(1);
 
     // I420 plane sizes for tightly-packed strides at the chosen
     // dimensions.
@@ -184,11 +182,10 @@ fuzz_target!(|data: &[u8]| {
                     .copied()
                     .map(|b| f32::from(b) * 4.0) // 0..=1020.0
                     .unwrap_or(0.0);
-                FrameComplexity {
-                    frame_index: i as u32,
-                    bits_per_mb: bpm,
-                    scene_cut: scene_cut_mask & (1 << i) != 0,
-                }
+                FrameComplexity::default()
+                    .with_frame_index(i as u32)
+                    .with_bits_per_mb(bpm)
+                    .with_scene_cut(scene_cut_mask & (1 << i) != 0)
             }
         };
 

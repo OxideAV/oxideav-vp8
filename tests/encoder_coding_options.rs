@@ -210,10 +210,7 @@ fn inter_options_intra_pick_matches_dedicated_entry() {
         None,
         &p,
         &refresh,
-        &InterCodingOptions {
-            intra_pick: true,
-            ..Default::default()
-        },
+        &InterCodingOptions::default().with_intra_pick(true),
     )
     .expect("options intra pick");
     assert_eq!(a, b, "intra_pick toggle must reproduce the dedicated wire");
@@ -234,11 +231,9 @@ fn inter_options_auto_lf_plus_intra_pick_matches_dedicated_entry() {
         None,
         &p,
         &RefreshControls::default(),
-        &InterCodingOptions {
-            intra_pick: true,
-            auto_loop_filter: true,
-            ..Default::default()
-        },
+        &InterCodingOptions::default()
+            .with_intra_pick(true)
+            .with_auto_loop_filter(true),
     )
     .expect("options auto lf");
     assert_eq!(
@@ -274,11 +269,9 @@ fn inter_options_intra_pick_fitted_matches_dedicated_entry() {
         None,
         &p,
         &refresh,
-        &InterCodingOptions {
-            intra_pick: true,
-            fitted_token_prob_updates: true,
-            ..Default::default()
-        },
+        &InterCodingOptions::default()
+            .with_intra_pick(true)
+            .with_fitted_token_prob_updates(true),
     )
     .expect("options fitted intra pick");
     assert_eq!(
@@ -302,11 +295,10 @@ fn inter_all_toggles_decodes_lockstep_and_never_grows() {
         None,
         &p,
         &refresh,
-        &InterCodingOptions {
-            intra_pick: true,
-            auto_loop_filter: true,
-            fitted_token_prob_updates: false,
-        },
+        &InterCodingOptions::default()
+            .with_intra_pick(true)
+            .with_auto_loop_filter(true)
+            .with_fitted_token_prob_updates(false),
     )
     .expect("no-fit baseline");
     let (bytes, planes) = encode_p_frame_multi_ref_with_refresh_and_coding_options(
@@ -316,11 +308,10 @@ fn inter_all_toggles_decodes_lockstep_and_never_grows() {
         None,
         &p,
         &refresh,
-        &InterCodingOptions {
-            intra_pick: true,
-            auto_loop_filter: true,
-            fitted_token_prob_updates: true,
-        },
+        &InterCodingOptions::default()
+            .with_intra_pick(true)
+            .with_auto_loop_filter(true)
+            .with_fitted_token_prob_updates(true),
     )
     .expect("all toggles");
     assert!(
@@ -354,10 +345,7 @@ fn invisible_update_options_intra_pick_matches_dedicated_entry() {
         Some(&kf),
         Some(&kf),
         &p,
-        &InterCodingOptions {
-            intra_pick: true,
-            ..Default::default()
-        },
+        &InterCodingOptions::default().with_intra_pick(true),
     )
     .expect("options invisible");
     assert_eq!(
@@ -378,11 +366,10 @@ fn invisible_update_all_toggles_stays_invisible_and_updates_altref_only() {
         Some(&kf),
         Some(&kf),
         &p,
-        &InterCodingOptions {
-            intra_pick: true,
-            auto_loop_filter: true,
-            fitted_token_prob_updates: true,
-        },
+        &InterCodingOptions::default()
+            .with_intra_pick(true)
+            .with_auto_loop_filter(true)
+            .with_fitted_token_prob_updates(true),
     )
     .expect("all-toggle invisible");
     // §9.1 tag byte 0 bit 4 must be clear (show_frame = 0).

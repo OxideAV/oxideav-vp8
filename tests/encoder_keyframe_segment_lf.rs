@@ -60,11 +60,9 @@ fn source() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 fn aq_config(lf_level: u8) -> AdaptiveQuantConfig {
-    AdaptiveQuantConfig {
-        base_y_ac_qi: 40,
-        loop_filter_level: lf_level,
-        ..AdaptiveQuantConfig::default()
-    }
+    AdaptiveQuantConfig::default()
+        .with_base_y_ac_qi(40)
+        .with_loop_filter_level(lf_level)
 }
 
 const DELTAS: [i8; 4] = [16, 6, -6, -16];

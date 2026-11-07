@@ -143,6 +143,7 @@ impl BlockType {
 
 /// Out-of-band conditions surfaced by [`decode_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DctTokenError {
     /// Underlying bool-decoder ran out of bytes mid-token.
     BoolDecoder(BoolDecoderError),
@@ -725,6 +726,7 @@ impl MbEntropyCtx {
 
 /// Out-of-band conditions surfaced by [`decode_mb_coeffs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MbCoeffError {
     /// A per-block token decode failed (bool-decoder ran dry, or a
     /// corrupted tree table). Carries the residual block index

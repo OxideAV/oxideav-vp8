@@ -260,16 +260,10 @@ fn two_pass_auto_loop_filter_decodes_end_to_end() {
 
     // A coarse base qindex so the busier frames (checker / noise) carry
     // real block-edge error the RD selector can act on.
-    let base = Vp8EncoderConfig {
-        qindex: 96,
-        lf_level: 0,
-        ..Vp8EncoderConfig::default()
-    };
-    let auto_cfg = Vp8TwoPassConfig {
-        base,
-        auto_loop_filter: true,
-        ..Vp8TwoPassConfig::default()
-    };
+    let base = Vp8EncoderConfig::default().with_qindex(96).with_lf_level(0);
+    let auto_cfg = Vp8TwoPassConfig::default()
+        .with_base(base)
+        .with_auto_loop_filter(true);
 
     // run_four_frame_clip already decodes every frame through the stateful
     // decoder, so a successful return proves the whole auto-LF stream
@@ -292,11 +286,10 @@ fn two_pass_auto_loop_filter_decodes_end_to_end() {
 #[test]
 fn two_pass_qindex_for_frame_handles_baseline_complexity() {
     let config = Vp8TwoPassConfig::default();
-    let complexity = FrameComplexity {
-        frame_index: 0,
-        bits_per_mb: 100.0,
-        scene_cut: false,
-    };
+    let complexity = FrameComplexity::default()
+        .with_frame_index(0)
+        .with_bits_per_mb(100.0)
+        .with_scene_cut(false);
     let qi = two_pass_qindex_for_frame(&config, complexity).expect("stateless picker must succeed");
     // With no GOP-mean reference the per-frame delta collapses to zero,
     // so the picker must return the base qindex unchanged.
@@ -307,15 +300,11 @@ fn two_pass_qindex_for_frame_handles_baseline_complexity() {
 fn two_pass_qindex_for_frame_applies_scene_cut_boost() {
     let mut config = Vp8TwoPassConfig::default();
     config.base.qindex = 60;
-    let baseline = FrameComplexity {
-        frame_index: 0,
-        bits_per_mb: 100.0,
-        scene_cut: false,
-    };
-    let cut = FrameComplexity {
-        scene_cut: true,
-        ..baseline
-    };
+    let baseline = FrameComplexity::default()
+        .with_frame_index(0)
+        .with_bits_per_mb(100.0)
+        .with_scene_cut(false);
+    let cut = baseline.with_scene_cut(true);
     let qi_baseline = two_pass_qindex_for_frame(&config, baseline).unwrap();
     let qi_cut = two_pass_qindex_for_frame(&config, cut).unwrap();
     assert!(
@@ -329,11 +318,10 @@ fn two_pass_qindex_for_frame_applies_scene_cut_boost() {
 fn two_pass_qindex_for_frame_rejects_out_of_range_base() {
     let mut config = Vp8TwoPassConfig::default();
     config.base.qindex = 200; // Beyond RFC 6386 §9.6 0..=127.
-    let complexity = FrameComplexity {
-        frame_index: 0,
-        bits_per_mb: 100.0,
-        scene_cut: false,
-    };
+    let complexity = FrameComplexity::default()
+        .with_frame_index(0)
+        .with_bits_per_mb(100.0)
+        .with_scene_cut(false);
     let r = two_pass_qindex_for_frame(&config, complexity);
     assert!(
         r.is_err(),
@@ -369,12 +357,10 @@ fn closed_loop_bitrate_target_is_monotone_and_decodable() {
     // Encode the clip at a given bitrate; return the emitted byte total.
     // Every frame is decoded so the test fails loudly on a bad stream.
     let encode_at = |bps: u32| -> usize {
-        let config = Vp8TwoPassConfig {
-            target_bitrate_bps: bps,
-            fps_num: 30,
-            fps_den: 1,
-            ..Vp8TwoPassConfig::default()
-        };
+        let config = Vp8TwoPassConfig::default()
+            .with_target_bitrate_bps(bps)
+            .with_fps_num(30)
+            .with_fps_den(1);
         assert!(config.bitrate_targeted(), "config must be bitrate-targeted");
         let mut enc = Vp8TwoPassEncoder::new(config);
         let stats = enc.first_pass_analyze(&i420).unwrap();
@@ -415,11 +401,10 @@ fn bitrate_without_frame_rate_stays_constant_quality() {
         .map(|(y, u, v)| I420Frame::packed(32, 32, y, u, v))
         .collect();
 
-    let config = Vp8TwoPassConfig {
-        target_bitrate_bps: 50_000,
-        fps_num: 0, // no rate → solver disabled
-        ..Vp8TwoPassConfig::default()
-    };
+    let config = Vp8TwoPassConfig::default()
+        .with_target_bitrate_bps(50_000)
+        .with_fps_num(0) // no rate → solver disabled
+    ;
     assert!(!config.bitrate_targeted());
 
     let mut enc = Vp8TwoPassEncoder::new(config);
@@ -445,11 +430,10 @@ fn encoder_fallback_without_first_pass_uses_base_qindex() {
     let mut encoder = Vp8TwoPassEncoder::new(Vp8TwoPassConfig::default());
     let (y, u, v) = solid_frame();
     let frame = I420Frame::packed(32, 32, &y, &u, &v);
-    let complexity = FrameComplexity {
-        frame_index: 0,
-        bits_per_mb: 100.0,
-        scene_cut: false,
-    };
+    let complexity = FrameComplexity::default()
+        .with_frame_index(0)
+        .with_bits_per_mb(100.0)
+        .with_scene_cut(false);
     let bytes = encoder
         .encode_frame(&frame, complexity)
         .expect("encode without first_pass must still succeed");
@@ -466,13 +450,12 @@ fn encoder_fallback_without_first_pass_uses_base_qindex() {
 fn two_pass_honours_base_trellis_strength() {
     use oxideav_vp8::{TrellisStrength, Vp8EncoderConfig};
 
-    let mk = |s: TrellisStrength| Vp8TwoPassConfig {
-        base: Vp8EncoderConfig {
-            qindex: 48,
-            trellis_strength: s,
-            ..Vp8EncoderConfig::default()
-        },
-        ..Vp8TwoPassConfig::default()
+    let mk = |s: TrellisStrength| {
+        Vp8TwoPassConfig::default().with_base(
+            Vp8EncoderConfig::default()
+                .with_qindex(48)
+                .with_trellis_strength(s),
+        )
     };
 
     let total = |bytes: &[Vec<u8>]| -> usize { bytes.iter().map(Vec::len).sum() };

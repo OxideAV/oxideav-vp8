@@ -4,6 +4,12 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.8...v0.3.0) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive errors/options/records + builders
+
 ### Added
 
 - `Default` on `Vp8CodedHeader`, `MbLfAdjustments`, `QuantIndices`, `Vp8DecodedFrame` and the other newly `#[non_exhaustive]` records whose fields all have one; full-field `new` on `Vp8FrameHeader`, `EncodedStreamFrame`, `AltrefStreamPacket` and `I420Frame`; `with_<field>` setters on all of them and on `KeyframeParams` / `KeyframeCodingOptions`. Tests, benches and fuzz targets build records through them.

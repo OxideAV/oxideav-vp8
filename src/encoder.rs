@@ -2491,6 +2491,100 @@ fn estimate_block_bits_tabled(
     bits
 }
 
+/// [`estimate_block_bits`] from the pre-summed per-token rates
+/// ([`TrellisRateTables::small`] / [`TrellisRateTables::level_rate`] /
+/// [`TrellisRateTables::eob`]): one table read per coefficient instead of
+/// one per tree step.
+///
+/// It adds up exactly the terms the reference estimate adds, but grouped
+/// per token, so the two results can differ in the last few units of
+/// rounding and nowhere else. The mode pickers use it only to *rank*
+/// candidates, behind [`RD_TIE_GUARD`].
+fn estimate_block_bits_presummed(
+    tables: &TrellisRateTables,
+    block_type: BlockType,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> f64 {
+    let first_coeff = block_type.first_coeff();
+    let plane = block_type.plane_index();
+    let small = &tables.small[plane];
+    let mut end = 16;
+    while end > first_coeff && coeffs[end - 1] == 0 {
+        end -= 1;
+    }
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let mut prev_was_zero = 0usize;
+    let mut bits = 0.0;
+    for (i, &v) in coeffs.iter().enumerate().take(end).skip(first_coeff) {
+        let level = v.unsigned_abs() as u32;
+        let band = COEFF_BANDS[i];
+        bits += if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+            small[band][ctx3][prev_was_zero][level as usize]
+        } else {
+            TrellisRateTables::level_rate(
+                &small[band],
+                &tables.cat_path[plane][band],
+                ctx3,
+                prev_was_zero == 1,
+                level,
+            )
+        };
+        ctx3 = (level as usize).min(2);
+        prev_was_zero = (level == 0) as usize;
+    }
+    if end < 16 {
+        bits += tables.eob[plane][COEFF_BANDS[end]][ctx3];
+    }
+    bits
+}
+
+/// Margin below which two candidate costs ranked through
+/// [`estimate_block_bits_presummed`] are treated as undecided.
+///
+/// A pre-summed token-bit total and the reference total are two
+/// groupings of the same at most ~300 terms, each at most 8 bits, so they
+/// agree to within `2 · 300 · 2^-53 · 2400 < 2e-10` bits; scaled by a
+/// mode lambda of at most `157² / 32 < 771` and carried through the cost
+/// expression (magnitude below `4e6`, one unit of rounding `< 1e-9`), a
+/// ranking cost is within `2e-7` of the reference cost. When the leading
+/// candidate beats every other by more than this guard — four orders of
+/// magnitude wider — the reference costs order the same way with no tie,
+/// so the reference search would pick the same candidate. Anything
+/// closer is re-decided with the reference costs in the reference order.
+const RD_TIE_GUARD: f64 = 1e-3;
+
+#[cfg(test)]
+thread_local! {
+    /// When set, [`decisive_minimum`] reports every decision as
+    /// undecided, so the pickers run the reference search throughout —
+    /// the oracle `ranked_search_matches_reference_search` compares the
+    /// guarded ranking against.
+    static FORCE_REFERENCE_SEARCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The first minimum of `costs` and whether it leads every other entry
+/// by more than [`RD_TIE_GUARD`].
+fn decisive_minimum(costs: &[f64]) -> (usize, bool) {
+    let mut best = 0usize;
+    for (n, &cost) in costs.iter().enumerate().skip(1) {
+        if cost < costs[best] {
+            best = n;
+        }
+    }
+    // Test hook: route every decision through the reference search.
+    #[cfg(test)]
+    if FORCE_REFERENCE_SEARCH.with(|f| f.get()) {
+        return (best, false);
+    }
+    let decisive = costs
+        .iter()
+        .enumerate()
+        .all(|(n, &cost)| n == best || cost - costs[best] > RD_TIE_GUARD);
+    (best, decisive)
+}
+
 /// Fraction of the mode-decision Lagrange multiplier the §13 coefficient
 /// trellis spends at [`TrellisStrength::DEFAULT`] (`= 1.0`). Coefficient-level
 /// RDO is a much finer rate lever than the mode picker (it can drop one
@@ -2778,6 +2872,39 @@ impl TrellisRateTables {
             }
         }
         tables
+    }
+
+    /// [`level_rate`](Self::level_rate) of one extra-bit level (`> 4`)
+    /// from all three contexts at once — context 0 with the given
+    /// "previous token was `DCT_0`" state, contexts 1 and 2 without (a
+    /// non-zero level precedes them). Each context's sum takes the same
+    /// additions in the same order as `level_rate`; only the token
+    /// classification and the extra-bit costs are shared.
+    #[inline]
+    fn cat_level_rates(cat_path: &[[[f64; 6]; 2]; 3], zero_run: usize, level: u32) -> [f64; 3] {
+        let abs_level = level as u16;
+        let token = classify_coeff_token(abs_level);
+        let cat = token as usize - DctToken::Cat1 as usize;
+        let mut rates = [
+            cat_path[0][zero_run][cat],
+            cat_path[1][0][cat],
+            cat_path[2][0][cat],
+        ];
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_level.saturating_sub(base);
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let cost = bool_bits(p, ((extra >> (n - 1 - j)) & 1) == 1);
+                for rate in rates.iter_mut() {
+                    *rate += cost;
+                }
+            }
+        }
+        let sign = bool_bits(128, false);
+        for rate in rates.iter_mut() {
+            *rate += sign;
+        }
+        rates
     }
 
     /// [`coeff_token_bits`] for any level from the tables of one
@@ -3070,13 +3197,11 @@ fn trellis_scan_tabled(
                     s2 + d + lambda * rows[2][level as usize],
                 ]
             } else {
-                let rate = |ctx: usize, pwz: bool| {
-                    TrellisRateTables::level_rate(band_small, &cat_path[band], ctx, pwz, level)
-                };
+                let rates = TrellisRateTables::cat_level_rates(&cat_path[band], zero_run, level);
                 [
-                    s0 + d + lambda * rate(0, zero_run == 1),
-                    s1 + d + lambda * rate(1, false),
-                    s2 + d + lambda * rate(2, false),
+                    s0 + d + lambda * rates[0],
+                    s1 + d + lambda * rates[1],
+                    s2 + d + lambda * rates[2],
                 ]
             }
         };
@@ -3122,16 +3247,14 @@ fn trellis_scan_tabled(
             } else {
                 (n1, n2)
             };
-            if t1 < best_term_cost {
-                best_term_cost = t1;
-                best_term_pos = k;
-                best_term_ctx = 1;
-            }
-            if t2 < best_term_cost {
-                best_term_cost = t2;
-                best_term_pos = k;
-                best_term_ctx = 2;
-            }
+            let better = t1 < best_term_cost;
+            best_term_cost = select(better, t1, best_term_cost);
+            best_term_pos = select(better, k, best_term_pos);
+            best_term_ctx = select(better, 1, best_term_ctx);
+            let better = t2 < best_term_cost;
+            best_term_cost = select(better, t2, best_term_cost);
+            best_term_pos = select(better, k, best_term_pos);
+            best_term_ctx = select(better, 2, best_term_ctx);
         }
 
         surv = [n0, n1, n2];
@@ -3368,6 +3491,35 @@ impl MbRdCtx<'_> {
     #[inline]
     fn trellis_active(&self) -> bool {
         self.trellis_lambda() > 0.0
+    }
+
+    /// Token bits of one scan-order block for *ranking* candidates: the
+    /// pre-summed estimate when per-frame tables are attached (see
+    /// [`RD_TIE_GUARD`]), else the reference estimate itself.
+    #[inline]
+    fn ranking_block_bits(
+        &self,
+        block_type: BlockType,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+        coeffs: &[i16; 16],
+    ) -> f64 {
+        match self.rate_tables {
+            Some(tables) => estimate_block_bits_presummed(
+                tables,
+                block_type,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+            None => estimate_block_bits(
+                block_type,
+                self.coeff_probs,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+        }
     }
 
     /// §13.3 token bits of one scan-order block — [`estimate_block_bits`],
@@ -3616,23 +3768,69 @@ fn reconstruct_whole_block_luma(
 /// matches the relative ranking the frame-shared contexts produce (a
 /// neighbour's non-zero state shifts every candidate's first-band cost by
 /// the same amount, so it does not change the winner).
+///
+/// `ranking` selects the pre-summed per-block estimate (see
+/// [`RD_TIE_GUARD`]); `false` is the reference estimate.
 fn estimate_whole_block_luma_bits(
     rd: &MbRdCtx,
     y_quant: &[[i16; 16]; 16],
     y2_quant: &[i16; 16],
+    ranking: bool,
 ) -> f64 {
     let mut above = MbEntropyCtx::default();
     let mut left = MbEntropyCtx::default();
     let mut bits = 0.0;
 
     let scan_y2 = raster_to_scan(y2_quant);
-    bits += estimate_block_bits_with_ctx(24, BlockType::Y2, rd, &scan_y2, &mut above, &mut left);
+    bits += estimate_block_bits_with_ctx(
+        24,
+        BlockType::Y2,
+        rd,
+        &scan_y2,
+        &mut above,
+        &mut left,
+        ranking,
+    );
     for (i, blk) in y_quant.iter().enumerate() {
         let scan = raster_to_scan(blk);
-        bits +=
-            estimate_block_bits_with_ctx(i, BlockType::YAfterY2, rd, &scan, &mut above, &mut left);
+        bits += estimate_block_bits_with_ctx(
+            i,
+            BlockType::YAfterY2,
+            rd,
+            &scan,
+            &mut above,
+            &mut left,
+            ranking,
+        );
     }
     bits
+}
+
+/// §13.3 token bits of the eight chroma blocks of one candidate (4 U
+/// sub-blocks 16..19, then 4 V 20..23), threading the local above / left
+/// non-zero contexts. `ranking` as in [`estimate_whole_block_luma_bits`].
+fn estimate_chroma_bits(
+    rd: &MbRdCtx,
+    u_quant: &[[i16; 16]; 4],
+    v_quant: &[[i16; 16]; 4],
+    ranking: bool,
+) -> f64 {
+    let mut above = MbEntropyCtx::default();
+    let mut left = MbEntropyCtx::default();
+    let mut token_bits = 0.0;
+    for (i, blk) in u_quant.iter().chain(v_quant.iter()).enumerate() {
+        let scan = raster_to_scan(blk);
+        token_bits += estimate_block_bits_with_ctx(
+            16 + i,
+            BlockType::UV,
+            rd,
+            &scan,
+            &mut above,
+            &mut left,
+            ranking,
+        );
+    }
+    token_bits
 }
 
 /// Bit cost of one residual block at `block_index`, threading the §13.3
@@ -3645,6 +3843,7 @@ fn estimate_block_bits_with_ctx(
     scan_coeffs: &[i16; 16],
     above: &mut MbEntropyCtx,
     left: &mut MbEntropyCtx,
+    ranking: bool,
 ) -> f64 {
     const LEFT_CTX: [usize; 25] = [
         0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8,
@@ -3654,12 +3853,12 @@ fn estimate_block_bits_with_ctx(
     ];
     let a_slot = ABOVE_CTX[block_index];
     let l_slot = LEFT_CTX[block_index];
-    let bits = rd.block_bits(
-        block_type,
-        above.nonzero[a_slot],
-        left.nonzero[l_slot],
-        scan_coeffs,
-    );
+    let (a_nonzero, l_nonzero) = (above.nonzero[a_slot], left.nonzero[l_slot]);
+    let bits = if ranking {
+        rd.ranking_block_bits(block_type, a_nonzero, l_nonzero, scan_coeffs)
+    } else {
+        rd.block_bits(block_type, a_nonzero, l_nonzero, scan_coeffs)
+    };
     let first = block_type.first_coeff();
     let has_coeffs = scan_coeffs[first..].iter().any(|&v| v != 0);
     above.nonzero[a_slot] = has_coeffs;
@@ -3688,8 +3887,13 @@ fn pick_y16x16_mode(
 ) -> WholeBlockLuma {
     const CANDIDATES: [IntraYMode; 4] =
         [IntraYMode::Dc, IntraYMode::V, IntraYMode::H, IntraYMode::Tm];
-    let mut best: Option<WholeBlockLuma> = None;
-    for &mode in &CANDIDATES {
+    // Every candidate goes through the full chain; the token bits are
+    // first taken from the pre-summed ranking estimate.
+    let mut quant = [([[0i16; 16]; 16], [0i16; 16]); 4];
+    let mut ssd = [0f64; 4];
+    let mut mode_bits = [0f64; 4];
+    let mut ranking_cost = [0f64; 4];
+    for (n, &mode) in CANDIDATES.iter().enumerate() {
         let mut pred = [0u8; 256];
         // predict_y16x16 returns None only for B_PRED, which is not in
         // CANDIDATES, so this is always Some.
@@ -3697,21 +3901,40 @@ fn pick_y16x16_mode(
 
         let (y_quant, y2_quant) = transform_whole_block_luma_rd(src, &pred, rd.factors, Some(rd));
         let recon = reconstruct_whole_block_luma(&pred, &y_quant, &y2_quant, rd.factors);
-        let ssd = block_ssd(&recon, src) as f64;
-        let token_bits = estimate_whole_block_luma_bits(rd, &y_quant, &y2_quant);
-        let mode_bits = treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mode.leaf());
-        let rd_cost = ssd + rd.lambda * (token_bits + mode_bits);
-
-        if best.as_ref().map(|b| rd_cost < b.rd_cost).unwrap_or(true) {
-            best = Some(WholeBlockLuma {
-                mode,
-                y_coeffs: y_quant,
-                y2_coeffs: y2_quant,
-                rd_cost,
-            });
-        }
+        ssd[n] = block_ssd(&recon, src) as f64;
+        mode_bits[n] = treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mode.leaf());
+        let token_bits = estimate_whole_block_luma_bits(rd, &y_quant, &y2_quant, true);
+        ranking_cost[n] = ssd[n] + rd.lambda * (token_bits + mode_bits[n]);
+        quant[n] = (y_quant, y2_quant);
     }
-    best.expect("CANDIDATES is non-empty")
+    // The reference cost of a candidate: exact token bits.
+    let reference_cost = |n: usize| {
+        let token_bits = estimate_whole_block_luma_bits(rd, &quant[n].0, &quant[n].1, false);
+        ssd[n] + rd.lambda * (token_bits + mode_bits[n])
+    };
+    let (leader, decisive) = decisive_minimum(&ranking_cost);
+    let (winner, rd_cost) = if decisive {
+        (leader, reference_cost(leader))
+    } else {
+        // Too close to call on the ranking estimate: the reference
+        // search — first strictly smaller reference cost wins.
+        let mut winner = 0usize;
+        let mut best_cost = reference_cost(0);
+        for n in 1..CANDIDATES.len() {
+            let cost = reference_cost(n);
+            if cost < best_cost {
+                best_cost = cost;
+                winner = n;
+            }
+        }
+        (winner, best_cost)
+    };
+    WholeBlockLuma {
+        mode: CANDIDATES[winner],
+        y_coeffs: quant[winner].0,
+        y2_coeffs: quant[winner].1,
+        rd_cost,
+    }
 }
 
 /// One chroma plane's source pixels plus its three §12 prediction
@@ -3820,11 +4043,11 @@ fn pick_uv8x8_mode(
         IntraUvMode::H,
         IntraUvMode::Tm,
     ];
-    let mut best_mode = IntraUvMode::Dc;
-    let mut best_u = [[0i16; 16]; 4];
-    let mut best_v = [[0i16; 16]; 4];
-    let mut best_cost = f64::INFINITY;
-    for &mode in &CANDIDATES {
+    let mut quant = [([[0i16; 16]; 4], [[0i16; 16]; 4]); 4];
+    let mut ssd = [0f64; 4];
+    let mut mode_bits = [0f64; 4];
+    let mut ranking_cost = [0f64; 4];
+    for (n, &mode) in CANDIDATES.iter().enumerate() {
         let mut u_pred = [0u8; 64];
         let mut v_pred = [0u8; 64];
         predict_uv8x8(&mut u_pred, mode, u.above, u.left, u.topleft);
@@ -3834,46 +4057,34 @@ fn pick_uv8x8_mode(
         let v_quant = transform_chroma_plane_rd(v.src, &v_pred, rd.factors, Some(rd));
         let u_recon = reconstruct_chroma_plane(&u_pred, &u_quant, rd.factors);
         let v_recon = reconstruct_chroma_plane(&v_pred, &v_quant, rd.factors);
-        let ssd = (block_ssd(&u_recon, u.src) + block_ssd(&v_recon, v.src)) as f64;
-
-        // §13.3 chroma token bits: 4 U sub-blocks (16..19) then 4 V
-        // (20..23), threading the local above/left non-zero contexts.
-        let mut above = MbEntropyCtx::default();
-        let mut left = MbEntropyCtx::default();
-        let mut token_bits = 0.0;
-        for (i, blk) in u_quant.iter().enumerate() {
-            let scan = raster_to_scan(blk);
-            token_bits += estimate_block_bits_with_ctx(
-                16 + i,
-                BlockType::UV,
-                rd,
-                &scan,
-                &mut above,
-                &mut left,
-            );
-        }
-        for (i, blk) in v_quant.iter().enumerate() {
-            let scan = raster_to_scan(blk);
-            token_bits += estimate_block_bits_with_ctx(
-                20 + i,
-                BlockType::UV,
-                rd,
-                &scan,
-                &mut above,
-                &mut left,
-            );
-        }
-        let mode_bits = treed_bits_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mode.leaf());
-        let cost = ssd + rd.lambda * (token_bits + mode_bits);
-
-        if cost < best_cost {
-            best_cost = cost;
-            best_mode = mode;
-            best_u = u_quant;
-            best_v = v_quant;
-        }
+        ssd[n] = (block_ssd(&u_recon, u.src) + block_ssd(&v_recon, v.src)) as f64;
+        mode_bits[n] = treed_bits_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mode.leaf());
+        let token_bits = estimate_chroma_bits(rd, &u_quant, &v_quant, true);
+        ranking_cost[n] = ssd[n] + rd.lambda * (token_bits + mode_bits[n]);
+        quant[n] = (u_quant, v_quant);
     }
-    (best_mode, best_u, best_v)
+    let (leader, decisive) = decisive_minimum(&ranking_cost);
+    let winner = if decisive {
+        leader
+    } else {
+        // Too close to call on the ranking estimate: the reference
+        // search — first strictly smaller reference cost wins.
+        let reference_cost = |n: usize| {
+            let token_bits = estimate_chroma_bits(rd, &quant[n].0, &quant[n].1, false);
+            ssd[n] + rd.lambda * (token_bits + mode_bits[n])
+        };
+        let mut winner = 0usize;
+        let mut best_cost = reference_cost(0);
+        for n in 1..CANDIDATES.len() {
+            let cost = reference_cost(n);
+            if cost < best_cost {
+                best_cost = cost;
+                winner = n;
+            }
+        }
+        winner
+    };
+    (CANDIDATES[winner], quant[winner].0, quant[winner].1)
 }
 
 // ─────────────────────── §11.3 / §12.3 B_PRED luma picker ──────────────────────
@@ -4038,14 +4249,37 @@ fn encode_bpred_luma(
             let mode_bits_row = &KF_BMODE_BITS[above_mode.idx()][left_mode.idx()];
 
             // RD-pick the sub-mode: reconstruct each candidate, score
-            // SSD + lambda*(token bits + mode bits).
-            let mut best_mode = IntraBmode::Dc;
-            let mut best_coeffs = [0i16; 16];
-            let mut best_recon = [0u8; 16];
-            let mut best_cost = f64::INFINITY;
-            for &mode in &BMODE_CANDIDATES {
+            // SSD + lambda*(token bits + mode bits). The token bits are
+            // first taken from the pre-summed ranking estimate; the
+            // reference estimate prices the winner (and re-decides the
+            // sub-block when the ranking is too close to call).
+            let mut cand_coeffs = [[0i16; 16]; 10];
+            let mut cand_scan = [[0i16; 16]; 10];
+            let mut cand_recon = [[0u8; 16]; 10];
+            let mut cand_ssd = [0f64; 10];
+            let mut cand_rank_bits = [0f64; 10];
+            let mut cand_pred = [[0u8; 16]; 10];
+            let mut ranking_cost = [0f64; 10];
+            let (above_nonzero, left_nonzero) = (tok_above.nonzero[j], tok_left.nonzero[i]);
+            for (n, &mode) in BMODE_CANDIDATES.iter().enumerate() {
                 let mut pred = [0u8; 16];
                 predict_b4x4(&mut pred, mode, &above, &left, p);
+                cand_pred[n] = pred;
+                // A prediction identical to an earlier sub-mode's (flat
+                // or edge-less neighbourhoods make several modes
+                // coincide) yields the identical residual, levels,
+                // reconstruction and token bits — only the mode-signal
+                // cost differs.
+                if let Some(twin) = cand_pred[..n].iter().position(|earlier| *earlier == pred) {
+                    cand_coeffs[n] = cand_coeffs[twin];
+                    cand_scan[n] = cand_scan[twin];
+                    cand_recon[n] = cand_recon[twin];
+                    cand_ssd[n] = cand_ssd[twin];
+                    cand_rank_bits[n] = cand_rank_bits[twin];
+                    ranking_cost[n] =
+                        cand_ssd[n] + rd.lambda * (cand_rank_bits[n] + mode_bits_row[mode.idx()]);
+                    continue;
+                }
 
                 let mut residual = [0i16; 16];
                 for k in 0..16 {
@@ -4057,8 +4291,7 @@ fn encode_bpred_luma(
                     // §13 trellis: B_PRED sub-blocks are `YNoY2` (own DC,
                     // plane 3); seed the entry context from the real §13.3
                     // above/left non-zero predictors for this sub-block.
-                    let entry_ctx3 =
-                        (tok_above.nonzero[j] as usize) + (tok_left.nonzero[i] as usize);
+                    let entry_ctx3 = (above_nonzero as usize) + (left_nonzero as usize);
                     trellis_quantize_block(
                         &mut coeffs,
                         TrellisBlockSpec {
@@ -4077,23 +4310,41 @@ fn encode_bpred_luma(
                 }
 
                 let recon = reconstruct_block_4x4(&pred, &coeffs, factors.y1_dc, factors.y1_ac);
-                let ssd = block_ssd(&recon, &sb_src) as f64;
                 let scan = raster_to_scan(&coeffs);
-                let token_bits = rd.block_bits(
-                    BlockType::YNoY2,
-                    tok_above.nonzero[j],
-                    tok_left.nonzero[i],
-                    &scan,
-                );
-                let mode_bits = mode_bits_row[mode.idx()];
-                let cost = ssd + rd.lambda * (token_bits + mode_bits);
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_mode = mode;
-                    best_coeffs = coeffs;
-                    best_recon = recon;
-                }
+                let token_bits =
+                    rd.ranking_block_bits(BlockType::YNoY2, above_nonzero, left_nonzero, &scan);
+                cand_ssd[n] = block_ssd(&recon, &sb_src) as f64;
+                cand_rank_bits[n] = token_bits;
+                ranking_cost[n] =
+                    cand_ssd[n] + rd.lambda * (token_bits + mode_bits_row[mode.idx()]);
+                cand_coeffs[n] = coeffs;
+                cand_scan[n] = scan;
+                cand_recon[n] = recon;
             }
+            let reference_cost = |n: usize| {
+                let token_bits =
+                    rd.block_bits(BlockType::YNoY2, above_nonzero, left_nonzero, &cand_scan[n]);
+                cand_ssd[n] + rd.lambda * (token_bits + mode_bits_row[BMODE_CANDIDATES[n].idx()])
+            };
+            let (leader, decisive) = decisive_minimum(&ranking_cost);
+            let (winner, best_cost) = if decisive {
+                (leader, reference_cost(leader))
+            } else {
+                // The reference search: first strictly smaller cost wins.
+                let mut winner = 0usize;
+                let mut best_cost = reference_cost(0);
+                for n in 1..BMODE_CANDIDATES.len() {
+                    let cost = reference_cost(n);
+                    if cost < best_cost {
+                        best_cost = cost;
+                        winner = n;
+                    }
+                }
+                (winner, best_cost)
+            };
+            let best_mode = BMODE_CANDIDATES[winner];
+            let best_coeffs = cand_coeffs[winner];
+            let best_recon = cand_recon[winner];
             modes[idx] = best_mode;
             sub_modes[idx] = best_mode;
             y_coeffs[idx] = best_coeffs;
@@ -13891,6 +14142,111 @@ mod tests {
             }
             assert_eq!(fast.out, slow.out, "regime {regime}");
             assert_eq!(fast.finish(), slow.finish(), "regime {regime}");
+        }
+    }
+
+    /// The pre-summed ranking estimate stays within rounding of the
+    /// reference estimate — far inside the margin [`RD_TIE_GUARD`]
+    /// assumes.
+    #[test]
+    fn presummed_estimate_tracks_reference_estimate() {
+        let probs = &crate::DEFAULT_COEFF_PROBS;
+        let tables = TrellisRateTables::for_probs(probs);
+        let mut lcg = 0x0DDB_A11Du32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (lcg >> 16) as i32
+        };
+        let mut worst = 0f64;
+        for case in 0..40_000 {
+            let mut coeffs = [0i16; 16];
+            for (k, c) in coeffs.iter_mut().enumerate() {
+                *c = match case % 4 {
+                    0 => (next() % 3 - 1) as i16,
+                    1 => ((next() % 9 == 0) as i32 * (next() % 41 - 20)) as i16,
+                    2 => ((next() % 4229 - 2114) / (1 + k as i32)) as i16,
+                    _ => (next() % 4229 - 2114) as i16,
+                };
+            }
+            for block_type in [
+                BlockType::Y2,
+                BlockType::YAfterY2,
+                BlockType::YNoY2,
+                BlockType::UV,
+            ] {
+                let (above, left) = (case % 2 == 0, case % 3 == 0);
+                let reference = estimate_block_bits(block_type, probs, above, left, &coeffs);
+                let ranking =
+                    estimate_block_bits_presummed(&tables, block_type, above, left, &coeffs);
+                worst = worst.max((reference - ranking).abs());
+            }
+        }
+        assert!(worst < 1e-9, "pre-summed estimate drifted by {worst} bits");
+    }
+
+    #[test]
+    fn decisive_minimum_takes_the_first_minimum_and_flags_close_calls() {
+        assert_eq!(decisive_minimum(&[5.0, 3.0, 9.0]), (1, true));
+        assert_eq!(decisive_minimum(&[3.0, 3.0, 9.0]), (0, false));
+        assert_eq!(
+            decisive_minimum(&[3.0 + RD_TIE_GUARD / 2.0, 3.0, 9.0]),
+            (1, false)
+        );
+        assert_eq!(
+            decisive_minimum(&[3.0 + RD_TIE_GUARD * 2.0, 3.0]),
+            (1, true)
+        );
+        assert_eq!(decisive_minimum(&[7.0]), (0, true));
+    }
+
+    /// The guarded ranking search picks exactly what the reference
+    /// search picks: whole frames encode to the same bytes with every
+    /// decision forced through the reference costs.
+    #[test]
+    fn ranked_search_matches_reference_search() {
+        let (w, h) = (112usize, 80usize);
+        // Structured picture: ramps, a flat block, edges and grain, so
+        // whole-block and `B_PRED` macroblocks, identical-prediction
+        // sub-blocks and near-ties all occur.
+        let mut lcg = 0x7E57_F00Du32;
+        let mut y = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let grain = ((lcg >> 24) % 7) as i32 - 3;
+                let mut v = (col * 2 + row) as i32 % 256;
+                if (32..64).contains(&col) && (16..48).contains(&row) {
+                    v = 90;
+                } else if col > 70 {
+                    v = if (col / 6 + row / 9) % 2 == 0 {
+                        40
+                    } else {
+                        210
+                    } + grain;
+                } else if row > 56 {
+                    v += grain * 6;
+                }
+                y[row * w + col] = v.clamp(0, 255) as u8;
+            }
+        }
+        let u: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| (100 + (i % 37)) as u8)
+            .collect();
+        let v: Vec<u8> = (0..(w / 2) * (h / 2))
+            .map(|i| (150 - (i % 23)) as u8)
+            .collect();
+        let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
+        for qi in [0u8, 6, 20, 45, 90, 127] {
+            for strength in [0.0, 1.0, 3.0] {
+                let params = KeyframeParams::default()
+                    .with_y_ac_qi(qi)
+                    .with_trellis_strength(TrellisStrength::new(strength));
+                let ranked = encode_keyframe(&frame, &params).unwrap();
+                FORCE_REFERENCE_SEARCH.with(|f| f.set(true));
+                let reference = encode_keyframe(&frame, &params);
+                FORCE_REFERENCE_SEARCH.with(|f| f.set(false));
+                assert_eq!(ranked, reference.unwrap(), "qi {qi} strength {strength}");
+            }
         }
     }
 

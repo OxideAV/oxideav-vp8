@@ -112,10 +112,13 @@ shrinks a coarse-quantised keyframe ~24–40 % below the no-trellis wire for
 ~0.3 dB), performance tuning (SIMD primitives, profile-guided fast paths;
 the trellis prices tokens from per-frame precomputed rate tables, the
 whole-frame encode benches run ≈ 3× faster than the pre-r441 wire at
-byte-identical output, and the r451 pass added §18.3 identity-pass
+byte-identical output, the r451 pass added §18.3 identity-pass
 elision on single-axis sub-pel fractions plus rectangle-row SPLITMV
-group SAD — a further −4 % on the inter-encode bench), and bench / fuzz
-coverage — see `BENCHMARKS.md`.
+group SAD — a further −4 % on the inter-encode bench — and r486 cut the
+default key-frame encode a further ~35–40 % at identical bytes, added the
+`EncodeEffort` levels and the threaded wavefront described below, and
+sped the stable-build loop filter ~2.5×), and bench / fuzz coverage —
+see `BENCHMARKS.md`.
 
 ## Install
 
@@ -184,7 +187,63 @@ let vp8_bytes: Vec<u8> = encode_keyframe(&frame, &params)?;
 
 The output is a raw VP8 keyframe bitstream (3-byte tag + 7-byte start
 code + partitions); wrap it in an IVF / RIFF-WEBP / Matroska container
-as needed. For multi-frame inter encoding use `Vp8Encoder` +
+as needed.
+
+#### Encode effort and threads
+
+`encode_keyframe_with_options` takes a `KeyframeEncodeOptions` next to
+the `KeyframeParams` — the speed controls for latency-sensitive callers:
+
+```rust
+use oxideav_vp8::{
+    EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams, encode_keyframe_with_options,
+};
+# let (width, height) = (64u32, 48u32);
+# let y_plane = vec![128u8; (width * height) as usize];
+# let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+# let v_plane = u_plane.clone();
+let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+let options = KeyframeEncodeOptions::new()
+    .with_effort(EncodeEffort::Fast)   // Fastest | Fast | Balanced | Thorough (default)
+    .with_threads(4);                  // 0 / 1 = serial (default)
+let vp8_bytes = encode_keyframe_with_options(&frame, &KeyframeParams::default(), &options)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+* **`effort`** — how much mode search each macroblock gets.
+  `Thorough` (level 3, the default) carries every candidate mode through
+  transform, trellis, reconstruction and exact token pricing and
+  reproduces `encode_keyframe` byte for byte. `Balanced` (2) compares
+  the same candidates with a closed-form cost model and quantises only
+  the winners. `Fast` (1) additionally shortlists the sub-block modes
+  by squared prediction error and skips the per-sub-block search where
+  the whole-block prediction leaves no luma AC. `Fastest` (0) shortlists
+  harder, picks the whole-block modes by prediction error and drops the
+  trellis.
+* **`threads`** — the macroblock analysis runs as a macroblock-row
+  wavefront on up to that many scoped threads (no thread pool, no
+  dependency); the token pass follows the finished rows. **The bytes are
+  the same at every thread budget.**
+* `auto_loop_filter` / `fitted_token_prob_updates` — the two per-frame
+  quality switches, so one options value reaches every combination.
+
+Every level emits a conformant stream that this crate's decoder (and a
+black-box decoder) reconstructs to exactly the picture the encoder
+predicted from. Measured on the photo-like bench picture at the
+quality-80 operating point (`y_ac_qi` 25; Apple M-series, shared
+machine, minimum of several runs — see `BENCHMARKS.md` §Round 486 and
+`cargo run --release --example keyframe_timing`):
+
+| Effort | 800×533, 1 thread | 4 threads | bytes | PSNR-Y | 2400×1600, 1 thread | 8 threads | bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| before this round (no options) | 117 ms | — | 61 633 | 38.92 dB | 662 ms | — | 247 441 |
+| `Thorough` (default, same bytes) | 72 ms | 21 ms | 61 633 | 38.92 dB | 505 ms | 83 ms | 247 441 |
+| `Balanced` | 33 ms | 10.7 ms | 61 656 | 38.96 dB | 290 ms | 63 ms | 246 482 |
+| `Fast` | 28 ms | 8.5 ms | 62 102 | 38.91 dB | 216 ms | 55 ms | 248 285 |
+| `Fastest` | 14 ms | 4.7 ms | 64 047 | 38.79 dB | 104 ms | 24 ms | 256 277 |
+
+`Vp8EncoderConfig` and `AltrefStreamConfig` carry the same `effort` /
+`threads` pair for the key frames of a stream. For multi-frame inter encoding use `Vp8Encoder` +
 `Vp8EncoderConfig` (both reachable standalone) and feed successive
 `I420Frame`s; see `tests/encoder_inter_stream.rs` for a worked example.
 
@@ -390,6 +449,38 @@ let enc = make_encoder_with_qindex(&params, 32)?;
 Both factories return `Box<dyn oxideav_core::Encoder>` and integrate
 with the OxideAV pipeline through `send_frame` / `receive_packet`.
 
+The registered encoder factory (`ctx.codecs.first_encoder(&params)`,
+directly `make_encoder_from_param_options`) reads its settings from
+`CodecParameters::options`; `make_encoder_with_options` takes the same
+settings typed (`Vp8EncoderOptions`):
+
+| Option | Kind | Default | Meaning |
+|---|---|---|---|
+| `effort` | u32 | `3` | mode-search effort, `0` fastest ..= `3` thorough |
+| `threads` | u32 | `0` | thread budget; `0` follows `set_execution_context` (serial when none is announced) |
+| `qindex` | u32 | `32` | §9.6 quantiser index `0..=127` |
+| `quality` | f32 | unset | `0..=100`; replaces `qindex` and tunes the trellis |
+| `loop_filter_level` | u32 | `0` | §9.4 level `0..=63` |
+| `auto_loop_filter` | bool | `false` | choose the §9.4 level / sharpness per frame |
+| `partitions` | u32 | `1` | §9.5 token partitions (1 / 2 / 4 / 8) |
+
+```rust
+# use oxideav_core::{CodecId, CodecParameters, ExecutionContext, RuntimeContext};
+# let mut ctx = RuntimeContext::new();
+# oxideav_vp8::register(&mut ctx);
+let mut params = CodecParameters::video(CodecId::new(oxideav_vp8::CODEC_ID_STR));
+params.width = Some(800);
+params.height = Some(533);
+params.options = params.options.set("quality", "80").set("effort", "1");
+let mut encoder = ctx.codecs.first_encoder(&params)?;
+encoder.set_execution_context(&ExecutionContext::with_threads(4));
+# Ok::<(), oxideav_core::Error>(())
+```
+
+Both framework encoders take their thread budget from
+`set_execution_context` (an explicit `threads` option wins); the output
+never depends on it.
+
 ### Stream parameters
 
 The framework `Vp8Decoder` answers `output_params()` with the §9.1
@@ -458,7 +549,13 @@ of `cargo-fuzz` panic-freedom / round-trip targets under
   two-pass auto-alt-ref leg with hidden frames) and checks every shown
   picture byte-identical to the validator's per-segment decode with
   exactly one change per switch.
-* The 40 `fuzz/` targets cover the public encode / decode surface plus
+* [`tests/encoder_keyframe_effort.rs`](./tests/encoder_keyframe_effort.rs) —
+  the key-frame speed options: default options byte-identical to every
+  option-less front door, the same bytes and reconstruction at every
+  thread budget for every effort level, encoder↔decoder pixel lockstep
+  and a black-box cross-decode at every level, a size / PSNR envelope
+  for the reduced levels, and the registry option bag.
+* The 41 `fuzz/` targets cover the public encode / decode surface plus
   the per-stage primitive layers (bool coder, token coding, transforms,
   dequant, intra prediction, motion search / sub-pixel interpolation,
   inter-MB reconstruction, mode-info decode — key-frame *and*

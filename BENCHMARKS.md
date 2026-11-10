@@ -3111,3 +3111,164 @@ Fuzz: a bounded ASan session over the five touched-path targets
 (≈ 31 M combined executions) found nothing; 226 session-discovered
 coverage inputs were folded into committed seed sets (see
 `fuzz/README.md`).
+
+## Round 486 — key-frame encode latency: effort levels, wavefront threads, default-level waste
+
+A latency round driven by a production report: an 800×533 photo key
+frame at the quality-80 operating point took ~130 ms and a 2400×1600 one
+~1 s, single-threaded, with no way to trade bytes for time.
+
+### Instrument
+
+* Picture: `tests/support/photo.rs` — a deterministic, integer-only
+  photo-like scene (brightness ramp, four octaves of value noise, a band
+  of fine texture, hard-edged rectangles with inset grids, diagonal
+  strokes, grain), at 800×533 and 2400×1600 (same scene sampled twice as
+  densely).
+* Operating point: `y_ac_qi = 25`, `TrellisStrength` from
+  `quality_to_trellis_strength(80.0)`, no loop filter, one partition.
+* `cargo run --release --example keyframe_timing -- 800 533 25 31 1 2 4 8`
+  prints the matrix below (minimum / median wall time, bytes, PSNR, byte
+  digest; it asserts the digest does not move with the thread budget).
+  `cargo bench --bench keyframe_encode_photo` is the criterion form.
+* Hardware: Apple M-series, 18 cores, stable rustc. **The machine was
+  shared with other build jobs throughout (load average 16–25)**, so the
+  wall times are minima over 7–31 runs and carry several per cent of
+  noise; the per-encode instruction and cycle counts
+  (`/usr/bin/time -l`, difference between an 11-run and a 1-run process)
+  are the load-robust figures.
+
+### Result — 800×533
+
+| Effort | 1 thread | 2 | 4 | 8 | bytes | PSNR-Y | instructions | cycles |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| before (`encode_keyframe`) | 117 ms | — | — | — | 61 633 | 38.92 | 1 846 M | 494 M |
+| `Thorough` (default) | 72 ms | 39 ms | 21 ms | 15 ms | 61 633 | 38.92 | 1 177 M | 290 M |
+| `Balanced` | 33 ms | 20 ms | 10.7 ms | 7.7 ms | 61 656 | 38.96 | 575 M | 156 M |
+| `Fast` | 28 ms | 18 ms | 8.5 ms | 7.4 ms | 62 102 | 38.91 | 443 M | 110 M |
+| `Fastest` | 14 ms | 9.0 ms | 4.7 ms | 5.0 ms | 64 047 | 38.79 | 204 M | 57 M |
+
+`Thorough` is byte-identical to the pre-round encoder (digest
+`55c983f4c326b652` before and after): −36 % instructions, −41 % cycles,
+−38 % wall time single-threaded. The target of "well under half" at the
+default level was **not** reached single-threaded (0.6×); it is reached
+from two threads up, or one level down (`Balanced`: 0.28× the time for
++0.04 % bytes and +0.04 dB).
+
+### Result — 2400×1600
+
+| Effort | 1 thread | 2 | 4 | 8 | bytes | PSNR-Y | instructions | cycles |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| before (`encode_keyframe`) | 662 ms | — | — | — | 247 441 | 41.36 | 10 574 M | 2 761 M |
+| `Thorough` (default) | 505 ms | 263 ms | 147 ms | 83 ms | 247 441 | 41.36 | 7 505 M | 1 850 M |
+| `Balanced` | 290 ms | 148 ms | 83 ms | 63 ms | 246 482 | 41.39 | 4 501 M | 1 165 M |
+| `Fast` | 216 ms | 113 ms | 69 ms | 55 ms | 248 285 | 41.35 | 3 166 M | 852 M |
+| `Fastest` | 104 ms | 56 ms | 31 ms | 24 ms | 256 277 | 41.18 | 1 420 M | 424 M |
+
+The smoother large picture spends relatively less of the default search
+in the trellis, so the byte-identical gain is smaller (−29 %
+instructions). `Balanced` is *smaller* than `Thorough` here: it prices
+the §11.3 sub-mode signalling against the neighbouring macroblocks'
+real contexts, which the exhaustive search (frozen at its historical
+bytes) does not.
+
+### Size / PSNR of the levels across the quantiser range (800×533, 1 thread)
+
+| `y_ac_qi` | `Thorough` | `Balanced` | `Fast` | `Fastest` |
+|---:|---:|---:|---:|---:|
+| 10 | 102 178 B, 43.18 dB | 106 257 B (+4.0 %), 43.25 | 106 606 B (+4.3 %), 43.18 | 116 378 B (+13.9 %), 42.96 |
+| 25 | 61 633 B, 38.92 dB | 61 656 B (+0.0 %), 38.96 | 62 102 B (+0.8 %), 38.91 | 64 047 B (+3.9 %), 38.79 |
+| 50 | 39 123 B, 34.71 dB | 39 654 B (+1.4 %), 34.81 | 40 065 B (+2.4 %), 34.76 | 41 752 B (+6.7 %), 34.63 |
+| 90 | 17 213 B, 28.99 dB | 17 852 B (+3.7 %), 29.14 | 17 973 B (+4.4 %), 29.14 | 18 891 B (+9.7 %), 29.07 |
+
+`Fastest` pays for dropping the trellis (most at fine quantisers, where
+the trellis trims the most); the other two stay within a few per cent,
+partly bought back as PSNR.
+
+### What changed at the default level (byte-identical)
+
+Baseline profile (`sample`, 800×533): `trellis_quantize_block` 58 %,
+`estimate_block_bits` 20 %, per-macroblock token coding into a discarded
+buffer ~6 %, the rest transforms / prediction / reconstruction.
+
+1. **Trellis** — exact reciprocal-multiply level rounding (one multiply
+   instead of a 64-bit division per coefficient, checked against the
+   division for every magnitude × step), tabled tree-path sums for the
+   extra-bit tokens (shared across the three incoming contexts), and a
+   step specialised by the position's rounded level: context 0 is only
+   reached by level 0, context 1 only by level 1, context 2 by the two
+   high candidates, so each next survivor is a fixed short list reduced
+   pairwise with first-minimum tie semantics.
+2. **Token-bit estimate** — a per-frame step-cost table (same terms,
+   same order, bit-identical `f64`), then ranking: candidates are
+   *ranked* with a pre-summed per-token estimate (one table read per
+   coefficient) and only the winner is priced by the reference estimate.
+   A ranking cost is within `2e-7` of the reference cost; a decision is
+   accepted only when the leader is ahead by more than `1e-3`, otherwise
+   that decision re-runs the reference search — so the choice is
+   provably the reference choice (`ranked_search_matches_reference_search`
+   encodes frames both ways).
+3. No throw-away per-macroblock token pass; the chroma picker's winning
+   blocks are reused; identical sub-block predictions share one
+   evaluation.
+4. §7.3 boolean encoder renormalises in one step per symbol (shift by
+   the leading-zero count; at most one byte boundary; the carry test is
+   provably needed only at the boundary) — pinned state-for-state against
+   the one-bit listing loop.
+5. Mode layer from precomputed tree paths, tabled sub-mode signalling
+   costs, row-copy macroblock fetch, a vectorisable SSD.
+
+Negative results (measured, not kept): a fully branch-free trellis step
+selecting on raw bit patterns or on `f64` values (no gain over the
+level-class dispatch — the step is latency-bound on the survivor chain,
+not misprediction-bound), and branch-free termination updates (flat).
+
+### The reduced levels
+
+`Balanced` / `Fast` / `Fastest` replace the per-candidate
+transform → trellis → reconstruct → price chain with a closed-form cost:
+plain-rounded levels, their weighted squared rounding error (the
+trellis's own basis energies in 1/4096 fixed point; a flat 1/16 for Y2)
+plus the tabled §13.3 token bits along the real context chain. Only the
+winners are quantised for real. `Fast` shortlists the four best sub-block
+modes by squared prediction error and skips `B_PRED` when the whole-block
+winner has no luma AC; `Fastest` shortlists two, picks the whole-block
+luma / chroma modes by prediction error, and plain-rounds.
+
+### Threads
+
+Macroblock-row wavefront (`src/encoder/wavefront.rs`): row `r` may run
+once row `r − 1` is two macroblocks ahead; rows share only their bottom
+pixel line. Whichever worker finishes a row advances the in-order token
+pass, so entropy coding overlaps the remaining analysis. Scaling is
+near-linear to 4 threads at `Thorough` (3.4× at 800×533, 3.4× at
+2400×1600) and flattens where the serial token pass and mode layer start
+to dominate (`Fastest` at 800×533: 3.0× at 4 threads, no gain beyond).
+
+### Decoder
+
+| Workload | before | after |
+|---|---:|---:|
+| key frame 800×533, loop filter off | 4.2 ms | 4.2 ms |
+| key frame 800×533, `loop_filter_level` 20 | 7.0 ms | 5.2 ms |
+| key frame 2400×1600, `loop_filter_level` 20 | 41.1 ms | 33.7 ms |
+| 352×288 inter clip (1 key + 8 inter packets), filter on | 8.6 ms | 6.4 ms |
+
+Profile before (2400×1600, filter on): loop filter ≈ 48 %, token decode
+23 %, mode parse 10 %, inverse DCT 7 %. The §15.3 normal filter now
+takes each 16- / 8-pixel edge run through one branch-free kernel over
+fixed-size tap arrays (stable builds; the nightly `simd` path is
+unchanged), bit-identical to the per-window listing kernels — the filter
+itself is ~2.6× faster.
+
+### Next-round candidates
+
+* Single-partition token pass is the serial floor of the threaded encode
+  (≈ 20 % of `Fastest`): pre-tokenise rows in the workers, or code
+  partitions on separate lanes when `nbr_of_dct_partitions > 1` (needs
+  the per-row entry context computed ahead of the coder).
+* The cost model's block loop is scalar 64-bit arithmetic; a lane-parallel
+  form is the next target for `Balanced` / `Fast`.
+* The §15.2 simple filter and the mode-layer parser are the next decoder
+  self-time entries; the inter encoder (≈ 70 ms per 352×288 P-frame with
+  the fitted / intra-pick passes on) has no effort control yet.

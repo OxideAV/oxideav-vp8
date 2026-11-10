@@ -4,6 +4,21 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.8...v0.2.9) - 2026-11-10
+
+### Added
+
+- *(encoder)* key-frame effort levels, wavefront threading, registry encoder options
+
+### Other
+
+- *(benchmarks)* 2400x1600 instruction / cycle counts from the final build
+- *(encoder)* tokenise rows in the wavefront workers; coefficient flags instead of a flattened copy
+- *(encoder)* rank candidates with a guarded pre-summed token estimate; docs for the effort levels
+- *(loop-filter)* whole-run normal filter kernel; fuzz the key-frame effort / thread options
+- *(encoder)* class-specialised trellis step, tabled token-bit estimate, no throw-away per-MB token pass
+- API hygiene: non_exhaustive errors/options/records + builders
+
 ### Added
 
 - **Key-frame encode effort levels.** `EncodeEffort` (`Fastest` / `Fast` / `Balanced` / `Thorough`, numeric levels 0..=3) trades output size for encode time. `Thorough` (the default) is the exhaustive rate-distortion search and keeps the historical bytes; the reduced levels compare candidate modes with a closed-form cost model (weighted rounding error + tabled §13.3 token bits along the real context chain, §11.3 sub-mode signalling priced against the neighbouring macroblocks' contexts) and quantise only the winners — `Fast` and `Fastest` also shortlist modes by squared prediction error, and `Fastest` drops the trellis. Every level is a conformant stream that decodes to exactly the encoder's reconstruction.

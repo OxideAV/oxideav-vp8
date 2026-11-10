@@ -371,6 +371,193 @@ pub fn mb_filter(
 }
 
 // ===================================================================
+// §15.3 normal filter — whole edge run at once (stable toolchains)
+// ===================================================================
+//
+// The frame pass fires the §15.3 kernels once per pixel position along
+// a 16- or 8-pixel edge run, and those positions are independent: each
+// reads and writes only its own 8-tap window. [`normal_filter_run`]
+// therefore takes the whole run as eight tap arrays (`taps[k][n]` is tap
+// `k` of position `n`, already in the signed `u2s` domain) and evaluates
+// the listing's arithmetic for every position without a data-dependent
+// branch: both outcomes of the `filter_yes` / `hev` tests are computed
+// and the result is selected per position. Each position goes through
+// the same add / clamp / shift sequence [`mb_filter`] /
+// [`subblock_filter`] run for it, in 16-bit arithmetic (every
+// intermediate is bounded by `27·127 + 63`), so the selected output is
+// the scalar output bit for bit — `normal_filter_run_matches_scalar`
+// checks random and extreme windows across the parameter range. Written
+// over fixed-size arrays so the compiler can lay the positions out
+// across vector lanes.
+
+/// Saturate to the signed 8-bit range (the listing's `c()`), in 16-bit.
+#[cfg_attr(feature = "simd", allow(dead_code))]
+#[inline(always)]
+fn clamp_s8_i16(v: i16) -> i16 {
+    v.clamp(-128, 127)
+}
+
+/// Apply the §15.3 macroblock-edge (`mb_edge`) or sub-block-edge filter
+/// to `N` independent 8-tap windows held as signed tap arrays
+/// (`taps[0]` = `p3` … `taps[7]` = `q3`).
+// `n` walks one position across the eight parallel tap arrays.
+#[allow(clippy::needless_range_loop)]
+#[cfg_attr(feature = "simd", allow(dead_code))]
+#[inline(always)]
+fn normal_filter_run<const N: usize>(
+    taps: &mut [[i16; N]; 8],
+    hev_threshold: u8,
+    interior_limit: u8,
+    edge_limit: u8,
+    mb_edge: bool,
+) {
+    let (thresh, interior, edge) = (
+        hev_threshold as i16,
+        interior_limit as i16,
+        edge_limit as i16,
+    );
+    for n in 0..N {
+        let (p3, p2, p1, p0) = (taps[0][n], taps[1][n], taps[2][n], taps[3][n]);
+        let (q0, q1, q2, q3) = (taps[4][n], taps[5][n], taps[6][n], taps[7][n]);
+        let yes = (((p0 - q0).abs() * 2 + (p1 - q1).abs() / 2) <= edge)
+            & ((p3 - p2).abs() <= interior)
+            & ((p2 - p1).abs() <= interior)
+            & ((p1 - p0).abs() <= interior)
+            & ((q3 - q2).abs() <= interior)
+            & ((q2 - q1).abs() <= interior)
+            & ((q1 - q0).abs() <= interior);
+        let hev = ((p1 - p0).abs() > thresh) | ((q1 - q0).abs() > thresh);
+        // `c(c(p1 - q1) + 3*(q0 - p0))`: the macroblock filter's `w` and
+        // `common_adjust`'s `a` with the outer taps in use.
+        let outer = clamp_s8_i16(p1 - q1);
+        let step = 3 * (q0 - p0);
+        let with_outer = clamp_s8_i16(outer + step);
+        // `common_adjust`'s two rounded eighths of `a`.
+        let adjust = |a: i16| (clamp_s8_i16(a + 4) >> 3, clamp_s8_i16(a + 3) >> 3);
+        let (np2, np1, np0, nq0, nq1, nq2) = if mb_edge {
+            // No high edge variance: the three-tap-pair wide filter.
+            let w = with_outer;
+            let a0 = clamp_s8_i16((27 * w + 63) >> 7);
+            let a1 = clamp_s8_i16((18 * w + 63) >> 7);
+            let a2 = clamp_s8_i16((9 * w + 63) >> 7);
+            // High edge variance: `common_adjust(true)` on the inner pair.
+            let (a, b) = adjust(with_outer);
+            if hev {
+                (p2, p1, clamp_s8_i16(p0 + b), clamp_s8_i16(q0 - a), q1, q2)
+            } else {
+                (
+                    clamp_s8_i16(p2 + a2),
+                    clamp_s8_i16(p1 + a1),
+                    clamp_s8_i16(p0 + a0),
+                    clamp_s8_i16(q0 - a0),
+                    clamp_s8_i16(q1 - a1),
+                    clamp_s8_i16(q2 - a2),
+                )
+            }
+        } else {
+            // `common_adjust(hev)`: the outer taps count only under high
+            // edge variance; without it the outer pair moves by half.
+            let (a, b) = adjust(if hev { with_outer } else { clamp_s8_i16(step) });
+            let half = (a + 1) >> 1;
+            let (np1, nq1) = if hev {
+                (p1, q1)
+            } else {
+                (clamp_s8_i16(p1 + half), clamp_s8_i16(q1 - half))
+            };
+            (p2, np1, clamp_s8_i16(p0 + b), clamp_s8_i16(q0 - a), nq1, q2)
+        };
+        taps[1][n] = if yes { np2 } else { p2 };
+        taps[2][n] = if yes { np1 } else { p1 };
+        taps[3][n] = if yes { np0 } else { p0 };
+        taps[4][n] = if yes { nq0 } else { q0 };
+        taps[5][n] = if yes { nq1 } else { q1 };
+        taps[6][n] = if yes { nq2 } else { q2 };
+    }
+}
+
+/// [`filter_v_edge_normal`] for an `N`-row run through
+/// [`normal_filter_run`]: position `n` is row `y0 + n`, whose eight taps
+/// are the contiguous bytes `x - 4 .. x + 4`.
+// `n` walks one position across the eight parallel tap arrays.
+#[allow(clippy::needless_range_loop)]
+#[cfg(not(feature = "simd"))]
+#[inline(always)]
+fn filter_v_edge_normal_run<const N: usize>(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y0: usize,
+    params: &LoopFilterParams,
+    edge_limit: u8,
+    mb_edge: bool,
+) {
+    let mut taps = [[0i16; N]; 8];
+    for n in 0..N {
+        let row = (y0 + n) * stride + x - 4;
+        let window: &[u8; 8] = plane[row..row + 8].try_into().expect("8 taps");
+        for (k, tap) in taps.iter_mut().enumerate() {
+            tap[n] = window[k] as i16 - 128;
+        }
+    }
+    normal_filter_run(
+        &mut taps,
+        params.hev_threshold,
+        params.interior_limit,
+        edge_limit,
+        mb_edge,
+    );
+    for n in 0..N {
+        let row = (y0 + n) * stride + x - 4;
+        let window: &mut [u8; 8] = (&mut plane[row..row + 8]).try_into().expect("8 taps");
+        for k in 1..7 {
+            window[k] = (taps[k][n] + 128) as u8;
+        }
+    }
+}
+
+/// [`filter_h_edge_normal`] for an `N`-column run through
+/// [`normal_filter_run`]: tap `k` of every position is the contiguous
+/// run of `N` bytes on row `y - 4 + k`.
+// `n` walks one position across the eight parallel tap arrays.
+#[allow(clippy::needless_range_loop)]
+#[cfg(not(feature = "simd"))]
+#[inline(always)]
+fn filter_h_edge_normal_run<const N: usize>(
+    plane: &mut [u8],
+    stride: usize,
+    y: usize,
+    x0: usize,
+    params: &LoopFilterParams,
+    edge_limit: u8,
+    mb_edge: bool,
+) {
+    let mut taps = [[0i16; N]; 8];
+    for (k, tap) in taps.iter_mut().enumerate() {
+        let start = (y - 4 + k) * stride + x0;
+        let row: &[u8; N] = plane[start..start + N].try_into().expect("N columns");
+        for n in 0..N {
+            tap[n] = row[n] as i16 - 128;
+        }
+    }
+    normal_filter_run(
+        &mut taps,
+        params.hev_threshold,
+        params.interior_limit,
+        edge_limit,
+        mb_edge,
+    );
+    for (k, tap) in taps.iter().enumerate().take(7).skip(1) {
+        let start = (y - 4 + k) * stride + x0;
+        let row: &mut [u8; N] = (&mut plane[start..start + N])
+            .try_into()
+            .expect("N columns");
+        for n in 0..N {
+            row[n] = (tap[n] + 128) as u8;
+        }
+    }
+}
+
+// ===================================================================
 // §15.2 / §15.3 SIMD filter kernels (4 segments at once)
 // ===================================================================
 //
@@ -1349,6 +1536,21 @@ fn filter_v_edge_normal(
             return;
         }
     }
+    // Whole-run path for the two run lengths the frame pass uses.
+    #[cfg(not(feature = "simd"))]
+    match len {
+        16 => {
+            return filter_v_edge_normal_run::<16>(
+                plane, stride, x, y0, params, edge_limit, mb_edge,
+            );
+        }
+        8 => {
+            return filter_v_edge_normal_run::<8>(
+                plane, stride, x, y0, params, edge_limit, mb_edge,
+            );
+        }
+        _ => {}
+    }
 
     let mut seg = [0u8; 8];
     for r in 0..len {
@@ -1467,6 +1669,21 @@ fn filter_h_edge_normal(
             filter_h_edge_normal_simd(plane, stride, y, x0, len, params, edge_limit, mb_edge);
             return;
         }
+    }
+    // Whole-run path for the two run lengths the frame pass uses.
+    #[cfg(not(feature = "simd"))]
+    match len {
+        16 => {
+            return filter_h_edge_normal_run::<16>(
+                plane, stride, y, x0, params, edge_limit, mb_edge,
+            );
+        }
+        8 => {
+            return filter_h_edge_normal_run::<8>(
+                plane, stride, y, x0, params, edge_limit, mb_edge,
+            );
+        }
+        _ => {}
     }
 
     let mut seg = [0u8; 8];
@@ -2056,6 +2273,68 @@ pub(crate) fn filter_frame_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole-run §15.3 kernel equals the per-window scalar kernels
+    /// on every position, for random and extreme windows across the
+    /// threshold / limit range, on both edge kinds.
+    #[test]
+    fn normal_filter_run_matches_scalar() {
+        let mut lcg = 0x5EED_F17Eu32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            lcg >> 8
+        };
+        let mut filtered = 0usize;
+        for case in 0..60_000u32 {
+            let hev_threshold = [0u8, 1, 2, 3, 9, 40][(next() % 6) as usize];
+            let interior_limit = [1u8, 2, 5, 9, 20, 63][(next() % 6) as usize];
+            let edge_limit = [0u8, 3, 12, 40, 90, 135, 255][(next() % 7) as usize];
+            let mut windows = [[0u8; 8]; 16];
+            for window in windows.iter_mut() {
+                let base = next() as u8;
+                let spread = [0u32, 2, 6, 20, 256][(next() % 5) as usize];
+                for px in window.iter_mut() {
+                    *px = match case % 7 {
+                        0 => [0u8, 255][(next() & 1) as usize],
+                        _ if spread == 256 => next() as u8,
+                        _ if spread == 0 => base,
+                        _ => (base as i32 + (next() % (2 * spread + 1)) as i32 - spread as i32)
+                            .clamp(0, 255) as u8,
+                    };
+                }
+            }
+            for mb_edge in [false, true] {
+                let mut taps = [[0i16; 16]; 8];
+                for (n, window) in windows.iter().enumerate() {
+                    for k in 0..8 {
+                        taps[k][n] = window[k] as i16 - 128;
+                    }
+                }
+                normal_filter_run(
+                    &mut taps,
+                    hev_threshold,
+                    interior_limit,
+                    edge_limit,
+                    mb_edge,
+                );
+                for (n, window) in windows.iter().enumerate() {
+                    let mut want = *window;
+                    if mb_edge {
+                        mb_filter(hev_threshold, interior_limit, edge_limit, &mut want, 0);
+                    } else {
+                        subblock_filter(hev_threshold, interior_limit, edge_limit, &mut want, 0);
+                    }
+                    let got: [u8; 8] = core::array::from_fn(|k| (taps[k][n] + 128) as u8);
+                    assert_eq!(
+                        got, want,
+                        "window {window:?} hev {hev_threshold} interior {interior_limit} edge {edge_limit} mb {mb_edge}"
+                    );
+                    filtered += usize::from(want != *window);
+                }
+            }
+        }
+        assert!(filtered > 100_000, "only {filtered} windows were filtered");
+    }
 
     // ----- §15.2 helpers -----------------------------------------------
 

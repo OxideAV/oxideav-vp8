@@ -862,6 +862,18 @@ path = "fuzz_targets/encode_decode_pixel_lockstep.rs"
 test = false
 doc = false
 
+# Round 486 — key-frame encode options: the `EncodeEffort` level and the
+# macroblock-row wavefront thread budget (plus the auto loop-filter /
+# fitted token-probability switches) through
+# `encode_keyframe_with_reconstruction_and_options`. Oracles: threaded
+# bytes + reconstruction == serial, `decode_vp8` == the encoder's
+# reconstruction at every level, default options == `encode_keyframe`.
+[[bin]]
+name = "keyframe_effort_threads_lockstep"
+path = "fuzz_targets/keyframe_effort_threads_lockstep.rs"
+test = false
+doc = false
+
 [[bin]]
 name = "decode_stream_token_descent"
 path = "fuzz_targets/decode_stream_token_descent.rs"

@@ -3160,10 +3160,10 @@ level down (`Balanced`: 0.28× the time for +0.04 % bytes and +0.04 dB).
 | Effort | 1 thread | 2 | 4 | 8 | bytes | PSNR-Y | instructions | cycles |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | before (`encode_keyframe`) | 616 ms | — | — | — | 247 441 | 41.36 | 10 574 M | 2 761 M |
-| `Thorough` (default) | 390 ms | 204 ms | 108 ms | 61 ms | 247 441 | 41.36 | 7 505 M | 1 850 M |
-| `Balanced` | 241 ms | 122 ms | 68 ms | 40 ms | 246 482 | 41.39 | 4 501 M | 1 165 M |
-| `Fast` | 175 ms | 100 ms | 55 ms | 35 ms | 248 285 | 41.35 | 3 166 M | 852 M |
-| `Fastest` | 97 ms | 52 ms | 30 ms | 18 ms | 256 277 | 41.18 | 1 420 M | 424 M |
+| `Thorough` (default) | 390 ms | 204 ms | 108 ms | 61 ms | 247 441 | 41.36 | 7 553 M | 1 710 M |
+| `Balanced` | 241 ms | 122 ms | 68 ms | 40 ms | 246 482 | 41.39 | 4 532 M | 1 076 M |
+| `Fast` | 175 ms | 100 ms | 55 ms | 35 ms | 248 285 | 41.35 | 3 209 M | 796 M |
+| `Fastest` | 97 ms | 52 ms | 30 ms | 18 ms | 256 277 | 41.18 | 1 461 M | 378 M |
 
 The smoother large picture spends relatively less of the default search
 in the trellis, so the byte-identical gain is smaller (−29 %

@@ -2361,6 +2361,62 @@ fn estimate_block_bits(
     bits
 }
 
+/// [`estimate_block_bits`] priced from the per-frame
+/// [`TrellisRateTables::step`] costs instead of per-step [`bool_bits`]
+/// calls. The accumulation visits the same terms in the same order, and
+/// each table entry is the very `f64` the direct call returns, so the sum
+/// is bit-for-bit the reference estimate
+/// (`estimate_block_bits_tabled_matches_direct`).
+fn estimate_block_bits_tabled(
+    tables: &TrellisRateTables,
+    block_type: BlockType,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> f64 {
+    let first_coeff = block_type.first_coeff();
+    let plane_steps = &tables.step[block_type.plane_index()];
+    let paths = &*TOKEN_BIT_PATHS;
+
+    // One past the last non-zero scan position (`first_coeff` when none).
+    let mut end = 16;
+    while end > first_coeff && coeffs[end - 1] == 0 {
+        end -= 1;
+    }
+
+    let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
+    let mut prev_was_zero = false;
+    let mut bits = 0.0;
+    for (i, &v) in coeffs.iter().enumerate().take(end).skip(first_coeff) {
+        let steps = &plane_steps[COEFF_BANDS[i]][ctx3];
+        let abs_value = v.unsigned_abs();
+        let token = classify_coeff_token(abs_value);
+        let (path, len) = &paths[prev_was_zero as usize][token as usize];
+        for step in &path[..*len as usize] {
+            bits += steps[step.prob_index as usize][step.bit as usize];
+        }
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_value.saturating_sub(base);
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                bits += bool_bits(p, bit);
+            }
+        }
+        if abs_value != 0 {
+            bits += bool_bits(128, false);
+        }
+        ctx3 = level_ctx3(abs_value);
+        prev_was_zero = abs_value == 0;
+    }
+    if end < 16 {
+        // Explicit EOB: the root's left branch (node 0, bit 0). A block
+        // never ends on a literal zero, so the root is always reachable.
+        bits += plane_steps[COEFF_BANDS[end]][ctx3][0][0];
+    }
+    bits
+}
+
 /// Fraction of the mode-decision Lagrange multiplier the §13 coefficient
 /// trellis spends at [`TrellisStrength::DEFAULT`] (`= 1.0`). Coefficient-level
 /// RDO is a much finer rate lever than the mode picker (it can drop one
@@ -2587,6 +2643,16 @@ struct TrellisRateTables {
     small: [[[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
     /// `eob[plane][band][ctx3]` — the exact [`eob_token_bits`] value.
     eob: [[[f64; 3]; 8]; 4],
+    /// `step[plane][band][ctx3][prob_index][bit]` — the exact
+    /// [`bool_bits`] cost of coding `bit` at §13.2 tree node
+    /// `prob_index` against `coeff_probs[plane][band][ctx3]`, the
+    /// per-step term [`estimate_block_bits`] accumulates.
+    step: [[[[[f64; 2]; 11]; 3]; 8]; 4],
+    /// `cat_path[plane][band][ctx3][prev_was_zero][cat]` — the §13.2
+    /// tree-path part of [`coeff_token_bits`] for the six extra-bit
+    /// tokens (`cat = token − Cat1`): the running sum that function holds
+    /// before it adds the value-dependent extra bits and the sign bit.
+    cat_path: [[[[[f64; 6]; 2]; 3]; 8]; 4],
 }
 
 impl TrellisRateTables {
@@ -2607,10 +2673,26 @@ impl TrellisRateTables {
         let mut tables = TrellisRateTables {
             small: [[[[[0.0; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
             eob: [[[0.0; 3]; 8]; 4],
+            step: [[[[[0.0; 2]; 11]; 3]; 8]; 4],
+            cat_path: [[[[[0.0; 6]; 2]; 3]; 8]; 4],
         };
         for plane in 0..4 {
             for (band, &i) in band_pos.iter().enumerate() {
                 for ctx3 in 0..3 {
+                    let probs = &coeff_probs[plane][band][ctx3];
+                    for (node, costs) in tables.step[plane][band][ctx3].iter_mut().enumerate() {
+                        *costs = [bool_bits(probs[node], false), bool_bits(probs[node], true)];
+                    }
+                    for (pwz, slot) in tables.cat_path[plane][band][ctx3].iter_mut().enumerate() {
+                        for (cat, cell) in slot.iter_mut().enumerate() {
+                            let (path, len) = &TOKEN_BIT_PATHS[pwz][DctToken::Cat1 as usize + cat];
+                            let mut bits = 0.0;
+                            for step in &path[..*len as usize] {
+                                bits += bool_bits(probs[step.prob_index as usize], step.bit);
+                            }
+                            *cell = bits;
+                        }
+                    }
                     tables.eob[plane][band][ctx3] = eob_token_bits(coeff_probs, plane, i, ctx3);
                     for (pwz, slot) in tables.small[plane][band][ctx3].iter_mut().enumerate() {
                         for (abs, cell) in slot.iter_mut().enumerate() {
@@ -2623,21 +2705,46 @@ impl TrellisRateTables {
         }
         tables
     }
+
+    /// [`coeff_token_bits`] for any level from the tables of one
+    /// `(plane, band)` cell pair: a direct lookup up to level 4, else the
+    /// tabled tree-path sum followed by the same extra-bit and sign-bit
+    /// additions, in the same order (`level_rate_matches_coeff_token_bits`).
+    #[inline]
+    fn level_rate(
+        small: &[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3],
+        cat_path: &[[[f64; 6]; 2]; 3],
+        ctx3: usize,
+        prev_was_zero: bool,
+        level: u32,
+    ) -> f64 {
+        if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+            return small[ctx3][prev_was_zero as usize][level as usize];
+        }
+        let abs_level = level as u16;
+        let token = classify_coeff_token(abs_level);
+        let mut bits =
+            cat_path[ctx3][prev_was_zero as usize][token as usize - DctToken::Cat1 as usize];
+        if let Some((base, plist)) = cat_extras(token) {
+            let extra = abs_level.saturating_sub(base);
+            let n = plist.len();
+            for (j, &p) in plist.iter().enumerate() {
+                let bit = ((extra >> (n - 1 - j)) & 1) == 1;
+                bits += bool_bits(p, bit);
+            }
+        }
+        bits += bool_bits(128, false);
+        bits
+    }
 }
 
-/// One Viterbi survivor at a scan position: the minimal accumulated
-/// `J = D + lambda·R` to *reach and code through* this position landing in
-/// the carried context, the chosen absolute level, and a back-pointer to
-/// the predecessor context.
+/// One Viterbi decision record of the retained test-module reference
+/// trellis: accumulated cost, chosen absolute level, predecessor context.
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct TrellisCell {
-    /// Accumulated `D + lambda·R` for coding positions `first..=i` with
-    /// this position's coefficient as the (current) last non-zero one,
-    /// i.e. *not yet* including any terminating EOB.
     cost: f64,
-    /// The chosen absolute level at this position.
     level: u16,
-    /// The predecessor context (`ctx3`) this survivor came from.
     prev_ctx: usize,
 }
 
@@ -2673,11 +2780,128 @@ struct TrellisBlockSpec {
 ///
 /// Falls back to plain rounding when `lambda <= 0` (lossless / qi-0 paths
 /// where the rate trade has no benefit), keeping those streams unchanged.
+///
+/// Two production forms share the recurrence of the retained test-module
+/// reference, evaluated in the same order with the same `f64` expressions
+/// (so every comparison, and therefore every chosen level, is identical):
+/// [`trellis_scan_tabled`] when per-frame rate tables are supplied and
+/// [`trellis_scan_direct`] otherwise. Both replace the per-coefficient
+/// divisions with an exact reciprocal multiply. Pinned level-for-level
+/// against the reference by `trellis_lut_and_early_exit_match_reference`.
 fn trellis_quantize_block(
     block: &mut [i16; 16],
     spec: TrellisBlockSpec,
     coeff_probs: &CoeffProbs,
     tables: Option<&TrellisRateTables>,
+    lambda: f64,
+) {
+    if lambda <= 0.0 {
+        enc_quantize_block_range(block, spec.dc, spec.ac, spec.first_coeff);
+        return;
+    }
+    match tables {
+        Some(tables) => trellis_scan_tabled(block, spec, tables, lambda),
+        None => trellis_scan_direct(block, spec, coeff_probs, lambda),
+    }
+}
+
+/// Scan-order view of one block for the trellis: coefficient magnitudes,
+/// signs, round-half-up candidate levels, the per-position drop-to-zero
+/// distortion with its suffix sums (accumulated from position 15
+/// downward), and the last position whose candidate level is non-zero.
+struct TrellisScan {
+    ax: [u32; 16],
+    negative: [bool; 16],
+    m_rounds: [u32; 16],
+    zero_dist: [f64; 16],
+    suffix_zero_dist: [f64; 17],
+    /// `None` when every in-scan coefficient rounds to level 0 — the
+    /// search then provably returns the all-zero block.
+    last_cand_nonzero: Option<usize>,
+}
+
+impl TrellisScan {
+    #[inline]
+    fn new(block: &[i16; 16], dc_q: u32, ac_q: u32, first_coeff: usize) -> Self {
+        let norms = &*IDCT_BASIS_NORM_SQ;
+        let mut scan = TrellisScan {
+            ax: [0; 16],
+            negative: [false; 16],
+            m_rounds: [0; 16],
+            zero_dist: [0.0; 16],
+            suffix_zero_dist: [0.0; 17],
+            last_cand_nonzero: None,
+        };
+        for k in (first_coeff..16).rev() {
+            let x = block[crate::dct_tokens::ZIGZAG[k]];
+            let q = if k == 0 { dc_q } else { ac_q };
+            let ax = x.unsigned_abs() as u32;
+            scan.ax[k] = ax;
+            scan.negative[k] = x < 0;
+            scan.m_rounds[k] = rounded_level(ax, q);
+            if scan.m_rounds[k] != 0 && scan.last_cand_nonzero.is_none() {
+                scan.last_cand_nonzero = Some(k);
+            }
+            scan.zero_dist[k] = norms[k] * (ax as u64 * ax as u64) as f64;
+            scan.suffix_zero_dist[k] = scan.suffix_zero_dist[k + 1] + scan.zero_dist[k];
+        }
+        scan
+    }
+
+    /// Transform-domain distortion of coding position `k` at `level`.
+    #[inline]
+    fn dist(&self, k: usize, level: u32, q: u32) -> f64 {
+        let err = self.ax[k] as i64 - level as i64 * q as i64;
+        IDCT_BASIS_NORM_SQ[k] * (err * err) as f64
+    }
+}
+
+/// `if take { a } else { b }` — written as a value selection so the
+/// trellis step compiles to conditional moves rather than
+/// data-dependent branches.
+#[inline(always)]
+fn select<T: Copy>(take: bool, a: T, b: T) -> T {
+    if take { a } else { b }
+}
+
+/// The first minimum of three costs and its index: a later entry wins
+/// only when strictly smaller.
+#[inline(always)]
+fn first_min3(c: [f64; 3]) -> (f64, u8) {
+    let lt1 = c[1] < c[0];
+    let m01 = select(lt1, c[1], c[0]);
+    let i01 = lt1 as u8;
+    let lt2 = c[2] < m01;
+    (select(lt2, c[2], m01), select(lt2, 2, i01))
+}
+
+/// The trellis against the per-frame [`TrellisRateTables`].
+///
+/// Same recurrence and evaluation order as [`trellis_scan_direct`], with
+/// the step specialised by the position's rounded level `m`. The
+/// candidates are `m`, `m − 1` and `0` (those that exist) and the carried
+/// context of a level is `min(level, 2)`, so:
+///
+/// * context 0 is only ever reached by level 0;
+/// * context 1 by level 1 — the `m` candidate when `m = 1`, the `m − 1`
+///   candidate when `m = 2`;
+/// * context 2 by `m` when `m ≥ 2` and by `m − 1` when `m ≥ 3`.
+///
+/// Each next-context survivor is therefore the first minimum over a fixed
+/// list of `(incoming context, candidate)` costs in the reference order
+/// (incoming context outer, `m` before `m − 1`), which [`first_min3`]
+/// reduces pairwise — a later entry wins only when strictly smaller at
+/// every level, so ties resolve exactly as the sequential scan does. A
+/// dead incoming context carries infinite cost and loses every strict
+/// comparison just as if it had been skipped (no cost is ever NaN).
+///
+/// A survivor in context 0 always arrived through a literal zero except
+/// before the first position, so the "previous token was `DCT_0`" flag
+/// needs no per-survivor storage.
+fn trellis_scan_tabled(
+    block: &mut [i16; 16],
+    spec: TrellisBlockSpec,
+    tables: &TrellisRateTables,
     lambda: f64,
 ) {
     let TrellisBlockSpec {
@@ -2687,261 +2911,333 @@ fn trellis_quantize_block(
         entry_ctx3,
         plane,
     } = spec;
-    // `lambda` is the **effective** coefficient-level price the caller has
-    // already scaled down from the mode-decision multiplier (coefficient
-    // RDO spends `lambda` far more effectively than the mode-granular
-    // picker — it can drop one trailing coefficient rather than a whole
-    // mode — so the raw mode lambda over-trades quality for rate). The
-    // scale is resolved by [`MbRdCtx::trellis_lambda`] from the
-    // [`TrellisStrength`] knob; this entry consumes the resolved value
-    // directly so callers can dial the rate/quality trade per stream.
+    let norms: &[f64; 16] = &IDCT_BASIS_NORM_SQ;
+    let (dc_q, ac_q) = (dc as u32, ac as u32);
 
-    // Baseline rounding for the lossless / no-trade path.
-    if lambda <= 0.0 {
-        enc_quantize_block_range(block, dc, ac, first_coeff);
-        return;
+    // Scan-order magnitudes, sign / non-zero-candidate bitmaps and
+    // round-half-up candidate levels.
+    let mut ax = [0u32; 16];
+    let mut m_rounds = [0u32; 16];
+    let mut negative = 0u32;
+    let mut candidate = 0u32;
+    for k in first_coeff..16 {
+        let x = block[crate::dct_tokens::ZIGZAG[k]];
+        ax[k] = x.unsigned_abs() as u32;
+        negative |= ((x < 0) as u32) << k;
+        let q = if k == 0 { dc_q } else { ac_q };
+        m_rounds[k] = rounded_level(ax[k], q);
+        candidate |= ((m_rounds[k] != 0) as u32) << k;
     }
-
-    // Scan-order view of the unquantised coefficients + per-position step
-    // + the round-half-away-from-zero candidate magnitude per position.
-    let mut scan_x = [0i32; 16];
-    let mut step = [0i32; 16];
-    let mut m_rounds = [0i64; 16];
-    let mut last_cand_nonzero: i32 = -1;
-    for k in 0..16 {
-        scan_x[k] = block[crate::dct_tokens::ZIGZAG[k]] as i32;
-        step[k] = if k == 0 { dc as i32 } else { ac as i32 };
-        let q = step[k] as i64;
-        m_rounds[k] = (scan_x[k].unsigned_abs() as i64 + q / 2) / q;
-        if k >= first_coeff && m_rounds[k] != 0 {
-            last_cand_nonzero = k as i32;
-        }
-    }
-
-    // Sub-threshold early exit: when every in-scan coefficient rounds to
-    // magnitude 0 the candidate set at every position is exactly `{0}`,
-    // so every survivor carries level 0, no terminating position ever
-    // qualifies (`cell.level != 0` never holds), and the traceback below
-    // provably writes an all-zero block. Emit that block directly.
-    if last_cand_nonzero < 0 {
+    if candidate == 0 {
         *block = [0i16; 16];
         return;
     }
+    let last = 31 - candidate.leading_zeros() as usize;
 
-    let norms = &*IDCT_BASIS_NORM_SQ;
-
-    // Per-frame rate LUT views for this block's `plane` (see
-    // [`TrellisRateTables`] — lookups are bit-for-bit the direct-call
-    // values, so costs and decisions cannot move; `None` falls back to
-    // the direct reference calls).
-    let small_rates = tables.map(|t| &t.small[plane]);
-    let eob_rates = tables.map(|t| &t.eob[plane]);
-
-    // Distortion of coding scan position `k` at absolute level `m`
-    // (transform-domain squared error scaled by the basis norm). `m` is a
-    // magnitude (≥ 0); the dequantised coefficient carries `scan_x[k]`'s
-    // sign, so the error is computed on absolute magnitudes.
-    let dist = |k: usize, m: i64| -> f64 {
-        let q = step[k] as i64;
-        let recon = m * q;
-        let err = (scan_x[k] as i64).abs() - recon;
+    // Drop-to-zero distortion per position and its suffix sums,
+    // accumulated from position 15 downward.
+    let mut zero_dist = [0f64; 16];
+    let mut suffix_zero_dist = [0f64; 17];
+    for k in first_coeff..16 {
+        zero_dist[k] = norms[k] * (ax[k] as u64 * ax[k] as u64) as f64;
+    }
+    for k in (first_coeff..16).rev() {
+        suffix_zero_dist[k] = suffix_zero_dist[k + 1] + zero_dist[k];
+    }
+    let dist = |k: usize, level: u32, q: u32| -> f64 {
+        let err = ax[k] as i64 - level as i64 * q as i64;
         norms[k] * (err * err) as f64
     };
 
-    // Suffix distortion of *dropping* every position k..16 to level 0 —
-    // the distortion the §13.3 implicit/explicit EOB tail pays for the
-    // coefficients past the last coded one. `suffix_zero_dist[k]` =
-    // Σ_{j=k}^{15} dist(j, 0). Without this, terminating early would hide
-    // the energy of the dropped tail and the trellis would zero
-    // everything. `suffix_zero_dist[16] = 0`.
-    let mut suffix_zero_dist = [0f64; 17];
-    let mut zero_dist = [0f64; 16];
-    for k in (first_coeff..16).rev() {
-        zero_dist[k] = dist(k, 0);
-        suffix_zero_dist[k] = suffix_zero_dist[k + 1] + zero_dist[k];
-    }
+    let small = &tables.small[plane];
+    let cat_path = &tables.cat_path[plane];
+    let eob = &tables.eob[plane];
 
-    // Forward Viterbi. State = carried `ctx3 ∈ {0,1,2}`. `cells[k]` holds
-    // the best survivor *ending at* scan position `k` with each carried
-    // context, where "ending" means position `k` holds the last coded
-    // (possibly non-zero) coefficient so far. We also separately track the
-    // running all-zero-prefix cost so a block can terminate with EOB at
-    // `first_coeff` (entirely zero) for free of trailing-token bits.
-    //
-    // `prev[ctx]` is the best (cost, level, prev_ctx, prev_was_zero) to
-    // arrive at the *current* position carrying `ctx`.
     const INF: f64 = f64::INFINITY;
+    let mut surv = [INF, INF, INF];
+    surv[entry_ctx3] = 0.0;
+    let mut zero_run = 0usize;
+    // Per position: predecessor context of each carried context, and the
+    // level behind carried context 2 (contexts 0 / 1 imply levels 0 / 1).
+    let mut choice_prev = [[0u8; 3]; 16];
+    let mut choice_level2 = [0u16; 16];
 
-    // survivor reaching position `k` with carried ctx — initialised at the
-    // virtual "before first_coeff" boundary: a single state carrying
-    // `entry_ctx3`, cost 0, prev_was_zero = false (the first token may emit
-    // EOB).
-    #[derive(Clone, Copy)]
-    struct Surv {
-        cost: f64,
-        prev_was_zero: bool,
-        // back-pointer chain stored in `choice` below
-    }
-    let mut surv = [Surv {
-        cost: INF,
-        prev_was_zero: false,
-    }; 3];
-    surv[entry_ctx3] = Surv {
-        cost: 0.0,
-        prev_was_zero: false,
-    };
-
-    // Decision record per (position, carried-ctx): the level chosen at this
-    // position and which predecessor ctx it came from, for traceback.
-    let mut choice = [[TrellisCell {
-        cost: INF,
-        level: 0,
-        prev_ctx: 0,
-    }; 3]; 16];
-
-    // Best terminating survivor: code positions first..=t, then EOB after
-    // t (if t+1 < 16) or implicit EOB. `best_end_pos = first_coeff - 1`
-    // (sentinel `usize::MAX` meaning "all zero") seeds the all-zero block.
-    let mut best_term_cost = {
-        // All-zero block: EOB token at `first_coeff` against the entry ctx,
-        // plus the distortion of dropping every coefficient to zero.
-        let mut c = INF;
-        let s = &surv[entry_ctx3];
-        if s.cost < INF {
-            let eob_r = match eob_rates {
-                Some(e) => e[COEFF_BANDS[first_coeff]][entry_ctx3],
-                None => eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3),
-            };
-            c = s.cost + lambda * eob_r + suffix_zero_dist[first_coeff];
-        }
-        c
-    };
-    let mut best_term_pos: i32 = -1; // -1 ⇒ all-zero
+    let mut best_term_cost =
+        0.0 + lambda * eob[COEFF_BANDS[first_coeff]][entry_ctx3] + suffix_zero_dist[first_coeff];
+    let mut best_term_pos = usize::MAX;
     let mut best_term_ctx = entry_ctx3;
 
-    // Positions past `last_cand_nonzero` admit only the level-0 candidate:
-    // they can never become a terminating (non-zero last-coded) slot, the
-    // traceback never starts past `best_term_pos` (which needs a non-zero
-    // level), and the tail's drop-to-zero distortion is already priced by
-    // `suffix_zero_dist` in every termination cost — so the scan over them
-    // is dead work and stops here, with identical output.
-    for k in first_coeff..=(last_cand_nonzero as usize) {
-        let m_round = m_rounds[k];
+    for k in first_coeff..=last {
+        let m = m_rounds[k];
         let band = COEFF_BANDS[k];
-        // Candidate magnitudes: round and round-1 (≥0), deduplicated, plus
-        // a forced 0 so a non-trivial coefficient can still be dropped.
-        let mut cands = [0i64; 3];
-        let mut ncand = 0usize;
-        for cand in [m_round, m_round - 1, 0] {
-            if cand >= 0 && !cands[..ncand].contains(&cand) {
-                cands[ncand] = cand;
-                ncand += 1;
+        let q = if k == 0 { dc_q } else { ac_q };
+        let band_small = &small[band];
+        let rows = [
+            &band_small[0][zero_run],
+            &band_small[1][0],
+            &band_small[2][0],
+        ];
+        let [s0, s1, s2] = surv;
+
+        // Context 0: first minimum of the level-0 costs.
+        let d_zero = zero_dist[k];
+        let (n0, p0) = first_min3([
+            s0 + d_zero + lambda * rows[0][0],
+            s1 + d_zero + lambda * rows[1][0],
+            s2 + d_zero + lambda * rows[2][0],
+        ]);
+        // The costs of coding one non-zero `level` from each context.
+        let level_costs = |level: u32| -> [f64; 3] {
+            let d = dist(k, level, q);
+            if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+                [
+                    s0 + d + lambda * rows[0][level as usize],
+                    s1 + d + lambda * rows[1][level as usize],
+                    s2 + d + lambda * rows[2][level as usize],
+                ]
+            } else {
+                let rate = |ctx: usize, pwz: bool| {
+                    TrellisRateTables::level_rate(band_small, &cat_path[band], ctx, pwz, level)
+                };
+                [
+                    s0 + d + lambda * rate(0, zero_run == 1),
+                    s1 + d + lambda * rate(1, false),
+                    s2 + d + lambda * rate(2, false),
+                ]
+            }
+        };
+        let (n1, p1, n2, p2, l2) = match m {
+            0 => (INF, 0, INF, 0, 0),
+            1 => {
+                let (n1, p1) = first_min3(level_costs(1));
+                (n1, p1, INF, 0, 0)
+            }
+            2 => {
+                let (n2, p2) = first_min3(level_costs(2));
+                let (n1, p1) = first_min3(level_costs(1));
+                (n1, p1, n2, p2, 2)
+            }
+            _ => {
+                // `m` then `m − 1` per incoming context, then across
+                // contexts.
+                let high = level_costs(m);
+                let low = level_costs(m - 1);
+                let take_low = [low[0] < high[0], low[1] < high[1], low[2] < high[2]];
+                let (n2, p2) = first_min3([
+                    select(take_low[0], low[0], high[0]),
+                    select(take_low[1], low[1], high[1]),
+                    select(take_low[2], low[2], high[2]),
+                ]);
+                (INF, 0, n2, p2, m - take_low[p2 as usize] as u32)
+            }
+        };
+        choice_prev[k] = [p0, p1, p2];
+        choice_level2[k] = l2 as u16;
+
+        // Terminating after position k needs a non-zero level there:
+        // carried context 1, then 2. A dead survivor's infinite cost
+        // never beats the (finite) running best.
+        if m != 0 {
+            let (t1, t2) = if k + 1 < 16 {
+                let eob_next = &eob[COEFF_BANDS[k + 1]];
+                let tail = suffix_zero_dist[k + 1];
+                (
+                    n1 + lambda * eob_next[1] + tail,
+                    n2 + lambda * eob_next[2] + tail,
+                )
+            } else {
+                (n1, n2)
+            };
+            if t1 < best_term_cost {
+                best_term_cost = t1;
+                best_term_pos = k;
+                best_term_ctx = 1;
+            }
+            if t2 < best_term_cost {
+                best_term_cost = t2;
+                best_term_pos = k;
+                best_term_ctx = 2;
             }
         }
 
-        let mut next = [Surv {
-            cost: INF,
-            prev_was_zero: false,
-        }; 3];
-        let mut next_choice = [TrellisCell {
-            cost: INF,
-            level: 0,
-            prev_ctx: 0,
-        }; 3];
+        surv = [n0, n1, n2];
+        zero_run = 1;
+    }
 
-        // Distortion depends only on the candidate magnitude, not on the
-        // carried context — compute each candidate's term once (the m = 0
-        // slot reuses the cached drop-to-zero value bit-for-bit).
+    *block = [0i16; 16];
+    if best_term_pos != usize::MAX {
+        let mut k = best_term_pos;
+        let mut ctx = best_term_ctx;
+        loop {
+            let level = match ctx {
+                0 => 0,
+                1 => 1,
+                _ => choice_level2[k] as i16,
+            };
+            block[crate::dct_tokens::ZIGZAG[k]] = if (negative >> k) & 1 != 0 {
+                -level
+            } else {
+                level
+            };
+            if k == first_coeff {
+                break;
+            }
+            ctx = choice_prev[k][ctx] as usize;
+            k -= 1;
+        }
+    }
+}
+
+/// The trellis pricing every token through the direct reference rate
+/// functions — the path the per-macroblock public entries take when no
+/// per-frame tables exist. Level-for-level identical to
+/// [`trellis_scan_tabled`].
+fn trellis_scan_direct(
+    block: &mut [i16; 16],
+    spec: TrellisBlockSpec,
+    coeff_probs: &CoeffProbs,
+    lambda: f64,
+) {
+    let TrellisBlockSpec {
+        dc,
+        ac,
+        first_coeff,
+        entry_ctx3,
+        plane,
+    } = spec;
+    let (dc_q, ac_q) = (dc as u32, ac as u32);
+    let scan = TrellisScan::new(block, dc_q, ac_q, first_coeff);
+    let Some(last) = scan.last_cand_nonzero else {
+        *block = [0i16; 16];
+        return;
+    };
+
+    const INF: f64 = f64::INFINITY;
+    // Survivor per carried context: accumulated cost and whether the
+    // coefficient that produced it was a literal zero.
+    let mut surv_cost = [INF; 3];
+    let mut surv_pwz = [false; 3];
+    surv_cost[entry_ctx3] = 0.0;
+    // Decision records for the traceback.
+    let mut choice_level = [[0u16; 3]; 16];
+    let mut choice_prev = [[0u8; 3]; 16];
+
+    let entry_eob = eob_token_bits(coeff_probs, plane, first_coeff, entry_ctx3);
+    let mut best_term_cost = 0.0 + lambda * entry_eob + scan.suffix_zero_dist[first_coeff];
+    let mut best_term_pos = usize::MAX;
+    let mut best_term_ctx = entry_ctx3;
+
+    for k in first_coeff..=last {
+        let m = scan.m_rounds[k];
+        let q = if k == 0 { dc_q } else { ac_q };
+        // Candidates in evaluation order: the rounded level, one below it,
+        // and zero — without repeats.
+        let cands = [m, m.saturating_sub(1), 0];
+        let ncand = (m as usize).min(2) + 1;
         let mut cand_dist = [0f64; 3];
-        for (slot, &m) in cand_dist.iter_mut().zip(&cands[..ncand]) {
-            *slot = if m == 0 { zero_dist[k] } else { dist(k, m) };
+        for c in 0..ncand {
+            cand_dist[c] = if cands[c] == 0 {
+                scan.zero_dist[k]
+            } else {
+                scan.dist(k, cands[c], q)
+            };
         }
 
-        for (in_ctx, &s) in surv.iter().enumerate() {
-            if s.cost >= INF {
+        let mut next_cost = [INF; 3];
+        let mut next_pwz = [false; 3];
+        let mut next_level = [0u16; 3];
+        let mut next_prev = [0u8; 3];
+        for in_ctx in 0..3 {
+            let base = surv_cost[in_ctx];
+            if base >= INF {
                 continue;
             }
-            for (&m, &d) in cands[..ncand].iter().zip(&cand_dist[..ncand]) {
-                let abs = m as u16;
-                let r = match small_rates {
-                    Some(t) if abs <= TRELLIS_SMALL_LEVEL_MAX => {
-                        t[band][in_ctx][s.prev_was_zero as usize][abs as usize]
-                    }
-                    _ => coeff_token_bits(coeff_probs, plane, k, in_ctx, s.prev_was_zero, abs),
-                };
-                let cost = s.cost + d + lambda * r;
-                let out_ctx = level_ctx3(abs);
-                if cost < next[out_ctx].cost {
-                    next[out_ctx] = Surv {
-                        cost,
-                        prev_was_zero: abs == 0,
-                    };
-                    next_choice[out_ctx] = TrellisCell {
-                        cost,
-                        level: abs,
-                        prev_ctx: in_ctx,
-                    };
+            let pwz = surv_pwz[in_ctx];
+            for c in 0..ncand {
+                let level = cands[c];
+                let r = coeff_token_bits(coeff_probs, plane, k, in_ctx, pwz, level as u16);
+                let cost = base + cand_dist[c] + lambda * r;
+                let out_ctx = level_ctx3(level as u16);
+                if cost < next_cost[out_ctx] {
+                    next_cost[out_ctx] = cost;
+                    next_pwz[out_ctx] = level == 0;
+                    next_level[out_ctx] = level as u16;
+                    next_prev[out_ctx] = in_ctx as u8;
                 }
             }
         }
+        choice_level[k] = next_level;
+        choice_prev[k] = next_prev;
 
-        choice[k] = next_choice;
-
-        // Consider terminating *after* position k: position k must hold a
-        // non-zero coefficient to be a meaningful last-coded slot (a zero
-        // last slot is dominated by terminating one position earlier). The
-        // EOB after position k lands at k+1 (if any) against k's out-ctx;
-        // at k = 15 the implicit EOB costs nothing.
-        for (out_ctx, &cell) in next_choice.iter().enumerate() {
-            if cell.cost >= INF || cell.level == 0 {
+        // Terminating after position k needs a non-zero level there, i.e.
+        // a survivor in carried context 1 or 2 (context 0 is reached only
+        // through level 0).
+        for (out_ctx, &cost) in next_cost.iter().enumerate().skip(1) {
+            if cost >= INF {
                 continue;
             }
-            // `cell.cost` covers coding first..=k; add the EOB token (if
-            // any remain) plus the distortion of dropping positions k+1..16.
             let term_cost = if k + 1 < 16 {
-                let eob_r = match eob_rates {
-                    Some(e) => e[COEFF_BANDS[k + 1]][out_ctx],
-                    None => eob_token_bits(coeff_probs, plane, k + 1, out_ctx),
-                };
-                cell.cost + lambda * eob_r + suffix_zero_dist[k + 1]
+                cost + lambda * eob_token_bits(coeff_probs, plane, k + 1, out_ctx)
+                    + scan.suffix_zero_dist[k + 1]
             } else {
-                cell.cost // implicit EOB after the last coefficient
+                cost
             };
             if term_cost < best_term_cost {
                 best_term_cost = term_cost;
-                best_term_pos = k as i32;
+                best_term_pos = k;
                 best_term_ctx = out_ctx;
             }
         }
 
-        surv = next;
+        surv_cost = next_cost;
+        surv_pwz = next_pwz;
     }
 
-    // Traceback from the best terminating position, writing scan-order
-    // levels then permuting back to raster.
-    let mut scan_levels = [0i32; 16];
-    if best_term_pos >= 0 {
-        let mut k = best_term_pos as usize;
+    *block = [0i16; 16];
+    if best_term_pos != usize::MAX {
+        let mut k = best_term_pos;
         let mut ctx = best_term_ctx;
         loop {
-            let cell = choice[k][ctx];
-            let lvl = cell.level as i32;
-            let signed = if scan_x[k] < 0 { -lvl } else { lvl };
-            scan_levels[k] = signed;
+            let level = choice_level[k][ctx] as i16;
+            block[crate::dct_tokens::ZIGZAG[k]] = if scan.negative[k] { -level } else { level };
             if k == first_coeff {
                 break;
             }
-            ctx = cell.prev_ctx;
+            ctx = choice_prev[k][ctx] as usize;
             k -= 1;
         }
     }
+}
 
-    // Permute scan levels back into the raster `block`.
-    for v in block.iter_mut() {
-        *v = 0;
+/// `QUANT_RECIPROCAL[q] = floor(2^32 / q) + 1` for `q` in `1..1024` — the
+/// multiplier that turns the trellis's round-half-up division into one
+/// multiply and shift (see [`rounded_level`]).
+const QUANT_RECIPROCAL: [u64; 1024] = {
+    let mut table = [0u64; 1024];
+    let mut q = 1usize;
+    while q < 1024 {
+        table[q] = (1u64 << 32) / q as u64 + 1;
+        q += 1;
     }
-    for (k, &lvl) in scan_levels.iter().enumerate() {
-        block[crate::dct_tokens::ZIGZAG[k]] = lvl as i16;
+    table
+};
+
+/// `floor((magnitude + q / 2) / q)` — the round-half-up quantised level of
+/// a coefficient magnitude at step `q`.
+///
+/// For `q < 1024` (every §14.1 step is far below that) the quotient comes
+/// from a reciprocal multiply. With `r = floor(2^32 / q) + 1` we have
+/// `r·q = 2^32 + e`, `0 < e <= q`, so `n·r / 2^32 = n/q + n·e / (q·2^32)`;
+/// the excess stays below `1/q` — too small to carry the value across the
+/// next integer — whenever `n·e < 2^32`, which `n < 2^17`, `q < 2^10`
+/// guarantees. `rounded_level_matches_division` checks every pair.
+#[inline]
+fn rounded_level(magnitude: u32, q: u32) -> u32 {
+    let n = magnitude as u64 + (q / 2) as u64;
+    if (q as usize) < QUANT_RECIPROCAL.len() && q != 0 {
+        ((n * QUANT_RECIPROCAL[q as usize]) >> 32) as u32
+    } else {
+        (n / q as u64) as u32
     }
 }
 
@@ -2998,6 +3294,35 @@ impl MbRdCtx<'_> {
     #[inline]
     fn trellis_active(&self) -> bool {
         self.trellis_lambda() > 0.0
+    }
+
+    /// §13.3 token bits of one scan-order block — [`estimate_block_bits`],
+    /// priced from the per-frame step table when one is attached (the
+    /// two forms return the identical `f64`).
+    #[inline]
+    fn block_bits(
+        &self,
+        block_type: BlockType,
+        above_has_nonzero: bool,
+        left_has_nonzero: bool,
+        coeffs: &[i16; 16],
+    ) -> f64 {
+        match self.rate_tables {
+            Some(tables) => estimate_block_bits_tabled(
+                tables,
+                block_type,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+            None => estimate_block_bits(
+                block_type,
+                self.coeff_probs,
+                above_has_nonzero,
+                left_has_nonzero,
+                coeffs,
+            ),
+        }
     }
 }
 
@@ -3218,7 +3543,7 @@ fn reconstruct_whole_block_luma(
 /// neighbour's non-zero state shifts every candidate's first-band cost by
 /// the same amount, so it does not change the winner).
 fn estimate_whole_block_luma_bits(
-    coeff_probs: &CoeffProbs,
+    rd: &MbRdCtx,
     y_quant: &[[i16; 16]; 16],
     y2_quant: &[i16; 16],
 ) -> f64 {
@@ -3227,24 +3552,11 @@ fn estimate_whole_block_luma_bits(
     let mut bits = 0.0;
 
     let scan_y2 = raster_to_scan(y2_quant);
-    bits += estimate_block_bits_with_ctx(
-        24,
-        BlockType::Y2,
-        coeff_probs,
-        &scan_y2,
-        &mut above,
-        &mut left,
-    );
+    bits += estimate_block_bits_with_ctx(24, BlockType::Y2, rd, &scan_y2, &mut above, &mut left);
     for (i, blk) in y_quant.iter().enumerate() {
         let scan = raster_to_scan(blk);
-        bits += estimate_block_bits_with_ctx(
-            i,
-            BlockType::YAfterY2,
-            coeff_probs,
-            &scan,
-            &mut above,
-            &mut left,
-        );
+        bits +=
+            estimate_block_bits_with_ctx(i, BlockType::YAfterY2, rd, &scan, &mut above, &mut left);
     }
     bits
 }
@@ -3255,7 +3567,7 @@ fn estimate_whole_block_luma_bits(
 fn estimate_block_bits_with_ctx(
     block_index: usize,
     block_type: BlockType,
-    coeff_probs: &CoeffProbs,
+    rd: &MbRdCtx,
     scan_coeffs: &[i16; 16],
     above: &mut MbEntropyCtx,
     left: &mut MbEntropyCtx,
@@ -3268,9 +3580,8 @@ fn estimate_block_bits_with_ctx(
     ];
     let a_slot = ABOVE_CTX[block_index];
     let l_slot = LEFT_CTX[block_index];
-    let bits = estimate_block_bits(
+    let bits = rd.block_bits(
         block_type,
-        coeff_probs,
         above.nonzero[a_slot],
         left.nonzero[l_slot],
         scan_coeffs,
@@ -3313,7 +3624,7 @@ fn pick_y16x16_mode(
         let (y_quant, y2_quant) = transform_whole_block_luma_rd(src, &pred, rd.factors, Some(rd));
         let recon = reconstruct_whole_block_luma(&pred, &y_quant, &y2_quant, rd.factors);
         let ssd = block_ssd(&recon, src) as f64;
-        let token_bits = estimate_whole_block_luma_bits(rd.coeff_probs, &y_quant, &y2_quant);
+        let token_bits = estimate_whole_block_luma_bits(rd, &y_quant, &y2_quant);
         let mode_bits = treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mode.leaf());
         let rd_cost = ssd + rd.lambda * (token_bits + mode_bits);
 
@@ -3421,12 +3732,14 @@ fn reconstruct_chroma_plane(
 /// candidate is reconstructed through the full §14 chain; `D` is the
 /// summed self-decode SSD across U and V, `R` the eight §13.3 `UV`-block
 /// token bits plus the §11.4 chroma-mode-signal bits. Returns the joint
-/// winner plus both prediction buffers.
+/// winner plus its quantised `U` / `V` blocks (the blocks the residual
+/// pass emits — re-deriving them would repeat the same deterministic
+/// transform and quantisation).
 fn pick_uv8x8_mode(
     u: &ChromaPlane,
     v: &ChromaPlane,
     rd: &MbRdCtx,
-) -> (IntraUvMode, [u8; 64], [u8; 64]) {
+) -> (IntraUvMode, [[i16; 16]; 4], [[i16; 16]; 4]) {
     const CANDIDATES: [IntraUvMode; 4] = [
         IntraUvMode::Dc,
         IntraUvMode::V,
@@ -3434,8 +3747,8 @@ fn pick_uv8x8_mode(
         IntraUvMode::Tm,
     ];
     let mut best_mode = IntraUvMode::Dc;
-    let mut best_u = [0u8; 64];
-    let mut best_v = [0u8; 64];
+    let mut best_u = [[0i16; 16]; 4];
+    let mut best_v = [[0i16; 16]; 4];
     let mut best_cost = f64::INFINITY;
     for &mode in &CANDIDATES {
         let mut u_pred = [0u8; 64];
@@ -3459,7 +3772,7 @@ fn pick_uv8x8_mode(
             token_bits += estimate_block_bits_with_ctx(
                 16 + i,
                 BlockType::UV,
-                rd.coeff_probs,
+                rd,
                 &scan,
                 &mut above,
                 &mut left,
@@ -3470,7 +3783,7 @@ fn pick_uv8x8_mode(
             token_bits += estimate_block_bits_with_ctx(
                 20 + i,
                 BlockType::UV,
-                rd.coeff_probs,
+                rd,
                 &scan,
                 &mut above,
                 &mut left,
@@ -3482,8 +3795,8 @@ fn pick_uv8x8_mode(
         if cost < best_cost {
             best_cost = cost;
             best_mode = mode;
-            best_u = u_pred;
-            best_v = v_pred;
+            best_u = u_quant;
+            best_v = v_quant;
         }
     }
     (best_mode, best_u, best_v)
@@ -3692,9 +4005,8 @@ fn encode_bpred_luma(
                 let recon = reconstruct_block_4x4(&pred, &coeffs, factors.y1_dc, factors.y1_ac);
                 let ssd = block_ssd(&recon, &sb_src) as f64;
                 let scan = raster_to_scan(&coeffs);
-                let token_bits = estimate_block_bits(
+                let token_bits = rd.block_bits(
                     BlockType::YNoY2,
-                    rd.coeff_probs,
                     tok_above.nonzero[j],
                     tok_left.nonzero[i],
                     &scan,
@@ -3890,6 +4202,139 @@ pub fn encode_mb_block_set_with_neighbors_strength(
     )
 }
 
+/// One macroblock's mode decision and quantised residual — what the
+/// frame drivers need from the per-macroblock search, without the token
+/// bytes the standalone [`EncodedMb`] entries also produce.
+struct MbAnalysis {
+    /// The 25 raw-quantised coefficient blocks ([`MbCoeffs`] layout).
+    coeffs: MbCoeffs,
+    /// Chosen luma mode (`B_PRED` or one of the four §12.2 modes).
+    y_mode: IntraYMode,
+    /// Chosen §12.2 chroma mode.
+    uv_mode: IntraUvMode,
+    /// The sixteen §12.3 sub-block modes, present iff `y_mode` is
+    /// `B_PRED`.
+    b_subblock_modes: Option<[IntraBmode; 16]>,
+    /// Number of residual blocks the §13.3 walk codes with at least one
+    /// non-zero coefficient (`0` ⇒ the macroblock is a §11.1 skip).
+    nonzero_block_count: usize,
+}
+
+impl MbAnalysis {
+    /// Bundle a decision, counting the non-zero blocks exactly as the
+    /// §13.3 walk in [`encode_mb_tokens`] reports them: the Y2 block only
+    /// off `B_PRED`, the sixteen Y blocks from their first coded position
+    /// (1 when the DC lives in Y2), and the eight chroma blocks.
+    fn from_coeffs(
+        coeffs: MbCoeffs,
+        y_mode: IntraYMode,
+        uv_mode: IntraUvMode,
+        b_subblock_modes: Option<[IntraBmode; 16]>,
+    ) -> Self {
+        let use_bpred = y_mode == IntraYMode::B;
+        let y_first = usize::from(!use_bpred);
+        let any = |block: &[i16]| block.iter().any(|&v| v != 0);
+        let nonzero_block_count = usize::from(!use_bpred && any(&coeffs.y2))
+            + coeffs.y.iter().filter(|b| any(&b[y_first..])).count()
+            + coeffs.u.iter().filter(|b| any(&b[..])).count()
+            + coeffs.v.iter().filter(|b| any(&b[..])).count();
+        MbAnalysis {
+            coeffs,
+            y_mode,
+            uv_mode,
+            b_subblock_modes,
+            nonzero_block_count,
+        }
+    }
+}
+
+/// The exhaustive per-macroblock search: every §12.2 luma mode, the
+/// §12.3 `B_PRED` pass with all ten sub-modes per sub-block, and every
+/// §12.2 chroma mode, each candidate carried through the full transform /
+/// trellis / reconstruction chain and scored by `J = SSD + lambda·R`.
+fn analyze_mb_exhaustive(
+    pixels: &MbPixels,
+    neighbors: &crate::reconstruct::MbNeighbors,
+    rd: &MbRdCtx,
+) -> MbAnalysis {
+    // ---- 2. Pick the §12.2 whole-block luma mode by rate-distortion.
+    //         Each candidate is reconstructed through the full §14 chain
+    //         (predict → FDCT → Y2/WHT → quant → dequant → IDCT → add),
+    //         so the distortion term is the exact self-decode SSD and the
+    //         rate term is the §13.3 token bits + §11.2 mode bits. The
+    //         shared `predict_*` kernels apply each mode's off-frame
+    //         default (V → 127, H → 129, TM → 129, DC → 128 fill) for any
+    //         `None` edge, identically on both sides, so the residual the
+    //         picker scores is the one the decoder reconstructs. The
+    //         corner (-1,-1) read only by TM_PRED defaults to the §12
+    //         `DEFAULT_ABOVE_PIXEL` (127) when off-frame, mirroring
+    //         `decode_keyframe_mb_non_bpred`.
+    let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
+    let whole = pick_y16x16_mode(
+        &pixels.y,
+        neighbors.y_above.as_ref(),
+        neighbors.y_left.as_ref(),
+        neighbors.y_topleft.unwrap_or(default_corner),
+        rd,
+    );
+
+    // ---- 2b. Score the §11.3 / §12.3 B_PRED per-4×4-sub-block luma pass
+    //          and decide luma by RD cost. The §11.2 luma-mode flag
+    //          differs between the two paths, so add each path's
+    //          mode-signal bits to its residual RD cost before comparing:
+    //          the whole-block cost already folds its mode bits inside
+    //          `pick_y16x16_mode`, and we charge the B_PRED MB its §11.2
+    //          B-flag here (its per-sub-block mode bits are already inside
+    //          `encode_bpred_luma`'s RD cost). B_PRED wins iff its total
+    //          RD cost is strictly lower.
+    let bpred = encode_bpred_luma(&pixels.y, neighbors, rd);
+    let bpred_flag_bits =
+        treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], IntraYMode::B.leaf());
+    let bpred_total_cost = bpred.rd_cost + rd.lambda * bpred_flag_bits;
+    let use_bpred = bpred_total_cost < whole.rd_cost;
+    let y_mode = if use_bpred { IntraYMode::B } else { whole.mode };
+
+    let (uv_mode, u_coeffs, v_coeffs) = pick_uv8x8_mode(
+        &ChromaPlane {
+            src: &pixels.u,
+            above: neighbors.u_above.as_ref(),
+            left: neighbors.u_left.as_ref(),
+            topleft: neighbors.u_topleft.unwrap_or(default_corner),
+        },
+        &ChromaPlane {
+            src: &pixels.v,
+            above: neighbors.v_above.as_ref(),
+            left: neighbors.v_left.as_ref(),
+            topleft: neighbors.v_topleft.unwrap_or(default_corner),
+        },
+        rd,
+    );
+
+    // ---- 3. Assemble the quantised coefficients from the winning modes.
+    //         The pickers already ran the §14 FDCT / Y2-WHT / quant chain
+    //         for their winner, so the luma blocks are reused directly:
+    //   * whole-block: `whole.y_coeffs` (DC in Y2) + `whole.y2_coeffs`;
+    //   * B_PRED: `bpred.y_coeffs` (each sub-block carries its own DC),
+    //     Y2 stays zero (§13 / §14.2: a B_PRED MB has no Y2 block).
+    //         The chroma blocks are the chroma picker's winner.
+    let mut raw_coeffs = MbCoeffs::default();
+    if use_bpred {
+        raw_coeffs.y = bpred.y_coeffs;
+    } else {
+        raw_coeffs.y = whole.y_coeffs;
+        raw_coeffs.y2 = whole.y2_coeffs;
+    }
+    raw_coeffs.u = u_coeffs;
+    raw_coeffs.v = v_coeffs;
+
+    MbAnalysis::from_coeffs(
+        raw_coeffs,
+        y_mode,
+        uv_mode,
+        use_bpred.then_some(bpred.modes),
+    )
+}
+
 /// [`encode_mb_block_set_with_neighbors_strength`] with an optional
 /// per-frame [`TrellisRateTables`] built for `coeff_probs`. The
 /// frame-level drivers pass `Some` so the §13 trellis prices tokens from
@@ -3915,96 +4360,14 @@ fn encode_mb_block_set_with_neighbors_strength_rates(
         lambda: rd_lambda(&factors),
         trellis,
     };
-
-    // ---- 2. Pick the §12.2 whole-block luma mode by rate-distortion.
-    //         Each candidate is reconstructed through the full §14 chain
-    //         (predict → FDCT → Y2/WHT → quant → dequant → IDCT → add),
-    //         so the distortion term is the exact self-decode SSD and the
-    //         rate term is the §13.3 token bits + §11.2 mode bits. The
-    //         shared `predict_*` kernels apply each mode's off-frame
-    //         default (V → 127, H → 129, TM → 129, DC → 128 fill) for any
-    //         `None` edge, identically on both sides, so the residual the
-    //         picker scores is the one the decoder reconstructs. The
-    //         corner (-1,-1) read only by TM_PRED defaults to the §12
-    //         `DEFAULT_ABOVE_PIXEL` (127) when off-frame, mirroring
-    //         `decode_keyframe_mb_non_bpred`.
-    let default_corner = crate::intra_predict::DEFAULT_ABOVE_PIXEL;
-    let whole = pick_y16x16_mode(
-        &pixels.y,
-        neighbors.y_above.as_ref(),
-        neighbors.y_left.as_ref(),
-        neighbors.y_topleft.unwrap_or(default_corner),
-        &rd,
-    );
-
-    // ---- 2b. Score the §11.3 / §12.3 B_PRED per-4×4-sub-block luma pass
-    //          and decide luma by RD cost. The §11.2 luma-mode flag
-    //          differs between the two paths, so add each path's
-    //          mode-signal bits to its residual RD cost before comparing:
-    //          the whole-block cost already folds its mode bits inside
-    //          `pick_y16x16_mode`, and we charge the B_PRED MB its §11.2
-    //          B-flag here (its per-sub-block mode bits are already inside
-    //          `encode_bpred_luma`'s RD cost). B_PRED wins iff its total
-    //          RD cost is strictly lower.
-    let bpred = encode_bpred_luma(&pixels.y, neighbors, &rd);
-    let bpred_flag_bits =
-        treed_bits_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], IntraYMode::B.leaf());
-    let bpred_total_cost = bpred.rd_cost + rd.lambda * bpred_flag_bits;
-    let use_bpred = bpred_total_cost < whole.rd_cost;
-    let y_mode = if use_bpred { IntraYMode::B } else { whole.mode };
-
-    let (uv_mode, _u_pred, _v_pred) = pick_uv8x8_mode(
-        &ChromaPlane {
-            src: &pixels.u,
-            above: neighbors.u_above.as_ref(),
-            left: neighbors.u_left.as_ref(),
-            topleft: neighbors.u_topleft.unwrap_or(default_corner),
-        },
-        &ChromaPlane {
-            src: &pixels.v,
-            above: neighbors.v_above.as_ref(),
-            left: neighbors.v_left.as_ref(),
-            topleft: neighbors.v_topleft.unwrap_or(default_corner),
-        },
-        &rd,
-    );
-    // Re-derive the chosen chroma mode's predictions + quantised blocks.
-    let mut u_pred = [0u8; 64];
-    let mut v_pred = [0u8; 64];
-    predict_uv8x8(
-        &mut u_pred,
+    let MbAnalysis {
+        coeffs: raw_coeffs,
+        y_mode,
         uv_mode,
-        neighbors.u_above.as_ref(),
-        neighbors.u_left.as_ref(),
-        neighbors.u_topleft.unwrap_or(default_corner),
-    );
-    predict_uv8x8(
-        &mut v_pred,
-        uv_mode,
-        neighbors.v_above.as_ref(),
-        neighbors.v_left.as_ref(),
-        neighbors.v_topleft.unwrap_or(default_corner),
-    );
-
-    // ---- 3. Assemble the quantised coefficients from the winning modes.
-    //         The pickers already ran the §14 FDCT / Y2-WHT / quant chain
-    //         for their winner, so the luma blocks are reused directly:
-    //   * whole-block: `whole.y_coeffs` (DC in Y2) + `whole.y2_coeffs`;
-    //   * B_PRED: `bpred.y_coeffs` (each sub-block carries its own DC),
-    //     Y2 stays zero (§13 / §14.2: a B_PRED MB has no Y2 block).
-    //         Chroma is FDCT+quantised here against the chosen uv_mode.
-    let mut raw_coeffs = MbCoeffs::default();
-    if use_bpred {
-        raw_coeffs.y = bpred.y_coeffs;
-    } else {
-        raw_coeffs.y = whole.y_coeffs;
-        raw_coeffs.y2 = whole.y2_coeffs;
-    }
-    // Chroma is re-FDCT+quantised here against the chosen uv_mode; use the
-    // same §13 trellis the picker scored so the emitted bytes match the
-    // chosen-mode RD cost.
-    raw_coeffs.u = transform_chroma_plane_rd(&pixels.u, &u_pred, &factors, Some(&rd));
-    raw_coeffs.v = transform_chroma_plane_rd(&pixels.v, &v_pred, &factors, Some(&rd));
+        b_subblock_modes,
+        ..
+    } = analyze_mb_exhaustive(pixels, neighbors, &rd);
+    let use_bpred = y_mode == IntraYMode::B;
 
     // ---- 6. Walk §13.3 residual order, encode each block in scan
     //         order against fresh above / left predictor contexts.
@@ -4033,7 +4396,6 @@ fn encode_mb_block_set_with_neighbors_strength_rates(
     )?;
 
     let bytes = enc.finish();
-    let b_subblock_modes = if use_bpred { Some(bpred.modes) } else { None };
     Ok(EncodedMb {
         coeffs: raw_coeffs,
         bytes,
@@ -5345,8 +5707,7 @@ fn encode_keyframe_inner_lf(
     // (see `TrellisRateTables`) — built once here so the per-MB mode
     // search prices tokens from lookups instead of re-walking the §13.2
     // tree per candidate. Values (and bytes) are identical either way.
-    let trellis_rate_tables =
-        (params.trellis_strength.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
+    let trellis_rate_tables = Some(TrellisRateTables::for_probs(&coeff_probs));
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -5375,6 +5736,13 @@ fn encode_keyframe_inner_lf(
     // can re-walk them into the shared encoder after the mode layer is
     // written into the first partition).
     let mut all_coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
+    let rd = MbRdCtx {
+        factors: &factors,
+        coeff_probs: &coeff_probs,
+        rate_tables: trellis_rate_tables.as_ref(),
+        lambda: rd_lambda(&factors),
+        trellis: params.trellis_strength,
+    };
 
     for mb_row in 0..mb_rows {
         for mb_col in 0..mb_cols {
@@ -5383,15 +5751,7 @@ fn encode_keyframe_inner_lf(
 
             // Mode pick + forward transform/quant against the genuine
             // reconstructed neighbours.
-            let encoded = encode_mb_block_set_with_neighbors_strength_rates(
-                &pixels,
-                &neighbors,
-                params.y_ac_qi,
-                &coeff_probs,
-                trellis_rate_tables.as_ref(),
-                params.trellis_strength,
-            )
-            .map_err(EncodeError::Token)?;
+            let encoded = analyze_mb_exhaustive(&pixels, &neighbors, &rd);
 
             // A macroblock with no non-zero residual is coded as a skip
             // MB (§11.1): the decoder reconstructs it as pure prediction,
@@ -5990,8 +6350,7 @@ fn encode_keyframe_adaptive_quant_inner_lf(
     // Per-frame §13 trellis rate tables (see `TrellisRateTables`); the
     // tables depend only on `coeff_probs`, not on the per-segment
     // quantiser factors, so one build serves every segment.
-    let trellis_rate_tables =
-        (trellis.get() > 0.0).then(|| TrellisRateTables::for_probs(&coeff_probs));
+    let trellis_rate_tables = Some(TrellisRateTables::for_probs(&coeff_probs));
 
     // §10 per-segment effective qindex + the matching §14.1 dequant
     // factors. Delta mode: q_seg = clamp(base + delta, 0, 127). The
@@ -12990,6 +13349,112 @@ mod tests {
     use crate::coded_header::Vp8CodedHeader;
     use crate::decode_vp8;
     use crate::frame_header::Vp8FrameHeader;
+
+    /// [`TrellisRateTables::level_rate`] is bit-for-bit
+    /// [`coeff_token_bits`] over the whole §13.2 alphabet.
+    #[test]
+    fn level_rate_matches_coeff_token_bits() {
+        let probs = &crate::DEFAULT_COEFF_PROBS;
+        let tables = TrellisRateTables::for_probs(probs);
+        for plane in 0..4 {
+            for (i, &band) in COEFF_BANDS.iter().enumerate() {
+                for ctx3 in 0..3 {
+                    for pwz in [false, true] {
+                        for level in 0u32..=2114 {
+                            let want = coeff_token_bits(probs, plane, i, ctx3, pwz, level as u16);
+                            let got = TrellisRateTables::level_rate(
+                                &tables.small[plane][band],
+                                &tables.cat_path[plane][band],
+                                ctx3,
+                                pwz,
+                                level,
+                            );
+                            assert_eq!(want.to_bits(), got.to_bits());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reciprocal-multiply level rounding equals the plain division
+    /// for every magnitude a 16-bit coefficient can take at every tabled
+    /// quantiser step (and on the division fallback above the table).
+    #[test]
+    fn rounded_level_matches_division() {
+        for q in 1u32..1100 {
+            for magnitude in 0u32..=32768 {
+                let want = (magnitude + q / 2) / q;
+                assert_eq!(
+                    rounded_level(magnitude, q),
+                    want,
+                    "magnitude {magnitude} q {q}"
+                );
+            }
+        }
+    }
+
+    /// The step-table estimator returns the bit-identical `f64` the
+    /// direct per-step walk does, across block types, neighbour contexts,
+    /// probability tables and coefficient shapes (empty, sparse, dense,
+    /// full to position 15, cat-token magnitudes).
+    #[test]
+    fn estimate_block_bits_tabled_matches_direct() {
+        let mut perturbed = crate::DEFAULT_COEFF_PROBS;
+        let mut st = 0x1357_9BDFu32;
+        for prob in perturbed.iter_mut().flatten().flatten().flatten() {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *prob = ((st >> 24) as u8).max(1);
+        }
+        let mut lcg = 0xDEAD_BEEFu32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (lcg >> 16) as i32
+        };
+        let mut cases = 0usize;
+        for probs in [&crate::DEFAULT_COEFF_PROBS, &perturbed] {
+            let tables = TrellisRateTables::for_probs(probs);
+            for block_type in [
+                BlockType::Y2,
+                BlockType::YAfterY2,
+                BlockType::YNoY2,
+                BlockType::UV,
+            ] {
+                for shape in 0..6 {
+                    for _ in 0..200 {
+                        let mut coeffs = [0i16; 16];
+                        for (k, c) in coeffs.iter_mut().enumerate() {
+                            let v = match shape {
+                                0 => 0,
+                                1 => (next() % 8 == 0) as i32 * (next() % 3 - 1),
+                                2 => next() % 5 - 2,
+                                3 => next() % 2 * 2 - 1,
+                                4 => (next() % 4200 - 2100) / (1 + k as i32),
+                                _ => (next() % 3 == 0) as i32 * (next() % 140 - 70),
+                            };
+                            *c = v as i16;
+                        }
+                        for above in [false, true] {
+                            for left in [false, true] {
+                                let want =
+                                    estimate_block_bits(block_type, probs, above, left, &coeffs);
+                                let got = estimate_block_bits_tabled(
+                                    &tables, block_type, above, left, &coeffs,
+                                );
+                                assert_eq!(
+                                    want.to_bits(),
+                                    got.to_bits(),
+                                    "{block_type:?} above {above} left {left} {coeffs:?}"
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 30_000);
+    }
 
     /// Every point of the per-frame [`TrellisRateTables`] domain must be
     /// **bit-for-bit** the value the direct reference rate call returns —

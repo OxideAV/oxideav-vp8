@@ -1025,6 +1025,8 @@ mod registry {
             CodecInfo::new(CodecId::new(VP8_CODEC_ID))
                 .capabilities(caps)
                 .decoder(make_decoder)
+                .encoder(crate::encoder::make_encoder_from_param_options)
+                .encoder_options::<crate::encoder::Vp8EncoderOptions>()
                 .tags([
                     CodecTag::fourcc(b"VP80"),
                     CodecTag::fourcc(b"vp08"),

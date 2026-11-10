@@ -281,35 +281,65 @@ impl BoolEncoder {
     /// Encode one boolean against the §7.3 probability split formula.
     /// `prob` is the (approximate) probability that `value` is `false`,
     /// expressed as `prob / 256`.
+    ///
+    /// The §7.3 listing renormalises one bit at a time: while
+    /// `range < 128` it doubles `range`, propagates a carry if bit 31 of
+    /// `bottom` is set, doubles `bottom`, and emits the top byte every
+    /// time `bit_count` reaches zero. This routine takes the whole
+    /// renormalisation in one step. The shift count is the number of
+    /// leading zeros of the 8-bit `range` (1..=7), and at most one byte
+    /// boundary falls inside it. Bit 31 can only be set at the doubling
+    /// that completes a byte: `bottom` is below `2^24` after a byte is
+    /// emitted (below `2^8` initially) and gains less than `2^8` between
+    /// doublings (the splits added while `range` stays ≥ 128 sum to less
+    /// than 128), so after `k` doublings it is below `(2^24 + 2^8)·2^k`,
+    /// which stays under `2^31` until the eighth. The carry test is
+    /// therefore needed exactly once, on the value shifted to just
+    /// before the boundary. `write_bool_matches_bitwise_listing` pins
+    /// the byte stream and the final state against the one-bit loop.
+    #[inline]
     pub fn write_bool(&mut self, prob: u8, value: bool) {
         // split = 1 + (((range - 1) * prob) >> 8) — the same formula as
         // §7.3's decoder so the value→bit split is exact.
         let split = 1 + (((self.range - 1) * prob as u32) >> 8);
-        if value {
-            self.bottom = self.bottom.wrapping_add(split);
-            self.range -= split;
+        let (mut range, mut bottom) = if value {
+            (self.range - split, self.bottom.wrapping_add(split))
         } else {
-            self.range = split;
-        }
-        while self.range < 128 {
-            self.range <<= 1;
-            // §7.3 `add_one_to_output`: propagate a carry into the
-            // already-written tail, scanning backwards through 0xFF
-            // bytes (which roll to 0 and force the next byte to
-            // receive the carry).
-            if (self.bottom >> 31) & 1 == 1 {
-                add_one_to_output(&mut self.out);
-            }
-            self.bottom <<= 1;
-            self.bit_count -= 1;
-            if self.bit_count == 0 {
-                // Emit the high byte of `bottom`, keep the low 24 bits.
-                let byte = (self.bottom >> 24) as u8;
-                self.out.push(byte);
-                self.bottom &= (1 << 24) - 1;
-                self.bit_count = 8;
+            (split, self.bottom)
+        };
+        if range < 128 {
+            let shift = range.leading_zeros() - 24;
+            range <<= shift;
+            let count = self.bit_count as u32;
+            if shift < count {
+                bottom <<= shift;
+                self.bit_count -= shift as i32;
+            } else {
+                bottom = self.emit_byte(bottom, shift, count);
             }
         }
+        self.range = range;
+        self.bottom = bottom;
+    }
+
+    /// The renormalisation step that crosses a byte boundary: shift up
+    /// to the doubling that brings `bit_count` to zero, run the carry
+    /// test (§7.3 `add_one_to_output`), emit the high byte, keep the low
+    /// 24 bits and apply the rest of the shift. Kept out of line so
+    /// [`write_bool`](Self::write_bool)'s common path stays small.
+    #[cold]
+    #[inline(never)]
+    fn emit_byte(&mut self, mut bottom: u32, shift: u32, count: u32) -> u32 {
+        bottom <<= count - 1;
+        if bottom >> 31 == 1 {
+            add_one_to_output(&mut self.out);
+        }
+        bottom <<= 1;
+        self.out.push((bottom >> 24) as u8);
+        bottom &= (1 << 24) - 1;
+        let rest = shift - count;
+        self.bit_count = 8 - rest as i32;
+        bottom << rest
     }
 
     /// Encode `num_bits` flag bits MSB-first at the flat probability of
@@ -399,6 +429,19 @@ impl BoolEncoder {
         for &bit in &path[..len] {
             self.write_bool(prob_lookup((i as usize) >> 1), bit);
             i = tree[i as usize + bit as usize];
+        }
+    }
+
+    /// [`write_treed`](Self::write_treed) from a precomputed path table:
+    /// the same `(probability index, bit)` steps in the same order,
+    /// without the per-symbol tree search.
+    fn write_treed_cached<F>(&mut self, paths: &[TreedLeafPath], prob_lookup: F, leaf: u8)
+    where
+        F: Fn(usize) -> u8,
+    {
+        let p = &paths[leaf as usize];
+        for s in 0..p.len as usize {
+            self.write_bool(prob_lookup(p.prob_index[s] as usize), p.bits[s]);
         }
     }
 
@@ -1837,23 +1880,28 @@ pub fn encode_coeff_block(
     let plane = block_type.plane_index();
     let first_coeff = block_type.first_coeff();
 
-    // Validate range up front — §13.2 Cat6 maxes out at 67 + 2047 = 2114.
-    for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
-        let abs = v.unsigned_abs();
-        if abs > 2114 {
-            return Err(TokenEncodeError::CoefficientOutOfRange { index: i, value: v });
-        }
-    }
-
-    // Find the last non-zero coefficient so the encoder knows where
-    // (if anywhere) to emit the explicit EOB token. If the entire
-    // block is zero the EOB lands at `first_coeff` immediately.
+    // One pass over the coded positions: the largest magnitude (for the
+    // §13.2 range check — Cat6 maxes out at 67 + 2047 = 2114) and the
+    // last non-zero coefficient, which tells the encoder where (if
+    // anywhere) to emit the explicit EOB token. If the entire block is
+    // zero the EOB lands at `first_coeff` immediately.
     let mut last_non_zero: i32 = -1;
-    for (i, &v) in coeffs.iter().enumerate() {
-        if i >= first_coeff && v != 0 {
+    let mut max_abs = 0u16;
+    for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
+        max_abs = max_abs.max(v.unsigned_abs());
+        if v != 0 {
             last_non_zero = i as i32;
         }
     }
+    if max_abs > 2114 {
+        // Report the first offender.
+        for (i, &v) in coeffs.iter().enumerate().skip(first_coeff) {
+            if v.unsigned_abs() > 2114 {
+                return Err(TokenEncodeError::CoefficientOutOfRange { index: i, value: v });
+            }
+        }
+    }
+    let token_paths = &*TOKEN_BIT_PATHS;
 
     let mut ctx3: usize = (above_has_nonzero as usize) + (left_has_nonzero as usize);
     let mut prev_was_zero = false;
@@ -1878,9 +1926,9 @@ pub fn encode_coeff_block(
         // internal node 1 (raw index 2) when the previous coefficient
         // was a literal `DCT_0` — the decoder will not have read the
         // EOB-vs-rest split bit, so neither must we write it.
-        let start = if prev_was_zero { 2i8 } else { 0i8 };
-
-        for step in token_to_bit_path(token, start) {
+        let (path, path_len) = &token_paths[prev_was_zero as usize][token as usize];
+        debug_assert!(*path_len > 0, "EOB cannot follow a literal DCT_0");
+        for step in &path[..*path_len as usize] {
             enc.write_bool(probs[step.prob_index as usize], step.bit);
         }
 
@@ -2000,6 +2048,11 @@ use crate::macroblock::{
     MacroblockModes, UV_MODE_TREE,
 };
 
+mod effort;
+mod wavefront;
+
+pub use effort::{EncodeEffort, KeyframeEncodeOptions};
+
 /// Round-half-away-from-zero integer division — the natural inverse of
 /// the §14.1 `q * factor` dequant multiply. Used by the encoder to
 /// quantise a single 16-bit coefficient by an `i16` factor.
@@ -2054,12 +2107,20 @@ pub struct MbPixels {
 #[inline]
 fn block_ssd(recon: &[u8], src: &[u8]) -> u64 {
     debug_assert_eq!(recon.len(), src.len());
+    // A term is at most 255² and a block at most 256 pixels, so a `u32`
+    // accumulator cannot overflow (4096-pixel chunks keep that true for
+    // longer slices) and the loop vectorises.
     recon
-        .iter()
-        .zip(src.iter())
-        .map(|(&r, &s)| {
-            let d = r as i64 - s as i64;
-            (d * d) as u64
+        .chunks(4096)
+        .zip(src.chunks(4096))
+        .map(|(r, s)| {
+            r.iter()
+                .zip(s)
+                .map(|(&a, &b)| {
+                    let d = a as i32 - b as i32;
+                    (d * d) as u32
+                })
+                .sum::<u32>() as u64
         })
         .sum()
 }
@@ -2252,6 +2313,19 @@ static UV_MODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 4]> =
 /// Precomputed paths for the §11.2 / §11.4 4×4 sub-block mode tree.
 static BMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 10]> =
     std::sync::LazyLock::new(|| precompute_treed_paths(&BMODE_TREE));
+/// `KF_BMODE_BITS[above][left][mode]` — the §11.3 key-frame sub-block
+/// mode-signal cost in bits: [`treed_bits_cached`] over [`BMODE_PATHS`]
+/// against `KF_BMODE_PROB[above][left]`, for every context pair.
+static KF_BMODE_BITS: std::sync::LazyLock<[[[f64; 10]; 10]; 10]> = std::sync::LazyLock::new(|| {
+    core::array::from_fn(|above| {
+        core::array::from_fn(|left| {
+            let prob_row = &KF_BMODE_PROB[above][left];
+            core::array::from_fn(|mode| {
+                treed_bits_cached(&*BMODE_PATHS, |k| prob_row[k], mode as u8)
+            })
+        })
+    })
+});
 /// Precomputed paths for the §11.3 interframe intra luma mode tree.
 static IF_YMODE_PATHS: std::sync::LazyLock<[TreedLeafPath; 5]> =
     std::sync::LazyLock::new(|| precompute_treed_paths(&IF_YMODE_TREE));
@@ -3231,7 +3305,7 @@ const QUANT_RECIPROCAL: [u64; 1024] = {
 /// the excess stays below `1/q` — too small to carry the value across the
 /// next integer — whenever `n·e < 2^32`, which `n < 2^17`, `q < 2^10`
 /// guarantees. `rounded_level_matches_division` checks every pair.
-#[inline]
+#[inline(always)]
 fn rounded_level(magnitude: u32, q: u32) -> u32 {
     let n = magnitude as u64 + (q / 2) as u64;
     if (q as usize) < QUANT_RECIPROCAL.len() && q != 0 {
@@ -3961,7 +4035,7 @@ fn encode_bpred_luma(
             } else {
                 sub_modes[i * 4 + (j - 1)]
             };
-            let prob_row = &KF_BMODE_PROB[above_mode.idx()][left_mode.idx()];
+            let mode_bits_row = &KF_BMODE_BITS[above_mode.idx()][left_mode.idx()];
 
             // RD-pick the sub-mode: reconstruct each candidate, score
             // SSD + lambda*(token bits + mode bits).
@@ -4011,7 +4085,7 @@ fn encode_bpred_luma(
                     tok_left.nonzero[i],
                     &scan,
                 );
-                let mode_bits = treed_bits_cached(&*BMODE_PATHS, |k| prob_row[k], mode.idx() as u8);
+                let mode_bits = mode_bits_row[mode.idx()];
                 let cost = ssd + rd.lambda * (token_bits + mode_bits);
                 if cost < best_cost {
                     best_cost = cost;
@@ -5053,13 +5127,28 @@ impl<'a> I420Frame<'a> {
         };
         let y0 = mb_row * 16;
         let x0 = mb_col * 16;
+        let cy0 = mb_row * 8;
+        let cx0 = mb_col * 8;
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        if x0 + 16 <= w && y0 + 16 <= h && cx0 + 8 <= cw && cy0 + 8 <= ch {
+            // Entirely inside the picture: straight row copies.
+            for r in 0..16 {
+                let src = (y0 + r) * self.y_stride + x0;
+                p.y[r * 16..r * 16 + 16].copy_from_slice(&self.y[src..src + 16]);
+            }
+            for r in 0..8 {
+                let src = (cy0 + r) * self.uv_stride + cx0;
+                p.u[r * 8..r * 8 + 8].copy_from_slice(&self.u[src..src + 8]);
+                p.v[r * 8..r * 8 + 8].copy_from_slice(&self.v[src..src + 8]);
+            }
+            return p;
+        }
         for r in 0..16 {
             for c in 0..16 {
                 p.y[r * 16 + c] = self.y_at(x0 + c, y0 + r);
             }
         }
-        let cy0 = mb_row * 8;
-        let cx0 = mb_col * 8;
         for r in 0..8 {
             for c in 0..8 {
                 p.u[r * 8 + c] = self.uv_at(cx0 + c, cy0 + r, false);
@@ -5595,6 +5684,81 @@ pub fn encode_keyframe_with_reconstruction_and_coding_options(
     }
 }
 
+/// Encode a key frame under [`KeyframeEncodeOptions`] — the entry point
+/// for callers that want to trade output size for encode time
+/// ([`EncodeEffort`]) or spread the encode over several threads.
+///
+/// `KeyframeEncodeOptions::default()` is byte-identical to
+/// [`encode_keyframe`]; for any options the bytes are independent of
+/// `options.threads`. Returns the bitstream only — see
+/// [`encode_keyframe_with_reconstruction_and_options`] for the planes.
+///
+/// ```
+/// use oxideav_vp8::{
+///     EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams,
+///     encode_keyframe_with_options,
+/// };
+/// # let (width, height) = (64u32, 48u32);
+/// # let y_plane = vec![128u8; (width * height) as usize];
+/// # let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+/// # let v_plane = u_plane.clone();
+/// let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+/// let options = KeyframeEncodeOptions::new()
+///     .with_effort(EncodeEffort::Fast)
+///     .with_threads(4);
+/// let bytes = encode_keyframe_with_options(&frame, &KeyframeParams::default(), &options)?;
+/// # assert!(!bytes.is_empty());
+/// # Ok::<(), oxideav_vp8::EncodeError>(())
+/// ```
+pub fn encode_keyframe_with_options(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeEncodeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    encode_keyframe_with_reconstruction_and_options(frame, params, options).map(|(bytes, _)| bytes)
+}
+
+/// [`encode_keyframe_with_options`] returning both the bitstream and the
+/// macroblock-aligned post-§15 reconstruction (the planes a decoder
+/// rebuilds from those bytes).
+///
+/// With `options.fitted_token_prob_updates` the encode runs twice — once
+/// against the §13.5 defaults to collect the branch counts, once against
+/// the fitted table — and the smaller wire ships with its matching
+/// planes, exactly as
+/// [`encode_keyframe_with_reconstruction_and_coding_options`] does.
+pub fn encode_keyframe_with_reconstruction_and_options(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeEncodeOptions,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let (effort, threads, auto_lf) = (options.effort, options.threads, options.auto_loop_filter);
+    if !options.fitted_token_prob_updates {
+        return encode_keyframe_tuned(frame, params, None, None, auto_lf, effort, threads);
+    }
+    let mut counts = empty_branch_counts();
+    let (bytes_default, planes_default) = encode_keyframe_tuned(
+        frame,
+        params,
+        None,
+        Some(&mut counts),
+        auto_lf,
+        effort,
+        threads,
+    )?;
+    let fitted = fit_token_prob_updates(&counts, 2.0);
+    if !any_token_prob_update(&fitted) {
+        return Ok((bytes_default, planes_default));
+    }
+    let (bytes_fitted, planes_fitted) =
+        encode_keyframe_tuned(frame, params, Some(&fitted), None, auto_lf, effort, threads)?;
+    if bytes_fitted.len() <= bytes_default.len() {
+        Ok((bytes_fitted, planes_fitted))
+    } else {
+        Ok((bytes_default, planes_default))
+    }
+}
+
 /// Encode a key frame and return both the bitstream bytes **and** the
 /// post-loop-filter reconstructed [`crate::frame::KeyframePlanes`],
 /// optionally threading a §13.4 `token_prob_update()` payload through
@@ -5658,6 +5822,31 @@ fn encode_keyframe_inner_lf(
     token_updates: Option<&TokenProbUpdates>,
     counts: Option<&mut BranchCounts>,
     auto_lf: bool,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_keyframe_tuned(
+        frame,
+        params,
+        token_updates,
+        counts,
+        auto_lf,
+        EncodeEffort::Thorough,
+        1,
+    )
+}
+
+/// The key-frame driver behind every front door: [`encode_keyframe_inner_lf`]
+/// plus the mode-search `effort` and the `threads` budget of the
+/// macroblock-row wavefront (see the `wavefront` module). `Thorough` on
+/// one thread is the historical encode; the bytes never depend on
+/// `threads`.
+fn encode_keyframe_tuned(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
+    auto_lf: bool,
+    effort: EncodeEffort,
+    threads: usize,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     let width = frame.width;
     let height = frame.height;
@@ -5731,74 +5920,41 @@ fn encode_keyframe_inner_lf(
         mb_rows,
     };
 
-    let mut modes: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
-    // Raw-quantised coefficients per MB (kept so the DCT partition pass
-    // can re-walk them into the shared encoder after the mode layer is
-    // written into the first partition).
-    let mut all_coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
-    let rd = MbRdCtx {
-        factors: &factors,
-        coeff_probs: &coeff_probs,
-        rate_tables: trellis_rate_tables.as_ref(),
-        lambda: rd_lambda(&factors),
-        trellis: params.trellis_strength,
+    // ---- Macroblock analysis + §19.2 DCT partitions ----------------------
+    //
+    // Each macroblock: gather the reconstructed neighbour strips, pick
+    // the modes and quantise the residual (exhaustively, or through the
+    // cost model at a reduced effort), reconstruct through the decoder's
+    // own §14.2 / §12.3 orchestrators, and write the result back so
+    // later macroblocks predict from genuine reconstructed pixels. A
+    // macroblock with no non-zero residual is coded as a §11.1 skip.
+    //
+    // The §13.3 token data follows the analysis row by row: macroblock
+    // row `r` is coded into partition `r % N` (§20.4), each partition
+    // through its own [`BoolEncoder`] (§4 page 9 — "All partitions are
+    // decoded using separate instances of the boolean entropy decoder")
+    // finalised with its own §7.3 flush trailer; the "above" non-zero
+    // context is per column and frame-lived, the "left" context resets
+    // at each row start.
+    let search = wavefront::KeyframeSearch {
+        frame,
+        rd: MbRdCtx {
+            factors: &factors,
+            coeff_probs: &coeff_probs,
+            rate_tables: trellis_rate_tables.as_ref(),
+            lambda: rd_lambda(&factors),
+            trellis: params.trellis_strength,
+        },
+        effort,
+        mb_cols,
+        mb_rows,
+        num_partitions,
     };
-
-    for mb_row in 0..mb_rows {
-        for mb_col in 0..mb_cols {
-            let pixels = frame.extract_mb(mb_row, mb_col);
-            let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
-
-            // Mode pick + forward transform/quant against the genuine
-            // reconstructed neighbours.
-            let encoded = analyze_mb_exhaustive(&pixels, &neighbors, &rd);
-
-            // A macroblock with no non-zero residual is coded as a skip
-            // MB (§11.1): the decoder reconstructs it as pure prediction,
-            // which is exactly what zero residue produces.
-            let mb_skip_coeff = encoded.nonzero_block_count == 0;
-
-            // Dequantise a copy of the raw coefficients and reconstruct
-            // through the decoder's §14.2 / §12.3 orchestrators, writing
-            // the result back so the next MB sees real neighbours.
-            let mut dq = encoded.coeffs;
-            factors.dequantize(&mut dq);
-            let use_bpred = encoded.y_mode == IntraYMode::B;
-            let recon = if use_bpred {
-                crate::reconstruct::decode_keyframe_mb_bpred(
-                    encoded.b_subblock_modes.as_ref(),
-                    encoded.uv_mode,
-                    mb_skip_coeff,
-                    &neighbors,
-                    &dq.y,
-                    &dq.u,
-                    &dq.v,
-                )
-            } else {
-                crate::reconstruct::decode_keyframe_mb_non_bpred(
-                    encoded.y_mode,
-                    encoded.uv_mode,
-                    mb_skip_coeff,
-                    &neighbors,
-                    &dq.y2,
-                    &dq.y,
-                    &dq.u,
-                    &dq.v,
-                )
-            }
-            .map_err(EncodeError::Reconstruct)?;
-            crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
-
-            modes.push(MacroblockModes {
-                segment_id: None,
-                mb_skip_coeff,
-                y_mode: encoded.y_mode,
-                subblock_modes: encoded.b_subblock_modes,
-                uv_mode: encoded.uv_mode,
-            });
-            all_coeffs.push(encoded.coeffs);
-        }
-    }
+    let wavefront::AnalysedFrame {
+        modes,
+        coeffs: all_coeffs,
+        partitions: dct_partitions,
+    } = wavefront::analyse_and_tokenize(&search, &mut planes, threads)?;
 
     // ---- §15 loop-filter post-pass --------------------------------------
     //
@@ -5956,62 +6112,15 @@ fn encode_keyframe_inner_lf(
         });
     }
 
-    // ---- §19.2 DCT partition group: per-MB §13.3 token data --------------
-    //
-    // Macroblock rows are distributed round-robin across the §9.5
-    // partitions per the §20.4 row-loop: row `r` is encoded into
-    // partition `r % N`. Each partition gets its own [`BoolEncoder`]
-    // instance (§4 page 9 — "All partitions are decoded using separate
-    // instances of the boolean entropy decoder"), finalised independently
-    // with its own §7.3 4-byte flush trailer. The §13.3 above-context
-    // is column-wise and frame-lived — shared across partitions because
-    // the decoder's `decode_residuals` also keeps one above slot per
-    // column for the whole frame. The "left" context resets at every row
-    // start so it does not need to cross partitions.
-    let mut partitions: Vec<BoolEncoder> =
-        (0..num_partitions).map(|_| BoolEncoder::new()).collect();
-    // One above-context per macroblock column, frame-lived (§13.3),
-    // shared by every row irrespective of which partition that row routes
-    // to.
-    let mut above_ctx: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
-    for mb_row in 0..mb_rows {
-        // §13.3 page 65: the "left" predictor resets at the start of
-        // every macroblock row.
-        let mut left_ctx = MbEntropyCtx::default();
-        let part_idx = mb_row % num_partitions;
-        let tok = &mut partitions[part_idx];
-        for (mb_col, above_col) in above_ctx.iter_mut().enumerate() {
-            let raster = mb_row * mb_cols + mb_col;
-            let mb = &modes[raster];
-            let use_bpred = mb.y_mode == IntraYMode::B;
-            if mb.mb_skip_coeff {
-                // §13.1: a skip macroblock emits no tokens, but its
-                // predictor slots are cleared so the next macroblock's
-                // context is correct.
-                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
-                continue;
-            }
-            encode_mb_tokens(
-                tok,
-                &all_coeffs[raster],
-                use_bpred,
-                &coeff_probs,
-                above_col,
-                &mut left_ctx,
-            )
-            .map_err(EncodeError::Token)?;
-        }
-    }
     // §13.4 observed-counts side-channel (round 157). Re-walks the
-    // §13.3 token loop above with `count_keyframe_branches`, driving
+    // §13.3 token loop with `count_keyframe_branches`, driving
     // its own private above / left predictor contexts in lockstep —
     // so the recorded per-position counts are bit-for-bit the events
-    // the bytes in `partitions` just emitted. With `counts = None`
+    // the bytes in `dct_partitions` carry. With `counts = None`
     // this is a no-op.
     if let Some(c) = counts {
         count_keyframe_branches(&modes, &all_coeffs, mb_cols, mb_rows, c);
     }
-    let dct_partitions: Vec<Vec<u8>> = partitions.into_iter().map(|p| p.finish()).collect();
     let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();
     let size_table_len = (num_partitions - 1) * 3;
 
@@ -6672,6 +6781,7 @@ fn write_mode_layer_segmented(
     // §11.3 item 3: the "above" sub-block context spans the whole frame
     // width (4 sub-blocks per MB column), initialised to B_DC_PRED.
     let mut above_subblock = vec![IntraBmode::Dc; mb_cols * 4];
+    let bmode_paths: &[TreedLeafPath] = &*BMODE_PATHS;
 
     for mb_row in 0..mb_rows {
         // §11.3 item 3: the four left predictors reset to B_DC_PRED at
@@ -6693,7 +6803,7 @@ fn write_mode_layer_segmented(
             hdr.write_bool(prob_skip_false, mb.mb_skip_coeff);
 
             // 2. Luma mode (§11.2).
-            hdr.write_treed(&KF_YMODE_TREE, |i| KF_YMODE_PROB[i], mb.y_mode.leaf());
+            hdr.write_treed_cached(&*KF_YMODE_PATHS, |i| KF_YMODE_PROB[i], mb.y_mode.leaf());
 
             // 3. Sub-block modes (§11.3 / §11.5) for B_PRED only.
             if let Some(sub) = &mb.subblock_modes {
@@ -6711,12 +6821,12 @@ fn write_mode_layer_segmented(
                         sub[row * 4 + (col - 1)]
                     };
                     let prob_row = &KF_BMODE_PROB[above.idx()][left.idx()];
-                    hdr.write_treed(&BMODE_TREE, |i| prob_row[i], sub[j].idx() as u8);
+                    hdr.write_treed_cached(bmode_paths, |i| prob_row[i], sub[j].idx() as u8);
                 }
             }
 
             // 4. Chroma mode (§11.4).
-            hdr.write_treed(&UV_MODE_TREE, |i| KF_UV_MODE_PROB[i], mb.uv_mode.leaf());
+            hdr.write_treed_cached(&*UV_MODE_PATHS, |i| KF_UV_MODE_PROB[i], mb.uv_mode.leaf());
 
             // §11.3 item 3 / 4: update the cross-macroblock context.
             match &mb.subblock_modes {
@@ -11094,8 +11204,255 @@ mod factory {
         VideoFrame,
     };
 
-    use super::{I420Frame, KeyframeParams, encode_keyframe, encode_keyframe_auto_loop_filter};
+    use super::{
+        EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams,
+        encode_keyframe_with_options,
+    };
     use crate::decoder::VP8_CODEC_ID;
+
+    /// Typed options of the registry key-frame encoder — the struct
+    /// behind the `CodecParameters::options` bag the registered factory
+    /// ([`make_encoder_from_param_options`]) parses, and the argument of
+    /// the direct [`make_encoder_with_options`] door.
+    ///
+    /// | key | kind | default | meaning |
+    /// |---|---|---|---|
+    /// | `effort` | u32 | `3` | mode-search effort, `0` fastest ..= `3` thorough ([`EncodeEffort`]) |
+    /// | `threads` | u32 | `0` | thread budget; `0` follows the `ExecutionContext` (serial when none is announced) |
+    /// | `qindex` | u32 | `32` | §9.6 `y_ac_qi`, `0..=127` |
+    /// | `quality` | f32 | `-1` | `0..=100` quality; when ≥ 0 it replaces `qindex` and also sets the trellis strength |
+    /// | `loop_filter_level` | u32 | `0` | §9.4 level, `0..=63` |
+    /// | `auto_loop_filter` | bool | `false` | RD-select the §9.4 level / sharpness per frame |
+    /// | `partitions` | u32 | `1` | §9.5 token partition count (1 / 2 / 4 / 8) |
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    #[non_exhaustive]
+    pub struct Vp8EncoderOptions {
+        /// Mode-search effort.
+        pub effort: EncodeEffort,
+        /// Thread budget; `0` follows the announced `ExecutionContext`.
+        pub threads: usize,
+        /// §9.6 `y_ac_qi` (ignored when `quality` is set).
+        pub qindex: u8,
+        /// `0..=100` quality (see [`super::quality_to_qindex`] /
+        /// [`super::quality_to_trellis_strength`]); `None` uses `qindex`.
+        pub quality: Option<f32>,
+        /// §9.4 `loop_filter_level`.
+        pub loop_filter_level: u8,
+        /// RD-select the §9.4 level / sharpness.
+        pub auto_loop_filter: bool,
+        /// §9.5 token partition count.
+        pub partitions: u8,
+    }
+
+    impl Default for Vp8EncoderOptions {
+        fn default() -> Self {
+            let keyframe = KeyframeParams::default();
+            Vp8EncoderOptions {
+                effort: EncodeEffort::Thorough,
+                threads: 0,
+                qindex: keyframe.y_ac_qi,
+                quality: None,
+                loop_filter_level: keyframe.loop_filter_level,
+                auto_loop_filter: false,
+                partitions: keyframe.nbr_of_dct_partitions,
+            }
+        }
+    }
+
+    impl Vp8EncoderOptions {
+        /// The defaults (see the table on the type).
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Set `effort`.
+        #[must_use]
+        pub fn with_effort(mut self, v: EncodeEffort) -> Self {
+            self.effort = v;
+            self
+        }
+
+        /// Set `threads`.
+        #[must_use]
+        pub fn with_threads(mut self, v: usize) -> Self {
+            self.threads = v;
+            self
+        }
+
+        /// Set `qindex`.
+        #[must_use]
+        pub fn with_qindex(mut self, v: u8) -> Self {
+            self.qindex = v;
+            self
+        }
+
+        /// Set `quality`.
+        #[must_use]
+        pub fn with_quality(mut self, v: Option<f32>) -> Self {
+            self.quality = v;
+            self
+        }
+
+        /// Set `loop_filter_level`.
+        #[must_use]
+        pub fn with_loop_filter_level(mut self, v: u8) -> Self {
+            self.loop_filter_level = v;
+            self
+        }
+
+        /// Set `auto_loop_filter`.
+        #[must_use]
+        pub fn with_auto_loop_filter(mut self, v: bool) -> Self {
+            self.auto_loop_filter = v;
+            self
+        }
+
+        /// Set `partitions`.
+        #[must_use]
+        pub fn with_partitions(mut self, v: u8) -> Self {
+            self.partitions = v;
+            self
+        }
+    }
+
+    impl oxideav_core::CodecOptionsStruct for Vp8EncoderOptions {
+        const SCHEMA: &'static [oxideav_core::OptionField] = &[
+            oxideav_core::OptionField {
+                name: "effort",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(3),
+                help: "mode-search effort: 0 fastest, 1 fast, 2 balanced, 3 thorough",
+            },
+            oxideav_core::OptionField {
+                name: "threads",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(0),
+                help: "thread budget (0 = follow the execution context)",
+            },
+            oxideav_core::OptionField {
+                name: "qindex",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(32),
+                help: "quantiser index 0..=127 (lower = better)",
+            },
+            oxideav_core::OptionField {
+                name: "quality",
+                kind: oxideav_core::OptionKind::F32,
+                default: oxideav_core::OptionValue::F32(-1.0),
+                help: "quality 0..=100 (overrides qindex; negative = unset)",
+            },
+            oxideav_core::OptionField {
+                name: "loop_filter_level",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(0),
+                help: "loop filter level 0..=63",
+            },
+            oxideav_core::OptionField {
+                name: "auto_loop_filter",
+                kind: oxideav_core::OptionKind::Bool,
+                default: oxideav_core::OptionValue::Bool(false),
+                help: "choose the loop filter level per frame",
+            },
+            oxideav_core::OptionField {
+                name: "partitions",
+                kind: oxideav_core::OptionKind::U32,
+                default: oxideav_core::OptionValue::U32(1),
+                help: "token partition count: 1, 2, 4 or 8",
+            },
+        ];
+
+        fn apply(&mut self, key: &str, value: &oxideav_core::OptionValue) -> Result<()> {
+            let small = |v: u32, max: u32, what: &str| {
+                if v > max {
+                    Err(Error::invalid(format!(
+                        "vp8 encoder: option '{what}' out of range (0..={max}), got {v}"
+                    )))
+                } else {
+                    Ok(v as u8)
+                }
+            };
+            match key {
+                "effort" => self.effort = EncodeEffort::from_level(small(value.as_u32()?, 3, key)?),
+                "threads" => self.threads = value.as_u32()? as usize,
+                "qindex" => self.qindex = small(value.as_u32()?, 127, key)?,
+                "quality" => {
+                    let q = value.as_f32()?;
+                    self.quality = (q >= 0.0).then_some(q);
+                }
+                "loop_filter_level" => self.loop_filter_level = small(value.as_u32()?, 63, key)?,
+                "auto_loop_filter" => self.auto_loop_filter = value.as_bool()?,
+                "partitions" => {
+                    let n = value.as_u32()?;
+                    if !matches!(n, 1 | 2 | 4 | 8) {
+                        return Err(Error::invalid(format!(
+                            "vp8 encoder: option 'partitions' must be 1, 2, 4 or 8, got {n}"
+                        )));
+                    }
+                    self.partitions = n as u8;
+                }
+                other => {
+                    return Err(Error::invalid(format!(
+                        "vp8 encoder: unknown option '{other}'"
+                    )));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Build the zero-latency key-frame encoder from typed
+    /// [`Vp8EncoderOptions`] — the direct twin of the registered factory.
+    /// `Vp8EncoderOptions::default()` gives the same encoder as
+    /// [`make_encoder`].
+    pub fn make_encoder_with_options(
+        params: &CodecParameters,
+        options: &Vp8EncoderOptions,
+    ) -> Result<Box<dyn Encoder>> {
+        let (width, height, pixel_format) = validate_video_params(params)?;
+        if options.qindex > 127 {
+            return Err(Error::invalid(
+                "vp8 encoder: qindex out of range (must be 0..=127)",
+            ));
+        }
+        if options.loop_filter_level > 63 {
+            return Err(Error::invalid(
+                "vp8 encoder: loop_filter_level out of range (must be 0..=63)",
+            ));
+        }
+        if !matches!(options.partitions, 1 | 2 | 4 | 8) {
+            return Err(Error::invalid(
+                "vp8 encoder: partitions must be 1, 2, 4 or 8",
+            ));
+        }
+        let mut keyframe = KeyframeParams::default()
+            .with_y_ac_qi(options.qindex)
+            .with_loop_filter_level(options.loop_filter_level)
+            .with_nbr_of_dct_partitions(options.partitions);
+        if let Some(quality) = options.quality {
+            keyframe.y_ac_qi = super::quality_to_qindex(quality);
+            keyframe.trellis_strength = super::quality_to_trellis_strength(quality);
+        }
+        let mut encoder = build_frame_encoder_typed(
+            params,
+            width,
+            height,
+            pixel_format,
+            keyframe,
+            options.auto_loop_filter,
+        );
+        encoder.effort = options.effort;
+        encoder.option_threads = options.threads;
+        Ok(Box::new(encoder))
+    }
+
+    /// The registry's encoder factory: parse `params.options` (strictly —
+    /// an unknown key or a malformed value is an error) into
+    /// [`Vp8EncoderOptions`] and build the key-frame encoder from it. An
+    /// empty bag gives the same encoder as [`make_encoder`].
+    pub fn make_encoder_from_param_options(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+        let options = oxideav_core::parse_options::<Vp8EncoderOptions>(&params.options)?;
+        make_encoder_with_options(params, &options)
+    }
 
     /// Build a framework-side VP8 encoder bound to `params` with all
     /// defaults: `y_ac_qi = 32`, no loop filter, 1 DCT partition,
@@ -11255,6 +11612,8 @@ mod factory {
             auto_loop_filter: config.auto_loop_filter,
             fitted_token_prob_updates: true,
             intra_pick: true,
+            effort: config.effort,
+            threads: config.threads,
             ..crate::stream::AltrefStreamConfig::default()
         };
         let stream = crate::stream::Vp8AltrefStreamEncoder::new(stream_config)
@@ -11405,6 +11764,16 @@ mod factory {
             }
             Ok(())
         }
+
+        /// Adopt the announced thread budget for the key frames unless
+        /// the configuration named one itself (`threads > 1`). The bytes
+        /// do not depend on it.
+        fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+            if self.stream_config.threads <= 1 {
+                self.stream_config.threads = ctx.threads;
+                self.stream.set_threads(ctx.threads);
+            }
+        }
     }
 
     /// Shared constructor for the framework-side keyframe encoder adapter.
@@ -11418,6 +11787,24 @@ mod factory {
         keyframe: KeyframeParams,
         auto_lf: bool,
     ) -> Result<Box<dyn Encoder>> {
+        Ok(Box::new(build_frame_encoder_typed(
+            params,
+            width,
+            height,
+            pixel_format,
+            keyframe,
+            auto_lf,
+        )))
+    }
+
+    fn build_frame_encoder_typed(
+        params: &CodecParameters,
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        keyframe: KeyframeParams,
+        auto_lf: bool,
+    ) -> Vp8FrameEncoder {
         let mut output_params = params.clone();
         output_params.media_type = MediaType::Video;
         output_params.codec_id = CodecId::new(VP8_CODEC_ID);
@@ -11429,16 +11816,19 @@ mod factory {
             .frame_rate
             .map_or(TimeBase::new(1, 90_000), |r| TimeBase::new(r.den, r.num));
 
-        Ok(Box::new(Vp8FrameEncoder {
+        Vp8FrameEncoder {
             output_params,
             width,
             height,
             keyframe,
             auto_lf,
+            effort: EncodeEffort::Thorough,
+            option_threads: 0,
+            context_threads: 1,
             time_base,
             pending: VecDeque::new(),
             eof: false,
-        }))
+        }
     }
 
     /// Zero-latency [`oxideav_core::Encoder`] adapter around the
@@ -11456,9 +11846,32 @@ mod factory {
         /// §9.4 RD loop-filter auto-selection (per
         /// [`Vp8EncoderConfig::auto_loop_filter`]).
         auto_lf: bool,
+        /// Mode-search effort ([`Vp8EncoderOptions::effort`]).
+        effort: EncodeEffort,
+        /// Explicit thread budget from the options (`0` = none given).
+        option_threads: usize,
+        /// Thread budget announced through `set_execution_context`
+        /// (`1` until one is).
+        context_threads: usize,
         time_base: TimeBase,
         pending: VecDeque<Packet>,
         eof: bool,
+    }
+
+    impl Vp8FrameEncoder {
+        /// The per-frame speed options: the explicit `threads` option if
+        /// one was given, else the announced execution-context budget.
+        fn keyframe_options(&self) -> KeyframeEncodeOptions {
+            let threads = if self.option_threads > 0 {
+                self.option_threads
+            } else {
+                self.context_threads
+            };
+            KeyframeEncodeOptions::new()
+                .with_effort(self.effort)
+                .with_threads(threads)
+                .with_auto_loop_filter(self.auto_lf)
+        }
     }
 
     impl std::fmt::Debug for Vp8FrameEncoder {
@@ -11497,8 +11910,13 @@ mod factory {
                 }
                 _ => return Err(Error::invalid("vp8 encoder: video frames only")),
             };
-            let bytes =
-                encode_video_frame(v, self.width, self.height, &self.keyframe, self.auto_lf)?;
+            let bytes = encode_video_frame(
+                v,
+                self.width,
+                self.height,
+                &self.keyframe,
+                &self.keyframe_options(),
+            )?;
             let mut pkt = Packet::new(0, self.time_base, bytes);
             pkt.pts = v.pts;
             pkt.dts = v.pts;
@@ -11520,6 +11938,12 @@ mod factory {
         fn flush(&mut self) -> Result<()> {
             self.eof = true;
             Ok(())
+        }
+
+        /// Record the announced thread budget; it applies unless the
+        /// `threads` option named one. The bytes do not depend on it.
+        fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+            self.context_threads = ctx.threads;
         }
     }
 
@@ -11643,17 +12067,12 @@ mod factory {
         width: u32,
         height: u32,
         keyframe: &KeyframeParams,
-        auto_lf: bool,
+        options: &KeyframeEncodeOptions,
     ) -> Result<Vec<u8>> {
         let (y_packed, u_packed, v_packed) = packed_planes_from_video_frame(frame, width, height)?;
         let src = I420Frame::packed(width, height, &y_packed, &u_packed, &v_packed);
-        let bytes = if auto_lf {
-            encode_keyframe_auto_loop_filter(&src, keyframe)
-        } else {
-            encode_keyframe(&src, keyframe)
-        }
-        .map_err(|e| Error::invalid(e.to_string()))?;
-        Ok(bytes)
+        encode_keyframe_with_options(&src, keyframe, options)
+            .map_err(|e| Error::invalid(e.to_string()))
     }
 
     fn repack_plane(data: &[u8], stride: usize, w: usize, h: usize) -> Vec<u8> {
@@ -11667,7 +12086,10 @@ mod factory {
 }
 
 #[cfg(feature = "registry")]
-pub use factory::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
+pub use factory::{
+    Vp8EncoderOptions, make_encoder, make_encoder_from_param_options, make_encoder_with_options,
+    make_encoder_with_qindex, make_encoder_with_quality,
+};
 
 // ───────────────────── 0.1.13 public-surface compatibility ─────────────────────
 //
@@ -11814,9 +12236,39 @@ pub struct Vp8EncoderConfig {
     /// trades PSNR for smaller output, [`TrellisStrength::OFF`] reverts to
     /// plain round-quantisation.
     pub trellis_strength: TrellisStrength,
+    /// Mode-search effort of the key frames this configuration encodes
+    /// (see [`EncodeEffort`]); inter frames run their own search and do
+    /// not consult it. Default [`EncodeEffort::Thorough`] — the
+    /// historical bytes.
+    pub effort: EncodeEffort,
+    /// Thread budget for each key frame's macroblock-row wavefront
+    /// (`0` / `1` = serial, the default). Never changes the bytes.
+    pub threads: usize,
 }
 
 impl Vp8EncoderConfig {
+    /// Set `effort`.
+    #[must_use]
+    pub fn with_effort(mut self, v: EncodeEffort) -> Self {
+        self.effort = v;
+        self
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
+    /// The key-frame speed options this configuration implies.
+    fn keyframe_options(&self) -> KeyframeEncodeOptions {
+        KeyframeEncodeOptions::new()
+            .with_effort(self.effort)
+            .with_threads(self.threads)
+            .with_auto_loop_filter(self.auto_loop_filter)
+    }
+
     /// Set `qindex`.
     #[must_use]
     pub fn with_qindex(mut self, v: u8) -> Self {
@@ -11893,6 +12345,8 @@ impl Default for Vp8EncoderConfig {
             target_bitrate_bps: 0,
             auto_loop_filter: false,
             trellis_strength: TrellisStrength::DEFAULT,
+            effort: EncodeEffort::Thorough,
+            threads: 1,
         }
     }
 }
@@ -11942,12 +12396,8 @@ impl Vp8Encoder {
             trellis_strength: self.config.trellis_strength,
             ..KeyframeParams::default()
         };
-        let bytes = if self.config.auto_loop_filter {
-            encode_keyframe_auto_loop_filter(frame, &params)
-        } else {
-            encode_keyframe(frame, &params)
-        }
-        .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
+        let bytes = encode_keyframe_with_options(frame, &params, &self.config.keyframe_options())
+            .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?;
         self.stats.frames_encoded += 1;
         self.stats.keyframes_emitted += 1;
         self.stats.bytes_emitted += bytes.len() as u64;
@@ -12016,6 +12466,8 @@ impl Vp8Encoder {
             auto_loop_filter: self.config.auto_loop_filter,
             fitted_token_prob_updates: true,
             intra_pick: true,
+            effort: self.config.effort,
+            threads: self.config.threads,
             ..crate::stream::AltrefStreamConfig::default()
         };
         let mut enc = crate::stream::Vp8AltrefStreamEncoder::new(config)
@@ -12370,11 +12822,15 @@ impl Vp8TwoPassEncoder {
         // the wire so decoder lockstep holds either way.
         let auto_lf = self.config.auto_loop_filter;
         let (bytes, planes) = if force_key {
-            if auto_lf {
-                encode_keyframe_auto_loop_filter_with_reconstruction(frame, &params)
-            } else {
-                encode_keyframe_with_reconstruction(frame, &params)
-            }
+            encode_keyframe_with_reconstruction_and_options(
+                frame,
+                &params,
+                &self
+                    .config
+                    .base
+                    .keyframe_options()
+                    .with_auto_loop_filter(auto_lf),
+            )
             .map_err(|e| crate::error::Vp8Error::invalid(e.to_string()))?
         } else {
             let reference = self
@@ -13374,6 +13830,67 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The one-step renormalisation in [`BoolEncoder::write_bool`]
+    /// produces the same byte stream and the same final state as the
+    /// §7.3 one-bit-at-a-time loop, over skewed, balanced and extreme
+    /// probabilities and long runs of either bit (carry chains).
+    #[test]
+    fn write_bool_matches_bitwise_listing() {
+        fn write_bool_bitwise(enc: &mut BoolEncoder, prob: u8, value: bool) {
+            let split = 1 + (((enc.range - 1) * prob as u32) >> 8);
+            if value {
+                enc.bottom = enc.bottom.wrapping_add(split);
+                enc.range -= split;
+            } else {
+                enc.range = split;
+            }
+            while enc.range < 128 {
+                enc.range <<= 1;
+                if (enc.bottom >> 31) & 1 == 1 {
+                    add_one_to_output(&mut enc.out);
+                }
+                enc.bottom <<= 1;
+                enc.bit_count -= 1;
+                if enc.bit_count == 0 {
+                    enc.out.push((enc.bottom >> 24) as u8);
+                    enc.bottom &= (1 << 24) - 1;
+                    enc.bit_count = 8;
+                }
+            }
+        }
+        let mut lcg = 0x0BAD_5EEDu32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            lcg >> 8
+        };
+        for regime in 0..8 {
+            let mut fast = BoolEncoder::new();
+            let mut slow = BoolEncoder::new();
+            for n in 0..300_000u32 {
+                let r = next();
+                let (prob, value) = match regime {
+                    0 => ((r & 0xFF) as u8, r & 0x100 != 0),
+                    1 => (128, r & 1 != 0),
+                    2 => (1, r & 0xFF00 != 0),
+                    3 => (255, r & 0xFF00 == 0),
+                    4 => (1, true),
+                    5 => (255, n % 97 == 0),
+                    6 => ((r & 0xFF) as u8, true),
+                    _ => (2 + (r & 3) as u8, r & 0x700 != 0),
+                };
+                fast.write_bool(prob, value);
+                write_bool_bitwise(&mut slow, prob, value);
+                assert_eq!(
+                    (fast.range, fast.bottom, fast.bit_count),
+                    (slow.range, slow.bottom, slow.bit_count),
+                    "regime {regime} symbol {n}"
+                );
+            }
+            assert_eq!(fast.out, slow.out, "regime {regime}");
+            assert_eq!(fast.finish(), slow.finish(), "regime {regime}");
         }
     }
 

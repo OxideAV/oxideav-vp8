@@ -244,3 +244,11 @@ harness = false
 [[bench]]
 name = "bool_encoder_write"
 harness = false
+
+# Round 486 bench. Whole-keyframe encode on photo-like content (the
+# deterministic integer-synthesised picture of `tests/support/photo.rs`)
+# at 800×533 and 2400×1600, per `EncodeEffort` level and thread budget —
+# the latency matrix `BENCHMARKS.md` §Round 486 records.
+[[bench]]
+name = "keyframe_encode_photo"
+harness = false

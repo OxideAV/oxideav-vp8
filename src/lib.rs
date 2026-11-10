@@ -423,11 +423,11 @@ pub fn decode_frame(
 }
 pub use dequant::{MbDequantFactors, UV_DC_MAX, Y2_AC_MIN, decode_and_dequantize_mb};
 pub use encoder::{
-    AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector, EncodeError, EncodedMb,
-    I420Frame, InterCodingOptions, InterSegmentationConfig, KeyframeCodingOptions, KeyframeParams,
-    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
-    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
-    TokenEncoder, TrellisStrength, UpdateSegmentationLayer, classify_coeff_token,
+    AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector, EncodeEffort, EncodeError,
+    EncodedMb, I420Frame, InterCodingOptions, InterSegmentationConfig, KeyframeCodingOptions,
+    KeyframeEncodeOptions, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels,
+    RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams,
+    TokenEncodeError, TokenEncoder, TrellisStrength, UpdateSegmentationLayer, classify_coeff_token,
     count_block_branches, count_inter_frame_branches, count_keyframe_branches, count_mb_branches,
     empty_branch_counts, encode_coeff_block, encode_invisible_altref_update,
     encode_invisible_altref_update_with_coding_options, encode_keyframe,
@@ -437,9 +437,10 @@ pub use encoder::{
     encode_keyframe_adaptive_quant_with_segment_lf_deltas_and_trellis,
     encode_keyframe_adaptive_quant_with_trellis, encode_keyframe_auto_loop_filter,
     encode_keyframe_auto_loop_filter_with_reconstruction,
-    encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_reconstruction,
-    encode_keyframe_with_reconstruction_and_coding_options,
+    encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_options,
+    encode_keyframe_with_reconstruction, encode_keyframe_with_reconstruction_and_coding_options,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
+    encode_keyframe_with_reconstruction_and_options,
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors,
     encode_mb_block_set_with_neighbors_strength, encode_p_frame_multi_ref,
@@ -467,7 +468,10 @@ pub use encoder::{
 /// `use oxideav_vp8::make_encoder;` works for binding-compatible
 /// downstream code (notably `oxideav-webp`'s lossy VP8 path).
 #[cfg(feature = "registry")]
-pub use encoder::{make_encoder, make_encoder_with_qindex, make_encoder_with_quality};
+pub use encoder::{
+    Vp8EncoderOptions, make_encoder, make_encoder_from_param_options, make_encoder_with_options,
+    make_encoder_with_qindex, make_encoder_with_quality,
+};
 pub use forward_transform::{forward_dct_4x4, forward_wht_4x4, raster_to_scan};
 pub use frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
 pub use frame_header::{

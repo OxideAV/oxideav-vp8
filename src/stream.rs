@@ -2179,9 +2179,31 @@ pub struct AltrefStreamConfig {
     /// keep the frame-wide quantiser (the keyframe AQ path is a
     /// separate front door). Default `None`.
     pub segmentation: Option<crate::encoder::InterSegmentationConfig>,
+    /// Mode-search effort of the stream's **key frames** (see
+    /// [`EncodeEffort`](crate::encoder::EncodeEffort)). The inter frames
+    /// run their own search and do not consult it. Default
+    /// `Thorough` (the historical bytes).
+    pub effort: crate::encoder::EncodeEffort,
+    /// Thread budget for each key frame's macroblock-row wavefront
+    /// (`0` / `1` = serial, the default). Does not change the bytes.
+    pub threads: usize,
 }
 
 impl AltrefStreamConfig {
+    /// Set `effort`.
+    #[must_use]
+    pub fn with_effort(mut self, v: crate::encoder::EncodeEffort) -> Self {
+        self.effort = v;
+        self
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
     /// Set `params`.
     #[must_use]
     pub fn with_params(mut self, v: KeyframeParams) -> Self {
@@ -2268,6 +2290,8 @@ impl Default for AltrefStreamConfig {
             fitted_token_prob_updates: false,
             intra_pick: false,
             segmentation: None,
+            effort: crate::encoder::EncodeEffort::Thorough,
+            threads: 1,
         }
     }
 }
@@ -2474,6 +2498,13 @@ impl Vp8AltrefStreamEncoder {
         })
     }
 
+    /// Change the key-frame thread budget of a running stream (the
+    /// bytes do not depend on it).
+    #[cfg_attr(not(feature = "registry"), allow(dead_code))]
+    pub(crate) fn set_threads(&mut self, threads: usize) {
+        self.config.threads = threads;
+    }
+
     /// The configuration this stream was built with.
     pub fn config(&self) -> &AltrefStreamConfig {
         &self.config
@@ -2590,12 +2621,15 @@ impl Vp8AltrefStreamEncoder {
         // Key frame: scheduled, scene-cut-forced, or forced because
         // the stream has no reference yet.
         if self.is_key_index(start) || forced_key || self.last.is_none() {
-            let (bytes, recon) =
-                crate::encoder::encode_keyframe_with_reconstruction_and_coding_options(
-                    &group[0].as_i420(),
-                    &self.config.params,
-                    &kf_options,
-                )?;
+            let (bytes, recon) = crate::encoder::encode_keyframe_with_reconstruction_and_options(
+                &group[0].as_i420(),
+                &self.config.params,
+                &crate::encoder::KeyframeEncodeOptions::new()
+                    .with_effort(self.config.effort)
+                    .with_threads(self.config.threads)
+                    .with_auto_loop_filter(kf_options.auto_loop_filter)
+                    .with_fitted_token_prob_updates(kf_options.fitted_token_prob_updates),
+            )?;
             self.last = Some(recon.clone());
             self.golden = Some(recon.clone());
             self.altref = Some(recon);

@@ -1877,6 +1877,62 @@ pub fn encode_coeff_block(
     left_has_nonzero: bool,
     coeffs: &[i16; 16],
 ) -> Result<usize, TokenEncodeError> {
+    encode_coeff_block_into(
+        enc,
+        block_type,
+        coeff_probs,
+        above_has_nonzero,
+        left_has_nonzero,
+        coeffs,
+    )
+}
+
+/// Where the §13 token walk sends its §7.3 boolean decisions: straight
+/// into a [`BoolEncoder`], or into a [`RecordedBools`] list that is
+/// replayed into one later (the threaded key-frame driver tokenises rows
+/// in its workers and leaves only the arithmetic coding in order).
+trait BoolSink {
+    /// One decision: `value` at probability-of-zero `prob / 256`.
+    fn put(&mut self, prob: u8, value: bool);
+}
+
+impl BoolSink for BoolEncoder {
+    #[inline]
+    fn put(&mut self, prob: u8, value: bool) {
+        self.write_bool(prob, value);
+    }
+}
+
+/// Recorded §7.3 decisions in coding order — the probability in the low
+/// byte, the bit in bit 8.
+type RecordedBools = Vec<u16>;
+
+impl BoolSink for RecordedBools {
+    #[inline]
+    fn put(&mut self, prob: u8, value: bool) {
+        self.push(prob as u16 | (value as u16) << 8);
+    }
+}
+
+impl BoolEncoder {
+    /// Code a recorded decision list — the same `write_bool` calls, in
+    /// order, the recording walk would have made directly.
+    fn write_recorded(&mut self, decisions: &[u16]) {
+        for &d in decisions {
+            self.write_bool(d as u8, d >> 8 != 0);
+        }
+    }
+}
+
+/// [`encode_coeff_block`] into any [`BoolSink`].
+fn encode_coeff_block_into<S: BoolSink>(
+    enc: &mut S,
+    block_type: BlockType,
+    coeff_probs: &CoeffProbs,
+    above_has_nonzero: bool,
+    left_has_nonzero: bool,
+    coeffs: &[i16; 16],
+) -> Result<usize, TokenEncodeError> {
     let plane = block_type.plane_index();
     let first_coeff = block_type.first_coeff();
 
@@ -1929,7 +1985,7 @@ pub fn encode_coeff_block(
         let (path, path_len) = &token_paths[prev_was_zero as usize][token as usize];
         debug_assert!(*path_len > 0, "EOB cannot follow a literal DCT_0");
         for step in &path[..*path_len as usize] {
-            enc.write_bool(probs[step.prob_index as usize], step.bit);
+            enc.put(probs[step.prob_index as usize], step.bit);
         }
 
         if token == DctToken::Eob {
@@ -1945,12 +2001,12 @@ pub fn encode_coeff_block(
             let n = plist.len();
             for (j, &p) in plist.iter().enumerate() {
                 let bit = ((extra >> (n - 1 - j)) & 1) == 1;
-                enc.write_bool(p, bit);
+                enc.put(p, bit);
             }
         }
 
         if abs_value != 0 {
-            enc.write_bool(128, sign);
+            enc.put(128, sign);
             non_zero_count += 1;
         }
 
@@ -4750,8 +4806,8 @@ fn encode_mb_block_set_with_neighbors_strength_rates(
 /// frame-lived) / `left` (per row) so the §13.3 non-zero predictor
 /// state evolves macroblock-to-macroblock exactly as the decoder
 /// reconstructs it.
-fn encode_mb_tokens(
-    enc: &mut BoolEncoder,
+fn encode_mb_tokens<S: BoolSink>(
+    enc: &mut S,
     raw_coeffs: &MbCoeffs,
     use_bpred: bool,
     coeff_probs: &crate::dct_tokens::CoeffProbs,
@@ -4812,8 +4868,8 @@ fn encode_mb_tokens(
 ///
 /// This is the encoder partner of the `decode_one` closure inside
 /// `decode_mb_coeffs`; both update the predictor contexts in place.
-fn encode_block_with_ctx(
-    enc: &mut BoolEncoder,
+fn encode_block_with_ctx<S: BoolSink>(
+    enc: &mut S,
     block_index: usize,
     block_type: BlockType,
     coeff_probs: &crate::dct_tokens::CoeffProbs,
@@ -4842,7 +4898,7 @@ fn encode_block_with_ctx(
     let a_slot = ABOVE_CTX[block_index];
     let l_slot = LEFT_CTX[block_index];
 
-    let nz = encode_coeff_block(
+    let nz = encode_coeff_block_into(
         enc,
         block_type,
         coeff_probs,
@@ -6201,11 +6257,10 @@ fn encode_keyframe_tuned(
         mb_rows,
         num_partitions,
     };
-    let wavefront::AnalysedFrame {
-        modes,
-        coeffs: all_coeffs,
-        partitions: dct_partitions,
-    } = wavefront::analyse_and_tokenize(&search, &mut planes, threads)?;
+    let analysed = wavefront::analyse_and_tokenize(&search, &mut planes, threads)?;
+    let modes = &analysed.modes;
+    let has_coeffs = &analysed.has_coeffs;
+    let dct_partitions = &analysed.partitions;
 
     // ---- §15 loop-filter post-pass --------------------------------------
     //
@@ -6228,7 +6283,8 @@ fn encode_keyframe_tuned(
     // "any-coded-coefficient" test that gates the inter-subblock edges
     // (steps 2 and 4); that test reduces to "any non-zero coefficient",
     // which is invariant under dequantisation by the non-zero §14.1 Q
-    // steps, so we can pass the raw quantised `all_coeffs` directly.
+    // steps, so the flag computed from the raw quantised coefficients
+    // (`has_coeffs`) is the flag the decoder derives.
     // The §15 base config (level filled in below). Segmentation off and
     // `mode_ref_lf_delta_enabled = false`, so every per-MB override is 0
     // and each MB's effective level reduces to the frame base.
@@ -6261,10 +6317,6 @@ fn encode_keyframe_tuned(
     // chosen values are written to the header below so the decoder runs
     // the identical §15 pass.
     let (eff_lf_level, eff_sharpness) = if auto_lf {
-        let has_coeffs: Vec<bool> = all_coeffs
-            .iter()
-            .map(crate::loop_filter::mb_has_coeffs)
-            .collect();
         let src = crate::loop_filter::SourcePlanes {
             width: width as usize,
             height: height as usize,
@@ -6274,21 +6326,14 @@ fn encode_keyframe_tuned(
             y_stride: frame.y_stride,
             uv_stride: frame.uv_stride,
         };
-        crate::loop_filter::select_filter_params(
-            &planes,
-            &modes,
-            &has_coeffs,
-            &lf_config,
-            &src,
-            None,
-        )
+        crate::loop_filter::select_filter_params(&planes, modes, has_coeffs, &lf_config, &src, None)
     } else {
         (params.loop_filter_level, params.sharpness_level)
     };
     lf_config.loop_filter_level = eff_lf_level;
     lf_config.sharpness_level = eff_sharpness;
     if eff_lf_level != 0 {
-        crate::loop_filter::filter_frame(&mut planes, &modes, &all_coeffs, &lf_config);
+        crate::loop_filter::filter_frame_flags(&mut planes, modes, has_coeffs, &lf_config);
     }
     // `planes` is the macroblock-aligned post-§15 reconstruction. It is
     // returned to the caller alongside the bitstream below so a
@@ -6353,7 +6398,7 @@ fn encode_keyframe_tuned(
     // §11 macroblock-mode layer, threading the §11.3 cross-macroblock
     // B_PRED sub-block context buffers exactly as `parse_key_frame_*`
     // reads them.
-    write_mode_layer(&mut hdr, &modes, mb_rows, mb_cols, prob_skip_false);
+    write_mode_layer(&mut hdr, modes, mb_rows, mb_cols, prob_skip_false);
 
     let first_partition = hdr.finish();
     let first_partition_size = first_partition.len();
@@ -6370,7 +6415,7 @@ fn encode_keyframe_tuned(
     // the bytes in `dct_partitions` carry. With `counts = None`
     // this is a no-op.
     if let Some(c) = counts {
-        count_keyframe_branches(&modes, &all_coeffs, mb_cols, mb_rows, c);
+        count_keyframe_branches(modes, &analysed.flat_coeffs(), mb_cols, mb_rows, c);
     }
     let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();
     let size_table_len = (num_partitions - 1) * 3;
@@ -6399,7 +6444,7 @@ fn encode_keyframe_tuned(
         out.push(((sz >> 8) & 0xff) as u8);
         out.push(((sz >> 16) & 0xff) as u8);
     }
-    for part in &dct_partitions {
+    for part in dct_partitions {
         out.extend_from_slice(part);
     }
 

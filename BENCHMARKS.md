@@ -3132,9 +3132,9 @@ frame at the quality-80 operating point took ~130 ms and a 2400×1600 one
   digest; it asserts the digest does not move with the thread budget).
   `cargo bench --bench keyframe_encode_photo` is the criterion form.
 * Hardware: Apple M-series, 18 cores, stable rustc. **The machine was
-  shared with other build jobs throughout (load average 16–25)**, so the
-  wall times are minima over 7–31 runs and carry several per cent of
-  noise; the per-encode instruction and cycle counts
+  shared with other build jobs throughout (load average 13–25)**, so the
+  wall times are minima over 7–31 runs of one interleaved pass and carry
+  several per cent of noise; the per-encode instruction and cycle counts
   (`/usr/bin/time -l`, difference between an 11-run and a 1-run process)
   are the load-robust figures.
 
@@ -3142,35 +3142,35 @@ frame at the quality-80 operating point took ~130 ms and a 2400×1600 one
 
 | Effort | 1 thread | 2 | 4 | 8 | bytes | PSNR-Y | instructions | cycles |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| before (`encode_keyframe`) | 117 ms | — | — | — | 61 633 | 38.92 | 1 846 M | 494 M |
-| `Thorough` (default) | 72 ms | 39 ms | 21 ms | 15 ms | 61 633 | 38.92 | 1 177 M | 290 M |
-| `Balanced` | 33 ms | 20 ms | 10.7 ms | 7.7 ms | 61 656 | 38.96 | 575 M | 156 M |
-| `Fast` | 28 ms | 18 ms | 8.5 ms | 7.4 ms | 62 102 | 38.91 | 443 M | 110 M |
-| `Fastest` | 14 ms | 9.0 ms | 4.7 ms | 5.0 ms | 64 047 | 38.79 | 204 M | 57 M |
+| before (`encode_keyframe`) | 113 ms | — | — | — | 61 633 | 38.92 | 1 846 M | 494 M |
+| `Thorough` (default) | 63 ms | 33 ms | 19 ms | 12.6 ms | 61 633 | 38.92 | 1 191 M | 290 M |
+| `Balanced` | 32 ms | 20 ms | 10.9 ms | 6.5 ms | 61 656 | 38.96 | 584 M | 155 M |
+| `Fast` | 27 ms | 14 ms | 8.3 ms | 5.2 ms | 62 102 | 38.91 | 451 M | 110 M |
+| `Fastest` | 14 ms | 7.5 ms | 4.7 ms | 3.2 ms | 64 047 | 38.79 | 212 M | 57 M |
 
 `Thorough` is byte-identical to the pre-round encoder (digest
-`55c983f4c326b652` before and after): −36 % instructions, −41 % cycles,
-−38 % wall time single-threaded. The target of "well under half" at the
-default level was **not** reached single-threaded (0.6×); it is reached
-from two threads up, or one level down (`Balanced`: 0.28× the time for
-+0.04 % bytes and +0.04 dB).
+`55c983f4c326b652` before and after): −35 % instructions, −41 % cycles,
+−44 % wall time single-threaded (63 vs 113 ms in the same interleaved
+pass). That is short of the "well under half" target for one thread at
+the default level (0.56×); it is reached from two threads up, or one
+level down (`Balanced`: 0.28× the time for +0.04 % bytes and +0.04 dB).
 
 ### Result — 2400×1600
 
 | Effort | 1 thread | 2 | 4 | 8 | bytes | PSNR-Y | instructions | cycles |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| before (`encode_keyframe`) | 662 ms | — | — | — | 247 441 | 41.36 | 10 574 M | 2 761 M |
-| `Thorough` (default) | 505 ms | 263 ms | 147 ms | 83 ms | 247 441 | 41.36 | 7 505 M | 1 850 M |
-| `Balanced` | 290 ms | 148 ms | 83 ms | 63 ms | 246 482 | 41.39 | 4 501 M | 1 165 M |
-| `Fast` | 216 ms | 113 ms | 69 ms | 55 ms | 248 285 | 41.35 | 3 166 M | 852 M |
-| `Fastest` | 104 ms | 56 ms | 31 ms | 24 ms | 256 277 | 41.18 | 1 420 M | 424 M |
+| before (`encode_keyframe`) | 616 ms | — | — | — | 247 441 | 41.36 | 10 574 M | 2 761 M |
+| `Thorough` (default) | 390 ms | 204 ms | 108 ms | 61 ms | 247 441 | 41.36 | 7 505 M | 1 850 M |
+| `Balanced` | 241 ms | 122 ms | 68 ms | 40 ms | 246 482 | 41.39 | 4 501 M | 1 165 M |
+| `Fast` | 175 ms | 100 ms | 55 ms | 35 ms | 248 285 | 41.35 | 3 166 M | 852 M |
+| `Fastest` | 97 ms | 52 ms | 30 ms | 18 ms | 256 277 | 41.18 | 1 420 M | 424 M |
 
 The smoother large picture spends relatively less of the default search
 in the trellis, so the byte-identical gain is smaller (−29 %
-instructions). `Balanced` is *smaller* than `Thorough` here: it prices
-the §11.3 sub-mode signalling against the neighbouring macroblocks'
-real contexts, which the exhaustive search (frozen at its historical
-bytes) does not.
+instructions, 0.63× wall time). `Balanced` is *smaller* than `Thorough`
+here: it prices the §11.3 sub-mode signalling against the neighbouring
+macroblocks' real contexts, which the exhaustive search (frozen at its
+historical bytes) does not.
 
 ### Size / PSNR of the levels across the quantiser range (800×533, 1 thread)
 
@@ -3239,11 +3239,16 @@ luma / chroma modes by prediction error, and plain-rounds.
 
 Macroblock-row wavefront (`src/encoder/wavefront.rs`): row `r` may run
 once row `r − 1` is two macroblocks ahead; rows share only their bottom
-pixel line. Whichever worker finishes a row advances the in-order token
-pass, so entropy coding overlaps the remaining analysis. Scaling is
-near-linear to 4 threads at `Thorough` (3.4× at 800×533, 3.4× at
-2400×1600) and flattens where the serial token pass and mode layer start
-to dominate (`Fastest` at 800×533: 3.0× at 4 threads, no gain beyond).
+pixel line, the sub-mode context and the per-column "above" token
+context. Each worker also tokenises its row into a list of
+`(probability, bit)` decisions; whichever worker finishes a row replays
+the ready lists, in row order, into the partition's boolean encoder — so
+the only serial work is the arithmetic-coder loop, the mode layer and the
+final assembly. Scaling at `Thorough`: 3.3× at 4 threads and 5.0× at 8
+(800×533), 3.6× / 6.4× (2400×1600); `Fastest`, whose analysis is small
+next to the serial coder loop: 3.0× / 4.4× and 3.2× / 5.4×. Recording the
+decisions costs the single-threaded encode about 1 % (`Thorough`) to
+3.5 % (`Fastest`) in instructions.
 
 ### Decoder
 
@@ -3263,10 +3268,10 @@ itself is ~2.6× faster.
 
 ### Next-round candidates
 
-* Single-partition token pass is the serial floor of the threaded encode
-  (≈ 20 % of `Fastest`): pre-tokenise rows in the workers, or code
-  partitions on separate lanes when `nbr_of_dct_partitions > 1` (needs
-  the per-row entry context computed ahead of the coder).
+* The arithmetic-coder replay and the mode layer are the serial floor of
+  the threaded encode: with `nbr_of_dct_partitions > 1` the recorded
+  rows of different partitions could be coded on separate lanes, and the
+  mode layer could overlap the replay tail.
 * The cost model's block loop is scalar 64-bit arithmetic; a lane-parallel
   form is the next target for `Balanced` / `Fast`.
 * The §15.2 simple filter and the mode-layer parser are the next decoder

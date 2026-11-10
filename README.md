@@ -222,8 +222,9 @@ let vp8_bytes = encode_keyframe_with_options(&frame, &KeyframeParams::default(),
   trellis.
 * **`threads`** — the macroblock analysis runs as a macroblock-row
   wavefront on up to that many scoped threads (no thread pool, no
-  dependency); the token pass follows the finished rows. **The bytes are
-  the same at every thread budget.**
+  dependency); each worker also tokenises its rows, leaving only the
+  arithmetic coding in row order. **The bytes are the same at every
+  thread budget.**
 * `auto_loop_filter` / `fitted_token_prob_updates` — the two per-frame
   quality switches, so one options value reaches every combination.
 
@@ -236,11 +237,11 @@ machine, minimum of several runs — see `BENCHMARKS.md` §Round 486 and
 
 | Effort | 800×533, 1 thread | 4 threads | bytes | PSNR-Y | 2400×1600, 1 thread | 8 threads | bytes |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| before this round (no options) | 117 ms | — | 61 633 | 38.92 dB | 662 ms | — | 247 441 |
-| `Thorough` (default, same bytes) | 72 ms | 21 ms | 61 633 | 38.92 dB | 505 ms | 83 ms | 247 441 |
-| `Balanced` | 33 ms | 10.7 ms | 61 656 | 38.96 dB | 290 ms | 63 ms | 246 482 |
-| `Fast` | 28 ms | 8.5 ms | 62 102 | 38.91 dB | 216 ms | 55 ms | 248 285 |
-| `Fastest` | 14 ms | 4.7 ms | 64 047 | 38.79 dB | 104 ms | 24 ms | 256 277 |
+| before this round (no options) | 113 ms | — | 61 633 | 38.92 dB | 616 ms | — | 247 441 |
+| `Thorough` (default, same bytes) | 63 ms | 19 ms | 61 633 | 38.92 dB | 390 ms | 61 ms | 247 441 |
+| `Balanced` | 32 ms | 10.9 ms | 61 656 | 38.96 dB | 241 ms | 40 ms | 246 482 |
+| `Fast` | 27 ms | 8.3 ms | 62 102 | 38.91 dB | 175 ms | 35 ms | 248 285 |
+| `Fastest` | 14 ms | 4.7 ms | 64 047 | 38.79 dB | 97 ms | 18 ms | 256 277 |
 
 `Vp8EncoderConfig` and `AltrefStreamConfig` carry the same `effort` /
 `threads` pair for the key frames of a stream. For multi-frame inter encoding use `Vp8Encoder` +

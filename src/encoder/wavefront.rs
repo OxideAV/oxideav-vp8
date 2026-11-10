@@ -15,11 +15,16 @@
 //! The reconstruction itself is written into that row's own disjoint
 //! strip of the frame planes.
 //!
-//! The §13.3 token pass needs rows in order (each row's "above" non-zero
-//! context is the previous row's outcome), but it does not need the
-//! analysis of later rows: whichever worker finishes a row advances the
-//! token pass over every row that is ready, so with more than one thread
-//! the entropy coding overlaps the remaining analysis.
+//! The §13.3 tokens split the same way. *Which* decisions a row codes
+//! depends on the row above only through each column's "above" non-zero
+//! context, a pure function of the coefficients that is published with
+//! the bottom line — so each worker also tokenises its row into a list
+//! of `(probability, bit)` decisions. What must happen in row order is
+//! only the §7.3 arithmetic coding of those lists: whichever worker
+//! finishes a row replays every list that is ready into its partition's
+//! boolean encoder, so with more than one thread the entropy coding
+//! overlaps the remaining analysis and its serial part is the bare
+//! coder loop.
 //!
 //! The serial path is the same code on the calling thread, rows in
 //! order. Because every macroblock sees the same neighbour pixels and
@@ -32,8 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::effort::{BmodeContext, EncodeEffort, analyze_mb_model};
 use super::{
     BoolEncoder, EncodeError, I420Frame, IntraBmode, IntraYMode, MacroblockModes, MbCoeffs,
-    MbEntropyCtx, MbRdCtx, TokenEncodeError, analyze_mb_exhaustive, clear_skip_ctx,
-    encode_mb_tokens,
+    MbEntropyCtx, MbRdCtx, RecordedBools, analyze_mb_exhaustive, clear_skip_ctx, encode_mb_tokens,
 };
 use crate::frame::KeyframePlanes;
 use crate::intra_predict::DEFAULT_LEFT_PIXEL;
@@ -54,10 +58,22 @@ pub(super) struct KeyframeSearch<'a> {
 pub(super) struct AnalysedFrame {
     /// Per-macroblock modes, raster order.
     pub(super) modes: Vec<MacroblockModes>,
-    /// Per-macroblock raw-quantised coefficients, raster order.
-    pub(super) coeffs: Vec<MbCoeffs>,
+    /// Per-macroblock "has any non-zero coefficient" flag, raster order
+    /// — all the §15 loop filter needs of the residual.
+    pub(super) has_coeffs: Vec<bool>,
+    /// Per-macroblock raw-quantised coefficients, one `Vec` per
+    /// macroblock row (see [`AnalysedFrame::flat_coeffs`]).
+    pub(super) coeff_rows: Vec<Vec<MbCoeffs>>,
     /// The finished §9.5 token partitions.
     pub(super) partitions: Vec<Vec<u8>>,
+}
+
+impl AnalysedFrame {
+    /// The coefficients as one raster-order vector (a copy — only the
+    /// §13.4 branch-count walk needs this shape).
+    pub(super) fn flat_coeffs(&self) -> Vec<MbCoeffs> {
+        self.coeff_rows.iter().flatten().copied().collect()
+    }
 }
 
 /// The bottom pixel line of one macroblock row's reconstruction, and
@@ -68,12 +84,19 @@ struct RowBottom {
     u: Vec<u8>,
     v: Vec<u8>,
     bmodes: Vec<IntraBmode>,
+    /// §13.3 "above" non-zero context each macroblock leaves for the one
+    /// below it (per column, frame-lived: a skipped `B_PRED` macroblock
+    /// passes the inherited Y2 slot through).
+    entropy: Vec<MbEntropyCtx>,
 }
 
 /// One row's decisions, handed from the analysis to the token pass.
 struct RowOutput {
     modes: Vec<MacroblockModes>,
+    has_coeffs: Vec<bool>,
     coeffs: Vec<MbCoeffs>,
+    /// The row's §13.3 token decisions, in coding order.
+    tokens: RecordedBools,
 }
 
 /// What a row shares with other workers.
@@ -99,9 +122,6 @@ struct TokenPass {
     /// Next row to code.
     next_row: usize,
     partitions: Vec<BoolEncoder>,
-    /// One above-context per macroblock column, frame-lived (§13.3).
-    above_ctx: Vec<MbEntropyCtx>,
-    error: Option<TokenEncodeError>,
 }
 
 /// Raises the abort flag if the thread unwinds, so workers waiting on
@@ -137,6 +157,7 @@ pub(super) fn analyse_and_tokenize(
                 u: vec![0u8; mb_cols * 8],
                 v: vec![0u8; mb_cols * 8],
                 bmodes: vec![IntraBmode::Dc; mb_cols * 4],
+                entropy: vec![MbEntropyCtx::default(); mb_cols],
             }),
             done: AtomicUsize::new(0),
             output: Mutex::new(None),
@@ -158,8 +179,6 @@ pub(super) fn analyse_and_tokenize(
         partitions: (0..search.num_partitions)
             .map(|_| BoolEncoder::new())
             .collect(),
-        above_ctx: vec![MbEntropyCtx::default(); mb_cols],
-        error: None,
     });
 
     let worker = || {
@@ -203,13 +222,11 @@ pub(super) fn analyse_and_tokenize(
     }
     let mut pass = tokens.into_inner().unwrap_or_else(|p| p.into_inner());
     advance_tokens(search, &shared, &mut pass);
-    if let Some(e) = pass.error {
-        return Err(EncodeError::Token(e));
-    }
     debug_assert_eq!(pass.next_row, mb_rows);
 
     let mut modes = Vec::with_capacity(mb_rows * mb_cols);
-    let mut coeffs = Vec::with_capacity(mb_rows * mb_cols);
+    let mut has_coeffs = Vec::with_capacity(mb_rows * mb_cols);
+    let mut coeff_rows = Vec::with_capacity(mb_rows);
     for row in shared {
         let output = row
             .output
@@ -217,50 +234,28 @@ pub(super) fn analyse_and_tokenize(
             .unwrap_or_else(|p| p.into_inner())
             .expect("every row was analysed");
         modes.extend(output.modes);
-        coeffs.extend(output.coeffs);
+        has_coeffs.extend(output.has_coeffs);
+        coeff_rows.push(output.coeffs);
     }
     Ok(AnalysedFrame {
         modes,
-        coeffs,
+        has_coeffs,
+        coeff_rows,
         partitions: pass.partitions.into_iter().map(|p| p.finish()).collect(),
     })
 }
 
-/// Code the tokens of every analysed row from `pass.next_row` on, in
-/// order, stopping at the first row that is not ready yet.
-///
-/// Per the §20.4 row loop, macroblock row `r` goes to partition
-/// `r % N`. The "left" context resets at each row start; the "above"
-/// context is per column and frame-lived, shared across partitions.
+/// Arithmetic-code the recorded token decisions of every analysed row
+/// from `pass.next_row` on, in order, stopping at the first row that is
+/// not ready yet. Per the §20.4 row loop, macroblock row `r` goes to
+/// partition `r % N`.
 fn advance_tokens(search: &KeyframeSearch, shared: &[RowShared], pass: &mut TokenPass) {
-    while pass.next_row < search.mb_rows && pass.error.is_none() {
+    while pass.next_row < search.mb_rows {
         let guard = lock(&shared[pass.next_row].output);
         let Some(output) = guard.as_ref() else {
             break;
         };
-        let partition = &mut pass.partitions[pass.next_row % search.num_partitions];
-        let mut left_ctx = MbEntropyCtx::default();
-        for (mb_col, above_col) in pass.above_ctx.iter_mut().enumerate() {
-            let mb = &output.modes[mb_col];
-            let use_bpred = mb.y_mode == IntraYMode::B;
-            if mb.mb_skip_coeff {
-                // §13.1: a skip macroblock emits no tokens, but its
-                // predictor slots are cleared.
-                clear_skip_ctx(use_bpred, above_col, &mut left_ctx);
-                continue;
-            }
-            if let Err(e) = encode_mb_tokens(
-                partition,
-                &output.coeffs[mb_col],
-                use_bpred,
-                search.rd.coeff_probs,
-                above_col,
-                &mut left_ctx,
-            ) {
-                pass.error = Some(e);
-                return;
-            }
-        }
+        pass.partitions[pass.next_row % search.num_partitions].write_recorded(&output.tokens);
         pass.next_row += 1;
     }
 }
@@ -279,7 +274,13 @@ fn analyse_row(
     let y_stride = mb_cols * 16;
     let uv_stride = mb_cols * 8;
     let mut modes = Vec::with_capacity(mb_cols);
+    let mut has_coeffs = Vec::with_capacity(mb_cols);
     let mut coeffs = Vec::with_capacity(mb_cols);
+    // §13.3 token decisions of the row. The "left" non-zero context
+    // resets at each row start; the "above" context of a macroblock is
+    // what the macroblock over it left behind.
+    let mut tokens = RecordedBools::with_capacity(mb_cols * 256);
+    let mut left_ctx = MbEntropyCtx::default();
     let mut left: Option<ReconstructedMb> = None;
     // §11.3 sub-block-mode contexts from the neighbouring macroblocks:
     // `B_DC_PRED` outside the frame, as the mode layer initialises them.
@@ -291,6 +292,7 @@ fn analyse_row(
     for mb_col in 0..mb_cols {
         let mut neighbors = MbNeighbors::default();
         bmode_ctx.above = [IntraBmode::Dc; 4];
+        let mut above_ctx = MbEntropyCtx::default();
         if let Some(above) = above_row {
             // The above-right macroblock must be reconstructed too.
             let need = (mb_col + 2).min(mb_cols);
@@ -326,6 +328,7 @@ fn analyse_row(
             bmode_ctx
                 .above
                 .copy_from_slice(&bottom.bmodes[mb_col * 4..mb_col * 4 + 4]);
+            above_ctx = bottom.entropy[mb_col];
             if mb_col == 0 {
                 // §20.14: left of the frame, below the top row → 129.
                 neighbors.y_topleft = Some(DEFAULT_LEFT_PIXEL);
@@ -413,8 +416,26 @@ fn analyse_row(
             None => ([projected; 4], [projected; 4]),
         };
         bmode_ctx.left = edge_right;
+
+        // §13.3 token decisions of this macroblock. A skip macroblock
+        // (§13.1) emits none, but clears its predictor slots.
+        let use_bpred = analysis.y_mode == IntraYMode::B;
+        if mb_skip_coeff {
+            clear_skip_ctx(use_bpred, &mut above_ctx, &mut left_ctx);
+        } else {
+            encode_mb_tokens(
+                &mut tokens,
+                &analysis.coeffs,
+                use_bpred,
+                search.rd.coeff_probs,
+                &mut above_ctx,
+                &mut left_ctx,
+            )
+            .map_err(EncodeError::Token)?;
+        }
         {
             let mut bottom = lock(&this_row.bottom);
+            bottom.entropy[mb_col] = above_ctx;
             bottom.bmodes[mb_col * 4..mb_col * 4 + 4].copy_from_slice(&edge_bottom);
             bottom.y[yx..yx + 16].copy_from_slice(&recon.y[240..256]);
             bottom.u[cx..cx + 8].copy_from_slice(&recon.u[56..64]);
@@ -429,10 +450,16 @@ fn analyse_row(
             subblock_modes: analysis.b_subblock_modes,
             uv_mode: analysis.uv_mode,
         });
+        has_coeffs.push(crate::loop_filter::mb_has_coeffs(&analysis.coeffs));
         coeffs.push(analysis.coeffs);
         left = Some(recon);
     }
 
-    *lock(&this_row.output) = Some(RowOutput { modes, coeffs });
+    *lock(&this_row.output) = Some(RowOutput {
+        modes,
+        has_coeffs,
+        coeffs,
+        tokens,
+    });
     Ok(())
 }

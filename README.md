@@ -117,8 +117,10 @@ elision on single-axis sub-pel fractions plus rectangle-row SPLITMV
 group SAD — a further −4 % on the inter-encode bench — and r486 cut the
 default key-frame encode a further ~35–40 % at identical bytes, added the
 `EncodeEffort` levels and the threaded wavefront described below, and
-sped the stable-build loop filter ~2.5×), and bench / fuzz coverage —
-see `BENCHMARKS.md`.
+sped the stable-build loop filter ~2.5×; r490 gave inter frames their own
+effort ladder — 16–30× the previous frame rate at a third of the bits —
+with wavefront threads, a one-pass rate control and a threaded decoder),
+and bench / fuzz coverage — see `BENCHMARKS.md`.
 
 ## Install
 
@@ -169,6 +171,24 @@ for packet in vp8_frame_packets {
 
 `Vp8DecodedFrame` (also re-exported as `Vp8Frame`) carries the visible
 `width` / `height` plus three tightly-packed `Vec<u8>` planes.
+
+#### Decoder threads
+
+`Vp8DecoderState::new().with_threads(n)` grants a thread budget (serial
+by default; the registry decoder follows the `ExecutionContext`). Token
+rows decode on up to one worker per token partition, macroblock rows
+reconstruct concurrently and the loop filter runs in row bands; the
+pictures are identical at every budget. 1920×1080, 30 packets from a
+black-box encoder at 6 Mbit/s (`cargo run --release --example ivf_decode`):
+
+| | before | 1 thread | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| 1 token partition | 141 fps | 143 fps | 196 fps | 250 fps | 226 fps |
+| 8 token partitions | 148 fps | 143 fps | 197 fps | 304 fps | 311 fps |
+
+Serial decode speed is unchanged this round. The workers wait on each
+other by spinning, so on a machine with fewer free cores than the budget
+a threaded decode can be slower than a serial one.
 
 ### Encode a keyframe
 
@@ -247,6 +267,55 @@ machine, minimum of several runs — see `BENCHMARKS.md` §Round 486 and
 `threads` pair for the key frames of a stream. For multi-frame inter encoding use `Vp8Encoder` +
 `Vp8EncoderConfig` (both reachable standalone) and feed successive
 `I420Frame`s; see `tests/encoder_inter_stream.rs` for a worked example.
+
+#### Inter-frame effort, threads and rate control
+
+Inter frames take the same `EncodeEffort`. On the stream encoders it is
+`inter_effort` (default `Balanced`); on the per-frame entry points it is
+`InterCodingOptions::with_effort(level)` — without it those keep the
+crate's original exhaustive search and its bytes, which every level
+beats on both speed and bits. `threads` covers the inter frames too
+(macroblock-row wavefront, loop-filter search and loop filter, alt-ref
+filter); the stream is identical at every budget.
+
+```rust
+use oxideav_vp8::{EncodeEffort, I420Frame, Vp8Encoder, Vp8EncoderConfig};
+
+# let (width, height) = (64u32, 48u32);
+# let y_plane = vec![128u8; (width * height) as usize];
+# let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+# let v_plane = u_plane.clone();
+# let i420_frames = vec![I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane); 4];
+let config = Vp8EncoderConfig::default()
+    .with_inter_effort(EncodeEffort::Fast)  // Fastest | Fast | Balanced (default) | Thorough
+    .with_threads(4)                         // caller-granted budget; serial by default
+    .with_golden_interval(120)               // key-frame interval
+    .with_target_bitrate_bps(1_500_000)      // one-pass rate control; 0 = constant qindex
+    .with_frame_rate(30.0);
+let packets = Vp8Encoder::new(config).encode_sequence(&i420_frames)?;
+# let _ = packets;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Measured on the moving test clip at `qindex` 50, one key frame then
+inter frames, one thread unless noted (shared machine, medians — see
+`BENCHMARKS.md` §Round 490 and
+`cargo run --release --example inter_timing`):
+
+| Inter effort | 1280×720 fps | 4 threads | kbit/s | PSNR-Y | 1920×1080 fps | 4 threads | kbit/s | PSNR-Y |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| before this round (one search, no options) | 1.58 | — | 7 482 | 35.83 dB | 0.77 | — | 10 534 | 37.33 dB |
+| `Fastest` | 50.6 | 141 | 2 693 | 34.28 dB | 23.5 | 66 | 3 877 | 36.34 dB |
+| `Fast` | 33.4 | 100 | 2 652 | 34.66 dB | 16.4 | 47 | 4 010 | 36.54 dB |
+| `Balanced` (default) | 25.0 | 51–76 | 2 523 | 34.69 dB | 13.6 | 54 | 3 799 | 36.62 dB |
+| `Thorough` | 18.0 | 72 | 2 400 | 34.60 dB | 8.6 | 27 | 3 520 | 36.56 dB |
+
+(Single-thread columns: 10 frames; 4-thread columns: 30 frames of the
+same clip.) The levels spend about a third of the bits of the old search
+at the same quantiser; at matched quality `Balanced` reaches 36.5 dB at
+3 477 kbit/s (`qindex` 35) where the old search needed 7 482 kbit/s for
+35.8 dB. The one-pass rate control lands within 7 % of 0.5 / 1.5 /
+4 Mbit/s targets on a 2-second 720p clip at every level tried.
 
 ### Two-pass rate-control encode
 
@@ -556,7 +625,18 @@ of `cargo-fuzz` panic-freedom / round-trip targets under
   thread budget for every effort level, encoder↔decoder pixel lockstep
   and a black-box cross-decode at every level, a size / PSNR envelope
   for the reduced levels, and the registry option bag.
-* The 41 `fuzz/` targets cover the public encode / decode surface plus
+* [`tests/encoder_inter_effort.rs`](./tests/encoder_inter_effort.rs) —
+  the inter-frame options: default options byte-identical to the
+  option-less front door, the same bytes and reconstruction at every
+  thread budget for every level and the original search,
+  encoder↔decoder pixel lockstep (intra picker, token-probability fit,
+  loop-filter search, segmentation, 1–4 partitions) and a black-box
+  cross-decode, the ladder's size / PSNR ordering, and the one-pass rate
+  control within tolerance at every level.
+  [`tests/decoder_threads.rs`](./tests/decoder_threads.rs) — the
+  vendored vectors, encoded streams with 1–8 token partitions and 160
+  damaged streams decode identically at every thread budget.
+* The 43 `fuzz/` targets cover the public encode / decode surface plus
   the per-stage primitive layers (bool coder, token coding, transforms,
   dequant, intra prediction, motion search / sub-pixel interpolation,
   inter-MB reconstruction, mode-info decode — key-frame *and*

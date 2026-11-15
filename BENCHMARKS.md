@@ -3277,3 +3277,189 @@ itself is ~2.6× faster.
 * The §15.2 simple filter and the mode-layer parser are the next decoder
   self-time entries; the inter encoder (≈ 70 ms per 352×288 P-frame with
   the fitted / intra-pick passes on) has no effort control yet.
+
+## Round 490 — inter-frame encode: effort ladder, wavefront threads, one-pass rate control; threaded decode
+
+Inter frames had one search — exhaustive, and with no effort or thread
+control. This round profiled it, replaced it (for every caller that asks
+for an effort level, and by default in the lagged stream encoders) with a
+rate-distortion search with four levels, threaded encode and decode, and
+gave the lagged stream encoder a one-pass rate control.
+
+### Instrument
+
+`cargo run --release --example inter_timing -- W H FRAMES QI RUNS THREADS…`
+encodes the deterministic moving clip of `tests/support/clip.rs` (the
+photo-like picture panning by half-pixel steps, three textured rectangles
+moving over it, fresh grain per frame) through `Vp8Encoder::encode_sequence`
+and prints, per effort level and thread budget, the median wall time, the
+stream size as kbit/s at 30 fps, the PSNR-Y of this crate's decode and a
+digest of the stream (asserted equal across budgets).
+`cargo run --release --example ivf_decode -- file.ivf RUNS THREADS…` times
+the decoder. Apple M-series, 18 cores, **shared with fourteen other
+builds** (load average 20–30 throughout; under load 50+ every threaded
+number here degrades sharply and can fall below serial — the wavefronts
+wait by spinning). Medians of 3–21 runs; treat the thread columns as
+indicative.
+
+### Profile before (1280×720, `qindex` 50, default settings, one thread)
+
+`sample` over the inter frames of the clip, self time:
+
+| Stage | share |
+|---|---:|
+| trellis quantisation of every candidate (each reference's winner and each of 16 intra mode pairs is fully re-encoded) | 37 % |
+| …with its forward DCT / WHT, inverse DCT and reconstruction | 15 % |
+| sub-pixel interpolation of whole candidate macroblocks (8 half- + 8 quarter-pixel probes per reference) | 13 % |
+| `SPLITMV` group searches (four partitions on every macroblock of every reference) | 11 % |
+| per-macroblock driver (copies of candidate records) | 9 % |
+| whole-pixel SAD, vector bit costs | 3 % |
+| alt-ref temporal filter, key frame, token coding, loop filter | rest |
+
+So over half the time re-encoded candidates that were then thrown away,
+and a quarter went to search steps taken regardless of need.
+
+### What the levels do
+
+`src/encoder/inter_search.rs`. Per macroblock: whole-pixel pattern
+descent on each reference from the best of the predicted vectors (zero,
+the §16.3 census vectors, the neighbours' vectors), every SAD abandoned
+once it cannot win, a reference abandoned once the error is below what
+the quantiser keeps; sub-pixel refinement only around the best reference's
+whole-pixel vector, the eight half-pixel neighbours read from three
+§18.3-filtered planes computed once (three filter passes instead of
+eight) and quarter-pixel probes around the best of those; then the mode
+decision — inter, `SPLITMV`, intra, or skip — on the transform-domain
+cost model of the key-frame levels (weighted squared rounding error plus
+tabled token bits), the costlier candidates built only where the inter
+prediction misses by more than the quantiser keeps. Only the winner is
+quantised (trellis from `Fast` up) and reconstructed, with the decoder's
+own inverse transforms. A macroblock whose coefficients cost more than
+the distortion they remove is coded as a skip. Token decisions are
+recorded per row with their probability slots, so the §13.4 probability
+fit needs no second encode.
+
+| | `Fastest` | `Fast` | `Balanced` | `Thorough` |
+|---|---|---|---|---|
+| descent rounds / wide pattern | 4 / no | 8 / yes | 16 / yes | 32 / yes |
+| other references searched | predicted vectors only | yes | yes | yes |
+| sub-pixel | half | half + quarter | half + quarter, runner-up reference too | every reference |
+| `SPLITMV` | — | — | 3 partitions where the prediction misses | 4 partitions, always |
+| intra | best-by-error mode where it misses badly | same, lower gate | 4 luma modes, lower gate | 4 luma modes, always |
+| trellis | no | yes | yes | yes |
+| loop-filter level search (when on) | sampled 2 rows in 16 | same | 2 rows in 8 | full grid |
+
+### Result — encode, one thread, `qindex` 50, one key frame then inter frames (10 frames)
+
+| | 1280×720 fps | kbit/s | PSNR-Y | 1920×1080 fps | kbit/s | PSNR-Y |
+|---|---:|---:|---:|---:|---:|---:|
+| before (the only search) | 1.58 | 7 482 | 35.83 dB | 0.77 | 10 534 | 37.33 dB |
+| `Fastest` | 50.6 | 2 693 | 34.28 dB | 23.5 | 3 877 | 36.34 dB |
+| `Fast` | 33.4 | 2 652 | 34.66 dB | 16.4 | 4 010 | 36.54 dB |
+| `Balanced` (stream default) | 25.0 | 2 523 | 34.69 dB | 13.6 | 3 799 | 36.62 dB |
+| `Thorough` | 18.0 | 2 400 | 34.60 dB | 8.6 | 3 520 | 36.56 dB |
+
+The levels spend a third of the bits at the same quantiser for about
+1 dB less — the old search ranked candidates on prediction error alone
+and never weighed a macroblock's coefficient bits against the distortion
+they remove.
+At matched quality the new search is far ahead: `Balanced` at `qindex`
+35 gives 36.5 dB at 3 477 kbit/s on the 720p clip, against 35.8 dB at
+7 482 kbit/s before. Along the ladder the bitrate falls as effort rises
+(30 frames, 720p: 1 543 / 1 548 / 1 433 / 1 336 kbit/s at 33.8 / 34.4 /
+34.4 / 34.3 dB).
+
+### Result — threads (30 frames, key frame once; fps)
+
+| | 720p ×1 | ×2 | ×4 | 1080p ×1 | ×2 | ×4 | ×8 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `Fastest` | 52.7 | 88.5 | 140.6 | 27.0 | 41.2 | 65.7 | 67.2 |
+| `Fast` | 37.9 | 59.1 | 100.1 | 21.2 | 36.2 | 46.7 | 41.8 |
+| `Balanced` | 35.7 | 55.1 | 51.3 | 17.3 | 32.6 | 54.0 | 54.7 |
+| `Thorough` | 24.6 | 39.5 | 72.2 | 13.3 | 19.4 | 27.2 | 19.5 |
+
+Identical digests in every row. The scatter (e.g. `Balanced` 720p ×4) is
+the shared machine, not the code. With the default configuration (a key
+frame every 8 frames at the `Thorough` key-frame level, 30 frames):
+720p 40.7 / 27.8 / 19.8 / 15.2 fps on one thread and 96.9 / 43.7 / 38.9 /
+25.2 on four; 1080p 20.8 / 14.5 / 11.5 / 7.6 and 42.6 / 29.9 / 24.7 /
+16.8 — before: 1.93 fps (720p) and 0.88 fps (1080p).
+
+What runs under the budget: the macroblock search as a row wavefront
+(row `r` two macroblocks behind `r − 1`; rows share their bottom pixel
+line, neighbour records and token contexts through atomic words), the
+loop-filter level search (candidates in parallel), the loop filter in
+row bands (`src/loop_filter/bands.rs`), the alt-ref filter's block
+alignment, and the key frames as before. Serial remainder: the mode
+layer and the arithmetic coding of the recorded tokens.
+
+### Rate control (one pass)
+
+`AltrefStreamConfig::target_bitrate_bps` (60 frames, 1280×720, 4
+threads, loop-filter search on, start `qindex` 50):
+
+| target | `Fastest` | `Fast` | `Balanced` |
+|---:|---:|---:|---:|
+| 500 kbit/s | 534.9 (+7.0 %), 29.1 dB | 529.6 (+5.9 %), 29.3 dB | 531.1 (+6.2 %), 29.6 dB |
+| 1 500 kbit/s | 1 562.6 (+4.2 %), 34.1 dB | 1 560.6 (+4.0 %), 34.6 dB | 1 558.4 (+3.9 %), 34.9 dB |
+| 4 000 kbit/s | 4 019.6 (+0.5 %), 37.2 dB | 4 044.6 (+1.1 %), 39.1 dB | 4 117.3 (+2.9 %), 39.3 dB |
+
+With a key frame every 8 frames at 1 500 kbit/s: 1 504.2 (`Fast`) and
+1 495.3 (`Balanced`). On 320×192, 45 frames, the lower three levels land
+within 5 % of 250 and 700 kbit/s; `tests/encoder_inter_effort.rs` holds
+all four within 12 %. The residual
+overshoot on short clips is the first key frame, paid back over a
+one-second window.
+
+### Decoder (1920×1080, 30 packets from a black-box encoder at 6 Mbit/s)
+
+Profile before, self time: loop filter 39 %, token decode 18 %,
+sub-pixel interpolation 14 % (chroma 9, luma 6) plus 4 % halo fetches,
+mode parsing and vector prediction 6 %, plane copies 4 %, inverse
+transform 3 %.
+
+| | before | after ×1 | ×2 | ×4 | ×8 |
+|---|---:|---:|---:|---:|---:|
+| 1 token partition, ms / packet | 7.12 | 7.01 | 5.11 | 4.01 | 4.43 |
+| fps | 141 | 143 | 196 | 250 | 226 |
+| 8 token partitions, ms / packet | 6.75 | 7.00 | 5.08 | 3.29 | 3.21 |
+| fps | 148 | 143 | 197 | 304 | 311 |
+
+Serial decode is unchanged within noise (15.05 G → 14.72 G instructions
+for 150 packets): the luma six-tap passes now run as whole 16-sample
+runs with 16-bit sign-split sums (half the instructions of the listing
+form on that kernel; the 8- and 4-sample forms measured *slower* that way
+and keep the listing), but luma interpolation was only 6 % of the decode.
+The loop filter and the token decoder — the two largest stages — were
+already rewritten in earlier rounds and were not improved here.
+
+Under a budget: the mode layer is parsed first on the calling thread;
+token rows then decode on up to one worker per partition (a single
+partition is one worker reading ahead), reconstruction rows run
+concurrently and wait on the row above only at intra macroblocks, and
+the loop filter runs in row bands. The single-partition ceiling is the
+serial chain of mode parsing → tokens; the loop filter is a strict
+wavefront.
+
+### Negative results
+
+* Sleeping (`Condvar`) between row units of the decoder: a row is tens
+  of microseconds of work, so each wake cost more than the unit; spinning
+  with a bounded spin-then-yield is what stayed.
+* A mutex around each row's shared strip, taken by both adjacent rows
+  per macroblock (the shape the key-frame wavefront had): contended
+  constantly once rows are cheap; replaced by atomic words everywhere.
+* The run-form six-tap kernel for chroma (8 wide) and sub-blocks (4
+  wide) in the two-pass case: 60–160 % more instructions than the
+  listing form.
+
+### Next-round candidates
+
+* Decoder: overlap the loop filter with reconstruction (row `r` can be
+  filtered once rows `r` and `r + 1` are reconstructed) and the mode
+  parse with token decoding; a 16-lane 8-bit loop-filter kernel.
+* Encoder: `SPLITMV` vectors are whole-pixel only; `B_PRED` is not a
+  candidate on inter frames; the mode layer and token replay are serial.
+* Rate control has no frame dropping and no lookahead; a target below
+  what `qindex` 127 produces is overshot.
+

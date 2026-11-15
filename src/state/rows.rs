@@ -226,8 +226,10 @@ pub(super) fn decode_rows(
     let workers = threads.clamp(1, (2 * mb_rows).max(1));
     // Token rows of one partition chain, so more token workers than
     // partitions would only wait; and tokens are about a third of the
-    // work of these two stages.
+    // work of these two stages, so more than two reconstruction workers
+    // per token worker would mostly wait for tokens.
     let token_workers = decoders.len().min(workers.div_ceil(3)).max(1);
+    let workers = workers.min(3 * token_workers);
     if workers == 1 {
         worker(true);
     } else {

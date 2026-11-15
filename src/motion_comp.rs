@@ -467,6 +467,113 @@ fn sixtap_vert(
     }
 }
 
+/// One §20.14 filter pass over a run of `N` adjacent output samples:
+/// `out[i] = interp(taps, [src[i], src[i + step], …, src[i + 5·step]])`,
+/// i.e. `clamp255((Σ taps[k]·src[i + k·step] + 64) >> 7)`.
+///
+/// `step = 1` is a horizontal pass over one row (`src` starts two
+/// samples left of output sample 0); `step = stride` is a vertical pass
+/// over one output row (`src` starts two rows above it).
+///
+/// The run is evaluated tap by tap over fixed-size arrays so the
+/// compiler can keep all `N` sums in vector registers. For tap rows with
+/// the §18.3 sign pattern (outer and centre taps ≥ 0, taps 1 and 4 ≤ 0)
+/// whose positive part cannot overflow 16 bits, the positive and negative
+/// parts are accumulated separately in `u16`: with `P` the positive part
+/// plus the rounding 64 and `M` the negative part's magnitude, the
+/// reference value is `clamp255((P − M) >> 7)`, which is `0` when
+/// `P < M` and `min(255, (P − M) >> 7)` otherwise — exactly
+/// `min(255, P.saturating_sub(M) >> 7)`. Any other tap row takes the
+/// plain `i32` sums. Both forms equal [`interp`] sample for sample
+/// (`sixtap_run_matches_interp`).
+#[inline(always)]
+pub(crate) fn sixtap_run<const N: usize>(src: &[u8], step: usize, taps: &[i32; 6]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let split_signs = taps[0] >= 0
+        && taps[2] >= 0
+        && taps[3] >= 0
+        && taps[5] >= 0
+        && taps[1] <= 0
+        && taps[4] <= 0
+        && (taps[0] + taps[2] + taps[3] + taps[5]) * 255 + 64 <= u16::MAX as i32
+        && -(taps[1] + taps[4]) * 255 <= u16::MAX as i32;
+    if split_signs {
+        let mut plus = [64u16; N];
+        let mut minus = [0u16; N];
+        for k in [0usize, 2, 3, 5] {
+            let tap = taps[k] as u16;
+            if tap != 0 {
+                let run: &[u8; N] = src[k * step..k * step + N]
+                    .try_into()
+                    .expect("run of N samples");
+                for i in 0..N {
+                    plus[i] += run[i] as u16 * tap;
+                }
+            }
+        }
+        for k in [1usize, 4] {
+            let tap = (-taps[k]) as u16;
+            if tap != 0 {
+                let run: &[u8; N] = src[k * step..k * step + N]
+                    .try_into()
+                    .expect("run of N samples");
+                for i in 0..N {
+                    minus[i] += run[i] as u16 * tap;
+                }
+            }
+        }
+        for i in 0..N {
+            out[i] = (plus[i].saturating_sub(minus[i]) >> 7).min(255) as u8;
+        }
+    } else {
+        let mut acc = [64i32; N];
+        for (k, &tap) in taps.iter().enumerate() {
+            let run: &[u8; N] = src[k * step..k * step + N]
+                .try_into()
+                .expect("run of N samples");
+            for i in 0..N {
+                acc[i] += run[i] as i32 * tap;
+            }
+        }
+        for i in 0..N {
+            out[i] = clamp255(acc[i] >> 7);
+        }
+    }
+    out
+}
+
+/// The two-pass §20.14 convolution of one `OW×OW` block from its
+/// `(OW+5)×(OW+5)` halo, each pass as [`sixtap_run`]s — the stable-build
+/// kernel behind [`sixtap_2d`] / [`sixtap_mb_luma`] /
+/// [`sixtap_mb_chroma`] when neither pass is the identity. Byte-exact
+/// with the reference listings (`sixtap_2d_scalar` and its macroblock
+/// forms), which the dispatcher stress tests compare it against.
+#[cfg_attr(feature = "simd", allow(dead_code))] // simd builds use the portable-simd kernels.
+#[inline]
+fn sixtap_block_runs<const HW: usize, const OW: usize, const HN: usize, const ON: usize>(
+    halo: &[u8; HN],
+    mx: usize,
+    my: usize,
+    filters: &[[i32; 6]; 8],
+) -> [u8; ON] {
+    debug_assert_eq!(HW, OW + 5);
+    debug_assert_eq!(HN, HW * HW);
+    debug_assert_eq!(ON, OW * OW);
+    // Horizontal pass: HW rows of OW samples (the block rows plus the
+    // two above / three below the vertical pass reads), 8-bit, stride OW.
+    let mut temp = [[0u8; OW]; HW];
+    for (r, row) in temp.iter_mut().enumerate() {
+        *row = sixtap_run::<OW>(&halo[r * HW..], 1, &filters[mx]);
+    }
+    let temp = temp.as_flattened();
+    let mut out = [0u8; ON];
+    for r in 0..OW {
+        let row = sixtap_run::<OW>(&temp[r * OW..], OW, &filters[my]);
+        out[r * OW..r * OW + OW].copy_from_slice(&row);
+    }
+    out
+}
+
 /// Two-dimensional six-tap interpolation of a 4×4 sub-block — RFC 6386
 /// §20.14 `sixtap_2d`.
 ///
@@ -496,7 +603,7 @@ pub fn sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8])
     #[cfg(not(feature = "simd"))]
     {
         sixtap_identity_elide::<9, 4, 81, 16>(halo, mx, my, filters)
-            .unwrap_or_else(|| sixtap_2d_scalar(halo, mx, my, filters))
+            .unwrap_or_else(|| sixtap_block_runs::<9, 4, 81, 16>(halo, mx, my, filters))
     }
 }
 
@@ -723,7 +830,7 @@ pub fn sixtap_mb_luma(
     #[cfg(not(feature = "simd"))]
     {
         sixtap_identity_elide::<21, 16, { 21 * 21 }, 256>(halo, mx, my, filters)
-            .unwrap_or_else(|| sixtap_mb_luma_scalar(halo, mx, my, filters))
+            .unwrap_or_else(|| sixtap_block_runs::<21, 16, { 21 * 21 }, 256>(halo, mx, my, filters))
     }
 }
 
@@ -797,59 +904,17 @@ fn sixtap_identity_elide<const HW: usize, const OW: usize, const HN: usize, cons
         // equals the halo samples, so run the vertical §18.3 dot
         // product directly over the halo at block-origin column 2
         // (output row r, tap k reads halo row r + k — the same rows the
-        // intermediate would hold). The six support rows are widened
-        // into per-row `i32` buffers so the inner column loop is six
-        // constant-bound multiply-accumulates over fixed-size arrays;
-        // seeding the accumulator with the `+64` rounding term
-        // reassociates exact (non-overflowing) `i32` adds only, so
-        // every sample equals the [`interp`] value.
-        let [f0, f1, f2, f3, f4, f5] = filters[my];
-        let mut hi = [[0i32; HW]; HW];
-        for (row, src) in hi.iter_mut().zip(halo.as_chunks::<HW>().0) {
-            for (dst, &s) in row.iter_mut().zip(src) {
-                *dst = s as i32;
-            }
-        }
+        // intermediate would hold), one [`sixtap_run`] per output row.
         for r in 0..OW {
-            let (r0, r1, r2, r3, r4, r5) = (
-                &hi[r],
-                &hi[r + 1],
-                &hi[r + 2],
-                &hi[r + 3],
-                &hi[r + 4],
-                &hi[r + 5],
-            );
-            for c in 0..OW {
-                let a = 64
-                    + r0[c + 2] * f0
-                    + r1[c + 2] * f1
-                    + r2[c + 2] * f2
-                    + r3[c + 2] * f3
-                    + r4[c + 2] * f4
-                    + r5[c + 2] * f5;
-                out[r * OW + c] = clamp255(a >> 7);
-            }
+            let row = sixtap_run::<OW>(&halo[r * HW + 2..], HW, &filters[my]);
+            out[r * OW..r * OW + OW].copy_from_slice(&row);
         }
     } else {
         // Vertical pass is the identity: the output rows are the
-        // horizontal §18.3 dot product over halo rows 2..2+OW, with the
-        // same widened-row / reassociated-`i32` shape as above.
-        let [f0, f1, f2, f3, f4, f5] = filters[mx];
+        // horizontal §18.3 dot product over halo rows 2..2+OW.
         for r in 0..OW {
-            let mut rowi = [0i32; HW];
-            for (dst, &s) in rowi.iter_mut().zip(&halo[(r + 2) * HW..(r + 3) * HW]) {
-                *dst = s as i32;
-            }
-            for c in 0..OW {
-                let a = 64
-                    + rowi[c] * f0
-                    + rowi[c + 1] * f1
-                    + rowi[c + 2] * f2
-                    + rowi[c + 3] * f3
-                    + rowi[c + 4] * f4
-                    + rowi[c + 5] * f5;
-                out[r * OW + c] = clamp255(a >> 7);
-            }
+            let row = sixtap_run::<OW>(&halo[(r + 2) * HW..], 1, &filters[mx]);
+            out[r * OW..r * OW + OW].copy_from_slice(&row);
         }
     }
     Some(out)
@@ -1077,7 +1142,7 @@ pub fn sixtap_mb_chroma(
     #[cfg(not(feature = "simd"))]
     {
         sixtap_identity_elide::<13, 8, { 13 * 13 }, 64>(halo, mx, my, filters)
-            .unwrap_or_else(|| sixtap_mb_chroma_scalar(halo, mx, my, filters))
+            .unwrap_or_else(|| sixtap_block_runs::<13, 8, { 13 * 13 }, 64>(halo, mx, my, filters))
     }
 }
 
@@ -3312,6 +3377,53 @@ mod tests {
                 let sy = (r as isize - 2).clamp(0, h as isize - 1) as usize;
                 let sx = (c as isize - 2).clamp(0, w as isize - 1) as usize;
                 assert_eq!(mb_halo[r * 21 + c], plane[sy * w + sx], "({r},{c})");
+            }
+        }
+    }
+
+    /// [`sixtap_run`] equals the §18.3 `interp` listing for every tap
+    /// row of both shipped sets and for rows that take the plain-`i32`
+    /// form (other sign patterns, sums past 16 bits), horizontally and
+    /// vertically, on extreme and pseudo-random samples.
+    #[test]
+    fn sixtap_run_matches_interp() {
+        let mut tap_rows: Vec<[i32; 6]> = Vec::new();
+        tap_rows.extend_from_slice(&SIXTAP_FILTERS);
+        tap_rows.extend_from_slice(&BILINEAR_FILTERS);
+        tap_rows.extend_from_slice(&[
+            [-3, 16, 77, 77, 16, -3],
+            [0, -128, 255, 255, -128, 0],
+            [5, -40, 200, 200, -40, 5],
+            [1, 2, 3, 4, 5, 6],
+            [0, 0, 0, 0, 0, 0],
+        ]);
+        const W: usize = 24;
+        let mut lcg = 0x1234_5678u32;
+        for case in 0..6 {
+            let mut samples = [0u8; W * 6];
+            for (n, s) in samples.iter_mut().enumerate() {
+                lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                *s = match case {
+                    0 => 0,
+                    1 => 255,
+                    2 => [0, 255][n & 1],
+                    3 => [255, 0][(n / W) & 1],
+                    _ => (lcg >> 16) as u8,
+                };
+            }
+            for taps in &tap_rows {
+                // Horizontal: 16 outputs from one row.
+                let got: [u8; 16] = sixtap_run(&samples, 1, taps);
+                for (i, &g) in got.iter().enumerate() {
+                    let support: [u8; 6] = core::array::from_fn(|k| samples[i + k]);
+                    assert_eq!(g, interp(taps, &support), "horizontal {taps:?} case {case}");
+                }
+                // Vertical: 16 outputs from six rows.
+                let got: [u8; 16] = sixtap_run(&samples, W, taps);
+                for (i, &g) in got.iter().enumerate() {
+                    let support: [u8; 6] = core::array::from_fn(|k| samples[i + k * W]);
+                    assert_eq!(g, interp(taps, &support), "vertical {taps:?} case {case}");
+                }
             }
         }
     }

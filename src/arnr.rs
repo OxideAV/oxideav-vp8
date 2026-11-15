@@ -200,8 +200,19 @@ fn block_sad(
         let src_row = &src.y[sy * src.y_stride + bx..sy * src.y_stride + bx + bw];
         let ref_base = (ry0 + r) * refp.y_stride + rx0;
         let ref_row = &refp.y[ref_base..ref_base + bw];
-        for (&s, &rp) in src_row.iter().zip(ref_row.iter()) {
-            sad += (s as i32 - rp as i32).unsigned_abs();
+        // Whole 16-pixel runs as fixed-size arrays (the common block
+        // width, summed in vector registers), then any remainder.
+        let (src_runs, src_tail) = src_row.as_chunks::<16>();
+        let (ref_runs, ref_tail) = ref_row.as_chunks::<16>();
+        for (a, b) in src_runs.iter().zip(ref_runs) {
+            let mut run = 0u32;
+            for i in 0..16 {
+                run += a[i].abs_diff(b[i]) as u32;
+            }
+            sad += run;
+        }
+        for (&s, &rp) in src_tail.iter().zip(ref_tail.iter()) {
+            sad += s.abs_diff(rp) as u32;
         }
         if sad >= early_exit_at {
             return sad;

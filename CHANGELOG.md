@@ -15,6 +15,8 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 - The lagged stream encoders (`Vp8AltrefStreamEncoder`, `Vp8Encoder::encode_sequence`, `make_encoder_with_config`) now encode their inter frames at `EncodeEffort::Balanced` by default; set `inter_effort` to `Thorough` for the previous output.
 - With a reduced effort level and `fitted_token_prob_updates`, the §13.4 token-probability fit runs on the recorded token decisions of a single analysis pass instead of encoding the frame twice.
+- *(perf)* §18.3 sub-pixel interpolation (stable builds): each filter pass runs as whole 16- / 8- / 4-sample runs over fixed-size arrays, the positive and negative taps accumulated separately in 16 bits, instead of a six-sample gather per output sample — bit-identical to the `interp` listing (`sixtap_run_matches_interp` and the dispatcher stress tests). Used by the decoder's motion compensation and the encoder's sub-pixel search alike.
+- *(perf)* the cost model settles an all-zero block without a division; the alt-ref filter's block SAD sums whole 16-pixel runs.
 - Inter frames record their §13.3 token decisions per macroblock row during the search and replay them into the partitions; the exhaustive search's bytes are unchanged.
 
 ## [0.2.9](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.8...v0.2.9) - 2026-11-10

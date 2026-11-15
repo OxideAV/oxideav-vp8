@@ -272,36 +272,58 @@ pub(super) fn model_block_parts(
     tables: &TrellisRateTables,
 ) -> BlockModel {
     let first = spec.first_coeff;
+    debug_assert!(first <= 1, "§13.3 blocks start at coefficient 0 or 1");
     let (dc_q, ac_q) = (spec.dc as u32, spec.ac as u32);
-    let mut levels = [0u32; 16];
-    let mut negative = 0u32;
-    let mut coded = 0u32;
-    let mut dist = 0u64;
-    let mut dist_zero = 0u64;
-    for k in first..16 {
-        let x = block[crate::dct_tokens::ZIGZAG[k]];
-        let ax = x.unsigned_abs() as u32;
-        let q = if k == 0 { dc_q } else { ac_q };
-        let level = rounded_level(ax, q);
-        let err = (ax as i64 - level as i64 * q as i64).unsigned_abs();
-        dist += weights[k] * err * err;
-        dist_zero += weights[k] * ax as u64 * ax as u64;
-        levels[k] = level;
-        negative |= ((x < 0) as u32) << k;
-        coded |= ((level != 0) as u32) << k;
+    // Magnitudes in scan order (an uncoded position 0 counts as zero),
+    // the all-zero distortion, and whether any coded position rounds to
+    // a level (`|x| + q/2 >= q`, i.e. `|x| >= q − q/2`). All-zero is the
+    // common case on inter residue and is settled here without a
+    // division.
+    let zigzag = &crate::dct_tokens::ZIGZAG;
+    let mut magnitude = [0u32; 16];
+    for (m, &pos) in magnitude.iter_mut().zip(zigzag.iter()) {
+        *m = block[pos].unsigned_abs() as u32;
     }
-    *block = [0i16; 16];
-    let small = &tables.small[spec.plane];
+    if first != 0 {
+        magnitude[0] = 0;
+    }
+    let mut thresholds = [ac_q - ac_q / 2; 16];
+    thresholds[0] = dc_q - dc_q / 2;
+    let mut dist_zero = 0u64;
+    let mut any_level = false;
+    for k in 0..16 {
+        let ax = magnitude[k];
+        dist_zero += weights[k] * (ax as u64 * ax as u64);
+        any_level |= ax >= thresholds[k];
+    }
     let mut ctx3 = spec.entry_ctx3;
-    if coded == 0 {
+    if !any_level {
         let rate = tables.eob[spec.plane][COEFF_BANDS[first]][ctx3];
+        *block = [0i16; 16];
         return BlockModel {
-            dist,
+            dist: dist_zero,
             dist_zero,
             rate,
             nonzero: false,
         };
     }
+    let mut levels = [0u32; 16];
+    let mut negative = 0u32;
+    let mut coded = 0u32;
+    let mut dist = 0u64;
+    for k in first..16 {
+        let ax = magnitude[k];
+        let q = if k == 0 { dc_q } else { ac_q };
+        let level = rounded_level(ax, q);
+        let err = (ax as i64 - level as i64 * q as i64).unsigned_abs();
+        dist += weights[k] * err * err;
+        levels[k] = level;
+        negative |= ((block[crate::dct_tokens::ZIGZAG[k]] < 0) as u32) << k;
+        coded |= ((level != 0) as u32) << k;
+    }
+    *block = [0i16; 16];
+    let small = &tables.small[spec.plane];
+    debug_assert!(coded != 0, "a level at or past half a step rounds up");
     let end = 32 - coded.leading_zeros() as usize;
 
     let mut rate = 0.0;

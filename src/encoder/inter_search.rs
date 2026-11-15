@@ -48,7 +48,7 @@ use super::{
 use crate::dequant::MbDequantFactors;
 use crate::intra_predict::DEFAULT_ABOVE_PIXEL;
 use crate::inverse_transform::{inverse_dct_4x4_add_into, inverse_wht_4x4};
-use crate::motion_comp::{RefFrame, predict_inter_mb, predict_split_mv};
+use crate::motion_comp::{RefFrame, predict_inter_mb, predict_split_mv, sixtap_run};
 use crate::motion_search::{LumaRef, mb_luma_sad_at_mv};
 use crate::motion_vector::{Mv, MvContexts, mv_component_bits};
 use crate::near_mv::{InterMode, MvClampRect, MvPartition, clamp_mv, find_near_mvs, mv_ref_probs};
@@ -95,7 +95,7 @@ impl EncodeEffort {
             EncodeEffort::Fastest => Some(SearchShape {
                 descent_rounds: 4,
                 wide_pattern: false,
-                half_diagonals: false,
+                half_diagonals: true,
                 quarter: false,
                 search_other_refs: false,
                 refine_runner_up: false,
@@ -265,25 +265,6 @@ fn fetch_window(reference: &LumaRef, x: i32, y: i32) -> [u8; WIN * WIN] {
     out
 }
 
-/// One §18.3 filter pass over a run of samples: `out[i]` is the
-/// six-tap `interp` of `taps[k]` against `src[i + k·step]`, `k = 0..6`,
-/// rounded and clamped to 8 bits exactly as §20.14 does.
-#[inline(always)]
-fn filter_run<const N: usize>(src: &[u8], step: usize, taps: &[i32; 6]) -> [u8; N] {
-    let mut acc = [64i32; N];
-    for (k, &tap) in taps.iter().enumerate() {
-        let run: &[u8] = &src[k * step..k * step + N];
-        for i in 0..N {
-            acc[i] += run[i] as i32 * tap;
-        }
-    }
-    let mut out = [0u8; N];
-    for i in 0..N {
-        out[i] = (acc[i] >> 7).clamp(0, 255) as u8;
-    }
-    out
-}
-
 /// The three half-pixel planes around a whole-pixel position `P`:
 /// `h[r][c]` is the §18.3 prediction sample half a pixel right of
 /// `P + (c − 1, r − 3)` (22 rows, so the diagonal plane can be filtered
@@ -308,18 +289,18 @@ impl HalfPlanes {
         // and c + 3, so its support starts at window column c.
         let h_rows = if diagonals { 0..WIN } else { 3..19 };
         for r in h_rows {
-            let row: [u8; HP] = filter_run(&window[r * WIN..], 1, taps);
+            let row: [u8; HP] = sixtap_run(&window[r * WIN..], 1, taps);
             planes.h[r * HP..r * HP + HP].copy_from_slice(&row);
         }
         // Vertical: output row r sits between window rows r + 2 and
         // r + 3; columns are window columns 3..19.
         for r in 0..HP {
-            let row: [u8; 16] = filter_run(&window[r * WIN + 3..], WIN, taps);
+            let row: [u8; 16] = sixtap_run(&window[r * WIN + 3..], WIN, taps);
             planes.v[r * 16..r * 16 + 16].copy_from_slice(&row);
         }
         if diagonals {
             for r in 0..HP {
-                let row: [u8; HP] = filter_run(&planes.h[r * HP..], HP, taps);
+                let row: [u8; HP] = sixtap_run(&planes.h[r * HP..], HP, taps);
                 planes.d[r * HP..r * HP + HP].copy_from_slice(&row);
             }
         }

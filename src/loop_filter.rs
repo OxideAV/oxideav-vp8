@@ -860,6 +860,8 @@ fn simple_segment_v(
 use crate::frame::{KeyframePlanes, MbCoeffs};
 use crate::macroblock::{IntraYMode, MacroblockModes};
 
+mod bands;
+
 /// Number of reference-frame loop-filter deltas (`MAX_REF_LF_DELTAS`,
 /// RFC 6386 §9.4) — one per reference-frame slot.
 pub const MAX_REF_LF_DELTAS: usize = 4;
@@ -2050,69 +2052,127 @@ pub fn select_filter_params(
     src: &SourcePlanes<'_>,
     inter: Option<&InterFilterInfo<'_>>,
 ) -> (u8, u8) {
-    const STEP: u8 = 4;
+    select_filter_params_threaded(planes, modes, has_coeffs, base, src, inter, 1)
+}
 
-    // Score a candidate (level, sharpness) against the source by cloning
-    // the unfiltered planes, running the real §15 pass, and measuring
-    // visible-window SSD. Level 0 short-circuits the §15 whole-frame skip
-    // (no clone, no filter) per §15 page 84 — sharpness is then a no-op.
-    let score = |level: u8, sharpness: u8| -> u64 {
-        if level == 0 {
-            return reconstruction_ssd(planes, src);
-        }
-        let mut cand = planes.clone();
-        let cfg = FrameFilterConfig {
-            loop_filter_level: level,
-            sharpness_level: sharpness,
-            ..*base
-        };
-        match inter {
-            Some(info) => filter_inter_frame_flags(
-                &mut cand,
-                modes,
-                has_coeffs,
-                info.ref_frames,
-                info.inter_modes,
-                &cfg,
-            ),
-            None => filter_frame_flags(&mut cand, modes, has_coeffs, &cfg),
-        }
-        reconstruction_ssd(&cand, src)
+/// Post-filter visible-window SSD of one `(level, sharpness)` candidate:
+/// clone the unfiltered planes, run the real §15 pass, measure. Level 0
+/// short-circuits the §15 whole-frame skip (no clone, no filter) per §15
+/// page 84 — sharpness is then a no-op.
+fn score_filter_candidate(
+    planes: &KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    base: &FrameFilterConfig,
+    src: &SourcePlanes<'_>,
+    inter: Option<&InterFilterInfo<'_>>,
+    (level, sharpness): (u8, u8),
+) -> u64 {
+    if level == 0 {
+        return reconstruction_ssd(planes, src);
+    }
+    let mut cand = planes.clone();
+    let cfg = FrameFilterConfig {
+        loop_filter_level: level,
+        sharpness_level: sharpness,
+        ..*base
     };
+    match inter {
+        Some(info) => filter_inter_frame_flags(
+            &mut cand,
+            modes,
+            has_coeffs,
+            info.ref_frames,
+            info.inter_modes,
+            &cfg,
+        ),
+        None => filter_frame_flags(&mut cand, modes, has_coeffs, &cfg),
+    }
+    reconstruction_ssd(&cand, src)
+}
 
+/// Evaluate `score` for every candidate on up to `threads` threads; the
+/// results come back in candidate order, so a caller's first-minimum
+/// choice does not depend on the budget.
+fn score_candidates<C: Copy + Sync>(
+    candidates: &[C],
+    threads: usize,
+    score: impl Fn(C) -> u64 + Sync,
+) -> Vec<u64> {
+    let workers = threads.clamp(1, candidates.len().max(1));
+    if workers == 1 {
+        return candidates.iter().map(|&c| score(c)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::atomic::AtomicU64> = candidates
+        .iter()
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+    let worker = || {
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(&candidate) = candidates.get(i) else {
+                break;
+            };
+            results[i].store(score(candidate), std::sync::atomic::Ordering::Release);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            scope.spawn(worker);
+        }
+        worker();
+    });
+    results.into_iter().map(|r| r.into_inner()).collect()
+}
+
+/// [`select_filter_params`] with its candidates scored on up to
+/// `threads` threads. The candidate sets and the first-minimum choice are
+/// those of the serial search, so the result does not depend on the
+/// budget.
+pub(crate) fn select_filter_params_threaded(
+    planes: &KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    base: &FrameFilterConfig,
+    src: &SourcePlanes<'_>,
+    inter: Option<&InterFilterInfo<'_>>,
+    threads: usize,
+) -> (u8, u8) {
+    const STEP: u8 = 4;
+    let score = |candidate: (u8, u8)| {
+        score_filter_candidate(planes, modes, has_coeffs, base, src, inter, candidate)
+    };
     let base_sharp = base.sharpness_level.min(7);
 
     // ---- Stage 1: pick the level at the base sharpness -----------------
     // Coarse grid: 0, STEP, 2·STEP, … plus the endpoint 63.
+    let mut grid: Vec<(u8, u8)> = (0..=63u8)
+        .step_by(STEP as usize)
+        .map(|l| (l, base_sharp))
+        .collect();
+    grid.push((63, base_sharp));
+    let scores = score_candidates(&grid, threads, score);
     let mut best_level = 0u8;
-    let mut best_ssd = score(0, base_sharp);
-    let mut l = STEP;
-    while l <= 63 {
-        let s = score(l, base_sharp);
+    let mut best_ssd = scores[0];
+    for (&(level, _), &s) in grid.iter().zip(&scores).skip(1) {
         if s < best_ssd {
             best_ssd = s;
-            best_level = l;
-        }
-        l = l.saturating_add(STEP);
-    }
-    {
-        let s = score(63, base_sharp);
-        if s < best_ssd {
-            best_ssd = s;
-            best_level = 63;
+            best_level = level;
         }
     }
     // Local refine: ±(STEP-1) around the grid winner.
     let lo = best_level.saturating_sub(STEP - 1);
     let hi = best_level.saturating_add(STEP - 1).min(63);
-    for cand in lo..=hi {
-        if cand == best_level {
-            continue;
-        }
-        let s = score(cand, base_sharp);
+    let refine: Vec<(u8, u8)> = (lo..=hi)
+        .filter(|&l| l != best_level)
+        .map(|l| (l, base_sharp))
+        .collect();
+    let scores = score_candidates(&refine, threads, score);
+    for (&(level, _), &s) in refine.iter().zip(&scores) {
         if s < best_ssd {
             best_ssd = s;
-            best_level = cand;
+            best_level = level;
         }
     }
 
@@ -2122,12 +2182,13 @@ pub fn select_filter_params(
     }
 
     // ---- Stage 2: sweep sharpness at the chosen level ------------------
+    let sweep: Vec<(u8, u8)> = (0u8..=7)
+        .filter(|&sharp| sharp != base_sharp)
+        .map(|sharp| (best_level, sharp))
+        .collect();
+    let scores = score_candidates(&sweep, threads, score);
     let mut best_sharp = base_sharp;
-    for sharp in 0u8..=7 {
-        if sharp == base_sharp {
-            continue;
-        }
-        let s = score(best_level, sharp);
+    for (&(_, sharp), &s) in sweep.iter().zip(&scores) {
         if s < best_ssd {
             best_ssd = s;
             best_sharp = sharp;
@@ -2135,6 +2196,222 @@ pub fn select_filter_params(
     }
 
     (best_level, best_sharp)
+}
+
+/// A band of macroblock rows lifted out of a frame, for scoring filter
+/// levels on part of the picture.
+struct FilterSample<'a> {
+    planes: KeyframePlanes,
+    modes: &'a [MacroblockModes],
+    has_coeffs: &'a [bool],
+    ref_frames: &'a [Option<crate::motion_comp::RefFrame>],
+    inter_modes: &'a [Option<crate::near_mv::InterMode>],
+    /// First macroblock row of the band in the frame.
+    first_row: usize,
+}
+
+/// Choose the §9.4 `loop_filter_level` of an inter frame from a sample
+/// of the picture (clean-room; the level is the encoder's choice).
+///
+/// Bands of two macroblock rows are taken every `every_rows` rows; each
+/// candidate level filters copies of the bands (a band's first row
+/// without its top edge) and is scored by the bands' visible-window SSD
+/// against the source. The level is found coarse to fine: every eighth
+/// level, then ±4, ±2 and ±1 around the running best — 15 candidates
+/// against the full search's ~30 full-frame passes. Sharpness stays at
+/// the base value. Candidates are scored on up to `threads` threads; the
+/// choice does not depend on the budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_filter_level_sampled(
+    planes: &KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    base: &FrameFilterConfig,
+    src: &SourcePlanes<'_>,
+    inter: &InterFilterInfo<'_>,
+    every_rows: usize,
+    threads: usize,
+) -> u8 {
+    const BAND_ROWS: usize = 2;
+    let (mb_cols, mb_rows) = (planes.mb_cols, planes.mb_rows);
+    let (ys, cs) = (planes.y_stride, planes.uv_stride);
+    let every_rows = every_rows.max(BAND_ROWS);
+    let mut samples: Vec<FilterSample<'_>> = Vec::new();
+    let mut first_row = 0usize;
+    while first_row < mb_rows {
+        let rows = BAND_ROWS.min(mb_rows - first_row);
+        let mbs = first_row * mb_cols..(first_row + rows) * mb_cols;
+        samples.push(FilterSample {
+            planes: KeyframePlanes {
+                y: planes.y[first_row * 16 * ys..(first_row + rows) * 16 * ys].to_vec(),
+                u: planes.u[first_row * 8 * cs..(first_row + rows) * 8 * cs].to_vec(),
+                v: planes.v[first_row * 8 * cs..(first_row + rows) * 8 * cs].to_vec(),
+                y_stride: ys,
+                uv_stride: cs,
+                mb_cols,
+                mb_rows: rows,
+            },
+            modes: &modes[mbs.clone()],
+            has_coeffs: &has_coeffs[mbs.clone()],
+            ref_frames: &inter.ref_frames[mbs.clone()],
+            inter_modes: &inter.inter_modes[mbs],
+            first_row,
+        });
+        first_row += every_rows;
+    }
+    let base_sharp = base.sharpness_level.min(7);
+    let score = |level: u8| -> u64 {
+        let mut total = 0u64;
+        for sample in &samples {
+            // The band's rows of the source (visible part only).
+            let y0 = sample.first_row * 16;
+            if y0 >= src.height {
+                continue;
+            }
+            let band_src = SourcePlanes {
+                width: src.width,
+                height: (sample.planes.mb_rows * 16).min(src.height - y0),
+                y: &src.y[y0 * src.y_stride..],
+                u: &src.u[(y0 / 2) * src.uv_stride..],
+                v: &src.v[(y0 / 2) * src.uv_stride..],
+                y_stride: src.y_stride,
+                uv_stride: src.uv_stride,
+            };
+            if level == 0 {
+                total += reconstruction_ssd(&sample.planes, &band_src);
+                continue;
+            }
+            let mut cand = sample.planes.clone();
+            let cfg = FrameFilterConfig {
+                loop_filter_level: level,
+                sharpness_level: base_sharp,
+                ..*base
+            };
+            filter_inter_frame_flags(
+                &mut cand,
+                sample.modes,
+                sample.has_coeffs,
+                sample.ref_frames,
+                sample.inter_modes,
+                &cfg,
+            );
+            total += reconstruction_ssd(&cand, &band_src);
+        }
+        total
+    };
+
+    let coarse: Vec<u8> = (0..=56u8).step_by(8).chain([63]).collect();
+    let scores = score_candidates(&coarse, threads, score);
+    let mut best_level = coarse[0];
+    let mut best_ssd = scores[0];
+    for (&level, &s) in coarse.iter().zip(&scores).skip(1) {
+        if s < best_ssd {
+            best_ssd = s;
+            best_level = level;
+        }
+    }
+    for step in [4u8, 2, 1] {
+        let mut around: Vec<u8> = Vec::with_capacity(2);
+        if best_level >= step {
+            around.push(best_level - step);
+        }
+        if best_level + step <= 63 {
+            around.push(best_level + step);
+        }
+        let scores = score_candidates(&around, threads, score);
+        for (&level, &s) in around.iter().zip(&scores) {
+            if s < best_ssd {
+                best_ssd = s;
+                best_level = level;
+            }
+        }
+    }
+    best_level
+}
+
+/// The per-macroblock filter decisions of a key frame (`None` = level 0).
+fn key_frame_filter_specs(
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    config: &FrameFilterConfig,
+) -> Vec<Option<bands::MbFilterSpec>> {
+    modes
+        .iter()
+        .zip(has_coeffs)
+        .map(|(mb, &coded)| {
+            let level = calculate_mb_filter_level(config, mb.segment_id, mb.y_mode);
+            (level != 0).then(|| bands::MbFilterSpec {
+                params: LoopFilterParams::derive(level, config.sharpness_level, config.key_frame),
+                filter_subblocks: mb.y_mode == IntraYMode::B || coded,
+            })
+        })
+        .collect()
+}
+
+/// [`filter_frame_flags`] on up to `threads` threads (see `bands.rs`);
+/// byte-for-byte the serial result.
+pub(crate) fn filter_frame_flags_threaded(
+    planes: &mut KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    config: &FrameFilterConfig,
+    threads: usize,
+) {
+    let expected = planes.mb_cols * planes.mb_rows;
+    if threads <= 1 || planes.mb_rows < 2 || modes.len() != expected || has_coeffs.len() != expected
+    {
+        return filter_frame_flags(planes, modes, has_coeffs, config);
+    }
+    let specs = key_frame_filter_specs(modes, has_coeffs, config);
+    bands::filter_banded(planes, &specs, config.simple, threads);
+}
+
+/// [`filter_inter_frame_flags`] on up to `threads` threads (see
+/// `bands.rs`); byte-for-byte the serial result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filter_inter_frame_flags_threaded(
+    planes: &mut KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    ref_frames: &[Option<crate::motion_comp::RefFrame>],
+    inter_modes: &[Option<crate::near_mv::InterMode>],
+    config: &FrameFilterConfig,
+    threads: usize,
+) {
+    let expected = planes.mb_cols * planes.mb_rows;
+    if threads <= 1
+        || planes.mb_rows < 2
+        || modes.len() != expected
+        || has_coeffs.len() != expected
+        || ref_frames.len() != expected
+        || inter_modes.len() != expected
+    {
+        return filter_inter_frame_flags(
+            planes,
+            modes,
+            has_coeffs,
+            ref_frames,
+            inter_modes,
+            config,
+        );
+    }
+    let specs: Vec<Option<bands::MbFilterSpec>> = (0..expected)
+        .map(|index| {
+            let mb = &modes[index];
+            let level = calculate_mb_filter_level_inter(
+                config,
+                mb.segment_id,
+                ref_frames[index],
+                inter_modes[index],
+                mb.y_mode,
+            );
+            (level != 0).then(|| bands::MbFilterSpec {
+                params: LoopFilterParams::derive(level, config.sharpness_level, config.key_frame),
+                filter_subblocks: mb.y_mode == IntraYMode::B || has_coeffs[index],
+            })
+        })
+        .collect();
+    bands::filter_banded(planes, &specs, config.simple, threads);
 }
 
 /// Flag-driven core of [`filter_frame`]: the §15.1 step-2/4 decision needs
@@ -3037,6 +3314,105 @@ mod tests {
                     p_coeffs, p_flags,
                     "filter_frame_flags must match filter_frame (simple={simple}, mask={mask:#b})"
                 );
+            }
+        }
+    }
+
+    /// The row-band threaded filter equals the raster-order pass for
+    /// every frame shape, filter type, mix of filtered / unfiltered
+    /// macroblocks and thread count.
+    #[test]
+    fn banded_filter_matches_serial() {
+        use crate::motion_comp::RefFrame;
+        use crate::near_mv::InterMode;
+        let mut lcg = 0x9E37_79B9u32;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            lcg >> 16
+        };
+        for (mb_cols, mb_rows) in [(1usize, 2usize), (2, 2), (5, 3), (3, 7), (9, 6)] {
+            let n = mb_cols * mb_rows;
+            for case in 0..6 {
+                let mut planes = KeyframePlanes {
+                    y: (0..n * 256).map(|_| next() as u8).collect(),
+                    u: (0..n * 64).map(|_| next() as u8).collect(),
+                    v: (0..n * 64).map(|_| next() as u8).collect(),
+                    y_stride: mb_cols * 16,
+                    uv_stride: mb_cols * 8,
+                    mb_cols,
+                    mb_rows,
+                };
+                // Smooth most of the picture so the filters engage.
+                for (i, p) in planes.y.iter_mut().enumerate() {
+                    *p = (*p % 24) + ((i / 7) % 200) as u8;
+                }
+                let modes: Vec<_> = (0..n)
+                    .map(|_| {
+                        mode(
+                            [IntraYMode::Dc, IntraYMode::B, IntraYMode::V][next() as usize % 3],
+                            None,
+                        )
+                    })
+                    .collect();
+                let has_coeffs: Vec<bool> = (0..n).map(|_| next() % 3 == 0).collect();
+                let refs: Vec<Option<RefFrame>> = (0..n)
+                    .map(|_| {
+                        [None, Some(RefFrame::Last), Some(RefFrame::Golden)][next() as usize % 3]
+                    })
+                    .collect();
+                let inter: Vec<Option<InterMode>> = refs
+                    .iter()
+                    .map(|r| {
+                        r.map(|_| {
+                            [InterMode::Zero, InterMode::New, InterMode::Split][next() as usize % 3]
+                        })
+                    })
+                    .collect();
+                let mut c = base_config();
+                c.key_frame = false;
+                c.simple = case % 2 == 1;
+                c.loop_filter_level = [9, 30, 63][case / 2];
+                c.sharpness_level = (case % 4) as u8;
+                c.delta_enabled = case >= 2;
+                c.ref_delta_current = -40;
+                c.ref_delta_golden = 12;
+                c.zero_mv_mode_delta = -6;
+                let mut want = planes.clone();
+                filter_inter_frame_flags(&mut want, &modes, &has_coeffs, &refs, &inter, &c);
+                assert_ne!(want.y, planes.y, "the filter did something");
+                for threads in [2usize, 3, 8] {
+                    let mut got = planes.clone();
+                    filter_inter_frame_flags_threaded(
+                        &mut got,
+                        &modes,
+                        &has_coeffs,
+                        &refs,
+                        &inter,
+                        &c,
+                        threads,
+                    );
+                    assert_eq!(
+                        got.y, want.y,
+                        "{mb_cols}x{mb_rows} case {case} threads {threads}"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{mb_cols}x{mb_rows} case {case} threads {threads}"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{mb_cols}x{mb_rows} case {case} threads {threads}"
+                    );
+                }
+                // Key-frame flavour.
+                c.key_frame = true;
+                let mut want = planes.clone();
+                filter_frame_flags(&mut want, &modes, &has_coeffs, &c);
+                let mut got = planes.clone();
+                filter_frame_flags_threaded(&mut got, &modes, &has_coeffs, &c, 4);
+                assert_eq!(got.y, want.y, "key {mb_cols}x{mb_rows} case {case}");
+                assert_eq!(got.u, want.u, "key {mb_cols}x{mb_rows} case {case}");
+                assert_eq!(got.v, want.v, "key {mb_cols}x{mb_rows} case {case}");
             }
         }
     }

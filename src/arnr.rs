@@ -478,6 +478,19 @@ pub fn build_arnr_altref(
     center: usize,
     cfg: &ArnrConfig,
 ) -> Result<ArnrPicture, EncodeError> {
+    build_arnr_altref_threaded(frames, center, cfg, 1)
+}
+
+/// [`build_arnr_altref`] with the per-block alignment searches spread
+/// over up to `threads` threads. The searches only read the frames, and
+/// the blend that follows runs in the serial order, so the picture does
+/// not depend on the budget.
+pub(crate) fn build_arnr_altref_threaded(
+    frames: &[I420Frame<'_>],
+    center: usize,
+    cfg: &ArnrConfig,
+    threads: usize,
+) -> Result<ArnrPicture, EncodeError> {
     assert!(
         center < frames.len(),
         "build_arnr_altref: center index {center} out of range ({} frames)",
@@ -535,6 +548,47 @@ pub fn build_arnr_altref(
     accumulate_center(&out.u, &mut acc_u, &mut wsum_u);
     accumulate_center(&out.v, &mut acc_v, &mut wsum_v);
 
+    // Alignment of every block of every frame against the center: one
+    // unit of work per (frame, block row).
+    let (bcols, brows) = (w.div_ceil(16), h.div_ceil(16));
+    let mut aligned = vec![(0i32, 0i32, 0u32); frames.len() * brows * bcols];
+    {
+        let units = std::sync::Mutex::new(aligned.chunks_mut(bcols).enumerate());
+        let worker = || {
+            loop {
+                let next = units
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .next();
+                let Some((unit, row)) = next else {
+                    break;
+                };
+                let (fi, brow) = (unit / brows, unit % brows);
+                if fi == center {
+                    continue;
+                }
+                let by = brow * 16;
+                let bh = (h - by).min(16);
+                for (bcol, slot) in row.iter_mut().enumerate() {
+                    let bx = bcol * 16;
+                    let bw = (w - bx).min(16);
+                    *slot = refine_search(ctr, &frames[fi], (bx, by, bw, bh));
+                }
+            }
+        };
+        let workers = threads.clamp(1, (frames.len() * brows).max(1));
+        if workers == 1 {
+            worker();
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 1..workers {
+                    scope.spawn(worker);
+                }
+                worker();
+            });
+        }
+    }
+
     for (fi, f) in frames.iter().enumerate() {
         if fi == center {
             continue;
@@ -545,7 +599,7 @@ pub fn build_arnr_altref(
             let mut bx = 0usize;
             while bx < w {
                 let bw = (w - bx).min(16);
-                let (mvx, mvy, sad) = refine_search(ctr, f, (bx, by, bw, bh));
+                let (mvx, mvy, sad) = aligned[(fi * brows + by / 16) * bcols + bx / 16];
                 // Occlusion / scene-change guard: a block that still
                 // mismatches after alignment is excluded outright.
                 if sad / (bw * bh) as u32 > BLOCK_SAD_PER_PIXEL_CUTOFF {

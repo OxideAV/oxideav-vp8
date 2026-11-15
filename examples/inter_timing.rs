@@ -6,7 +6,7 @@
 //! Environment:
 //! * `VP8_CLIP=<path>` — read the frames from a raw I420 file of the given
 //!   size instead of synthesising the clip;
-//! * `VP8_ONLY_EFFORT=<name>` — time just that effort level;
+//! * `VP8_ONLY_EFFORT=<name>[,<name>…]` — time just those effort levels;
 //! * `VP8_KEYINT=<n>` — key-frame interval (default: the
 //!   `Vp8EncoderConfig` default);
 //! * `VP8_AUTO_LF=1` — RD-select the loop-filter level per frame;
@@ -91,15 +91,18 @@ fn main() {
 
     println!("{w}x{h}, {frames} frames, qindex {qi}, {runs} runs per cell (median)");
     println!("effort    threads  enc ms/frame  enc fps    kbit/s  PSNR-Y dB  digest");
-    let only = std::env::var("VP8_ONLY_EFFORT")
-        .ok()
-        .and_then(|name| EncodeEffort::parse(&name));
+    let only: Option<Vec<EncodeEffort>> = std::env::var("VP8_ONLY_EFFORT").ok().map(|names| {
+        names
+            .split(',')
+            .map(|name| EncodeEffort::parse(name).expect("effort level name"))
+            .collect()
+    });
     let mut last_stream: Vec<Vec<u8>> = Vec::new();
     for effort in EncodeEffort::ALL {
         if decode_only && effort != EncodeEffort::Fastest {
             continue;
         }
-        if !decode_only && only.is_some_and(|e| e != effort) {
+        if !decode_only && only.as_ref().is_some_and(|list| !list.contains(&effort)) {
             continue;
         }
         let mut serial_digest = None;

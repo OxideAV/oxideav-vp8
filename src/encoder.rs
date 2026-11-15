@@ -6341,14 +6341,22 @@ fn encode_keyframe_tuned(
             y_stride: frame.y_stride,
             uv_stride: frame.uv_stride,
         };
-        crate::loop_filter::select_filter_params(&planes, modes, has_coeffs, &lf_config, &src, None)
+        crate::loop_filter::select_filter_params_threaded(
+            &planes, modes, has_coeffs, &lf_config, &src, None, threads,
+        )
     } else {
         (params.loop_filter_level, params.sharpness_level)
     };
     lf_config.loop_filter_level = eff_lf_level;
     lf_config.sharpness_level = eff_sharpness;
     if eff_lf_level != 0 {
-        crate::loop_filter::filter_frame_flags(&mut planes, modes, has_coeffs, &lf_config);
+        crate::loop_filter::filter_frame_flags_threaded(
+            &mut planes,
+            modes,
+            has_coeffs,
+            &lf_config,
+            threads,
+        );
     }
     // `planes` is the macroblock-aligned post-§15 reconstruction. It is
     // returned to the caller alongside the bitstream below so a
@@ -10663,27 +10671,52 @@ fn encode_p_frame_multi_ref_inner_full(
             ref_frames: &ref_frames_out,
             inter_modes: &inter_modes_out,
         };
-        crate::loop_filter::select_filter_params(
-            &planes,
-            &modes,
-            &has_coeffs,
-            &lf_config,
-            &src,
-            Some(&inter_info),
-        )
+        match speed.effort {
+            // The exhaustive level keeps the full-frame grid search (its
+            // candidates scored under the thread budget).
+            EncodeEffort::Thorough => crate::loop_filter::select_filter_params_threaded(
+                &planes,
+                &modes,
+                &has_coeffs,
+                &lf_config,
+                &src,
+                Some(&inter_info),
+                speed.threads,
+            ),
+            // The reduced levels choose the level on a sample of the
+            // picture and keep the configured sharpness.
+            effort => (
+                crate::loop_filter::select_filter_level_sampled(
+                    &planes,
+                    &modes,
+                    &has_coeffs,
+                    &lf_config,
+                    &src,
+                    &inter_info,
+                    if effort == EncodeEffort::Balanced {
+                        8
+                    } else {
+                        16
+                    },
+                    speed.threads,
+                ),
+                params.sharpness_level.min(7),
+            ),
+        }
     } else {
         (params.loop_filter_level, params.sharpness_level)
     };
     lf_config.loop_filter_level = eff_lf_level;
     lf_config.sharpness_level = eff_sharpness;
     if eff_lf_level != 0 {
-        crate::loop_filter::filter_inter_frame_flags(
+        crate::loop_filter::filter_inter_frame_flags_threaded(
             &mut planes,
             &modes,
             &has_coeffs,
             &ref_frames_out,
             &inter_modes_out,
             &lf_config,
+            speed.threads,
         );
     }
 

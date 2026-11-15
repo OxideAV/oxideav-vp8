@@ -2669,8 +2669,13 @@ impl Vp8AltrefStreamEncoder {
         let mut anchored = false;
         if p_count > 0 && group.len() >= 2 {
             let views: Vec<I420Frame<'_>> = group.iter().map(|f| f.as_i420()).collect();
-            let anchor = crate::arnr::build_arnr_altref(&views, views.len() - 1, &self.config.arnr)
-                .map_err(StreamEncodeError::Frame)?;
+            let anchor = crate::arnr::build_arnr_altref_threaded(
+                &views,
+                views.len() - 1,
+                &self.config.arnr,
+                self.config.threads,
+            )
+            .map_err(StreamEncodeError::Frame)?;
             let last_planes = self.last.as_ref().expect("keyframe path ran");
             let (bytes, alt_recon) = crate::encoder::encode_invisible_altref_update_full(
                 &anchor.as_i420(),

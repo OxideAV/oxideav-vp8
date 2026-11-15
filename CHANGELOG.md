@@ -4,6 +4,19 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **Inter-frame encode effort levels.** `InterCodingOptions::effort` takes the same `EncodeEffort` as key frames. `Thorough` (the default of the per-frame entry points) stays the exhaustive search and its bytes. `Balanced` / `Fast` / `Fastest` run a reduced search (`src/encoder/inter_search.rs`): whole-pixel pattern descent from predicted vectors with early-abandoned sums of absolute differences, sub-pixel refinement only around the best whole-pixel vector (the eight half-pixel neighbours read from three §18.3-filtered planes computed once), golden / alt-ref candidates pruned by cost, `SPLITMV` and intra candidates built only where the inter prediction misses by more than the quantiser keeps, the mode decision on a transform-domain cost model, and only the winner quantised for real. A macroblock whose coefficients cost more than the distortion they remove is coded as a skip; the reduced levels also fit `prob_skip_false`.
+- **Threaded inter-frame encode.** `InterCodingOptions::threads` runs the macroblock search as a macroblock-row wavefront on a caller-given budget (scoped `std::thread`s; serial by default). The bytes are identical at every budget, at every effort level including `Thorough`.
+- `inter_effort` on `AltrefStreamConfig` and `Vp8EncoderConfig` (default `Balanced`), and `partitions` on `Vp8EncoderConfig`; the `threads` field of both now also covers their inter frames.
+- `examples/inter_timing.rs` (encode fps / bitrate / PSNR per effort level and thread budget on a deterministic moving clip or a raw I420 file, plus decode timing) and `tests/encoder_inter_effort.rs`.
+
+### Changed
+
+- The lagged stream encoders (`Vp8AltrefStreamEncoder`, `Vp8Encoder::encode_sequence`, `make_encoder_with_config`) now encode their inter frames at `EncodeEffort::Balanced` by default; set `inter_effort` to `Thorough` for the previous output.
+- With a reduced effort level and `fitted_token_prob_updates`, the §13.4 token-probability fit runs on the recorded token decisions of a single analysis pass instead of encoding the frame twice.
+- Inter frames record their §13.3 token decisions per macroblock row during the search and replay them into the partitions; the exhaustive search's bytes are unchanged.
+
 ## [0.2.9](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.8...v0.2.9) - 2026-11-10
 
 ### Added

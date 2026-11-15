@@ -2181,15 +2181,29 @@ pub struct AltrefStreamConfig {
     pub segmentation: Option<crate::encoder::InterSegmentationConfig>,
     /// Mode-search effort of the stream's **key frames** (see
     /// [`EncodeEffort`](crate::encoder::EncodeEffort)). The inter frames
-    /// run their own search and do not consult it. Default
-    /// `Thorough` (the historical bytes).
+    /// follow [`inter_effort`](Self::inter_effort). Default `Thorough`
+    /// (the historical key-frame bytes).
     pub effort: crate::encoder::EncodeEffort,
-    /// Thread budget for each key frame's macroblock-row wavefront
-    /// (`0` / `1` = serial, the default). Does not change the bytes.
+    /// Thread budget for each frame's macroblock-row wavefront, key and
+    /// inter frames alike (`0` / `1` = serial, the default). Does not
+    /// change the bytes.
     pub threads: usize,
+    /// Mode-search effort of the stream's **inter frames** (the
+    /// invisible anchors and the visible P-frames). Defaults to
+    /// [`EncodeEffort::Balanced`](crate::encoder::EncodeEffort::Balanced);
+    /// [`EncodeEffort::Thorough`](crate::encoder::EncodeEffort::Thorough)
+    /// is the exhaustive legacy search.
+    pub inter_effort: crate::encoder::EncodeEffort,
 }
 
 impl AltrefStreamConfig {
+    /// Set `inter_effort`.
+    #[must_use]
+    pub fn with_inter_effort(mut self, v: crate::encoder::EncodeEffort) -> Self {
+        self.inter_effort = v;
+        self
+    }
+
     /// Set `effort`.
     #[must_use]
     pub fn with_effort(mut self, v: crate::encoder::EncodeEffort) -> Self {
@@ -2292,6 +2306,7 @@ impl Default for AltrefStreamConfig {
             segmentation: None,
             effort: crate::encoder::EncodeEffort::Thorough,
             threads: 1,
+            inter_effort: crate::encoder::EncodeEffort::Balanced,
         }
     }
 }
@@ -2498,8 +2513,8 @@ impl Vp8AltrefStreamEncoder {
         })
     }
 
-    /// Change the key-frame thread budget of a running stream (the
-    /// bytes do not depend on it).
+    /// Change the thread budget of a running stream (the bytes do not
+    /// depend on it).
     #[cfg_attr(not(feature = "registry"), allow(dead_code))]
     pub(crate) fn set_threads(&mut self, threads: usize) {
         self.config.threads = threads;
@@ -2611,11 +2626,15 @@ impl Vp8AltrefStreamEncoder {
             intra_pick: true,
             auto_loop_filter: self.config.auto_loop_filter,
             fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+            effort: self.config.inter_effort,
+            threads: self.config.threads,
         };
         let p_options = crate::encoder::InterCodingOptions {
             intra_pick: self.config.intra_pick,
             auto_loop_filter: self.config.auto_loop_filter,
             fitted_token_prob_updates: self.config.fitted_token_prob_updates,
+            effort: self.config.inter_effort,
+            threads: self.config.threads,
         };
 
         // Key frame: scheduled, scene-cut-forced, or forced because

@@ -228,12 +228,12 @@ struct ModelSearch {
 }
 
 /// Fixed-point scale of the model's distortion weights.
-const WEIGHT_SCALE: f64 = 4096.0;
+pub(super) const WEIGHT_SCALE: f64 = 4096.0;
 
 /// The trellis's inverse-DCT basis energies ([`IDCT_BASIS_NORM_SQ`], by
 /// scan position) in `1/4096` fixed point, so the model's distortion is
 /// an exact integer sum.
-static DCT_WEIGHTS: std::sync::LazyLock<[u64; 16]> = std::sync::LazyLock::new(|| {
+pub(super) static DCT_WEIGHTS: std::sync::LazyLock<[u64; 16]> = std::sync::LazyLock::new(|| {
     let norms = &*IDCT_BASIS_NORM_SQ;
     core::array::from_fn(|k| (norms[k] * WEIGHT_SCALE).round() as u64)
 });
@@ -243,30 +243,41 @@ static DCT_WEIGHTS: std::sync::LazyLock<[u64; 16]> = std::sync::LazyLock::new(||
 /// sixteen sub-block DCs by `1/8`, and a DC-only inverse DCT moves each
 /// of that sub-block's sixteen pixels by a further `1/8` — 256 pixels at
 /// `1/64` each, i.e. `1/16` per unit squared.
-const Y2_WEIGHTS: [u64; 16] = [(WEIGHT_SCALE / 16.0) as u64; 16];
+pub(super) const Y2_WEIGHTS: [u64; 16] = [(WEIGHT_SCALE / 16.0) as u64; 16];
 
-/// Plain-round one raster-order coefficient block in place and return
-/// its model cost `D + lambda·R` together with whether any level is
-/// non-zero.
-///
-/// `D` is the weighted squared rounding error over the coded positions
-/// (`first_coeff..16`), `R` the §13.3 token bits of the rounded levels
+/// What the cost model says about one plain-rounded block.
+pub(super) struct BlockModel {
+    /// Weighted squared rounding error of the coded positions, in
+    /// `1/4096` units ([`WEIGHT_SCALE`]).
+    pub(super) dist: u64,
+    /// The same error with every level forced to zero.
+    pub(super) dist_zero: u64,
+    /// §13.3 token bits of the rounded levels, through the end-of-block
+    /// token.
+    pub(super) rate: f64,
+    /// Whether any level is non-zero.
+    pub(super) nonzero: bool,
+}
+
+/// Plain-round one raster-order coefficient block in place and model its
+/// cost: the weighted squared rounding error over the coded positions
+/// (`first_coeff..16`) and the §13.3 token bits of the rounded levels
 /// from `spec.entry_ctx3` through the end-of-block token. The levels
 /// written are exactly what [`enc_quantize_block`](super::enc_quantize_block)
 /// produces (positions below `first_coeff` are zeroed).
-fn model_quantize_block(
+pub(super) fn model_block_parts(
     block: &mut [i16; 16],
     spec: TrellisBlockSpec,
     weights: &[u64; 16],
     tables: &TrellisRateTables,
-    lambda: f64,
-) -> (f64, bool) {
+) -> BlockModel {
     let first = spec.first_coeff;
     let (dc_q, ac_q) = (spec.dc as u32, spec.ac as u32);
     let mut levels = [0u32; 16];
     let mut negative = 0u32;
     let mut coded = 0u32;
     let mut dist = 0u64;
+    let mut dist_zero = 0u64;
     for k in first..16 {
         let x = block[crate::dct_tokens::ZIGZAG[k]];
         let ax = x.unsigned_abs() as u32;
@@ -274,6 +285,7 @@ fn model_quantize_block(
         let level = rounded_level(ax, q);
         let err = (ax as i64 - level as i64 * q as i64).unsigned_abs();
         dist += weights[k] * err * err;
+        dist_zero += weights[k] * ax as u64 * ax as u64;
         levels[k] = level;
         negative |= ((x < 0) as u32) << k;
         coded |= ((level != 0) as u32) << k;
@@ -283,7 +295,12 @@ fn model_quantize_block(
     let mut ctx3 = spec.entry_ctx3;
     if coded == 0 {
         let rate = tables.eob[spec.plane][COEFF_BANDS[first]][ctx3];
-        return (dist as f64 / WEIGHT_SCALE + lambda * rate, false);
+        return BlockModel {
+            dist,
+            dist_zero,
+            rate,
+            nonzero: false,
+        };
     }
     let end = 32 - coded.leading_zeros() as usize;
 
@@ -315,13 +332,37 @@ fn model_quantize_block(
     if end < 16 {
         rate += tables.eob[spec.plane][COEFF_BANDS[end]][ctx3];
     }
-    (dist as f64 / WEIGHT_SCALE + lambda * rate, true)
+    BlockModel {
+        dist,
+        dist_zero,
+        rate,
+        nonzero: true,
+    }
+}
+
+/// [`model_block_parts`] folded into one cost `D + lambda·R`, together
+/// with whether any level is non-zero.
+fn model_quantize_block(
+    block: &mut [i16; 16],
+    spec: TrellisBlockSpec,
+    weights: &[u64; 16],
+    tables: &TrellisRateTables,
+    lambda: f64,
+) -> (f64, bool) {
+    let m = model_block_parts(block, spec, weights, tables);
+    (m.dist as f64 / WEIGHT_SCALE + lambda * m.rate, m.nonzero)
 }
 
 /// Forward-DCT the 4×4 residual `src − pred` at `(row, col)` of two
 /// equally laid out `stride`-wide pixel blocks.
 #[inline]
-fn residual_dct(src: &[u8], pred: &[u8], stride: usize, row: usize, col: usize) -> [i16; 16] {
+pub(super) fn residual_dct(
+    src: &[u8],
+    pred: &[u8],
+    stride: usize,
+    row: usize,
+    col: usize,
+) -> [i16; 16] {
     let mut residual = [0i16; 16];
     for r in 0..4 {
         let off = (row + r) * stride + col;

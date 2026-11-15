@@ -383,6 +383,8 @@ pub struct Vp8DecoderState {
     /// key-frame path; interframes inherit the (already-capped) grid of the
     /// key frame that installed the reference slots.
     max_pixels_per_frame: u64,
+    /// Thread budget for decoding one frame (`0` / `1` = serial).
+    threads: usize,
 }
 
 impl Default for Vp8DecoderState {
@@ -413,7 +415,29 @@ impl Vp8DecoderState {
             color_space: None,
             clamping_type: None,
             max_pixels_per_frame: crate::decoder::DEFAULT_MAX_PIXELS_PER_FRAME,
+            threads: 1,
         }
+    }
+
+    /// Grant a thread budget for decoding each frame. `0` and `1` both
+    /// mean serial (the default); with `n > 1` up to `n` scoped threads
+    /// (they end with each `decode_frame` call) share the token parsing,
+    /// reconstruction and loop filtering of a frame. The decoded
+    /// pictures do not depend on the budget.
+    pub fn with_threads(mut self, threads: usize) -> Self {
+        self.threads = threads;
+        self
+    }
+
+    /// Change the thread budget of a running decoder (see
+    /// [`with_threads`](Self::with_threads)).
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads;
+    }
+
+    /// The thread budget granted to this decoder.
+    pub fn threads(&self) -> usize {
+        self.threads
     }
 
     /// Tighten the §9.1 declared-frame-size DoS cap.

@@ -126,7 +126,7 @@ struct TokenPass {
 
 /// Raises the abort flag if the thread unwinds, so workers waiting on
 /// this thread's row stop instead of spinning forever.
-struct AbortOnUnwind<'a>(&'a AtomicBool);
+pub(super) struct AbortOnUnwind<'a>(pub(super) &'a AtomicBool);
 
 impl Drop for AbortOnUnwind<'_> {
     fn drop(&mut self) {
@@ -136,7 +136,7 @@ impl Drop for AbortOnUnwind<'_> {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

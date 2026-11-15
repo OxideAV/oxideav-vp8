@@ -1,19 +1,20 @@
 //! Inter-frame encode effort levels and the thread budget.
 //!
-//! * the default options are the exhaustive search and reproduce the
-//!   option-less front door byte for byte;
-//! * for every effort level the bytes and the reconstruction are the
-//!   same at every thread budget;
+//! * the default options are the original exhaustive search and
+//!   reproduce the option-less front door byte for byte;
+//! * for every effort level (and the original search) the bytes and the
+//!   reconstruction are the same at every thread budget;
 //! * every level decodes through this crate's decoder to exactly the
 //!   reconstruction the encoder returned — with the intra picker, the
 //!   token-probability fit, the loop-filter search, segmentation and
 //!   several token partitions on — and through a black-box decoder to
 //!   the same pixels (skipped at runtime when the validator binary is
 //!   not installed);
-//! * the reduced levels do not cost more bits than the exhaustive search
-//!   for the quality they deliver on moving content;
-//! * the lagged stream encoder carries the inter effort and its output
-//!   does not depend on the thread budget.
+//! * every level costs fewer bits than the original search on moving
+//!   content, and the levels form a ladder;
+//! * the lagged stream encoder carries the inter effort, its output does
+//!   not depend on the thread budget, and its one-pass rate control hits
+//!   a bitrate target at every level.
 
 #[path = "support/photo.rs"]
 mod photo;
@@ -102,6 +103,24 @@ fn encode_chain(
     (packets, recons)
 }
 
+/// The original exhaustive search (`None`) and every effort level.
+fn searches() -> [Option<EncodeEffort>; 5] {
+    [
+        None,
+        Some(EncodeEffort::Fastest),
+        Some(EncodeEffort::Fast),
+        Some(EncodeEffort::Balanced),
+        Some(EncodeEffort::Thorough),
+    ]
+}
+
+fn with_search(options: InterCodingOptions, search: Option<EncodeEffort>) -> InterCodingOptions {
+    match search {
+        Some(effort) => options.with_effort(effort),
+        None => options,
+    }
+}
+
 fn decode_chain(packets: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut dec = Vp8DecoderState::new();
     packets
@@ -125,9 +144,9 @@ fn luma_psnr(decoded: &[Vec<u8>], source: &[clip::Planes], w: usize, h: usize) -
 }
 
 #[test]
-fn default_options_are_the_exhaustive_search() {
+fn default_options_are_the_original_search() {
     let default = InterCodingOptions::default();
-    assert_eq!(default.effort, EncodeEffort::Thorough);
+    assert_eq!(default.effort, None);
     assert_eq!(default.threads, 0);
     let (w, h) = (96usize, 64usize);
     let source = clip::moving_clip(w, h, 2);
@@ -158,17 +177,16 @@ fn default_options_are_the_exhaustive_search() {
 fn thread_budget_never_changes_the_output() {
     for (w, h) in [(16usize, 16usize), (80, 16), (16, 80), (98, 62), (176, 144)] {
         let source = clip::moving_clip(w, h, 3);
-        for effort in EncodeEffort::ALL {
-            // The exhaustive search is slow; one small size is enough to
+        for search in searches() {
+            // The original search is slow; one small size is enough to
             // show its wavefront is order-independent.
-            if effort == EncodeEffort::Thorough && w * h > 98 * 62 {
+            if search.is_none() && w * h > 98 * 62 {
                 continue;
             }
             let params = KeyframeParams::default()
                 .with_y_ac_qi(36)
                 .with_nbr_of_dct_partitions(2);
-            let options = InterCodingOptions::default()
-                .with_effort(effort)
+            let options = with_search(InterCodingOptions::default(), search)
                 .with_intra_pick(true)
                 .with_fitted_token_prob_updates(true)
                 .with_auto_loop_filter(true);
@@ -176,7 +194,7 @@ fn thread_budget_never_changes_the_output() {
             for threads in [2usize, 3, 8] {
                 let threaded =
                     encode_chain(&source, w, h, &params, &options.with_threads(threads), None);
-                assert_eq!(serial, threaded, "{w}x{h} {effort:?} threads {threads}");
+                assert_eq!(serial, threaded, "{w}x{h} {search:?} threads {threads}");
             }
         }
     }
@@ -186,16 +204,15 @@ fn thread_budget_never_changes_the_output() {
 fn every_effort_decodes_to_the_encoder_reconstruction() {
     for (w, h) in [(48usize, 32usize), (98, 62), (176, 144)] {
         let source = clip::moving_clip(w, h, 5);
-        for effort in EncodeEffort::ALL {
-            if effort == EncodeEffort::Thorough && w * h > 98 * 62 {
+        for search in searches() {
+            if search.is_none() && w * h > 98 * 62 {
                 continue;
             }
             for variant in 0..5 {
                 let mut params =
                     KeyframeParams::default().with_y_ac_qi([20, 44, 70, 100, 12][variant]);
-                let mut options = InterCodingOptions::default()
-                    .with_effort(effort)
-                    .with_threads(variant % 3);
+                let mut options =
+                    with_search(InterCodingOptions::default(), search).with_threads(variant % 3);
                 let mut segmentation = None;
                 match variant {
                     0 => {}
@@ -224,7 +241,7 @@ fn every_effort_decodes_to_the_encoder_reconstruction() {
                 assert_eq!(
                     decode_chain(&packets),
                     recons,
-                    "{w}x{h} {effort:?} variant {variant}"
+                    "{w}x{h} {search:?} variant {variant}"
                 );
             }
         }
@@ -232,13 +249,12 @@ fn every_effort_decodes_to_the_encoder_reconstruction() {
 }
 
 #[test]
-fn reduced_efforts_spend_no_more_than_the_exhaustive_search() {
+fn effort_levels_form_a_ladder_below_the_original_search() {
     let (w, h) = (176usize, 144usize);
-    let source = clip::moving_clip(w, h, 5);
+    let source = clip::moving_clip(w, h, 6);
     let params = KeyframeParams::default().with_y_ac_qi(40);
-    let run = |effort: EncodeEffort| {
-        let options = InterCodingOptions::default()
-            .with_effort(effort)
+    let run = |search: Option<EncodeEffort>| {
+        let options = with_search(InterCodingOptions::default(), search)
             .with_intra_pick(true)
             .with_fitted_token_prob_updates(true);
         let (packets, _) = encode_chain(&source, w, h, &params, &options, None);
@@ -248,22 +264,29 @@ fn reduced_efforts_spend_no_more_than_the_exhaustive_search() {
             luma_psnr(&decode_chain(&packets), &source, w, h),
         )
     };
-    let (thorough_bytes, thorough_psnr) = run(EncodeEffort::Thorough);
-    for effort in [
-        EncodeEffort::Fastest,
-        EncodeEffort::Fast,
-        EncodeEffort::Balanced,
-    ] {
-        let (bytes, psnr) = run(effort);
+    let (original_bytes, original_psnr) = run(None);
+    let levels: Vec<(usize, f64)> = EncodeEffort::ALL
+        .into_iter()
+        .map(|e| run(Some(e)))
+        .collect();
+    for (effort, &(bytes, psnr)) in EncodeEffort::ALL.iter().zip(&levels) {
         assert!(
-            bytes <= thorough_bytes,
-            "{effort:?}: {bytes} bytes against {thorough_bytes}"
+            bytes < original_bytes,
+            "{effort:?}: {bytes} bytes against {original_bytes}"
         );
         assert!(
-            psnr > thorough_psnr - 2.5,
-            "{effort:?}: {psnr:.2} dB against {thorough_psnr:.2}"
+            psnr > original_psnr - 2.5,
+            "{effort:?}: {psnr:.2} dB against {original_psnr:.2}"
         );
     }
+    // More effort does not cost quality, and the top level is not larger
+    // than the bottom one.
+    let (fastest, thorough) = (levels[0], levels[3]);
+    assert!(
+        thorough.1 > fastest.1 - 0.1,
+        "{thorough:?} against {fastest:?}"
+    );
+    assert!(thorough.0 <= fastest.0, "{thorough:?} against {fastest:?}");
 }
 
 fn validator_available() -> bool {
@@ -326,8 +349,8 @@ fn black_box_decoder_agrees_at_every_effort() {
     }
     for (w, h) in [(98usize, 62usize), (176, 144)] {
         let source = clip::moving_clip(w, h, 6);
-        for effort in EncodeEffort::ALL {
-            if effort == EncodeEffort::Thorough && w * h > 98 * 62 {
+        for search in searches() {
+            if search.is_none() && w * h > 98 * 62 {
                 continue;
             }
             for (lf, partitions) in [(0u8, 1u8), (14, 4)] {
@@ -335,8 +358,7 @@ fn black_box_decoder_agrees_at_every_effort() {
                     .with_y_ac_qi(34)
                     .with_loop_filter_level(lf)
                     .with_nbr_of_dct_partitions(partitions);
-                let options = InterCodingOptions::default()
-                    .with_effort(effort)
+                let options = with_search(InterCodingOptions::default(), search)
                     .with_threads(4)
                     .with_intra_pick(true)
                     .with_fitted_token_prob_updates(true);
@@ -348,7 +370,7 @@ fn black_box_decoder_agrees_at_every_effort() {
                 assert_eq!(
                     validator_decode(&stream),
                     decode_chain(&packets).concat(),
-                    "{w}x{h} {effort:?} lf {lf} partitions {partitions}"
+                    "{w}x{h} {search:?} lf {lf} partitions {partitions}"
                 );
             }
         }
@@ -388,11 +410,7 @@ fn stream_encoder_carries_the_inter_effort() {
         packets.into_iter().map(|p| p.bytes).collect()
     };
     let mut sizes = Vec::new();
-    for effort in [
-        EncodeEffort::Fastest,
-        EncodeEffort::Fast,
-        EncodeEffort::Balanced,
-    ] {
+    for effort in EncodeEffort::ALL {
         let serial = run(effort, 1);
         assert_eq!(serial, run(effort, 4), "{effort:?}");
         // Decodes, every visible frame recognisably the source.
@@ -403,5 +421,53 @@ fn stream_encoder_carries_the_inter_effort() {
         sizes.push(serial.iter().map(Vec::len).sum::<usize>());
     }
     // The levels are different searches.
-    assert!(sizes[0] != sizes[1] || sizes[1] != sizes[2]);
+    assert!(sizes[0] != sizes[1] || sizes[1] != sizes[2] || sizes[2] != sizes[3]);
+}
+
+#[test]
+fn one_pass_rate_control_hits_the_target_at_every_effort() {
+    let (w, h) = (320usize, 192usize);
+    let frames = 45;
+    let source = clip::moving_clip(w, h, frames);
+    for effort in EncodeEffort::ALL {
+        for target in [250_000u32, 700_000] {
+            let config = AltrefStreamConfig::default()
+                .with_params(KeyframeParams::default().with_y_ac_qi(50))
+                .with_keyframe_interval(0)
+                .with_altref_window(16)
+                .with_intra_pick(true)
+                .with_fitted_token_prob_updates(true)
+                .with_effort(EncodeEffort::Fast)
+                .with_inter_effort(effort)
+                .with_threads(4)
+                .with_target_bitrate_bps(target)
+                .with_frame_rate(30.0);
+            let mut enc = Vp8AltrefStreamEncoder::new(config).unwrap();
+            let mut bytes = 0usize;
+            let mut dec = Vp8DecoderState::new();
+            for planes in &source {
+                for packet in enc.push_frame(&view(planes, w, h)).unwrap() {
+                    bytes += packet.bytes.len();
+                    dec.decode_frame(&packet.bytes).expect("stream decodes");
+                }
+            }
+            for packet in enc.finish().unwrap() {
+                bytes += packet.bytes.len();
+                dec.decode_frame(&packet.bytes).expect("stream decodes");
+            }
+            let rate = bytes as f64 * 8.0 * 30.0 / frames as f64;
+            let off = rate / target as f64 - 1.0;
+            assert!(
+                off.abs() < 0.12,
+                "{effort:?} target {target}: {rate:.0} bit/s ({:+.1} %)",
+                off * 100.0
+            );
+        }
+    }
+    // Without a target the quantiser stays where it was put.
+    let fixed = Vp8AltrefStreamEncoder::new(
+        AltrefStreamConfig::default().with_params(KeyframeParams::default().with_y_ac_qi(33)),
+    )
+    .unwrap();
+    assert_eq!(fixed.next_qindex(), 33);
 }

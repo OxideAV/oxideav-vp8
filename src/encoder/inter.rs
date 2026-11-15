@@ -52,13 +52,13 @@ use crate::reconstruct::{MbNeighbors, ReconstructedMb};
 /// Speed controls of one inter-frame encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct InterSpeed {
-    /// Mode-search effort ([`EncodeEffort::Thorough`] is the exhaustive
-    /// search).
-    pub(crate) effort: EncodeEffort,
+    /// The rate-distortion search at this effort level; `None` is the
+    /// original exhaustive search of the option-less entry points.
+    pub(crate) effort: Option<EncodeEffort>,
     /// Thread budget (`0` / `1` = serial). Never changes the bytes.
     pub(crate) threads: usize,
     /// Fit the §13.4 token-probability updates to this encode's own
-    /// token statistics and ship them (the reduced search only — its
+    /// token statistics and ship them (the effort-level search only — its
     /// decisions do not depend on the shipped table, so no second
     /// analysis pass is needed).
     pub(crate) fit_token_probs: bool,
@@ -155,8 +155,9 @@ pub(super) struct InterSearch<'a> {
     pub(super) filters: &'a [[i32; 6]; 8],
     /// Also consider the §11 whole-block intra modes.
     pub(super) pick_intra: bool,
-    pub(super) effort: EncodeEffort,
-    /// §17.2 differential costs (the reduced search only).
+    /// `None` selects the original exhaustive search.
+    pub(super) effort: Option<EncodeEffort>,
+    /// §17.2 differential costs (the effort-level search only).
     pub(super) mv_costs: Option<super::inter_search::MvCostTable>,
     pub(super) mb_cols: usize,
     pub(super) mb_rows: usize,
@@ -422,7 +423,7 @@ fn analyse_row(
     let mut left: Option<ReconstructedMb> = None;
     let mut left_info = MbInfo::border();
     let mut aboveleft_info = MbInfo::border();
-    let shape = search.effort.inter_shape();
+    let shape = search.effort.map(EncodeEffort::inter_shape);
 
     for mb_col in 0..mb_cols {
         let mut neighbors = MbNeighbors::default();
@@ -487,7 +488,7 @@ fn analyse_row(
         };
         let decision = match &shape {
             None => decide_mb_exhaustive(search, &pixels, &place),
-            Some(shape) => super::inter_search::decide_mb_fast(search, &pixels, &place, shape),
+            Some(shape) => super::inter_search::decide_mb_rd(search, &pixels, &place, shape),
         };
 
         let (yx, cx) = (mb_col * 16, mb_col * 8);

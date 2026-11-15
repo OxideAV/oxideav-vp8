@@ -874,6 +874,27 @@ path = "fuzz_targets/keyframe_effort_threads_lockstep.rs"
 test = false
 doc = false
 
+# Round 490 — inter-frame search (the original exhaustive one or an
+# effort level) × encoder thread budget × intra picker / loop-filter
+# search / token-probability fit / segmentation, over a key + two inter
+# frames. Oracles: threaded bytes + reconstruction == serial, and a
+# serial and a threaded `Vp8DecoderState` both reproduce the encoder's
+# reconstruction of every frame.
+[[bin]]
+name = "inter_effort_threads_lockstep"
+path = "fuzz_targets/inter_effort_threads_lockstep.rs"
+test = false
+doc = false
+
+# Round 490 — the decoder's thread budget on arbitrary and on mutated
+# encoded packets: a serial and a threaded `Vp8DecoderState` must agree,
+# packet by packet, on accept / refuse and on every decoded sample.
+[[bin]]
+name = "decoder_threads_differential"
+path = "fuzz_targets/decoder_threads_differential.rs"
+test = false
+doc = false
+
 [[bin]]
 name = "decode_stream_token_descent"
 path = "fuzz_targets/decode_stream_token_descent.rs"

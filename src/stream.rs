@@ -2190,13 +2190,183 @@ pub struct AltrefStreamConfig {
     pub threads: usize,
     /// Mode-search effort of the stream's **inter frames** (the
     /// invisible anchors and the visible P-frames). Defaults to
-    /// [`EncodeEffort::Balanced`](crate::encoder::EncodeEffort::Balanced);
-    /// [`EncodeEffort::Thorough`](crate::encoder::EncodeEffort::Thorough)
-    /// is the exhaustive legacy search.
+    /// [`EncodeEffort::Balanced`](crate::encoder::EncodeEffort::Balanced).
     pub inter_effort: crate::encoder::EncodeEffort,
+    /// One-pass rate control target in bits per second; `0` (the
+    /// default) codes every frame at `params.y_ac_qi`. With a target the
+    /// stream starts at `params.y_ac_qi` and then moves the quantiser
+    /// frame by frame so that the stream's average rate approaches the
+    /// target (see [`RateControl`]); no frame is ever dropped, so a
+    /// target below what the coarsest quantiser produces is overshot.
+    pub target_bitrate_bps: u32,
+    /// Frames per second the rate target is spread over (default 30).
+    pub frame_rate: f64,
+}
+
+/// One-pass rate control for the lagged stream: a per-frame quantiser
+/// from a bit budget, without lookahead statistics.
+///
+/// Every visible frame adds `bitrate / frame_rate` bits to a budget and
+/// every packet (visible or not) spends from it. The next inter frame
+/// aims at the per-frame share, less what the invisible alt-ref frames
+/// have been costing per visible frame, less a fraction of the running
+/// overspend — so a key frame is paid back over the following frames
+/// instead of at once.
+/// The quantiser step for that aim comes from the measured cost of the
+/// previous inter frames: with `bits ∝ step^(−1.3)` across the range,
+/// `X = bits · step^1.3` is tracked as a running average and the step
+/// that meets a target `t` is `(X / t)^(1 / 1.3)`. Alt-ref frames are
+/// coded at the current inter quantiser. A key frame gets a budget of
+/// its own (a quarter of the payback window) and a quantiser from what
+/// the previous key frame cost; before the first key frame a
+/// lowest-effort trial encode stands in for that measurement.
+///
+/// The quantiser never moves more than a few indices per frame once the
+/// stream is under way, so quality does not pump.
+#[derive(Debug, Clone, Copy)]
+struct RateControl {
+    bits_per_frame: f64,
+    /// Frames an overspend is paid back over.
+    window: f64,
+    /// Bits spent minus bits budgeted so far.
+    overspend: f64,
+    /// Running average of `bits · step^1.3` over inter frames.
+    complexity: Option<f64>,
+    /// `bits · step^1.1` of the last key frame (or of a trial encode
+    /// before the first).
+    key_complexity: Option<f64>,
+    /// Running average of what an invisible alt-ref frame costs, spread
+    /// over the visible frames of its group (bits per visible frame).
+    hidden_share: f64,
+    /// Visible frames per alt-ref frame.
+    group: f64,
+    /// Quantiser index of the next frame.
+    qindex: u8,
+    /// Visible inter frames coded so far.
+    inter_frames: u32,
+}
+
+impl RateControl {
+    const RATE_EXPONENT: f64 = 1.3;
+
+    fn new(config: &AltrefStreamConfig) -> Option<Self> {
+        // A missing, zero, negative or NaN frame rate leaves the stream
+        // at a constant quantiser.
+        if config.target_bitrate_bps == 0 || config.frame_rate.is_nan() || config.frame_rate <= 0.0
+        {
+            return None;
+        }
+        let window = match config.keyframe_interval {
+            0 => 30.0,
+            n => (2 * n).clamp(12, 60) as f64,
+        };
+        Some(RateControl {
+            bits_per_frame: config.target_bitrate_bps as f64 / config.frame_rate,
+            window,
+            overspend: 0.0,
+            complexity: None,
+            key_complexity: None,
+            hidden_share: 0.0,
+            group: config.altref_window.max(1) as f64,
+            qindex: config.params.y_ac_qi.min(127),
+            inter_frames: 0,
+        })
+    }
+
+    fn step(qindex: u8) -> f64 {
+        crate::inverse_transform::AC_QLOOKUP[qindex as usize] as f64
+    }
+
+    /// The first quantiser index whose step is at least `step`.
+    fn qindex_for_step(step: f64) -> u8 {
+        crate::inverse_transform::AC_QLOOKUP
+            .iter()
+            .position(|&s| s as f64 >= step)
+            .unwrap_or(127) as u8
+    }
+
+    /// Key frames cost `∝ step^(−1.1)` across the range.
+    const KEY_RATE_EXPONENT: f64 = 1.1;
+
+    /// Note what a key frame cost at `qindex`.
+    fn measure_key(&mut self, qindex: u8, bytes: usize) {
+        self.key_complexity =
+            Some(bytes as f64 * 8.0 * Self::step(qindex).powf(Self::KEY_RATE_EXPONENT));
+    }
+
+    /// The quantiser for a key frame: a quarter of the payback window's
+    /// budget (between two and ten frames' worth), less what is already
+    /// overspent — but never finer than the inter frames are running.
+    fn key_qindex(&self) -> u8 {
+        let Some(complexity) = self.key_complexity else {
+            return self.qindex;
+        };
+        let frames = (self.window / 4.0).clamp(2.0, 10.0);
+        let budget =
+            (frames * self.bits_per_frame - self.overspend.max(0.0) / 2.0).max(self.bits_per_frame);
+        let wanted =
+            Self::qindex_for_step((complexity / budget).powf(1.0 / Self::KEY_RATE_EXPONENT));
+        if self.complexity.is_some() {
+            wanted.max(self.qindex.saturating_sub(8))
+        } else {
+            wanted
+        }
+    }
+
+    /// Account for one coded packet and choose the next quantiser.
+    fn record(&mut self, kind: AltrefPacketKind, bytes: usize) {
+        let bits = bytes as f64 * 8.0;
+        let visible = kind != AltrefPacketKind::AltrefUpdate;
+        self.overspend += bits - if visible { self.bits_per_frame } else { 0.0 };
+        if kind == AltrefPacketKind::Key {
+            self.measure_key(self.qindex, bytes);
+        }
+        if kind == AltrefPacketKind::Inter {
+            let x = bits * Self::step(self.qindex).powf(Self::RATE_EXPONENT);
+            self.complexity = Some(match self.complexity {
+                Some(average) => 0.75 * average + 0.25 * x,
+                None => x,
+            });
+            self.inter_frames += 1;
+        }
+        if !visible {
+            let share = bits / self.group;
+            self.hidden_share = if self.hidden_share == 0.0 {
+                share
+            } else {
+                0.5 * self.hidden_share + 0.5 * share
+            };
+        }
+        let Some(complexity) = self.complexity else {
+            return;
+        };
+        let target = (self.bits_per_frame - self.hidden_share - self.overspend / self.window)
+            .clamp(0.15 * self.bits_per_frame, 4.0 * self.bits_per_frame);
+        let wanted_step = (complexity / target).powf(1.0 / Self::RATE_EXPONENT);
+        let wanted = Self::qindex_for_step(wanted_step) as i32;
+        // Free movement while the model settles, then a few indices per
+        // frame.
+        let reach = if self.inter_frames <= 2 { 127 } else { 6 };
+        let current = self.qindex as i32;
+        self.qindex = wanted.clamp(current - reach, current + reach).clamp(0, 127) as u8;
+    }
 }
 
 impl AltrefStreamConfig {
+    /// Set `target_bitrate_bps`.
+    #[must_use]
+    pub fn with_target_bitrate_bps(mut self, v: u32) -> Self {
+        self.target_bitrate_bps = v;
+        self
+    }
+
+    /// Set `frame_rate`.
+    #[must_use]
+    pub fn with_frame_rate(mut self, v: f64) -> Self {
+        self.frame_rate = v;
+        self
+    }
+
     /// Set `inter_effort`.
     #[must_use]
     pub fn with_inter_effort(mut self, v: crate::encoder::EncodeEffort) -> Self {
@@ -2307,6 +2477,8 @@ impl Default for AltrefStreamConfig {
             effort: crate::encoder::EncodeEffort::Thorough,
             threads: 1,
             inter_effort: crate::encoder::EncodeEffort::Balanced,
+            target_bitrate_bps: 0,
+            frame_rate: 30.0,
         }
     }
 }
@@ -2472,6 +2644,8 @@ pub struct Vp8AltrefStreamEncoder {
     last: Option<KeyframePlanes>,
     golden: Option<KeyframePlanes>,
     altref: Option<KeyframePlanes>,
+    /// One-pass rate control state (`None` = constant quantiser).
+    rate: Option<RateControl>,
 }
 
 /// Mean absolute luma difference per pixel between the previous
@@ -2500,6 +2674,7 @@ impl Vp8AltrefStreamEncoder {
             return None;
         }
         Some(Vp8AltrefStreamEncoder {
+            rate: RateControl::new(&config),
             config,
             dimensions: None,
             pending: Vec::new(),
@@ -2523,6 +2698,28 @@ impl Vp8AltrefStreamEncoder {
     /// The configuration this stream was built with.
     pub fn config(&self) -> &AltrefStreamConfig {
         &self.config
+    }
+
+    /// The §9.6 quantiser index the next frame will be coded at: the
+    /// configured `params.y_ac_qi`, or the rate control's current choice.
+    pub fn next_qindex(&self) -> u8 {
+        self.rate
+            .map_or(self.config.params.y_ac_qi, |rate| rate.qindex)
+    }
+
+    /// The frame parameters for the next packet (the configured ones at
+    /// the rate control's quantiser).
+    fn frame_params(&self) -> KeyframeParams {
+        let mut params = self.config.params;
+        params.y_ac_qi = self.next_qindex();
+        params
+    }
+
+    /// Tell the rate control what a packet cost.
+    fn spent(&mut self, kind: AltrefPacketKind, bytes: usize) {
+        if let Some(rate) = &mut self.rate {
+            rate.record(kind, bytes);
+        }
     }
 
     /// Total source frames pushed so far (buffered + encoded).
@@ -2626,23 +2823,41 @@ impl Vp8AltrefStreamEncoder {
             intra_pick: true,
             auto_loop_filter: self.config.auto_loop_filter,
             fitted_token_prob_updates: self.config.fitted_token_prob_updates,
-            effort: self.config.inter_effort,
+            effort: Some(self.config.inter_effort),
             threads: self.config.threads,
         };
         let p_options = crate::encoder::InterCodingOptions {
             intra_pick: self.config.intra_pick,
             auto_loop_filter: self.config.auto_loop_filter,
             fitted_token_prob_updates: self.config.fitted_token_prob_updates,
-            effort: self.config.inter_effort,
+            effort: Some(self.config.inter_effort),
             threads: self.config.threads,
         };
 
         // Key frame: scheduled, scene-cut-forced, or forced because
         // the stream has no reference yet.
         if self.is_key_index(start) || forced_key || self.last.is_none() {
+            let mut key_params = self.frame_params();
+            if let Some(rate) = &mut self.rate {
+                // The key frame's quantiser comes from its own bit
+                // budget. The first one has nothing to go by, so a quick
+                // lowest-effort encode measures what the picture costs.
+                if rate.key_complexity.is_none() {
+                    let trial = crate::encoder::encode_keyframe_with_options(
+                        &group[0].as_i420(),
+                        &key_params,
+                        &crate::encoder::KeyframeEncodeOptions::new()
+                            .with_effort(crate::encoder::EncodeEffort::Fastest)
+                            .with_threads(self.config.threads),
+                    )?;
+                    rate.measure_key(key_params.y_ac_qi, trial.len());
+                }
+                key_params.y_ac_qi = rate.key_qindex();
+                rate.qindex = key_params.y_ac_qi;
+            }
             let (bytes, recon) = crate::encoder::encode_keyframe_with_reconstruction_and_options(
                 &group[0].as_i420(),
-                &self.config.params,
+                &key_params,
                 &crate::encoder::KeyframeEncodeOptions::new()
                     .with_effort(self.config.effort)
                     .with_threads(self.config.threads)
@@ -2652,6 +2867,7 @@ impl Vp8AltrefStreamEncoder {
             self.last = Some(recon.clone());
             self.golden = Some(recon.clone());
             self.altref = Some(recon);
+            self.spent(AltrefPacketKind::Key, bytes.len());
             out.push(AltrefStreamPacket {
                 bytes,
                 kind: AltrefPacketKind::Key,
@@ -2682,12 +2898,13 @@ impl Vp8AltrefStreamEncoder {
                 last_planes,
                 self.golden.as_ref(),
                 self.altref.as_ref(),
-                &self.config.params,
+                &self.frame_params(),
                 &anchor_options,
                 self.config.segmentation.as_ref(),
             )?;
             self.altref = Some(alt_recon);
             anchored = true;
+            self.spent(AltrefPacketKind::AltrefUpdate, bytes.len());
             out.push(AltrefStreamPacket {
                 bytes,
                 kind: AltrefPacketKind::AltrefUpdate,
@@ -2715,11 +2932,12 @@ impl Vp8AltrefStreamEncoder {
                 last_planes,
                 self.golden.as_ref(),
                 self.altref.as_ref(),
-                &self.config.params,
+                &self.frame_params(),
                 &refresh,
                 &p_options,
                 self.config.segmentation.as_ref(),
             )?;
+            self.spent(AltrefPacketKind::Inter, bytes.len());
             // Encoder-side slot mirror of the §20 page-147 walk:
             // copy_gf (ALTREF → GOLDEN, pre-refresh state) precedes
             // refresh_last.

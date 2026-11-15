@@ -9767,9 +9767,11 @@ pub struct InterCodingOptions {
     /// Two-pass §13.4 `token_prob_update()` fit (defaults pass →
     /// [`fit_token_prob_updates`] → fitted pass → smaller wire ships).
     pub fitted_token_prob_updates: bool,
-    /// Mode-search effort. The default, [`EncodeEffort::Thorough`], is
-    /// the exhaustive search (the bytes of the option-less entry points).
-    pub effort: EncodeEffort,
+    /// The rate-distortion search at an [`EncodeEffort`] level. `None`
+    /// (the default) is the original exhaustive search — the bytes of the
+    /// option-less entry points, kept for compatibility; it is both
+    /// slower and less rate-efficient than any level.
+    pub effort: Option<EncodeEffort>,
     /// Thread budget for the encode. `0` and `1` both mean serial (the
     /// default); with `n > 1` the macroblock search runs as a
     /// macroblock-row wavefront on up to `n` scoped threads that end
@@ -9778,10 +9780,10 @@ pub struct InterCodingOptions {
 }
 
 impl InterCodingOptions {
-    /// Set `effort`.
+    /// Select the rate-distortion search at effort level `v`.
     #[must_use]
     pub fn with_effort(mut self, v: EncodeEffort) -> Self {
-        self.effort = v;
+        self.effort = Some(v);
         self
     }
 
@@ -10001,7 +10003,7 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
         });
     }
 
-    if !options.fitted_token_prob_updates || options.effort != EncodeEffort::Thorough {
+    if !options.fitted_token_prob_updates || options.effort.is_some() {
         return encode_p_frame_multi_ref_inner_full(
             frame,
             last,
@@ -10363,7 +10365,8 @@ fn encode_p_frame_multi_ref_inner_full(
     };
     // Per-frame §13 trellis rate tables (see `TrellisRateTables`): one
     // build per frame, shared by every per-ref / intra-in-P mode pick.
-    let reduced_search = speed.effort != EncodeEffort::Thorough;
+    // The effort-level search (as against the original exhaustive one).
+    let reduced_search = speed.effort.is_some();
     let trellis_rate_tables = (reduced_search || inter_trellis_strength.get() > 0.0)
         .then(|| TrellisRateTables::for_probs(&coeff_probs));
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
@@ -10672,20 +10675,23 @@ fn encode_p_frame_multi_ref_inner_full(
             inter_modes: &inter_modes_out,
         };
         match speed.effort {
-            // The exhaustive level keeps the full-frame grid search (its
-            // candidates scored under the thread budget).
-            EncodeEffort::Thorough => crate::loop_filter::select_filter_params_threaded(
-                &planes,
-                &modes,
-                &has_coeffs,
-                &lf_config,
-                &src,
-                Some(&inter_info),
-                speed.threads,
-            ),
-            // The reduced levels choose the level on a sample of the
+            // The original search and the top level run the full-frame
+            // grid search (its candidates scored under the thread
+            // budget).
+            None | Some(EncodeEffort::Thorough) => {
+                crate::loop_filter::select_filter_params_threaded(
+                    &planes,
+                    &modes,
+                    &has_coeffs,
+                    &lf_config,
+                    &src,
+                    Some(&inter_info),
+                    speed.threads,
+                )
+            }
+            // The lower levels choose the level on a sample of the
             // picture and keep the configured sharpness.
-            effort => (
+            Some(effort) => (
                 crate::loop_filter::select_filter_level_sampled(
                     &planes,
                     &modes,
@@ -11761,6 +11767,11 @@ mod factory {
             effort: config.effort,
             threads: config.threads,
             inter_effort: config.inter_effort,
+            target_bitrate_bps: config.target_bitrate_bps,
+            frame_rate: params
+                .frame_rate
+                .filter(|r| r.num > 0 && r.den > 0)
+                .map_or(config.frame_rate, |r| r.num as f64 / r.den as f64),
             ..crate::stream::AltrefStreamConfig::default()
         };
         let stream = crate::stream::Vp8AltrefStreamEncoder::new(stream_config)
@@ -12366,7 +12377,10 @@ pub struct Vp8EncoderConfig {
     pub alt_ref_interval: u32,
     /// Lookahead window in frames (first-pass / scene-cut buffer).
     pub lookahead_window: u32,
-    /// Per-frame target bitrate in bits, or 0 for CQ mode.
+    /// One-pass rate control target of the lagged stream paths in bits
+    /// per second, or 0 (the default) for a constant quantiser: the
+    /// stream starts at `qindex` and then adapts the quantiser frame by
+    /// frame (see `AltrefStreamConfig::target_bitrate_bps`).
     pub target_bitrate_bps: u32,
     /// When `true`, the §9.4 `loop_filter_level` / `sharpness_level` are
     /// chosen per frame by the RD selector
@@ -12395,13 +12409,17 @@ pub struct Vp8EncoderConfig {
     /// Mode-search effort of the stream's **inter frames** (the lagged
     /// stream paths: [`Vp8Encoder::encode_sequence`] and
     /// `make_encoder_with_config`). Defaults to
-    /// [`EncodeEffort::Balanced`]; [`EncodeEffort::Thorough`] is the
-    /// exhaustive legacy search.
+    /// [`EncodeEffort::Balanced`].
     pub inter_effort: EncodeEffort,
     /// §9.5 token partition count (1 / 2 / 4 / 8) of every frame of the
     /// lagged stream paths; any other value is treated as 1. More
     /// partitions let a decoder parse tokens on several threads.
     pub partitions: u8,
+    /// Frames per second [`target_bitrate_bps`](Self::target_bitrate_bps)
+    /// is spread over on [`Vp8Encoder::encode_sequence`] (default 30).
+    /// The registry encoder uses the stream's own frame rate when the
+    /// codec parameters carry one.
+    pub frame_rate: f64,
 }
 
 impl Vp8EncoderConfig {
@@ -12430,6 +12448,13 @@ impl Vp8EncoderConfig {
     #[must_use]
     pub fn with_partitions(mut self, v: u8) -> Self {
         self.partitions = v;
+        self
+    }
+
+    /// Set `frame_rate`.
+    #[must_use]
+    pub fn with_frame_rate(mut self, v: f64) -> Self {
+        self.frame_rate = v;
         self
     }
 
@@ -12529,6 +12554,7 @@ impl Default for Vp8EncoderConfig {
             threads: 1,
             inter_effort: EncodeEffort::Balanced,
             partitions: 1,
+            frame_rate: 30.0,
         }
     }
 }
@@ -12652,6 +12678,8 @@ impl Vp8Encoder {
             effort: self.config.effort,
             threads: self.config.threads,
             inter_effort: self.config.inter_effort,
+            target_bitrate_bps: self.config.target_bitrate_bps,
+            frame_rate: self.config.frame_rate,
             ..crate::stream::AltrefStreamConfig::default()
         };
         let mut enc = crate::stream::Vp8AltrefStreamEncoder::new(config)

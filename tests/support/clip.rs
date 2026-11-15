@@ -1,6 +1,6 @@
-//! Deterministic moving test clip, shared by the inter-effort tests, the
-//! `inter_encode_clip` bench and the `inter_timing` example (each pulls
-//! this file in with `#[path]`, next to `photo.rs`).
+//! Deterministic moving test clip, shared by the inter-effort and
+//! decoder-thread tests and the `inter_timing` example (each pulls this
+//! file in with `#[path]`, next to `photo.rs`).
 //!
 //! The scene is the photo-like picture of `photo.rs` rendered on a canvas
 //! twice the clip size and box-filtered 2×2 down to it, so motion comes

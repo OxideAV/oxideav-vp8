@@ -163,11 +163,7 @@ fn encoded_streams_decode_identically_at_every_budget() {
     let case = |w, h, partitions, lf, simple, effort, segmentation| Case {
         w,
         h,
-        frames: if effort == EncodeEffort::Thorough {
-            4
-        } else {
-            7
-        },
+        frames: 7,
         partitions,
         lf,
         simple,

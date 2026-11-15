@@ -1,12 +1,15 @@
-//! The reduced-effort macroblock search for inter frames.
+//! The rate-distortion macroblock search for inter frames, at every
+//! effort level.
 //!
 //! RFC 6386 specifies decoding only; how an encoder finds its motion
-//! vectors and modes is its own business. The exhaustive search
-//! ([`EncodeEffort::Thorough`]) runs a full motion search, every
-//! `SPLITMV` partition and (optionally) sixteen intra mode pairs against
-//! every reference, carries each reference's winner through transform,
-//! trellis quantisation and reconstruction, and ranks on prediction
-//! error. The reduced levels spend their time differently:
+//! vectors and modes is its own business. The option-less per-frame
+//! entry points keep the crate's original search (a full motion search,
+//! every `SPLITMV` partition and optionally sixteen intra mode pairs
+//! against every reference, each reference's winner carried through
+//! transform, trellis quantisation and reconstruction, ranked on
+//! prediction error). The search here is what an [`EncodeEffort`] level
+//! selects; the levels differ in how wide each step below is (see
+//! [`SearchShape`]):
 //!
 //! * **Motion search.** Each reference is searched on the whole-pixel
 //!   grid from the best of a few predicted vectors (zero, the §16.3
@@ -54,7 +57,7 @@ use crate::motion_vector::{Mv, MvContexts, mv_component_bits};
 use crate::near_mv::{InterMode, MvClampRect, MvPartition, clamp_mv, find_near_mvs, mv_ref_probs};
 use crate::reconstruct::ReconstructedMb;
 
-/// How the reduced levels spend their search.
+/// How an effort level spends its search.
 #[derive(Clone, Copy)]
 pub(super) struct SearchShape {
     /// Rounds of the one-pixel pattern descent per reference.
@@ -88,11 +91,10 @@ pub(super) struct SearchShape {
 }
 
 impl EncodeEffort {
-    /// The reduced inter search of this level (`None` for
-    /// [`EncodeEffort::Thorough`], the exhaustive search).
-    pub(super) fn inter_shape(self) -> Option<SearchShape> {
+    /// The inter search of this level.
+    pub(super) fn inter_shape(self) -> SearchShape {
         match self {
-            EncodeEffort::Fastest => Some(SearchShape {
+            EncodeEffort::Fastest => SearchShape {
                 descent_rounds: 4,
                 wide_pattern: false,
                 half_diagonals: true,
@@ -104,8 +106,8 @@ impl EncodeEffort {
                 intra_gate: 16,
                 split_gate: u64::MAX,
                 trellis: false,
-            }),
-            EncodeEffort::Fast => Some(SearchShape {
+            },
+            EncodeEffort::Fast => SearchShape {
                 descent_rounds: 8,
                 wide_pattern: true,
                 half_diagonals: true,
@@ -117,8 +119,8 @@ impl EncodeEffort {
                 intra_gate: 8,
                 split_gate: u64::MAX,
                 trellis: true,
-            }),
-            EncodeEffort::Balanced => Some(SearchShape {
+            },
+            EncodeEffort::Balanced => SearchShape {
                 descent_rounds: 16,
                 wide_pattern: true,
                 half_diagonals: true,
@@ -134,8 +136,27 @@ impl EncodeEffort {
                 intra_gate: 4,
                 split_gate: 4,
                 trellis: true,
-            }),
-            EncodeEffort::Thorough => None,
+            },
+            // Every reference refined, every partition, every intra
+            // luma mode, on every macroblock whose residual is coded.
+            EncodeEffort::Thorough => SearchShape {
+                descent_rounds: 32,
+                wide_pattern: true,
+                half_diagonals: true,
+                quarter: true,
+                search_other_refs: true,
+                refine_runner_up: true,
+                split_partitions: &[
+                    MvPartition::Quarters,
+                    MvPartition::TopBottom,
+                    MvPartition::LeftRight,
+                    MvPartition::Mv16,
+                ],
+                intra_all_modes: true,
+                intra_gate: 0,
+                split_gate: 0,
+                trellis: true,
+            },
         }
     }
 }
@@ -821,8 +842,8 @@ struct InterCandidate {
     bits: f64,
 }
 
-/// The reduced-effort search for one macroblock.
-pub(super) fn decide_mb_fast(
+/// The rate-distortion search for one macroblock.
+pub(super) fn decide_mb_rd(
     search: &InterSearch,
     pixels: &MbPixels,
     place: &MbPlace,
@@ -835,10 +856,10 @@ pub(super) fn decide_mb_fast(
     let costs = search
         .mv_costs
         .as_ref()
-        .expect("the frame driver tables the vector costs for the reduced search");
+        .expect("the frame driver tables the vector costs for this search");
     let tables = search
         .rate_tables
-        .expect("the frame driver attaches the rate tables for the reduced search");
+        .expect("the frame driver attaches the rate tables for this search");
     let src = &pixels.y;
     let lambda = place.lambda;
     let lambda_sad = lambda.sqrt();
@@ -956,7 +977,8 @@ pub(super) fn decide_mb_fast(
         let Some((r, found, total)) = slot else {
             continue;
         };
-        let refine = n == leader || (shape.refine_runner_up && *total < leader_cost * 1.125);
+        let refine = n == leader
+            || (shape.refine_runner_up && (shape.split_gate == 0 || *total < leader_cost * 1.125));
         if !refine {
             continue;
         }

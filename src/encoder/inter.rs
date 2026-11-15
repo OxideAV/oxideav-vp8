@@ -29,7 +29,7 @@
 //! the output does not depend on the number of threads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::effort::EncodeEffort;
 use super::wavefront::{AbortOnUnwind, lock};
@@ -40,9 +40,9 @@ use super::{
     clear_skip_ctx, encode_mb_tokens, mb_luma_variance, pick_intra_mb_all, pick_mb_for_ref,
     ref_frame_tree_bits,
 };
+use crate::backoff::{SharedEntropy, SharedPixelLine};
 use crate::dequant::MbDequantFactors;
 use crate::frame::KeyframePlanes;
-use crate::intra_predict::DEFAULT_LEFT_PIXEL;
 use crate::loop_filter::MAX_MB_SEGMENTS;
 use crate::motion_comp::{RefFrame, ReferencePlanes};
 use crate::motion_vector::{Mv, MvContexts};
@@ -208,13 +208,90 @@ pub(super) struct InterAnalysis {
     pub(super) segment_counts: [u32; MAX_MB_SEGMENTS],
 }
 
-/// What a finished macroblock leaves for the row below.
+/// What a finished macroblock leaves for the row below — lock-free, as
+/// both rows touch it once per macroblock (see `backoff.rs`).
 struct RowBottom {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    infos: Vec<MbInfo>,
-    entropy: Vec<MbEntropyCtx>,
+    pixels: SharedPixelLine,
+    infos: SharedMbInfos,
+    entropy: SharedEntropy,
+}
+
+/// One §16.3 neighbour record ([`MbInfo`]) per macroblock column, shared
+/// like [`crate::backoff::SharedBytes`]: nine words per macroblock — the
+/// reference, flags and whole-block vector, then the sixteen sub-block
+/// vectors two to a word.
+struct SharedMbInfos {
+    words: Vec<AtomicU64>,
+}
+
+impl SharedMbInfos {
+    const WORDS: usize = 9;
+
+    fn new(mb_cols: usize) -> Self {
+        SharedMbInfos {
+            words: (0..mb_cols * Self::WORDS)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    fn pack(mv: Mv) -> u64 {
+        (mv.row as u16 as u64) | (mv.col as u16 as u64) << 16
+    }
+
+    fn unpack(bits: u64) -> Mv {
+        Mv {
+            row: bits as u16 as i16,
+            col: (bits >> 16) as u16 as i16,
+        }
+    }
+
+    fn store(&self, mb_col: usize, info: &MbInfo) {
+        let words = &self.words[mb_col * Self::WORDS..(mb_col + 1) * Self::WORDS];
+        let reference = match info.ref_frame {
+            None => 0u64,
+            Some(RefFrame::Last) => 1,
+            Some(RefFrame::Golden) => 2,
+            Some(RefFrame::AltRef) => 3,
+        };
+        let head = Self::pack(info.mv)
+            | reference << 32
+            | (info.is_split as u64) << 34
+            | (info.split_mvs.is_some() as u64) << 35;
+        words[0].store(head, Ordering::Relaxed);
+        if let Some(mvs) = &info.split_mvs {
+            for (word, pair) in words[1..].iter().zip(mvs.as_chunks::<2>().0) {
+                word.store(
+                    Self::pack(pair[0]) | Self::pack(pair[1]) << 32,
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    fn load(&self, mb_col: usize) -> MbInfo {
+        let words = &self.words[mb_col * Self::WORDS..(mb_col + 1) * Self::WORDS];
+        let head = words[0].load(Ordering::Relaxed);
+        let split_mvs = (head >> 35 & 1 != 0).then(|| {
+            let mut mvs = [Mv::default(); 16];
+            for (pair, word) in mvs.as_chunks_mut::<2>().0.iter_mut().zip(&words[1..]) {
+                let bits = word.load(Ordering::Relaxed);
+                *pair = [Self::unpack(bits), Self::unpack(bits >> 32)];
+            }
+            mvs
+        });
+        MbInfo {
+            ref_frame: match head >> 32 & 3 {
+                0 => None,
+                1 => Some(RefFrame::Last),
+                2 => Some(RefFrame::Golden),
+                _ => Some(RefFrame::AltRef),
+            },
+            mv: Self::unpack(head),
+            is_split: head >> 34 & 1 != 0,
+            split_mvs,
+        }
+    }
 }
 
 struct RowOutput {
@@ -225,7 +302,7 @@ struct RowOutput {
 
 struct RowShared {
     /// Valid for macroblock columns `< done`.
-    bottom: Mutex<RowBottom>,
+    bottom: RowBottom,
     done: AtomicUsize,
     output: Mutex<Option<RowOutput>>,
 }
@@ -247,13 +324,11 @@ pub(super) fn analyse_inter_frame(
     let (mb_cols, mb_rows) = (search.mb_cols, search.mb_rows);
     let shared: Vec<RowShared> = (0..mb_rows)
         .map(|_| RowShared {
-            bottom: Mutex::new(RowBottom {
-                y: vec![0u8; mb_cols * 16],
-                u: vec![0u8; mb_cols * 8],
-                v: vec![0u8; mb_cols * 8],
-                infos: vec![MbInfo::border(); mb_cols],
-                entropy: vec![MbEntropyCtx::default(); mb_cols],
-            }),
+            bottom: RowBottom {
+                pixels: SharedPixelLine::new(mb_cols),
+                infos: SharedMbInfos::new(mb_cols),
+                entropy: SharedEntropy::new(mb_cols),
+            },
             done: AtomicUsize::new(0),
             output: Mutex::new(None),
         })
@@ -355,48 +430,18 @@ fn analyse_row(
         let mut above_ctx = MbEntropyCtx::default();
         if let Some(above) = above_row {
             let need = (mb_col + 2).min(mb_cols);
-            let mut spins = 0u32;
+            let mut backoff = crate::backoff::Backoff::new();
             while above.done.load(Ordering::Acquire) < need {
                 if abort.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                spins += 1;
-                if spins < 64 {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
+                backoff.pause();
             }
-            let bottom = lock(&above.bottom);
-            above_info = bottom.infos[mb_col];
-            above_ctx = bottom.entropy[mb_col];
+            let bottom = &above.bottom;
+            above_info = bottom.infos.load(mb_col);
+            above_ctx = bottom.entropy.load(mb_col);
             if search.pick_intra {
-                let (yx, cx) = (mb_col * 16, mb_col * 8);
-                let mut y_above = [0u8; 16];
-                y_above.copy_from_slice(&bottom.y[yx..yx + 16]);
-                neighbors.y_above = Some(y_above);
-                let mut u_above = [0u8; 8];
-                u_above.copy_from_slice(&bottom.u[cx..cx + 8]);
-                neighbors.u_above = Some(u_above);
-                let mut v_above = [0u8; 8];
-                v_above.copy_from_slice(&bottom.v[cx..cx + 8]);
-                neighbors.v_above = Some(v_above);
-                // §12.3: the rightmost macroblock repeats its own (-1, 15).
-                let mut above_right = [bottom.y[yx + 15]; 4];
-                if mb_col + 1 < mb_cols {
-                    above_right.copy_from_slice(&bottom.y[yx + 16..yx + 20]);
-                }
-                neighbors.y_above_right = Some(above_right);
-                if mb_col == 0 {
-                    // §20.14: left of the frame, below the top row → 129.
-                    neighbors.y_topleft = Some(DEFAULT_LEFT_PIXEL);
-                    neighbors.u_topleft = Some(DEFAULT_LEFT_PIXEL);
-                    neighbors.v_topleft = Some(DEFAULT_LEFT_PIXEL);
-                } else {
-                    neighbors.y_topleft = Some(bottom.y[yx - 1]);
-                    neighbors.u_topleft = Some(bottom.u[cx - 1]);
-                    neighbors.v_topleft = Some(bottom.v[cx - 1]);
-                }
+                bottom.pixels.load_above(mb_col, mb_cols, &mut neighbors);
             }
         }
         if search.pick_intra
@@ -497,14 +542,9 @@ fn analyse_row(
                 split_mvs: None,
             }
         };
-        {
-            let mut bottom = lock(&this_row.bottom);
-            bottom.infos[mb_col] = info;
-            bottom.entropy[mb_col] = above_ctx;
-            bottom.y[yx..yx + 16].copy_from_slice(&recon.y[240..256]);
-            bottom.u[cx..cx + 8].copy_from_slice(&recon.u[56..64]);
-            bottom.v[cx..cx + 8].copy_from_slice(&recon.v[56..64]);
-        }
+        this_row.bottom.infos.store(mb_col, &info);
+        this_row.bottom.entropy.store(mb_col, &above_ctx);
+        this_row.bottom.pixels.store(mb_col, recon);
         this_row.done.store(mb_col + 1, Ordering::Release);
 
         records.push(MbRecord {

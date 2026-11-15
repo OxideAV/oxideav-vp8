@@ -48,7 +48,7 @@ use super::{
 use crate::dequant::MbDequantFactors;
 use crate::intra_predict::DEFAULT_ABOVE_PIXEL;
 use crate::inverse_transform::{inverse_dct_4x4_add_into, inverse_wht_4x4};
-use crate::motion_comp::{RefFrame, predict_inter_mb, predict_split_mv, sixtap_run};
+use crate::motion_comp::{RefFrame, TapPlan, predict_inter_mb, predict_split_mv};
 use crate::motion_search::{LumaRef, mb_luma_sad_at_mv};
 use crate::motion_vector::{Mv, MvContexts, mv_component_bits};
 use crate::near_mv::{InterMode, MvClampRect, MvPartition, clamp_mv, find_near_mvs, mv_ref_probs};
@@ -285,22 +285,23 @@ impl HalfPlanes {
             v: [0u8; HP * 16],
             d: [0u8; HP * HP],
         };
+        let plan = TapPlan::new(taps);
         // Horizontal: output column c sits between window columns c + 2
         // and c + 3, so its support starts at window column c.
         let h_rows = if diagonals { 0..WIN } else { 3..19 };
         for r in h_rows {
-            let row: [u8; HP] = sixtap_run(&window[r * WIN..], 1, taps);
+            let row: [u8; HP] = plan.run(&window[r * WIN..], 1);
             planes.h[r * HP..r * HP + HP].copy_from_slice(&row);
         }
         // Vertical: output row r sits between window rows r + 2 and
         // r + 3; columns are window columns 3..19.
         for r in 0..HP {
-            let row: [u8; 16] = sixtap_run(&window[r * WIN + 3..], WIN, taps);
+            let row: [u8; 16] = plan.run(&window[r * WIN + 3..], WIN);
             planes.v[r * 16..r * 16 + 16].copy_from_slice(&row);
         }
         if diagonals {
             for r in 0..HP {
-                let row: [u8; HP] = sixtap_run(&planes.h[r * HP..], HP, taps);
+                let row: [u8; HP] = plan.run(&planes.h[r * HP..], HP);
                 planes.d[r * HP..r * HP + HP].copy_from_slice(&row);
             }
         }

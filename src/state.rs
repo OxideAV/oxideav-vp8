@@ -59,6 +59,8 @@ use crate::near_mv::{
 };
 use crate::reconstruct::ReconstructedMb;
 
+mod rows;
+
 /// One slot of the §9 / §16 three-slot reference-frame buffer.
 ///
 /// Holds the reconstructed (post-loop-filter, padded-to-whole-macroblocks)
@@ -101,7 +103,7 @@ impl RefFrameSlot {
 
     /// Borrow the slot as the [`ReferencePlanes`] the §18 motion-comp
     /// fetch consumes.
-    fn as_reference_planes(&self) -> ReferencePlanes<'_> {
+    pub(crate) fn as_reference_planes(&self) -> ReferencePlanes<'_> {
         ReferencePlanes {
             y: &self.y,
             u: &self.u,
@@ -557,21 +559,51 @@ impl Vp8DecoderState {
         // post-frame value is what becomes the next frame's entry state.
         let frame_coeff_probs: CoeffProbs = merge_default_token_probs(&coded.token_prob_updates);
 
-        let coeffs = decode_intra_residuals(
-            &modes,
-            &partitions,
-            &frame_coeff_probs,
-            &dequant_factors,
-            mb_rows,
-            mb_cols,
-        )?;
-
-        let mut planes = decode_keyframe(mb_cols, mb_rows, &modes, &coeffs)?;
-
         let lf_config = FrameFilterConfig::keyframe(&coded);
-        if lf_config.loop_filter_level != 0 {
-            filter_frame(&mut planes, &modes, &coeffs, &lf_config);
-        }
+        let planes = if self.threads > 1 {
+            // Token decoding and reconstruction as row units on the
+            // thread budget (see `rows.rs`), then the row-band filter.
+            let predictions = vec![rows::Prediction::Intra; modes.len()];
+            let (mut planes, has_coeffs) = rows::decode_rows(
+                &rows::RowDecode {
+                    mb_cols,
+                    mb_rows,
+                    modes: &modes,
+                    predictions: &predictions,
+                    references: &[],
+                    partitions: &partitions,
+                    coeff_probs: &frame_coeff_probs,
+                    dequant_factors: &dequant_factors,
+                    full_pixel: false,
+                    filters: filter_set_for_version(header.version).taps(),
+                },
+                self.threads,
+            )?;
+            if lf_config.loop_filter_level != 0 {
+                crate::loop_filter::filter_frame_flags_threaded(
+                    &mut planes,
+                    &modes,
+                    &has_coeffs,
+                    &lf_config,
+                    self.threads,
+                );
+            }
+            planes
+        } else {
+            let coeffs = decode_intra_residuals(
+                &modes,
+                &partitions,
+                &frame_coeff_probs,
+                &dequant_factors,
+                mb_rows,
+                mb_cols,
+            )?;
+            let mut planes = decode_keyframe(mb_cols, mb_rows, &modes, &coeffs)?;
+            if lf_config.loop_filter_level != 0 {
+                filter_frame(&mut planes, &modes, &coeffs, &lf_config);
+            }
+            planes
+        };
         // §9.4 deltas carried into the next frame: on a key frame
         // `ref_delta_current` and `bpred_mode_delta` were resolved from
         // the header (or 0 when delta_enabled is off); the other slots
@@ -707,390 +739,420 @@ impl Vp8DecoderState {
 
         let dequant_factors = resolve_segment_dequant_factors(&coded);
 
-        // Allocate the output planes (same macroblock-aligned layout as
-        // the key-frame path; we crop at the end).
-        let y_stride = mb_cols * 16;
-        let uv_stride = mb_cols * 8;
-        let mut planes = KeyframePlanes {
-            y: vec![0u8; y_stride * mb_rows * 16],
-            u: vec![0u8; uv_stride * mb_rows * 8],
-            v: vec![0u8; uv_stride * mb_rows * 8],
-            y_stride,
-            uv_stride,
-            mb_cols,
-            mb_rows,
-        };
+        let (mut planes, modes_out, has_coeffs_out, ref_frames_out, inter_modes_out) = if self
+            .threads
+            > 1
+        {
+            self.decode_inter_rows_threaded(
+                header,
+                &coded,
+                &mut dec,
+                &partitions,
+                &dequant_factors,
+                &frame_coeff_probs,
+                &frame_intra_probs,
+                &frame_mv_contexts,
+                frame_sign_bias,
+            )?
+        } else {
+            // Allocate the output planes (same macroblock-aligned layout as
+            // the key-frame path; we crop at the end).
+            let y_stride = mb_cols * 16;
+            let uv_stride = mb_cols * 8;
+            let mut planes = KeyframePlanes {
+                y: vec![0u8; y_stride * mb_rows * 16],
+                u: vec![0u8; uv_stride * mb_rows * 8],
+                v: vec![0u8; uv_stride * mb_rows * 8],
+                y_stride,
+                uv_stride,
+                mb_cols,
+                mb_rows,
+            };
 
-        // Per-row entropy context (§13.3): one above context per MB column
-        // (lives across the whole frame), one left context per row.
-        let mut above_entropy = vec![MbEntropyCtx::default(); mb_cols];
+            // Per-row entropy context (§13.3): one above context per MB column
+            // (lives across the whole frame), one left context per row.
+            let mut above_entropy = vec![MbEntropyCtx::default(); mb_cols];
 
-        // §16.3 inter-MB neighbour records — one row of `mb_cols` above
-        // and one trailing `left` per row.
-        let mut above_mb: Vec<MbInfo> = vec![MbInfo::border(); mb_cols];
+            // §16.3 inter-MB neighbour records — one row of `mb_cols` above
+            // and one trailing `left` per row.
+            let mut above_mb: Vec<MbInfo> = vec![MbInfo::border(); mb_cols];
 
-        // Per-MB recorded mode + coeffs for the §15 loop-filter pass.
-        // §16 interframe per-MB outputs. Every macroblock is decoded
-        // exactly once, in raster order (`mb_row` outer, `mb_col` inner),
-        // and its four side-band records are written together at the end of
-        // the iteration before anything reads them back (the §15 loop filter
-        // consumes them only after the whole frame is decoded). The previous
-        // `vec![default(); N]` + indexed assignment paid a full-frame bulk
-        // default-fill (the `MbCoeffs` lane alone is 800 bytes per MB) plus a
-        // `sentinel_mode` clone for every `modes_out` slot, all immediately
-        // overwritten. Reserve the slots and `push` instead: identical
-        // raster-ordered contents, no reallocation, and the dead initial
-        // fill (the `__bzero` / `memset` the decode profile flags) is gone.
-        let mut modes_out: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
-        // The §15 loop filter consumes the per-MB coefficients only through
-        // `mb_has_coeffs` (a single boolean per MB). Compute that flag inline
-        // while the freshly-decoded `mb_coeffs` is hot in cache and store only
-        // the `bool` — avoids holding a whole-frame `Vec<MbCoeffs>`
-        // (≈ 800 bytes / MB) alive just to feed one boolean reduction.
-        let mut has_coeffs_out: Vec<bool> = Vec::with_capacity(mb_rows * mb_cols);
-        let mut ref_frames_out: Vec<Option<RefFrame>> = Vec::with_capacity(mb_rows * mb_cols);
-        let mut inter_modes_out: Vec<Option<InterMode>> = Vec::with_capacity(mb_rows * mb_cols);
+            // Per-MB recorded mode + coeffs for the §15 loop-filter pass.
+            // §16 interframe per-MB outputs. Every macroblock is decoded
+            // exactly once, in raster order (`mb_row` outer, `mb_col` inner),
+            // and its four side-band records are written together at the end of
+            // the iteration before anything reads them back (the §15 loop filter
+            // consumes them only after the whole frame is decoded). The previous
+            // `vec![default(); N]` + indexed assignment paid a full-frame bulk
+            // default-fill (the `MbCoeffs` lane alone is 800 bytes per MB) plus a
+            // `sentinel_mode` clone for every `modes_out` slot, all immediately
+            // overwritten. Reserve the slots and `push` instead: identical
+            // raster-ordered contents, no reallocation, and the dead initial
+            // fill (the `__bzero` / `memset` the decode profile flags) is gone.
+            let mut modes_out: Vec<MacroblockModes> = Vec::with_capacity(mb_rows * mb_cols);
+            // The §15 loop filter consumes the per-MB coefficients only through
+            // `mb_has_coeffs` (a single boolean per MB). Compute that flag inline
+            // while the freshly-decoded `mb_coeffs` is hot in cache and store only
+            // the `bool` — avoids holding a whole-frame `Vec<MbCoeffs>`
+            // (≈ 800 bytes / MB) alive just to feed one boolean reduction.
+            let mut has_coeffs_out: Vec<bool> = Vec::with_capacity(mb_rows * mb_cols);
+            let mut ref_frames_out: Vec<Option<RefFrame>> = Vec::with_capacity(mb_rows * mb_cols);
+            let mut inter_modes_out: Vec<Option<InterMode>> = Vec::with_capacity(mb_rows * mb_cols);
 
-        // DCT-partition bool decoders, lazily initialised per the §20.4
-        // round-robin row-striping rule (matches the keyframe path).
-        let mut partition_decoders: Vec<Option<BoolDecoder<'_>>> =
-            (0..num_partitions).map(|_| None).collect();
-        for mb_row in 0..mb_rows {
-            let part_idx = mb_row % num_partitions;
-            if partition_decoders[part_idx].is_none() {
-                // Use the §20-reference tolerant init: a tiny ALTREF-style
-                // frame can produce a DCT body with <2 bytes when every
-                // macroblock is `mb_skip = 1`. The §20 spec body sets
-                // `value = 0`, leaves `input = NULL` and reads bits
-                // succeed against `value = 0` (which yields `mb_skip = 1`
-                // for the dominant probability).
-                let bd = BoolDecoder::init_partition(partitions[part_idx]);
-                partition_decoders[part_idx] = Some(bd);
-            }
-        }
-
-        // Frame-header gates for the per-MB prefix (§19.3 `macroblock_header()`).
-        let segmentation_active = coded.segmentation_enabled
-            && coded
-                .update_segmentation
-                .as_ref()
-                .is_some_and(|seg| seg.update_mb_segmentation_map);
-        let segment_probs: [u8; 3] = if segmentation_active {
-            let seg = coded
-                .update_segmentation
-                .as_ref()
-                .expect("segmentation_active implies update_segmentation is Some");
-            let mut p = [255u8; 3];
-            for (i, slot) in p.iter_mut().enumerate() {
-                if let Some(v) = seg.segment_prob[i] {
-                    *slot = v;
+            // DCT-partition bool decoders, lazily initialised per the §20.4
+            // round-robin row-striping rule (matches the keyframe path).
+            let mut partition_decoders: Vec<Option<BoolDecoder<'_>>> =
+                (0..num_partitions).map(|_| None).collect();
+            for mb_row in 0..mb_rows {
+                let part_idx = mb_row % num_partitions;
+                if partition_decoders[part_idx].is_none() {
+                    // Use the §20-reference tolerant init: a tiny ALTREF-style
+                    // frame can produce a DCT body with <2 bytes when every
+                    // macroblock is `mb_skip = 1`. The §20 spec body sets
+                    // `value = 0`, leaves `input = NULL` and reads bits
+                    // succeed against `value = 0` (which yields `mb_skip = 1`
+                    // for the dominant probability).
+                    let bd = BoolDecoder::init_partition(partitions[part_idx]);
+                    partition_decoders[part_idx] = Some(bd);
                 }
             }
-            p
-        } else {
-            [255; 3]
-        };
-        let skip_active = coded.mb_no_skip_coeff;
-        let skip_prob = coded.prob_skip_false.unwrap_or(0);
-        let prob_intra = coded.prob_intra.unwrap_or(0);
-        let prob_last = coded.prob_last.unwrap_or(0);
-        let prob_gf = coded.prob_gf.unwrap_or(0);
 
-        let full_pixel = matches!(header.version, 3);
-        let filters = filter_set_for_version(header.version).taps();
+            // Frame-header gates for the per-MB prefix (§19.3 `macroblock_header()`).
+            let segmentation_active = coded.segmentation_enabled
+                && coded
+                    .update_segmentation
+                    .as_ref()
+                    .is_some_and(|seg| seg.update_mb_segmentation_map);
+            let segment_probs: [u8; 3] = if segmentation_active {
+                let seg = coded
+                    .update_segmentation
+                    .as_ref()
+                    .expect("segmentation_active implies update_segmentation is Some");
+                let mut p = [255u8; 3];
+                for (i, slot) in p.iter_mut().enumerate() {
+                    if let Some(v) = seg.segment_prob[i] {
+                        *slot = v;
+                    }
+                }
+                p
+            } else {
+                [255; 3]
+            };
+            let skip_active = coded.mb_no_skip_coeff;
+            let skip_prob = coded.prob_skip_false.unwrap_or(0);
+            let prob_intra = coded.prob_intra.unwrap_or(0);
+            let prob_last = coded.prob_last.unwrap_or(0);
+            let prob_gf = coded.prob_gf.unwrap_or(0);
 
-        for mb_row in 0..mb_rows {
-            let mut left_entropy = MbEntropyCtx::default();
-            let mut left_mb = MbInfo::border();
-            let mut aboveleft_mb = MbInfo::border();
+            let full_pixel = matches!(header.version, 3);
+            let filters = filter_set_for_version(header.version).taps();
 
-            for mb_col in 0..mb_cols {
-                let raster = mb_row * mb_cols + mb_col;
+            for mb_row in 0..mb_rows {
+                let mut left_entropy = MbEntropyCtx::default();
+                let mut left_mb = MbInfo::border();
+                let mut aboveleft_mb = MbInfo::border();
 
-                // §19.3 macroblock_header() prefix on an interframe:
-                // segment_id → mb_skip_coeff → is_inter_mb.
-                let segment_id = if segmentation_active {
-                    Some(read_segment_id(&mut dec, &segment_probs)?)
-                } else {
-                    None
-                };
-                let mb_skip_coeff = if skip_active {
-                    dec.read_bool(skip_prob)?
-                } else {
-                    false
-                };
-                let is_inter_mb = dec.read_bool(prob_intra)?;
+                for mb_col in 0..mb_cols {
+                    let raster = mb_row * mb_cols + mb_col;
 
-                let mb_info: MbInfo;
-                let mode_record: MacroblockModes;
-                let mb_coeffs: MbCoeffs;
-                let recon: ReconstructedMb;
-                // For the §15 loop-filter delta lookup we track per-MB:
-                // (a) the reference frame (None = intra) and
-                // (b) the InterMode (None = intra). These are separate
-                // from `MbInfo.ref_frame` / `MacroblockModes.y_mode`
-                // because the loop-filter ladder selects on the
-                // resolved §16.2 mode (ZEROMV / NEW / SPLIT) which the
-                // §15.1 "skip rule" `y_mode` field does not preserve.
-                let mut filter_ref_frame: Option<RefFrame> = None;
-                let mut filter_inter_mode: Option<InterMode> = None;
+                    // §19.3 macroblock_header() prefix on an interframe:
+                    // segment_id → mb_skip_coeff → is_inter_mb.
+                    let segment_id = if segmentation_active {
+                        Some(read_segment_id(&mut dec, &segment_probs)?)
+                    } else {
+                        None
+                    };
+                    let mb_skip_coeff = if skip_active {
+                        dec.read_bool(skip_prob)?
+                    } else {
+                        false
+                    };
+                    let is_inter_mb = dec.read_bool(prob_intra)?;
 
-                if is_inter_mb {
-                    // §16.2: pick the reference frame.
-                    let current_ref = select_ref_frame(&mut dec, prob_last, prob_gf)?;
-                    filter_ref_frame = Some(current_ref);
+                    let mb_info: MbInfo;
+                    let mode_record: MacroblockModes;
+                    let mb_coeffs: MbCoeffs;
+                    let recon: ReconstructedMb;
+                    // For the §15 loop-filter delta lookup we track per-MB:
+                    // (a) the reference frame (None = intra) and
+                    // (b) the InterMode (None = intra). These are separate
+                    // from `MbInfo.ref_frame` / `MacroblockModes.y_mode`
+                    // because the loop-filter ladder selects on the
+                    // resolved §16.2 mode (ZEROMV / NEW / SPLIT) which the
+                    // §15.1 "skip rule" `y_mode` field does not preserve.
+                    let mut filter_ref_frame: Option<RefFrame> = None;
+                    let mut filter_inter_mode: Option<InterMode> = None;
 
-                    // Resolve neighbour record for the census.
-                    let above = above_mb[mb_col];
-                    let above_left = aboveleft_mb;
-                    let left = left_mb;
+                    if is_inter_mb {
+                        // §16.2: pick the reference frame.
+                        let current_ref = select_ref_frame(&mut dec, prob_last, prob_gf)?;
+                        filter_ref_frame = Some(current_ref);
 
-                    // §16.3 census + §16.2 inter-mode tree.
-                    let near =
-                        find_near_mvs(&above, &left, &above_left, current_ref, frame_sign_bias);
-                    let probs = mv_ref_probs(&near.cnt);
-                    let mode = read_inter_mode(&mut dec, &probs)?;
-                    filter_inter_mode = Some(mode);
+                        // Resolve neighbour record for the census.
+                        let above = above_mb[mb_col];
+                        let above_left = aboveleft_mb;
+                        let left = left_mb;
 
-                    // The residual for an inter MB has Y2 unless this MB is
-                    // SPLITMV (§14.2 page 76 / §19.3 residual_data()).
-                    let has_y2 = !matches!(mode, InterMode::Split);
+                        // §16.3 census + §16.2 inter-mode tree.
+                        let near =
+                            find_near_mvs(&above, &left, &above_left, current_ref, frame_sign_bias);
+                        let probs = mv_ref_probs(&near.cnt);
+                        let mode = read_inter_mode(&mut dec, &probs)?;
+                        filter_inter_mode = Some(mode);
 
-                    // Read MVs + decode residual + reconstruct.
-                    let part_idx = mb_row % num_partitions;
-                    let dec_dct = partition_decoders[part_idx]
-                        .as_mut()
-                        .expect("partition decoder initialised above");
-                    let seg = segment_id.unwrap_or(0) as usize;
-                    let seg = seg.min(MAX_MB_SEGMENTS - 1);
-                    let factors = &dequant_factors[seg];
+                        // The residual for an inter MB has Y2 unless this MB is
+                        // SPLITMV (§14.2 page 76 / §19.3 residual_data()).
+                        let has_y2 = !matches!(mode, InterMode::Split);
 
-                    let reference_slot = self
-                        .slot_for_ref(current_ref)
-                        .ok_or(DecodeError::Unsupported(
-                        "VP8 interframe references a frame slot that has not been populated yet",
-                    ))?;
-                    let reference = reference_slot.as_reference_planes();
+                        // Read MVs + decode residual + reconstruct.
+                        let part_idx = mb_row % num_partitions;
+                        let dec_dct = partition_decoders[part_idx]
+                            .as_mut()
+                            .expect("partition decoder initialised above");
+                        let seg = segment_id.unwrap_or(0) as usize;
+                        let seg = seg.min(MAX_MB_SEGMENTS - 1);
+                        let factors = &dequant_factors[seg];
 
-                    // We need the bounds for clamping MVs. For NEWMV the
-                    // §17 differential is read *now*, so we resolve the
-                    // full vector here rather than via `decode_inter_mb`
-                    // (which reads probabilities + decodes MVs internally
-                    // — we've already read the probabilities; we'd
-                    // double-walk if we recursed in).
-                    let bounds = MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
-                    let resolved = resolve_inter_mb_mv_after_mode(
-                        &mut dec,
-                        mode,
-                        &near,
-                        &above,
-                        &left,
-                        &above_left,
-                        current_ref,
-                        frame_sign_bias,
-                        &bounds,
-                        &frame_mv_contexts,
-                    )?;
+                        let reference_slot = self
+                            .slot_for_ref(current_ref)
+                            .ok_or(DecodeError::Unsupported(
+                            "VP8 interframe references a frame slot that has not been populated yet",
+                        ))?;
+                        let reference = reference_slot.as_reference_planes();
 
-                    match resolved {
-                        ResolvedInterMode::Whole { mv, .. } => {
-                            // Decode + dequantize residual.
-                            let above_ctx = &mut above_entropy[mb_col];
-                            mb_coeffs = decode_and_dequantize_mb(
-                                dec_dct,
-                                has_y2,
+                        // We need the bounds for clamping MVs. For NEWMV the
+                        // §17 differential is read *now*, so we resolve the
+                        // full vector here rather than via `decode_inter_mb`
+                        // (which reads probabilities + decodes MVs internally
+                        // — we've already read the probabilities; we'd
+                        // double-walk if we recursed in).
+                        let bounds = MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+                        let resolved = resolve_inter_mb_mv_after_mode(
+                            &mut dec,
+                            mode,
+                            &near,
+                            &above,
+                            &left,
+                            &above_left,
+                            current_ref,
+                            frame_sign_bias,
+                            &bounds,
+                            &frame_mv_contexts,
+                        )?;
+
+                        match resolved {
+                            ResolvedInterMode::Whole { mv, .. } => {
+                                // Decode + dequantize residual.
+                                let above_ctx = &mut above_entropy[mb_col];
+                                mb_coeffs = decode_and_dequantize_mb(
+                                    dec_dct,
+                                    has_y2,
+                                    mb_skip_coeff,
+                                    &frame_coeff_probs,
+                                    factors,
+                                    above_ctx,
+                                    &mut left_entropy,
+                                )
+                                .map_err(|source| {
+                                    DecodeError::MbCoeffs {
+                                        index: raster,
+                                        source,
+                                    }
+                                })?;
+                                // §18 prediction + §14 residue.
+                                recon = reconstruct_inter_mb(
+                                    &reference,
+                                    mb_col,
+                                    mb_row,
+                                    mv,
+                                    full_pixel,
+                                    filters,
+                                    mb_skip_coeff,
+                                    &mb_coeffs.y2,
+                                    &mb_coeffs.y,
+                                    &mb_coeffs.u,
+                                    &mb_coeffs.v,
+                                );
+                                mode_record = MacroblockModes {
+                                    segment_id,
+                                    mb_skip_coeff,
+                                    // No intra modes for an inter MB — but the
+                                    // §15 loop filter only looks at y_mode to
+                                    // distinguish B_PRED from the rest. We map
+                                    // every whole-MB inter mode to DC_PRED for
+                                    // the filter's `skip` rule.
+                                    y_mode: IntraYMode::Dc,
+                                    subblock_modes: None,
+                                    uv_mode: crate::macroblock::IntraUvMode::Dc,
+                                };
+                                mb_info = MbInfo {
+                                    ref_frame: Some(current_ref),
+                                    mv,
+                                    is_split: false,
+                                    split_mvs: None,
+                                };
+                            }
+                            ResolvedInterMode::Split { best } => {
+                                // SPLITMV: read partition + per-sub-block
+                                // vectors, then reconstruct.
+                                let split: SplitMvResult = decode_split_mv(
+                                    &mut dec,
+                                    &above,
+                                    &left,
+                                    best,
+                                    &frame_mv_contexts,
+                                )?;
+
+                                let above_ctx = &mut above_entropy[mb_col];
+                                mb_coeffs = decode_and_dequantize_mb(
+                                    dec_dct,
+                                    false, // no Y2 for SPLITMV
+                                    mb_skip_coeff,
+                                    &frame_coeff_probs,
+                                    factors,
+                                    above_ctx,
+                                    &mut left_entropy,
+                                )
+                                .map_err(|source| {
+                                    DecodeError::MbCoeffs {
+                                        index: raster,
+                                        source,
+                                    }
+                                })?;
+                                recon = reconstruct_split_mv_mb(
+                                    &reference,
+                                    mb_col,
+                                    mb_row,
+                                    &split.split_mvs,
+                                    full_pixel,
+                                    filters,
+                                    mb_skip_coeff,
+                                    &mb_coeffs.y,
+                                    &mb_coeffs.u,
+                                    &mb_coeffs.v,
+                                );
+                                mode_record = MacroblockModes {
+                                    segment_id,
+                                    mb_skip_coeff,
+                                    // SPLITMV's §15 loop-filter rule mirrors
+                                    // B_PRED ("internal edges always filtered")
+                                    // — map y_mode to B for the filter
+                                    // geometry skip rule.
+                                    y_mode: IntraYMode::B,
+                                    subblock_modes: None,
+                                    uv_mode: crate::macroblock::IntraUvMode::Dc,
+                                };
+                                mb_info = MbInfo {
+                                    ref_frame: Some(current_ref),
+                                    mv: split.split_mvs[15],
+                                    is_split: true,
+                                    split_mvs: Some(split.split_mvs),
+                                };
+                            }
+                        }
+                    } else {
+                        // §16.1 intra-on-interframe macroblock.
+                        let modes = parse_inter_frame_intra_macroblock_modes(
+                            &mut dec,
+                            &frame_intra_probs,
+                            segment_id,
+                            mb_skip_coeff,
+                        )?;
+
+                        let part_idx = mb_row % num_partitions;
+                        let dec_dct = partition_decoders[part_idx]
+                            .as_mut()
+                            .expect("partition decoder initialised above");
+                        let seg = segment_id.unwrap_or(0) as usize;
+                        let seg = seg.min(MAX_MB_SEGMENTS - 1);
+                        let factors = &dequant_factors[seg];
+
+                        let has_y2 = modes.y_mode != IntraYMode::B;
+                        let above_ctx = &mut above_entropy[mb_col];
+                        mb_coeffs = decode_and_dequantize_mb(
+                            dec_dct,
+                            has_y2,
+                            mb_skip_coeff,
+                            &frame_coeff_probs,
+                            factors,
+                            above_ctx,
+                            &mut left_entropy,
+                        )
+                        .map_err(|source| DecodeError::MbCoeffs {
+                            index: raster,
+                            source,
+                        })?;
+
+                        // Intra reconstruction uses the in-frame neighbours
+                        // (already-written `planes`), reusing the keyframe
+                        // per-MB orchestrators.
+                        let neighbors =
+                            crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
+                        recon = if modes.y_mode == IntraYMode::B {
+                            crate::reconstruct::decode_keyframe_mb_bpred(
+                                modes.subblock_modes.as_ref(),
+                                modes.uv_mode,
                                 mb_skip_coeff,
-                                &frame_coeff_probs,
-                                factors,
-                                above_ctx,
-                                &mut left_entropy,
+                                &neighbors,
+                                &mb_coeffs.y,
+                                &mb_coeffs.u,
+                                &mb_coeffs.v,
                             )
-                            .map_err(|source| {
-                                DecodeError::MbCoeffs {
-                                    index: raster,
-                                    source,
-                                }
-                            })?;
-                            // §18 prediction + §14 residue.
-                            recon = reconstruct_inter_mb(
-                                &reference,
-                                mb_col,
-                                mb_row,
-                                mv,
-                                full_pixel,
-                                filters,
+                        } else {
+                            crate::reconstruct::decode_keyframe_mb_non_bpred(
+                                modes.y_mode,
+                                modes.uv_mode,
                                 mb_skip_coeff,
+                                &neighbors,
                                 &mb_coeffs.y2,
                                 &mb_coeffs.y,
                                 &mb_coeffs.u,
                                 &mb_coeffs.v,
-                            );
-                            mode_record = MacroblockModes {
-                                segment_id,
-                                mb_skip_coeff,
-                                // No intra modes for an inter MB — but the
-                                // §15 loop filter only looks at y_mode to
-                                // distinguish B_PRED from the rest. We map
-                                // every whole-MB inter mode to DC_PRED for
-                                // the filter's `skip` rule.
-                                y_mode: IntraYMode::Dc,
-                                subblock_modes: None,
-                                uv_mode: crate::macroblock::IntraUvMode::Dc,
-                            };
-                            mb_info = MbInfo {
-                                ref_frame: Some(current_ref),
-                                mv,
-                                is_split: false,
-                                split_mvs: None,
-                            };
-                        }
-                        ResolvedInterMode::Split { best } => {
-                            // SPLITMV: read partition + per-sub-block
-                            // vectors, then reconstruct.
-                            let split: SplitMvResult =
-                                decode_split_mv(&mut dec, &above, &left, best, &frame_mv_contexts)?;
-
-                            let above_ctx = &mut above_entropy[mb_col];
-                            mb_coeffs = decode_and_dequantize_mb(
-                                dec_dct,
-                                false, // no Y2 for SPLITMV
-                                mb_skip_coeff,
-                                &frame_coeff_probs,
-                                factors,
-                                above_ctx,
-                                &mut left_entropy,
                             )
-                            .map_err(|source| {
-                                DecodeError::MbCoeffs {
-                                    index: raster,
-                                    source,
-                                }
-                            })?;
-                            recon = reconstruct_split_mv_mb(
-                                &reference,
-                                mb_col,
-                                mb_row,
-                                &split.split_mvs,
-                                full_pixel,
-                                filters,
-                                mb_skip_coeff,
-                                &mb_coeffs.y,
-                                &mb_coeffs.u,
-                                &mb_coeffs.v,
-                            );
-                            mode_record = MacroblockModes {
-                                segment_id,
-                                mb_skip_coeff,
-                                // SPLITMV's §15 loop-filter rule mirrors
-                                // B_PRED ("internal edges always filtered")
-                                // — map y_mode to B for the filter
-                                // geometry skip rule.
-                                y_mode: IntraYMode::B,
-                                subblock_modes: None,
-                                uv_mode: crate::macroblock::IntraUvMode::Dc,
-                            };
-                            mb_info = MbInfo {
-                                ref_frame: Some(current_ref),
-                                mv: split.split_mvs[15],
-                                is_split: true,
-                                split_mvs: Some(split.split_mvs),
-                            };
                         }
+                        .map_err(|source| {
+                            DecodeError::Frame(FrameError::Macroblock {
+                                index: raster,
+                                source,
+                            })
+                        })?;
+
+                        mode_record = modes;
+                        mb_info = MbInfo {
+                            ref_frame: None,
+                            mv: Mv::default(),
+                            is_split: false,
+                            split_mvs: None,
+                        };
                     }
-                } else {
-                    // §16.1 intra-on-interframe macroblock.
-                    let modes = parse_inter_frame_intra_macroblock_modes(
-                        &mut dec,
-                        &frame_intra_probs,
-                        segment_id,
-                        mb_skip_coeff,
-                    )?;
 
-                    let part_idx = mb_row % num_partitions;
-                    let dec_dct = partition_decoders[part_idx]
-                        .as_mut()
-                        .expect("partition decoder initialised above");
-                    let seg = segment_id.unwrap_or(0) as usize;
-                    let seg = seg.min(MAX_MB_SEGMENTS - 1);
-                    let factors = &dequant_factors[seg];
+                    // Write the reconstructed MB into the frame buffers.
+                    crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
 
-                    let has_y2 = modes.y_mode != IntraYMode::B;
-                    let above_ctx = &mut above_entropy[mb_col];
-                    mb_coeffs = decode_and_dequantize_mb(
-                        dec_dct,
-                        has_y2,
-                        mb_skip_coeff,
-                        &frame_coeff_probs,
-                        factors,
-                        above_ctx,
-                        &mut left_entropy,
-                    )
-                    .map_err(|source| DecodeError::MbCoeffs {
-                        index: raster,
-                        source,
-                    })?;
+                    debug_assert_eq!(
+                        modes_out.len(),
+                        raster,
+                        "per-MB outputs pushed in raster order"
+                    );
+                    modes_out.push(mode_record);
+                    has_coeffs_out.push(crate::loop_filter::mb_has_coeffs(&mb_coeffs));
+                    ref_frames_out.push(filter_ref_frame);
+                    inter_modes_out.push(filter_inter_mode);
 
-                    // Intra reconstruction uses the in-frame neighbours
-                    // (already-written `planes`), reusing the keyframe
-                    // per-MB orchestrators.
-                    let neighbors = crate::frame::gather_neighbors_public(&planes, mb_row, mb_col);
-                    recon = if modes.y_mode == IntraYMode::B {
-                        crate::reconstruct::decode_keyframe_mb_bpred(
-                            modes.subblock_modes.as_ref(),
-                            modes.uv_mode,
-                            mb_skip_coeff,
-                            &neighbors,
-                            &mb_coeffs.y,
-                            &mb_coeffs.u,
-                            &mb_coeffs.v,
-                        )
-                    } else {
-                        crate::reconstruct::decode_keyframe_mb_non_bpred(
-                            modes.y_mode,
-                            modes.uv_mode,
-                            mb_skip_coeff,
-                            &neighbors,
-                            &mb_coeffs.y2,
-                            &mb_coeffs.y,
-                            &mb_coeffs.u,
-                            &mb_coeffs.v,
-                        )
-                    }
-                    .map_err(|source| {
-                        DecodeError::Frame(FrameError::Macroblock {
-                            index: raster,
-                            source,
-                        })
-                    })?;
-
-                    mode_record = modes;
-                    mb_info = MbInfo {
-                        ref_frame: None,
-                        mv: Mv::default(),
-                        is_split: false,
-                        split_mvs: None,
-                    };
+                    // Advance neighbour records.
+                    aboveleft_mb = above_mb[mb_col];
+                    left_mb = mb_info;
+                    above_mb[mb_col] = mb_info;
                 }
-
-                // Write the reconstructed MB into the frame buffers.
-                crate::frame::write_mb_public(&mut planes, mb_row, mb_col, &recon);
-
-                debug_assert_eq!(
-                    modes_out.len(),
-                    raster,
-                    "per-MB outputs pushed in raster order"
-                );
-                modes_out.push(mode_record);
-                has_coeffs_out.push(crate::loop_filter::mb_has_coeffs(&mb_coeffs));
-                ref_frames_out.push(filter_ref_frame);
-                inter_modes_out.push(filter_inter_mode);
-
-                // Advance neighbour records.
-                aboveleft_mb = above_mb[mb_col];
-                left_mb = mb_info;
-                above_mb[mb_col] = mb_info;
             }
-        }
+            (
+                planes,
+                modes_out,
+                has_coeffs_out,
+                ref_frames_out,
+                inter_modes_out,
+            )
+        };
 
         // ---- §15 loop filter ---------------------------------------------
         // Build the interframe filter config from the header + carried
@@ -1102,13 +1164,14 @@ impl Vp8DecoderState {
         self.ref_lf_deltas = lf_config.ref_deltas();
         self.mode_lf_deltas = lf_config.mode_deltas();
         if lf_config.loop_filter_level != 0 {
-            crate::loop_filter::filter_inter_frame_flags(
+            crate::loop_filter::filter_inter_frame_flags_threaded(
                 &mut planes,
                 &modes_out,
                 &has_coeffs_out,
                 &ref_frames_out,
                 &inter_modes_out,
                 &lf_config,
+                self.threads,
             );
         }
 
@@ -1164,6 +1227,212 @@ impl Vp8DecoderState {
         self.altref = new_altref;
 
         Ok(output)
+    }
+
+    /// The macroblock layer of an interframe on the thread budget: the
+    /// §19.3 mode layer is parsed here, on the calling thread (it is one
+    /// arithmetic-coded stream and does not depend on the residuals);
+    /// token decoding and reconstruction then run as row units (see
+    /// `rows.rs`). Returns what the serial walk produces: the unfiltered
+    /// planes and the per-macroblock records the loop filter reads.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn decode_inter_rows_threaded(
+        &self,
+        header: &Vp8FrameHeader,
+        coded: &Vp8CodedHeader,
+        dec: &mut BoolDecoder<'_>,
+        partitions: &[&[u8]],
+        dequant_factors: &[MbDequantFactors; MAX_MB_SEGMENTS],
+        frame_coeff_probs: &CoeffProbs,
+        frame_intra_probs: &InterFrameIntraProbs,
+        frame_mv_contexts: &MvContexts,
+        frame_sign_bias: SignBias,
+    ) -> Result<
+        (
+            KeyframePlanes,
+            Vec<MacroblockModes>,
+            Vec<bool>,
+            Vec<Option<RefFrame>>,
+            Vec<Option<InterMode>>,
+        ),
+        DecodeError,
+    > {
+        let last_slot = self.last.as_ref().expect("the caller checked LAST");
+        let (mb_cols, mb_rows) = (last_slot.mb_cols, last_slot.mb_rows);
+        let n = mb_rows * mb_cols;
+
+        // The populated reference slots, and each frame's index among
+        // them.
+        let mut references: Vec<ReferencePlanes<'_>> = Vec::with_capacity(3);
+        let mut reference_index = [None; 3];
+        for (slot, r) in [RefFrame::Last, RefFrame::Golden, RefFrame::AltRef]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(planes) = self.slot_for_ref(r) {
+                reference_index[slot] = Some(references.len());
+                references.push(planes.as_reference_planes());
+            }
+        }
+        let index_of = |r: RefFrame| -> Result<usize, DecodeError> {
+            let slot = match r {
+                RefFrame::Last => 0,
+                RefFrame::Golden => 1,
+                RefFrame::AltRef => 2,
+            };
+            reference_index[slot].ok_or(DecodeError::Unsupported(
+                "VP8 interframe references a frame slot that has not been populated yet",
+            ))
+        };
+
+        // Frame-header gates for the per-MB prefix (§19.3
+        // `macroblock_header()`), as in the serial walk.
+        let segmentation = coded
+            .update_segmentation
+            .as_ref()
+            .filter(|seg| coded.segmentation_enabled && seg.update_mb_segmentation_map);
+        let segment_probs: [u8; 3] = match segmentation {
+            Some(seg) => core::array::from_fn(|i| seg.segment_prob[i].unwrap_or(255)),
+            None => [255; 3],
+        };
+        let skip_active = coded.mb_no_skip_coeff;
+        let skip_prob = coded.prob_skip_false.unwrap_or(0);
+        let prob_intra = coded.prob_intra.unwrap_or(0);
+        let prob_last = coded.prob_last.unwrap_or(0);
+        let prob_gf = coded.prob_gf.unwrap_or(0);
+
+        let mut modes_out: Vec<MacroblockModes> = Vec::with_capacity(n);
+        let mut predictions: Vec<rows::Prediction> = Vec::with_capacity(n);
+        let mut ref_frames_out: Vec<Option<RefFrame>> = Vec::with_capacity(n);
+        let mut inter_modes_out: Vec<Option<InterMode>> = Vec::with_capacity(n);
+        let mut above_mb: Vec<MbInfo> = vec![MbInfo::border(); mb_cols];
+        for mb_row in 0..mb_rows {
+            let mut left_mb = MbInfo::border();
+            let mut aboveleft_mb = MbInfo::border();
+            for (mb_col, above_slot) in above_mb.iter_mut().enumerate() {
+                // segment_id → mb_skip_coeff → is_inter_mb.
+                let segment_id = if segmentation.is_some() {
+                    Some(read_segment_id(dec, &segment_probs)?)
+                } else {
+                    None
+                };
+                let mb_skip_coeff = if skip_active {
+                    dec.read_bool(skip_prob)?
+                } else {
+                    false
+                };
+                let is_inter_mb = dec.read_bool(prob_intra)?;
+                let mb_info = if is_inter_mb {
+                    let current_ref = select_ref_frame(dec, prob_last, prob_gf)?;
+                    let (above, left, above_left) = (*above_slot, left_mb, aboveleft_mb);
+                    let near =
+                        find_near_mvs(&above, &left, &above_left, current_ref, frame_sign_bias);
+                    let probs = mv_ref_probs(&near.cnt);
+                    let mode = read_inter_mode(dec, &probs)?;
+                    let reference = index_of(current_ref)?;
+                    let bounds = MvClampRect::for_mb(mb_col, mb_row, mb_cols, mb_rows);
+                    let resolved = resolve_inter_mb_mv_after_mode(
+                        dec,
+                        mode,
+                        &near,
+                        &above,
+                        &left,
+                        &above_left,
+                        current_ref,
+                        frame_sign_bias,
+                        &bounds,
+                        frame_mv_contexts,
+                    )?;
+                    ref_frames_out.push(Some(current_ref));
+                    inter_modes_out.push(Some(mode));
+                    match resolved {
+                        ResolvedInterMode::Whole { mv, .. } => {
+                            // A whole-block inter macroblock filters like
+                            // `DC_PRED` (see the serial walk).
+                            modes_out.push(MacroblockModes {
+                                segment_id,
+                                mb_skip_coeff,
+                                y_mode: IntraYMode::Dc,
+                                subblock_modes: None,
+                                uv_mode: crate::macroblock::IntraUvMode::Dc,
+                            });
+                            predictions.push(rows::Prediction::Whole { reference, mv });
+                            MbInfo {
+                                ref_frame: Some(current_ref),
+                                mv,
+                                is_split: false,
+                                split_mvs: None,
+                            }
+                        }
+                        ResolvedInterMode::Split { best } => {
+                            let split: SplitMvResult =
+                                decode_split_mv(dec, &above, &left, best, frame_mv_contexts)?;
+                            // `SPLITMV` filters like `B_PRED`.
+                            modes_out.push(MacroblockModes {
+                                segment_id,
+                                mb_skip_coeff,
+                                y_mode: IntraYMode::B,
+                                subblock_modes: None,
+                                uv_mode: crate::macroblock::IntraUvMode::Dc,
+                            });
+                            predictions.push(rows::Prediction::Split {
+                                reference,
+                                mvs: split.split_mvs,
+                            });
+                            MbInfo {
+                                ref_frame: Some(current_ref),
+                                mv: split.split_mvs[15],
+                                is_split: true,
+                                split_mvs: Some(split.split_mvs),
+                            }
+                        }
+                    }
+                } else {
+                    let modes = parse_inter_frame_intra_macroblock_modes(
+                        dec,
+                        frame_intra_probs,
+                        segment_id,
+                        mb_skip_coeff,
+                    )?;
+                    modes_out.push(modes);
+                    predictions.push(rows::Prediction::Intra);
+                    ref_frames_out.push(None);
+                    inter_modes_out.push(None);
+                    MbInfo {
+                        ref_frame: None,
+                        mv: Mv::default(),
+                        is_split: false,
+                        split_mvs: None,
+                    }
+                };
+                aboveleft_mb = *above_slot;
+                left_mb = mb_info;
+                *above_slot = mb_info;
+            }
+        }
+
+        let (planes, has_coeffs) = rows::decode_rows(
+            &rows::RowDecode {
+                mb_cols,
+                mb_rows,
+                modes: &modes_out,
+                predictions: &predictions,
+                references: &references,
+                partitions,
+                coeff_probs: frame_coeff_probs,
+                dequant_factors,
+                full_pixel: matches!(header.version, 3),
+                filters: filter_set_for_version(header.version).taps(),
+            },
+            self.threads,
+        )?;
+        Ok((
+            planes,
+            modes_out,
+            has_coeffs,
+            ref_frames_out,
+            inter_modes_out,
+        ))
     }
 
     /// Return the reference-frame slot indexed by `r`. `None` if that slot

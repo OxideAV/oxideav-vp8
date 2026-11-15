@@ -924,6 +924,13 @@ mod registry {
             Ok(())
         }
 
+        /// Take the thread budget for each frame's decode from the
+        /// framework (serial unless one is announced). The pictures do
+        /// not depend on it.
+        fn set_execution_context(&mut self, ctx: &oxideav_core::ExecutionContext) {
+            self.state.set_threads(ctx.threads);
+        }
+
         fn receive_frame(&mut self) -> Result<Frame> {
             if let Some(vf) = self.held.take() {
                 return Ok(Frame::Video(vf));
@@ -972,7 +979,10 @@ mod registry {
             self.held = None;
             self.eof = false;
             let cap = self.state.max_pixels_per_frame();
-            self.state = crate::state::Vp8DecoderState::new().with_max_pixels_per_frame(cap);
+            let threads = self.state.threads();
+            self.state = crate::state::Vp8DecoderState::new()
+                .with_max_pixels_per_frame(cap)
+                .with_threads(threads);
             // `shape` / `generation` are kept: the next picture is
             // compared against the last one returned before the reset.
             Ok(())

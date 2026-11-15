@@ -467,87 +467,137 @@ fn sixtap_vert(
     }
 }
 
-/// One §20.14 filter pass over a run of `N` adjacent output samples:
-/// `out[i] = interp(taps, [src[i], src[i + step], …, src[i + 5·step]])`,
-/// i.e. `clamp255((Σ taps[k]·src[i + k·step] + 64) >> 7)`.
+/// How one §18.3 tap row is evaluated over whole sample runs.
 ///
-/// `step = 1` is a horizontal pass over one row (`src` starts two
-/// samples left of output sample 0); `step = stride` is a vertical pass
-/// over one output row (`src` starts two rows above it).
-///
-/// The run is evaluated tap by tap over fixed-size arrays so the
-/// compiler can keep all `N` sums in vector registers. For tap rows with
-/// the §18.3 sign pattern (outer and centre taps ≥ 0, taps 1 and 4 ≤ 0)
-/// whose positive part cannot overflow 16 bits, the positive and negative
-/// parts are accumulated separately in `u16`: with `P` the positive part
-/// plus the rounding 64 and `M` the negative part's magnitude, the
-/// reference value is `clamp255((P − M) >> 7)`, which is `0` when
-/// `P < M` and `min(255, (P − M) >> 7)` otherwise — exactly
-/// `min(255, P.saturating_sub(M) >> 7)`. Any other tap row takes the
-/// plain `i32` sums. Both forms equal [`interp`] sample for sample
-/// (`sixtap_run_matches_interp`).
+/// With `P` the sum of the non-negative taps' products plus the rounding
+/// 64 and `M` the magnitude of the negative taps' products, the §20.14
+/// output sample is `clamp255((P − M) >> 7)`: `0` when `P < M`, else
+/// `min(255, (P − M) >> 7)` — exactly `min(255, P.saturating_sub(M) >> 7)`.
+/// Tap rows with the §18.3 sign pattern (taps 0, 2, 3, 5 ≥ 0, taps 1 and
+/// 4 ≤ 0) whose `P` and `M` cannot overflow 16 bits are evaluated that
+/// way in `u16` (twice the lanes per vector of the plain `i32` sum); any
+/// other row takes the `i32` sum. The plan is resolved once per block so
+/// the per-run loops carry no decisions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TapPlan {
+    /// Sign-split `u16` form with taps 0 and 5 zero (the even
+    /// eighth-pixel positions and the bilinear set): tap magnitudes.
+    Inner([u16; 6]),
+    /// Sign-split `u16` form with all six taps: tap magnitudes.
+    Full([u16; 6]),
+    /// Plain `i32` sums.
+    Wide([i32; 6]),
+}
+
+impl TapPlan {
+    pub(crate) fn new(taps: &[i32; 6]) -> Self {
+        let split_signs = taps[0] >= 0
+            && taps[2] >= 0
+            && taps[3] >= 0
+            && taps[5] >= 0
+            && taps[1] <= 0
+            && taps[4] <= 0
+            && (taps[0] + taps[2] + taps[3] + taps[5]) * 255 + 64 <= u16::MAX as i32
+            && -(taps[1] + taps[4]) * 255 <= u16::MAX as i32;
+        if !split_signs {
+            return TapPlan::Wide(*taps);
+        }
+        let magnitudes = taps.map(|t| t.unsigned_abs() as u16);
+        if taps[0] == 0 && taps[5] == 0 {
+            TapPlan::Inner(magnitudes)
+        } else {
+            TapPlan::Full(magnitudes)
+        }
+    }
+
+    /// One filter pass over a run of `N` adjacent output samples:
+    /// `out[i] = interp(taps, [src[i], src[i + step], …, src[i + 5·step]])`.
+    /// `step = 1` is a horizontal pass over one row (`src` starts two
+    /// samples left of output sample 0); `step = stride` is a vertical
+    /// pass over one output row (`src` starts two rows above it).
+    #[inline(always)]
+    pub(crate) fn run<const N: usize>(&self, src: &[u8], step: usize) -> [u8; N] {
+        match self {
+            TapPlan::Inner(m) => run_split::<N, false>(src, step, m),
+            TapPlan::Full(m) => run_split::<N, true>(src, step, m),
+            TapPlan::Wide(taps) => run_wide::<N>(src, step, taps),
+        }
+    }
+}
+
+/// The run of `N` samples `step·k` past the start of `src`.
 #[inline(always)]
-pub(crate) fn sixtap_run<const N: usize>(src: &[u8], step: usize, taps: &[i32; 6]) -> [u8; N] {
+fn tap_run<const N: usize>(src: &[u8], step: usize, k: usize) -> &[u8; N] {
+    src[k * step..k * step + N]
+        .try_into()
+        .expect("run of N samples")
+}
+
+/// [`TapPlan::run`] in the sign-split `u16` form; `OUTER` includes taps
+/// 0 and 5.
+#[inline(always)]
+fn run_split<const N: usize, const OUTER: bool>(src: &[u8], step: usize, m: &[u16; 6]) -> [u8; N] {
+    let (s1, s2, s3, s4) = (
+        tap_run::<N>(src, step, 1),
+        tap_run::<N>(src, step, 2),
+        tap_run::<N>(src, step, 3),
+        tap_run::<N>(src, step, 4),
+    );
     let mut out = [0u8; N];
-    let split_signs = taps[0] >= 0
-        && taps[2] >= 0
-        && taps[3] >= 0
-        && taps[5] >= 0
-        && taps[1] <= 0
-        && taps[4] <= 0
-        && (taps[0] + taps[2] + taps[3] + taps[5]) * 255 + 64 <= u16::MAX as i32
-        && -(taps[1] + taps[4]) * 255 <= u16::MAX as i32;
-    if split_signs {
-        let mut plus = [64u16; N];
-        let mut minus = [0u16; N];
-        for k in [0usize, 2, 3, 5] {
-            let tap = taps[k] as u16;
-            if tap != 0 {
-                let run: &[u8; N] = src[k * step..k * step + N]
-                    .try_into()
-                    .expect("run of N samples");
-                for i in 0..N {
-                    plus[i] += run[i] as u16 * tap;
-                }
-            }
-        }
-        for k in [1usize, 4] {
-            let tap = (-taps[k]) as u16;
-            if tap != 0 {
-                let run: &[u8; N] = src[k * step..k * step + N]
-                    .try_into()
-                    .expect("run of N samples");
-                for i in 0..N {
-                    minus[i] += run[i] as u16 * tap;
-                }
-            }
-        }
+    if OUTER {
+        let (s0, s5) = (tap_run::<N>(src, step, 0), tap_run::<N>(src, step, 5));
         for i in 0..N {
-            out[i] = (plus[i].saturating_sub(minus[i]) >> 7).min(255) as u8;
+            let plus = 64
+                + s0[i] as u16 * m[0]
+                + s2[i] as u16 * m[2]
+                + s3[i] as u16 * m[3]
+                + s5[i] as u16 * m[5];
+            let minus = s1[i] as u16 * m[1] + s4[i] as u16 * m[4];
+            out[i] = (plus.saturating_sub(minus) >> 7).min(255) as u8;
         }
     } else {
-        let mut acc = [64i32; N];
-        for (k, &tap) in taps.iter().enumerate() {
-            let run: &[u8; N] = src[k * step..k * step + N]
-                .try_into()
-                .expect("run of N samples");
-            for i in 0..N {
-                acc[i] += run[i] as i32 * tap;
-            }
-        }
         for i in 0..N {
-            out[i] = clamp255(acc[i] >> 7);
+            let plus = 64 + s2[i] as u16 * m[2] + s3[i] as u16 * m[3];
+            let minus = s1[i] as u16 * m[1] + s4[i] as u16 * m[4];
+            out[i] = (plus.saturating_sub(minus) >> 7).min(255) as u8;
         }
     }
     out
 }
 
+/// [`TapPlan::run`] as plain `i32` sums.
+#[inline(always)]
+fn run_wide<const N: usize>(src: &[u8], step: usize, taps: &[i32; 6]) -> [u8; N] {
+    let mut acc = [0i32; N];
+    for (k, &tap) in taps.iter().enumerate() {
+        let run = tap_run::<N>(src, step, k);
+        for i in 0..N {
+            acc[i] += run[i] as i32 * tap;
+        }
+    }
+    let mut out = [0u8; N];
+    for i in 0..N {
+        out[i] = clamp255((acc[i] + 64) >> 7);
+    }
+    out
+}
+
+/// One §20.14 filter pass over a run of `N` adjacent output samples —
+/// [`TapPlan::run`] for a caller that filters a single run. Equals
+/// [`interp`] sample for sample (`sixtap_run_matches_interp`).
+#[cfg(test)]
+fn sixtap_run<const N: usize>(src: &[u8], step: usize, taps: &[i32; 6]) -> [u8; N] {
+    TapPlan::new(taps).run::<N>(src, step)
+}
+
 /// The two-pass §20.14 convolution of one `OW×OW` block from its
-/// `(OW+5)×(OW+5)` halo, each pass as [`sixtap_run`]s — the stable-build
-/// kernel behind [`sixtap_2d`] / [`sixtap_mb_luma`] /
-/// [`sixtap_mb_chroma`] when neither pass is the identity. Byte-exact
-/// with the reference listings (`sixtap_2d_scalar` and its macroblock
-/// forms), which the dispatcher stress tests compare it against.
+/// `(OW+5)×(OW+5)` halo, each pass as whole-row runs ([`TapPlan`]) — the
+/// stable-build kernel behind [`sixtap_mb_luma`] when neither pass is
+/// the identity (measured: about half the instructions of the reference
+/// listing at 16 samples per run, but more at 8 and 4, so the chroma and
+/// sub-block forms keep the listing for their two-pass case). Byte-exact
+/// with the reference listing (`sixtap_mb_luma_scalar`), which the
+/// dispatcher stress tests compare it against.
 #[cfg_attr(feature = "simd", allow(dead_code))] // simd builds use the portable-simd kernels.
 #[inline]
 fn sixtap_block_runs<const HW: usize, const OW: usize, const HN: usize, const ON: usize>(
@@ -562,16 +612,48 @@ fn sixtap_block_runs<const HW: usize, const OW: usize, const HN: usize, const ON
     // Horizontal pass: HW rows of OW samples (the block rows plus the
     // two above / three below the vertical pass reads), 8-bit, stride OW.
     let mut temp = [[0u8; OW]; HW];
-    for (r, row) in temp.iter_mut().enumerate() {
-        *row = sixtap_run::<OW>(&halo[r * HW..], 1, &filters[mx]);
+    filter_rows(&mut temp, &TapPlan::new(&filters[mx]), halo, HW, 1);
+    let mut out = [[0u8; OW]; OW];
+    filter_rows(
+        &mut out,
+        &TapPlan::new(&filters[my]),
+        temp.as_flattened(),
+        OW,
+        OW,
+    );
+    let mut flat = [0u8; ON];
+    flat.copy_from_slice(out.as_flattened());
+    flat
+}
+
+/// Fill `rows` with one filter pass: row `r` is the run starting at
+/// `src[r · stride]`, taps `step` apart. The plan is matched once, so
+/// each arm is a plain loop of runs.
+#[inline(always)]
+fn filter_rows<const N: usize>(
+    rows: &mut [[u8; N]],
+    plan: &TapPlan,
+    src: &[u8],
+    stride: usize,
+    step: usize,
+) {
+    match plan {
+        TapPlan::Inner(m) => {
+            for (r, row) in rows.iter_mut().enumerate() {
+                *row = run_split::<N, false>(&src[r * stride..], step, m);
+            }
+        }
+        TapPlan::Full(m) => {
+            for (r, row) in rows.iter_mut().enumerate() {
+                *row = run_split::<N, true>(&src[r * stride..], step, m);
+            }
+        }
+        TapPlan::Wide(taps) => {
+            for (r, row) in rows.iter_mut().enumerate() {
+                *row = run_wide::<N>(&src[r * stride..], step, taps);
+            }
+        }
     }
-    let temp = temp.as_flattened();
-    let mut out = [0u8; ON];
-    for r in 0..OW {
-        let row = sixtap_run::<OW>(&temp[r * OW..], OW, &filters[my]);
-        out[r * OW..r * OW + OW].copy_from_slice(&row);
-    }
-    out
 }
 
 /// Two-dimensional six-tap interpolation of a 4×4 sub-block — RFC 6386
@@ -603,7 +685,7 @@ pub fn sixtap_2d(halo: &[u8; 81], mx: usize, my: usize, filters: &[[i32; 6]; 8])
     #[cfg(not(feature = "simd"))]
     {
         sixtap_identity_elide::<9, 4, 81, 16>(halo, mx, my, filters)
-            .unwrap_or_else(|| sixtap_block_runs::<9, 4, 81, 16>(halo, mx, my, filters))
+            .unwrap_or_else(|| sixtap_2d_scalar(halo, mx, my, filters))
     }
 }
 
@@ -904,18 +986,22 @@ fn sixtap_identity_elide<const HW: usize, const OW: usize, const HN: usize, cons
         // equals the halo samples, so run the vertical §18.3 dot
         // product directly over the halo at block-origin column 2
         // (output row r, tap k reads halo row r + k — the same rows the
-        // intermediate would hold), one [`sixtap_run`] per output row.
-        for r in 0..OW {
-            let row = sixtap_run::<OW>(&halo[r * HW + 2..], HW, &filters[my]);
-            out[r * OW..r * OW + OW].copy_from_slice(&row);
-        }
+        // intermediate would hold), one run per output row.
+        let mut rows = [[0u8; OW]; OW];
+        filter_rows(&mut rows, &TapPlan::new(&filters[my]), &halo[2..], HW, HW);
+        out.copy_from_slice(rows.as_flattened());
     } else {
         // Vertical pass is the identity: the output rows are the
         // horizontal §18.3 dot product over halo rows 2..2+OW.
-        for r in 0..OW {
-            let row = sixtap_run::<OW>(&halo[(r + 2) * HW..], 1, &filters[mx]);
-            out[r * OW..r * OW + OW].copy_from_slice(&row);
-        }
+        let mut rows = [[0u8; OW]; OW];
+        filter_rows(
+            &mut rows,
+            &TapPlan::new(&filters[mx]),
+            &halo[2 * HW..],
+            HW,
+            1,
+        );
+        out.copy_from_slice(rows.as_flattened());
     }
     Some(out)
 }
@@ -1142,7 +1228,7 @@ pub fn sixtap_mb_chroma(
     #[cfg(not(feature = "simd"))]
     {
         sixtap_identity_elide::<13, 8, { 13 * 13 }, 64>(halo, mx, my, filters)
-            .unwrap_or_else(|| sixtap_block_runs::<13, 8, { 13 * 13 }, 64>(halo, mx, my, filters))
+            .unwrap_or_else(|| sixtap_mb_chroma_scalar(halo, mx, my, filters))
     }
 }
 

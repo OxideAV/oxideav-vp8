@@ -32,15 +32,16 @@
 //! depend on the number of threads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use super::effort::{BmodeContext, EncodeEffort, analyze_mb_model};
 use super::{
-    BoolEncoder, EncodeError, I420Frame, IntraBmode, IntraYMode, MacroblockModes, MbCoeffs,
-    MbEntropyCtx, MbRdCtx, RecordedBools, analyze_mb_exhaustive, clear_skip_ctx, encode_mb_tokens,
+    BMODE_CANDIDATES, BoolEncoder, EncodeError, I420Frame, IntraBmode, IntraYMode, MacroblockModes,
+    MbCoeffs, MbEntropyCtx, MbRdCtx, RecordedBools, analyze_mb_exhaustive, clear_skip_ctx,
+    encode_mb_tokens,
 };
+use crate::backoff::{SharedEntropy, SharedPixelLine};
 use crate::frame::KeyframePlanes;
-use crate::intra_predict::DEFAULT_LEFT_PIXEL;
 use crate::reconstruct::{MbNeighbors, ReconstructedMb};
 
 /// Frame-constant inputs of the per-macroblock search.
@@ -80,14 +81,33 @@ impl AnalysedFrame {
 /// the §11.3 sub-block-mode context its bottom sub-block row presents to
 /// the row below (four entries per macroblock).
 struct RowBottom {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
-    bmodes: Vec<IntraBmode>,
+    pixels: SharedPixelLine,
+    /// The four bottom sub-block modes of each macroblock, as positions
+    /// in [`BMODE_CANDIDATES`], four bits each.
+    bmodes: Vec<AtomicU16>,
     /// §13.3 "above" non-zero context each macroblock leaves for the one
     /// below it (per column, frame-lived: a skipped `B_PRED` macroblock
     /// passes the inherited Y2 slot through).
-    entropy: Vec<MbEntropyCtx>,
+    entropy: SharedEntropy,
+}
+
+impl RowBottom {
+    fn store_bmodes(&self, mb_col: usize, modes: &[IntraBmode; 4]) {
+        let mut bits = 0u16;
+        for (n, mode) in modes.iter().enumerate() {
+            let position = BMODE_CANDIDATES
+                .iter()
+                .position(|candidate| candidate == mode)
+                .expect("every sub-block mode is a candidate");
+            bits |= (position as u16) << (4 * n);
+        }
+        self.bmodes[mb_col].store(bits, Ordering::Relaxed);
+    }
+
+    fn load_bmodes(&self, mb_col: usize) -> [IntraBmode; 4] {
+        let bits = self.bmodes[mb_col].load(Ordering::Relaxed);
+        core::array::from_fn(|n| BMODE_CANDIDATES[(bits >> (4 * n) & 15) as usize])
+    }
 }
 
 /// One row's decisions, handed from the analysis to the token pass.
@@ -101,8 +121,10 @@ struct RowOutput {
 
 /// What a row shares with other workers.
 struct RowShared {
-    /// Bottom pixel line, valid for macroblock columns `< done`.
-    bottom: Mutex<RowBottom>,
+    /// Bottom pixel line and contexts, valid for macroblock columns
+    /// `< done`; lock-free, as both rows touch it once per macroblock
+    /// (see `backoff.rs`).
+    bottom: RowBottom,
     /// Number of macroblocks of this row whose bottom line is published.
     done: AtomicUsize,
     /// The row's decisions, set once the whole row is analysed.
@@ -152,13 +174,11 @@ pub(super) fn analyse_and_tokenize(
     let (mb_cols, mb_rows) = (search.mb_cols, search.mb_rows);
     let shared: Vec<RowShared> = (0..mb_rows)
         .map(|_| RowShared {
-            bottom: Mutex::new(RowBottom {
-                y: vec![0u8; mb_cols * 16],
-                u: vec![0u8; mb_cols * 8],
-                v: vec![0u8; mb_cols * 8],
-                bmodes: vec![IntraBmode::Dc; mb_cols * 4],
-                entropy: vec![MbEntropyCtx::default(); mb_cols],
-            }),
+            bottom: RowBottom {
+                pixels: SharedPixelLine::new(mb_cols),
+                bmodes: (0..mb_cols).map(|_| AtomicU16::new(0)).collect(),
+                entropy: SharedEntropy::new(mb_cols),
+            },
             done: AtomicUsize::new(0),
             output: Mutex::new(None),
         })
@@ -296,49 +316,17 @@ fn analyse_row(
         if let Some(above) = above_row {
             // The above-right macroblock must be reconstructed too.
             let need = (mb_col + 2).min(mb_cols);
-            let mut spins = 0u32;
+            let mut backoff = crate::backoff::Backoff::new();
             while above.done.load(Ordering::Acquire) < need {
                 if abort.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                spins += 1;
-                if spins < 64 {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
+                backoff.pause();
             }
-            let bottom = lock(&above.bottom);
-            let (yx, cx) = (mb_col * 16, mb_col * 8);
-            let mut y_above = [0u8; 16];
-            y_above.copy_from_slice(&bottom.y[yx..yx + 16]);
-            neighbors.y_above = Some(y_above);
-            let mut u_above = [0u8; 8];
-            u_above.copy_from_slice(&bottom.u[cx..cx + 8]);
-            neighbors.u_above = Some(u_above);
-            let mut v_above = [0u8; 8];
-            v_above.copy_from_slice(&bottom.v[cx..cx + 8]);
-            neighbors.v_above = Some(v_above);
-            // §12.3: the rightmost macroblock repeats its own (-1, 15).
-            let mut above_right = [bottom.y[yx + 15]; 4];
-            if mb_col + 1 < mb_cols {
-                above_right.copy_from_slice(&bottom.y[yx + 16..yx + 20]);
-            }
-            neighbors.y_above_right = Some(above_right);
-            bmode_ctx
-                .above
-                .copy_from_slice(&bottom.bmodes[mb_col * 4..mb_col * 4 + 4]);
-            above_ctx = bottom.entropy[mb_col];
-            if mb_col == 0 {
-                // §20.14: left of the frame, below the top row → 129.
-                neighbors.y_topleft = Some(DEFAULT_LEFT_PIXEL);
-                neighbors.u_topleft = Some(DEFAULT_LEFT_PIXEL);
-                neighbors.v_topleft = Some(DEFAULT_LEFT_PIXEL);
-            } else {
-                neighbors.y_topleft = Some(bottom.y[yx - 1]);
-                neighbors.u_topleft = Some(bottom.u[cx - 1]);
-                neighbors.v_topleft = Some(bottom.v[cx - 1]);
-            }
+            let bottom = &above.bottom;
+            bottom.pixels.load_above(mb_col, mb_cols, &mut neighbors);
+            bmode_ctx.above = bottom.load_bmodes(mb_col);
+            above_ctx = bottom.entropy.load(mb_col);
         }
         if let Some(prev) = &left {
             let mut y_left = [0u8; 16];
@@ -433,14 +421,9 @@ fn analyse_row(
             )
             .map_err(EncodeError::Token)?;
         }
-        {
-            let mut bottom = lock(&this_row.bottom);
-            bottom.entropy[mb_col] = above_ctx;
-            bottom.bmodes[mb_col * 4..mb_col * 4 + 4].copy_from_slice(&edge_bottom);
-            bottom.y[yx..yx + 16].copy_from_slice(&recon.y[240..256]);
-            bottom.u[cx..cx + 8].copy_from_slice(&recon.u[56..64]);
-            bottom.v[cx..cx + 8].copy_from_slice(&recon.v[56..64]);
-        }
+        this_row.bottom.entropy.store(mb_col, &above_ctx);
+        this_row.bottom.store_bmodes(mb_col, &edge_bottom);
+        this_row.bottom.pixels.store(mb_col, &recon);
         this_row.done.store(mb_col + 1, Ordering::Release);
 
         modes.push(MacroblockModes {

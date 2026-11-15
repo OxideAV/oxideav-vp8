@@ -274,6 +274,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod arnr;
+mod backoff;
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;

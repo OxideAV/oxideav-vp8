@@ -15,7 +15,10 @@
 //! * `VP8_PARTITIONS=<n>` — token partition count;
 //! * `VP8_DECODE_ONLY=1` — encode once at the fastest level, then time
 //!   only the decode at each thread budget (for profiling the decoder);
-//! * `VP8_DUMP=<path>` — write the encoded stream as an IVF file.
+//! * `VP8_DUMP=<path>` — write the encoded stream as an IVF file;
+//! * `VP8_DUMP_YUV=<path>` — write the source clip as raw I420 and exit;
+//! * `VP8_DECODE_IVF=<path>` — skip the encode and time the decode of
+//!   that IVF file instead.
 //!
 //! For every effort level and thread budget it prints encode fps
 //! (median of `RUNS`), stream size as kbit/s at 30 fps, luma PSNR of this
@@ -66,6 +69,16 @@ fn main() {
         Err(_) => clip::moving_clip(w, h, frames),
     };
     let frames = source.len();
+    if let Ok(path) = std::env::var("VP8_DUMP_YUV") {
+        let mut raw = Vec::new();
+        for (y, u, v) in &source {
+            raw.extend_from_slice(y);
+            raw.extend_from_slice(u);
+            raw.extend_from_slice(v);
+        }
+        std::fs::write(&path, raw).expect("writable dump path");
+        return;
+    }
     let views: Vec<I420Frame<'_>> = source
         .iter()
         .map(|(y, u, v)| I420Frame::packed(w as u32, h as u32, y, u, v))
@@ -98,7 +111,20 @@ fn main() {
             .collect()
     });
     let mut last_stream: Vec<Vec<u8>> = Vec::new();
+    let external = std::env::var("VP8_DECODE_IVF").ok();
+    if let Some(path) = &external {
+        let ivf = std::fs::read(path).expect("readable IVF file");
+        let mut at = 32usize;
+        while at + 12 <= ivf.len() {
+            let size = u32::from_le_bytes(ivf[at..at + 4].try_into().expect("4 bytes")) as usize;
+            last_stream.push(ivf[at + 12..at + 12 + size].to_vec());
+            at += 12 + size;
+        }
+    }
     for effort in EncodeEffort::ALL {
+        if external.is_some() {
+            break;
+        }
         if decode_only && effort != EncodeEffort::Fastest {
             continue;
         }
@@ -171,7 +197,11 @@ fn main() {
     println!("decode   threads  ms/packet  packets/s");
     let mut reference: Option<u64> = None;
     for &threads in &thread_budgets {
-        let reps = if decode_only { runs.max(5) } else { runs };
+        let reps = if decode_only || external.is_some() {
+            runs.max(5)
+        } else {
+            runs
+        };
         let mut times = Vec::with_capacity(reps);
         let mut digest = 0u64;
         for _ in 0..reps {

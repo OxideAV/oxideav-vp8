@@ -18,11 +18,12 @@
 //! through a small shared buffer per row boundary:
 //!
 //! * a job loads its own bottom four rows unfiltered and, as it finishes
-//!   each macroblock, publishes the columns that macroblock has made
-//!   final for this row (all but the last three, which the next
-//!   macroblock's left edge may still rewrite);
+//!   each macroblock, publishes that macroblock's columns (the last
+//!   three become final only when the next macroblock's left edge has
+//!   run, which republishes them);
 //! * the job below copies the sixteen columns it needs from there before
-//!   filtering each macroblock (once the row above is far enough along),
+//!   filtering each macroblock (once the row above is two macroblocks
+//!   further, so that they are final),
 //!   filters across the boundary in its own buffer, and at the end writes
 //!   those four rows — now final — back into the picture together with
 //!   its own first twelve.
@@ -36,6 +37,8 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use crate::backoff::SharedBytes;
 
 use super::{
     LoopFilterParams, filter_h_edge_normal, filter_h_edge_simple, filter_v_edge_normal,
@@ -147,16 +150,20 @@ pub(crate) fn filter_serial(
 }
 
 /// The four pixel rows above a row boundary (luma, and chroma's four),
-/// as the upper row's job leaves them.
+/// as the upper row's job leaves them. Lock-free: the two rows touch it
+/// once per macroblock each (see [`SharedBytes`]).
 struct Boundary {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+    y: SharedBytes,
+    u: SharedBytes,
+    v: SharedBytes,
 }
 
 struct RowShared {
-    /// Final (for the upper row) in macroblock columns `< done`.
-    boundary: Mutex<Boundary>,
+    boundary: Boundary,
+    /// Macroblocks of the upper row that are filtered. The boundary
+    /// columns of macroblock `c` are final for the upper row once
+    /// `done >= min(c + 2, mb_cols)`: the next macroblock's left edge
+    /// rewrites the last three columns of `c`.
     done: AtomicUsize,
 }
 
@@ -244,11 +251,11 @@ pub(crate) fn filter_banded(
             let y0 = (r * 16 + 12) * ys;
             let c0 = (r * 8 + 4) * cs;
             RowShared {
-                boundary: Mutex::new(Boundary {
-                    y: planes.y[y0..y0 + 4 * ys].to_vec(),
-                    u: planes.u[c0..c0 + 4 * cs].to_vec(),
-                    v: planes.v[c0..c0 + 4 * cs].to_vec(),
-                }),
+                boundary: Boundary {
+                    y: SharedBytes::from_bytes(&planes.y[y0..y0 + 4 * ys]),
+                    u: SharedBytes::from_bytes(&planes.u[c0..c0 + 4 * cs]),
+                    v: SharedBytes::from_bytes(&planes.v[c0..c0 + 4 * cs]),
+                },
                 done: AtomicUsize::new(0),
             }
         })
@@ -323,46 +330,38 @@ fn filter_row(
     let mb_row = job.mb_row;
     let this_row = &shared[mb_row];
     let above_row = mb_row.checked_sub(1).map(|r| &shared[r]);
-    let (y_w, c_w) = (mb_cols * 16, mb_cols * 8);
-
     // Load this row: body from the picture, bottom four rows from the
     // shared boundary (still unfiltered — only this job writes it).
     buf_y[4 * ys..16 * ys].copy_from_slice(job.body[0]);
     buf_u[4 * cs..8 * cs].copy_from_slice(job.body[1]);
     buf_v[4 * cs..8 * cs].copy_from_slice(job.body[2]);
-    {
-        let own = lock(&this_row.boundary);
-        buf_y[16 * ys..20 * ys].copy_from_slice(&own.y);
-        buf_u[8 * cs..12 * cs].copy_from_slice(&own.u);
-        buf_v[8 * cs..12 * cs].copy_from_slice(&own.v);
-    }
+    let own = &this_row.boundary;
+    own.y.load(0, &mut buf_y[16 * ys..20 * ys]);
+    own.u.load(0, &mut buf_u[8 * cs..12 * cs]);
+    own.v.load(0, &mut buf_v[8 * cs..12 * cs]);
 
-    // Columns of this row's bottom rows already published.
-    let (mut pub_y, mut pub_c) = (0usize, 0usize);
     for mb_col in 0..mb_cols {
         if let Some(above) = above_row {
             let need = (mb_col + 2).min(mb_cols);
-            let mut spins = 0u32;
+            let mut backoff = crate::backoff::Backoff::new();
             while above.done.load(Ordering::Acquire) < need {
                 if abort.load(Ordering::Acquire) {
                     return;
                 }
-                spins += 1;
-                if spins < 64 {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
+                backoff.pause();
             }
-            let boundary = lock(&above.boundary);
+            let boundary = &above.boundary;
             let (yx, cx) = (mb_col * 16, mb_col * 8);
             for r in 0..4 {
-                buf_y[r * ys + yx..r * ys + yx + 16]
-                    .copy_from_slice(&boundary.y[r * ys + yx..r * ys + yx + 16]);
-                buf_u[r * cs + cx..r * cs + cx + 8]
-                    .copy_from_slice(&boundary.u[r * cs + cx..r * cs + cx + 8]);
-                buf_v[r * cs + cx..r * cs + cx + 8]
-                    .copy_from_slice(&boundary.v[r * cs + cx..r * cs + cx + 8]);
+                boundary
+                    .y
+                    .load(r * ys + yx, &mut buf_y[r * ys + yx..r * ys + yx + 16]);
+                boundary
+                    .u
+                    .load(r * cs + cx, &mut buf_u[r * cs + cx..r * cs + cx + 8]);
+                boundary
+                    .v
+                    .load(r * cs + cx, &mut buf_v[r * cs + cx..r * cs + cx + 8]);
             }
         }
         if let Some(spec) = &specs[mb_row * mb_cols + mb_col] {
@@ -380,27 +379,30 @@ fn filter_row(
                 mb_row > 0,
             );
         }
-        // Publish what this macroblock made final in the bottom rows:
-        // everything but its last three columns (the next macroblock's
-        // left edge may rewrite those), or all of it at the row's end.
-        let last = mb_col + 1 == mb_cols;
-        let (to_y, to_c) = if last {
-            (y_w, c_w)
-        } else {
-            (mb_col * 16 + 13, mb_col * 8 + 5)
-        };
-        {
-            let mut own = lock(&this_row.boundary);
-            for r in 0..4 {
-                own.y[r * ys + pub_y..r * ys + to_y]
-                    .copy_from_slice(&buf_y[(16 + r) * ys + pub_y..(16 + r) * ys + to_y]);
-                own.u[r * cs + pub_c..r * cs + to_c]
-                    .copy_from_slice(&buf_u[(8 + r) * cs + pub_c..(8 + r) * cs + to_c]);
-                own.v[r * cs + pub_c..r * cs + to_c]
-                    .copy_from_slice(&buf_v[(8 + r) * cs + pub_c..(8 + r) * cs + to_c]);
-            }
+        // Publish this macroblock's bottom rows, together with the last
+        // eight columns of the previous one (whose last three this
+        // macroblock's left edge may just have rewritten). The reader
+        // waits for the macroblock after the one it copies, so it only
+        // ever sees final columns.
+        let (from_y, from_c) = (
+            (mb_col * 16).saturating_sub(8),
+            (mb_col * 8).saturating_sub(8),
+        );
+        let (to_y, to_c) = (mb_col * 16 + 16, mb_col * 8 + 8);
+        for r in 0..4 {
+            own.y.store(
+                r * ys + from_y,
+                &buf_y[(16 + r) * ys + from_y..(16 + r) * ys + to_y],
+            );
+            own.u.store(
+                r * cs + from_c,
+                &buf_u[(8 + r) * cs + from_c..(8 + r) * cs + to_c],
+            );
+            own.v.store(
+                r * cs + from_c,
+                &buf_v[(8 + r) * cs + from_c..(8 + r) * cs + to_c],
+            );
         }
-        (pub_y, pub_c) = (to_y, to_c);
         this_row.done.store(mb_col + 1, Ordering::Release);
     }
 

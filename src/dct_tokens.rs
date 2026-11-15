@@ -1993,8 +1993,8 @@ mod tests {
         // every Y column/row slot set (each Y block has a nonzero AC);
         // U/V slots set.
         assert!(dec_above.nonzero[8], "Y2 above predictor should be set");
-        for slot in 0..8 {
-            assert!(dec_above.nonzero[slot], "above slot {slot} should be set");
+        for (slot, nonzero) in dec_above.nonzero.iter().enumerate().take(8) {
+            assert!(nonzero, "above slot {slot} should be set");
         }
     }
 

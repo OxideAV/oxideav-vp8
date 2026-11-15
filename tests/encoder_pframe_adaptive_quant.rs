@@ -172,8 +172,8 @@ fn segmented_p_frame_header_round_trips() {
         );
     }
     // The fitted tree probs are explicit (all three nodes written).
-    for n in 0..3 {
-        assert!(seg.segment_prob[n].is_some(), "tree node {n} prob written");
+    for (n, prob) in seg.segment_prob.iter().enumerate() {
+        assert!(prob.is_some(), "tree node {n} prob written");
     }
 }
 

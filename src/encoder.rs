@@ -14406,10 +14406,10 @@ mod tests {
                             eob_token_bits(probs, plane, i, ctx3).to_bits(),
                             "eob: plane {plane} pos {i} ctx {ctx3}"
                         );
-                        for pwz in 0..2usize {
+                        for (pwz, small) in t.small[plane][band][ctx3].iter().enumerate() {
                             for abs in 0..=TRELLIS_SMALL_LEVEL_MAX {
                                 assert_eq!(
-                                    t.small[plane][band][ctx3][pwz][abs as usize].to_bits(),
+                                    small[abs as usize].to_bits(),
                                     coeff_token_bits(probs, plane, i, ctx3, pwz == 1, abs)
                                         .to_bits(),
                                     "plane {plane} pos {i} ctx {ctx3} pwz {pwz} abs {abs}"
@@ -15008,9 +15008,8 @@ mod tests {
 
         // Width contract: no path should ever exceed the static buffer.
         const { assert!(TOKEN_BIT_PATH_MAX_LEN >= 7) };
-        for slot in 0..2 {
-            for token in 0..12 {
-                let (_, len) = &TOKEN_BIT_PATHS[slot][token];
+        for (slot, paths) in TOKEN_BIT_PATHS.iter().enumerate() {
+            for (token, (_, len)) in paths.iter().enumerate() {
                 assert!(
                     (*len as usize) <= TOKEN_BIT_PATH_MAX_LEN,
                     "path length {} > buffer capacity {} at slot={slot} token={token}",

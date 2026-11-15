@@ -2528,11 +2528,12 @@ mod tests {
             col: best.col + diff.col,
         };
         // Top half zero, bottom half NEW.
-        for b in 0..8 {
-            assert_eq!(res.split_mvs[b], Mv::default(), "top sub-block {}", b);
-        }
-        for b in 8..16 {
-            assert_eq!(res.split_mvs[b], expected_new, "bottom sub-block {}", b);
+        for (b, mv) in res.split_mvs.iter().enumerate() {
+            if b < 8 {
+                assert_eq!(*mv, Mv::default(), "top sub-block {}", b);
+            } else {
+                assert_eq!(*mv, expected_new, "bottom sub-block {}", b);
+            }
         }
     }
 
@@ -2559,11 +2560,12 @@ mod tests {
 
         let mut dec = BoolDecoder::init(&bytes).unwrap();
         let res = decode_split_mv(&mut dec, &above, &left, best, &mv_ctx).unwrap();
-        for b in 0..8 {
-            assert_eq!(res.split_mvs[b], above_mv, "top sub-block {}", b);
-        }
-        for b in 8..16 {
-            assert_eq!(res.split_mvs[b], Mv::default(), "bottom sub-block {}", b);
+        for (b, mv) in res.split_mvs.iter().enumerate() {
+            if b < 8 {
+                assert_eq!(*mv, above_mv, "top sub-block {}", b);
+            } else {
+                assert_eq!(*mv, Mv::default(), "bottom sub-block {}", b);
+            }
         }
     }
 

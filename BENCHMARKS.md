@@ -3463,3 +3463,91 @@ wavefront.
 * Rate control has no frame dropping and no lookahead; a target below
   what `qindex` 127 produces is overshot.
 
+## Round 492 — key-frame encode: probability fit in one search, default level, trellis, sampled loop filter; blocking waits
+
+**Method.** `examples/keyframe_timing.rs` on the deterministic photo-like
+picture (`tests/support/photo.rs`) at `y_ac_qi` 25 with the quality-80
+trellis strength; one encode per run, minimum of 15 runs at 800×533 and
+of 3 at 4000×3000. The machine (Apple M-series) was shared with nine
+other builds, so the previous round's binary (built from the commit
+before this round's work) and the new one were run back to back in the
+same minute; single figures still move by ±10 % between sessions, the
+ratios by much less. Instruction counts are `/usr/bin/time -l` over 20
+encodes. PSNR / SSIM are of this crate's decode against the source luma
+(SSIM: 8×8 windows stepped by 4, uniform weights).
+
+```
+cargo run --release --example keyframe_timing -- 800 533 25 15 1 4
+cargo run --release --example keyframe_timing -- 4000 3000 25 3 1 8
+VP8_LF=sample   cargo run --release --example keyframe_timing -- 800 533 25 15 1 4
+VP8_LF=search   cargo run --release --example keyframe_timing -- 800 533 25 5 1
+VP8_FIT=0 VP8_TWO_PASS=1 cargo run --release --example keyframe_timing -- 800 533 25 3 1
+VP8_PARTITIONS=8 cargo run --release --example keyframe_timing -- 4000 3000 25 3 8
+cargo run --release --example keyframe_decode_timing -- 4000 3000 25 7 1 2 4 8
+```
+
+**800×533, before (previous binary) → after**
+
+| level | 1 thread ms | 4 threads ms | bytes | PSNR-Y dB | SSIM-Y |
+|---|---:|---:|---:|---:|---:|
+| `Thorough` | 60.75 → 59.18 | 17.33 → 19.85 | 61 633 → 55 947 | 38.917 → 38.913 | 0.96721 → 0.96723 |
+| `Balanced` | 30.15 → 31.00 | 8.84 → 11.25 | 61 656 → 56 066 | 38.960 → 38.955 | 0.96789 → 0.96798 |
+| `Fast` | 24.46 → 26.32 | 7.35 → 9.36 | 62 102 → 56 434 | 38.912 → 38.908 | 0.96770 → 0.96765 |
+| `Fastest` | 12.77 → 13.96 | 4.19 → 6.13 | 64 047 → 58 245 | 38.790 → 38.790 | 0.96717 → 0.96717 |
+| default (`Thorough` → `Balanced`) | 60.75 → 31.00 | 17.33 → 11.25 | 61 633 → 56 066 | 38.917 → 38.955 | 0.96721 → 0.96798 |
+| best compression (two-pass `Thorough` → default) | 132.07 → 31.00 | — | 56 181 → 56 066 | 38.922 → 38.955 | 0.96714 → 0.96798 |
+
+`exhaustive()` (the old default's bytes, digest unchanged): 57.28 ms / 17.42 ms.
+With four token partitions the 4-thread column reads 17.51 / 9.56 / 8.15 /
+4.68 ms (`Thorough` … `Fastest`) — the tape coding of separate partitions
+runs side by side. Second search on top of the default
+(`VP8_TWO_PASS=1`): 61.3 ms for the same 56 066 bytes at `Balanced` (the
+second stream is not smaller, so the first ships) and 58 011 vs 58 245
+bytes at `Fastest`, which runs no pilot.
+
+**4000×3000, before → after**
+
+| level | 1 thread ms | 8 threads ms | bytes | PSNR-Y dB |
+|---|---:|---:|---:|---:|
+| `Thorough` | 999 → 946 | 158 → 160 | 563 081 → 497 551 | 41.814 → 41.827 |
+| `Balanced` | 579 → 488 | 103 → 98 | 560 573 → 495 698 | 41.85 → 41.847 |
+| `Fast` | 394 → 373 | 76 → 80 | 563 796 → 498 317 | 41.82 → 41.823 |
+| `Fastest` | 229 → 230 | 43 → 55 | 582 069 → 518 110 | 41.74 → 41.736 |
+| default (`Thorough` → `Balanced`) | 999 → 488 | 158 → 98 | 563 081 → 495 698 | 41.814 → 41.847 |
+| best compression (two-pass `Thorough` → default) | 1 994 → 488 | — | 499 399 → 495 698 | 41.832 → 41.847 |
+
+SSIM-Y after: 0.96284 / 0.96310 / 0.96300 / 0.96256 (`exhaustive()`:
+0.96284). `Balanced`, 8 threads, 8 partitions: 88 ms.
+
+**Loop filter choice** (default options, 1 thread; the level stays 0
+without a choice)
+
+| | 800×533 ms | PSNR-Y dB | SSIM-Y | 4000×3000 ms | PSNR-Y dB | SSIM-Y |
+|---|---:|---:|---:|---:|---:|---:|
+| none | 31.0 | 38.955 | 0.96798 | 509 | 41.847 | 0.96310 |
+| `sampled_loop_filter` | 36.6 | 39.360 | 0.97179 | 566 | 42.332 | 0.96695 |
+| `auto_loop_filter` | 60.7 | 39.360 | 0.97179 | 1 348 | 42.332 | 0.96695 |
+
+(The 12 MP rows of this table are from one session, in which the
+unfiltered encode read 509 ms.)
+
+**Trellis.** `Thorough` without the fit — the old default's exact bytes
+— went from 1 219.8 to 1 099.4 M instructions per 800×533 encode
+(−9.9 %); cycles are flat within the session's noise (264 → 266 M),
+i.e. the removed work was cheap, well-predicted arithmetic on infinite
+costs. The Viterbi step is unchanged level for level
+(`trellis_lut_and_early_exit_match_reference`).
+
+**Quantiser sweep, 800×533, default vs `exhaustive()`** (bytes, PSNR-Y):
+qi 5: 131 869 / 46.083 vs 158 672 / 46.192; qi 12: 83 462 / 42.552 vs
+91 275 / 42.464; qi 50: 36 794 / 34.803 vs 39 123 / 34.709; qi 90:
+16 491 / 29.146 vs 17 213 / 28.988; qi 120: 7 743 / 26.160 vs 8 145 /
+26.099 — at about half the time throughout. (At qi 5 the default is
+0.11 dB lower for 17 % fewer bytes.)
+
+**Decode** (`keyframe_decode_timing`, loop filter on, blocking waits):
+800×533 4.51 / 4.00 / 3.63 ms at 1 / 2 / 4 threads; 4000×3000 one
+partition 78.1 / 50.0 / 45.5 / 42.0 ms at 1 / 2 / 4 / 8; eight partitions
+80.3 / 34.2 / 27.8 ms at 1 / 4 / 8. Serial row-at-a-time decode against
+the whole-frame-coefficient path it replaces in `Vp8DecoderState`:
+4.76 vs 4.84 ms (800×533), 79.4 vs 79.0 ms (4000×3000) — the same.

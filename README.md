@@ -174,21 +174,53 @@ for packet in vp8_frame_packets {
 
 #### Decoder threads
 
-`Vp8DecoderState::new().with_threads(n)` grants a thread budget (serial
-by default; the registry decoder follows the `ExecutionContext`). Token
-rows decode on up to one worker per token partition, macroblock rows
-reconstruct concurrently and the loop filter runs in row bands; the
-pictures are identical at every budget. 1920×1080, 30 packets from a
-black-box encoder at 6 Mbit/s (`cargo run --release --example ivf_decode`):
+`Vp8DecoderState::new().with_threads(n)` grants a thread budget to a
+stream decode (serial by default; the registry decoder follows the
+`ExecutionContext`). A still picture takes it through the one-shot
+`decode_vp8_with_options`:
 
-| | before | 1 thread | 2 | 4 | 8 |
+```rust
+use oxideav_vp8::{Vp8DecodeOptions, decode_vp8_with_options};
+# use oxideav_vp8::{I420Frame, KeyframeParams, encode_keyframe};
+# let (w, h) = (64u32, 48u32);
+# let y: Vec<u8> = (0..w * h).map(|i| (i * 5 % 253) as u8).collect();
+# let c = vec![128u8; ((w / 2) * (h / 2)) as usize];
+# let vp8_keyframe_bytes =
+#     encode_keyframe(&I420Frame::packed(w, h, &y, &c, &c), &KeyframeParams::default())?;
+let options = Vp8DecodeOptions::new()      // serial, default pixel cap
+    .with_threads(4);                      // caller-granted budget
+let picture = decode_vp8_with_options(&vp8_keyframe_bytes, &options)?;
+# let _ = picture;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Token rows decode on up to one worker per token partition, macroblock
+rows reconstruct concurrently and the loop filter runs in row bands; the
+pictures are identical at every budget. **Every wait is a blocking
+wait**: a row that catches up with the row above sleeps on a condition
+variable until that row is a batch of macroblocks further — no worker
+spins or polls, so a budget larger than the free cores costs nothing
+but the idle threads.
+
+`decode_vp8_with_options` (and every key frame of `Vp8DecoderState`)
+works a macroblock row at a time — a row's coefficients are decoded,
+reconstructed and dropped — where `decode_vp8` holds the dequantised
+coefficients of the whole frame until reconstruction is over (800 bytes
+per macroblock: 38 MiB for a 12-megapixel picture). The pictures are
+bit-identical and the serial speed is the same.
+
+Key-frame decode of the photo-like bench picture, loop filter on
+(`cargo run --release --example keyframe_decode_timing`; shared machine,
+minimum of 7–21 runs):
+
+| picture | token partitions | 1 thread | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|---:|
-| 1 token partition | 141 fps | 143 fps | 196 fps | 250 fps | 226 fps |
-| 8 token partitions | 148 fps | 143 fps | 197 fps | 304 fps | 311 fps |
+| 800×533 | 1 | 4.5 ms | 4.0 ms | 3.6 ms | — |
+| 4000×3000 | 1 | 78 ms | 50 ms | 46 ms | 42 ms |
+| 4000×3000 | 8 | 80 ms | — | 34 ms | 28 ms |
 
-Serial decode speed is unchanged this round. The workers wait on each
-other by spinning, so on a machine with fewer free cores than the budget
-a threaded decode can be slower than a serial one.
+(With one token partition the token rows are one serial chain; the
+budget then only spreads reconstruction and the loop filter.)
 
 ### Encode a keyframe
 
@@ -209,59 +241,129 @@ The output is a raw VP8 keyframe bitstream (3-byte tag + 7-byte start
 code + partitions); wrap it in an IVF / RIFF-WEBP / Matroska container
 as needed.
 
-#### Encode effort and threads
+#### Encode options: effort, threads, probability fit, loop filter
 
 `encode_keyframe_with_options` takes a `KeyframeEncodeOptions` next to
-the `KeyframeParams` — the speed controls for latency-sensitive callers:
+the `KeyframeParams`. **Its default is the recommended still-picture
+encode** — about twice as fast as the option-less `encode_keyframe`, 9 %
+smaller and slightly closer to the source:
 
 ```rust
 use oxideav_vp8::{
-    EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams, encode_keyframe_with_options,
+    EncodeEffort, I420Frame, KeyframeEncodeOptions, KeyframeParams, encode_keyframe_detailed,
+    encode_keyframe_with_options,
 };
 # let (width, height) = (64u32, 48u32);
-# let y_plane = vec![128u8; (width * height) as usize];
+# let y_plane: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
 # let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
 # let v_plane = u_plane.clone();
 let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+let params = KeyframeParams::default();
+
+// The default: `Balanced` search, token probabilities fitted inside the
+// one search, serial.
+let vp8_bytes = encode_keyframe_with_options(&frame, &params, &KeyframeEncodeOptions::new())?;
+
+// Every knob.
 let options = KeyframeEncodeOptions::new()
-    .with_effort(EncodeEffort::Fast)   // Fastest | Fast | Balanced | Thorough (default)
-    .with_threads(4);                  // 0 / 1 = serial (default)
-let vp8_bytes = encode_keyframe_with_options(&frame, &KeyframeParams::default(), &options)?;
+    .with_effort(EncodeEffort::Fast)     // Fastest | Fast | Balanced (default) | Thorough
+    .with_threads(4)                     // 0 / 1 = serial (default)
+    .with_sampled_loop_filter(true);     // pick the §9.4 level / sharpness on a sample
+let encoded = encode_keyframe_detailed(&frame, &params, &options)?;
+// What the encoder settled on, next to the bytes and the reconstruction:
+let _ = (encoded.loop_filter_level, encoded.sharpness_level);
+// ... and the fitted table, to seed the search of the next similar picture.
+let next = options.with_search_token_probs(encoded.token_prob_updates);
+# let _ = (vp8_bytes, next);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 * **`effort`** — how much mode search each macroblock gets.
-  `Thorough` (level 3, the default) carries every candidate mode through
-  transform, trellis, reconstruction and exact token pricing and
-  reproduces `encode_keyframe` byte for byte. `Balanced` (2) compares
-  the same candidates with a closed-form cost model and quantises only
-  the winners. `Fast` (1) additionally shortlists the sub-block modes
-  by squared prediction error and skips the per-sub-block search where
-  the whole-block prediction leaves no luma AC. `Fastest` (0) shortlists
-  harder, picks the whole-block modes by prediction error and drops the
-  trellis.
+  `Balanced` (level 2, the default) compares every candidate mode with a
+  closed-form cost model and quantises only the winners. `Fast` (1)
+  additionally shortlists the sub-block modes by squared prediction
+  error and skips the per-sub-block search where the whole-block
+  prediction leaves no luma AC. `Fastest` (0) shortlists harder, picks
+  the whole-block modes by prediction error and drops the trellis.
+  `Thorough` (3) carries every candidate through transform, trellis,
+  reconstruction and exact token pricing — the search of the option-less
+  entry points.
+* **`token_prob_fit`** (on by default) — the search records its §13.3
+  token decisions on a tape instead of arithmetic-coding them; when the
+  frame is done the §13.4 probability updates are fitted to the tape and
+  the tape is coded against the fitted table. One search, no re-encode,
+  and never a larger stream. Before the search a pilot pass over a few
+  hundred macroblocks (cheapest search, predicting from the source)
+  gives the search a table close to the one that will ship, which is
+  worth about what a full second search against the fitted table used
+  to be. `fitted_token_prob_updates` still adds that second search for
+  callers who want it.
+* **`search_token_probs`** — a table to search against instead (the
+  `token_prob_updates` a previous, similar picture came out with);
+  `encode_keyframe_detailed` returns the table each frame carries.
+  Inter frames have the same pair: `InterCodingOptions::with_search_token_probs`
+  and `encode_p_frame_detailed`.
+* **`sampled_loop_filter`** — chooses the §9.4 loop-filter level and
+  sharpness on three to six bands of macroblock rows instead of
+  filtering the whole frame for every candidate (`auto_loop_filter`): at
+  both bench sizes it lands on the level the full search finds.
 * **`threads`** — the macroblock analysis runs as a macroblock-row
   wavefront on up to that many scoped threads (no thread pool, no
-  dependency); each worker also tokenises its rows, leaving only the
-  arithmetic coding in row order. **The bytes are the same at every
-  thread budget.**
-* `auto_loop_filter` / `fitted_token_prob_updates` — the two per-frame
-  quality switches, so one options value reaches every combination.
+  dependency, blocking waits); the loop filter and its search, the
+  pilot and the token coding of separate partitions spread over the
+  same budget. **The bytes are the same at every thread budget.** With
+  the fit the tokens are coded after the search, one partition a serial
+  job — give a threaded encode `nbr_of_dct_partitions` 4 or 8.
+* `KeyframeEncodeOptions::exhaustive()` is `encode_keyframe` byte for
+  byte (`Thorough`, no fit).
 
-Every level emits a conformant stream that this crate's decoder (and a
-black-box decoder) reconstructs to exactly the picture the encoder
+Every combination emits a conformant stream that this crate's decoder
+and a black-box decoder reconstruct to exactly the picture the encoder
 predicted from. Measured on the photo-like bench picture at the
-quality-80 operating point (`y_ac_qi` 25; Apple M-series, shared
-machine, minimum of several runs — see `BENCHMARKS.md` §Round 486 and
-`cargo run --release --example keyframe_timing`):
+quality-80 operating point (`y_ac_qi` 25 with the matching trellis
+strength; Apple M-series, a machine shared with other builds, minimum of
+3–15 runs, old and new binaries run back to back — `cargo run --release
+--example keyframe_timing`; `BENCHMARKS.md` §Round 492 has the method):
 
-| Effort | 800×533, 1 thread | 4 threads | bytes | PSNR-Y | 2400×1600, 1 thread | 8 threads | bytes |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| before this round (no options) | 113 ms | — | 61 633 | 38.92 dB | 616 ms | — | 247 441 |
-| `Thorough` (default, same bytes) | 63 ms | 19 ms | 61 633 | 38.92 dB | 390 ms | 61 ms | 247 441 |
-| `Balanced` | 32 ms | 10.9 ms | 61 656 | 38.96 dB | 241 ms | 40 ms | 246 482 |
-| `Fast` | 27 ms | 8.3 ms | 62 102 | 38.91 dB | 175 ms | 35 ms | 248 285 |
-| `Fastest` | 14 ms | 4.7 ms | 64 047 | 38.79 dB | 97 ms | 18 ms | 256 277 |
+**800×533** (the default moved from the first row to the bold one)
+
+| | 1 thread | 4 threads | bytes | PSNR-Y | SSIM-Y |
+|---|---:|---:|---:|---:|---:|
+| before: `Thorough` (old default) | 60.8 ms | 17.3 ms | 61 633 | 38.917 dB | 0.96721 |
+| before: `Thorough` + two-pass fit | 132 ms | — | 56 181 | 38.922 dB | 0.96714 |
+| before: `Balanced` | 30.2 ms | 8.8 ms | 61 656 | 38.960 dB | 0.96789 |
+| before: `Fast` | 24.5 ms | 7.4 ms | 62 102 | 38.912 dB | 0.96770 |
+| before: `Fastest` | 12.8 ms | 4.2 ms | 64 047 | 38.790 dB | 0.96717 |
+| `Thorough` | 59.2 ms | 19.9 ms | 55 947 | 38.913 dB | 0.96723 |
+| **`Balanced` (default)** | **31.0 ms** | 11.3 ms | **56 066** | **38.955 dB** | **0.96798** |
+| `Fast` | 26.3 ms | 9.4 ms | 56 434 | 38.908 dB | 0.96765 |
+| `Fastest` | 14.0 ms | 6.1 ms | 58 245 | 38.790 dB | 0.96717 |
+| default + `sampled_loop_filter` | 36.6 ms | 12.0 ms | 56 066 | 39.360 dB | 0.97179 |
+| default + `auto_loop_filter` (full search) | 60.7 ms | — | 56 066 | 39.360 dB | 0.97179 |
+| `exhaustive()` | 57.3 ms | 17.4 ms | 61 633 | 38.917 dB | 0.96721 |
+
+**4000×3000 (12 MP)**
+
+| | 1 thread | 8 threads | bytes | PSNR-Y | SSIM-Y |
+|---|---:|---:|---:|---:|---:|
+| before: `Thorough` (old default) | 999 ms | 158 ms | 563 081 | 41.814 dB | 0.96284 |
+| before: `Thorough` + two-pass fit | 1 994 ms | — | 499 399 | 41.832 dB | — |
+| before: `Balanced` | 579 ms | 103 ms | 560 573 | 41.85 dB | — |
+| before: `Fast` | 394 ms | 76 ms | 563 796 | 41.82 dB | — |
+| before: `Fastest` | 229 ms | 43 ms | 582 069 | 41.74 dB | — |
+| `Thorough` | 946 ms | 160 ms | 497 551 | 41.827 dB | 0.96284 |
+| **`Balanced` (default)** | **488 ms** | 98 ms (88 ms with 8 partitions) | **495 698** | **41.847 dB** | **0.96310** |
+| `Fast` | 373 ms | 80 ms | 498 317 | 41.823 dB | 0.96300 |
+| `Fastest` | 230 ms | 55 ms | 518 110 | 41.736 dB | 0.96256 |
+| default + `sampled_loop_filter` | 566 ms | — | 495 698 | 42.332 dB | 0.96695 |
+| default + `auto_loop_filter` (full search) | 1 348 ms | — | 495 698 | 42.332 dB | 0.96695 |
+
+The default is 1.96× (800×533) and 2.05× (12 MP) faster than the old
+default at 9 % and 12 % fewer bytes; against the old best-compression
+path (two full passes) it is 4.3× / 4.1× faster and still smaller. At a
+thread budget the single-partition token coding is a serial tail of
+about a tenth of the single-thread time, which is why the 4- and
+8-thread columns gain less than the 1-thread column.
 
 `Vp8EncoderConfig` and `AltrefStreamConfig` carry the same `effort` /
 `threads` pair for the key frames of a stream. For multi-frame inter encoding use `Vp8Encoder` +

@@ -4,6 +4,24 @@ All notable changes to `oxideav-vp8` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.10](https://github.com/OxideAV/oxideav-vp8/compare/v0.2.9...v0.2.10) - 2026-11-21
+
+### Added
+
+- *(encoder)* token probabilities fitted in one search, Balanced default, sampled loop filter, cheaper trellis
+- *(encoder)* four-level inter search ladder, one-pass rate control, fuzz targets
+- *(decoder)* thread budget — token rows, reconstruction rows and loop filter on scoped workers
+- row-band threaded loop filter, sampled filter-level search, threaded alt-ref alignment
+- *(encoder)* inter-frame effort levels and macroblock-row wavefront threads
+
+### Other
+
+- round 492 — encode options, before/after ladders, decoder threads, measurements
+- rows block on a condition variable; row-at-a-time key-frame decode; decode_vp8_with_options
+- round 490 measurements — inter effort ladder, threads, rate control, decoder threads
+- run-form six-tap interpolation, all-zero shortcut in the cost model
+- rewrite index loops flagged by the newer clippy (needless_range_loop)
+
 ### Added
 
 - **Token-probability fit inside the one key-frame search.** The key-frame search records its §13.3 token decisions on a tape (`src/encoder/tape.rs`: which probability each decision is coded against, not its value) instead of arithmetic-coding them; when the frame is done the §13.4 updates are fitted to the tape and the tape is coded against the fitted table — `KeyframeEncodeOptions::token_prob_fit`, on by default. No second search, never a larger stream. A pilot pass (`src/encoder/pilot.rs`: the cheapest model search over about 768 macroblocks in staggered runs, predicting from the source, blended into the §13.5 defaults) gives the search a table close to the one that ships. 800×533 photo-like picture at quality 80, `Balanced`: 61 656 → 56 066 bytes at 30 → 31 ms; the two-pass fit it replaces took 132 ms (`Thorough`) for 56 181 bytes.

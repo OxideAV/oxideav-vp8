@@ -149,3 +149,43 @@ pub fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
     10.0 * (255.0f64 * 255.0 * a.len() as f64 / sse as f64).log10()
 }
+
+/// Mean structural similarity of two `w`×`h` planes: the index
+/// `(2·μa·μb + c1)(2·σab + c2) / ((μa² + μb² + c1)(σa² + σb² + c2))`
+/// with `c1 = (0.01·255)²`, `c2 = (0.03·255)²`, over 8×8 windows stepped
+/// by 4 pixels, uniformly weighted.
+pub fn ssim(a: &[u8], b: &[u8], w: usize, h: usize) -> f64 {
+    const C1: f64 = 6.5025;
+    const C2: f64 = 58.5225;
+    if w < 8 || h < 8 {
+        return 1.0;
+    }
+    let mut total = 0.0;
+    let mut windows = 0u64;
+    for y0 in (0..=h - 8).step_by(4) {
+        for x0 in (0..=w - 8).step_by(4) {
+            let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for y in y0..y0 + 8 {
+                let ra = &a[y * w + x0..y * w + x0 + 8];
+                let rb = &b[y * w + x0..y * w + x0 + 8];
+                for (&p, &q) in ra.iter().zip(rb) {
+                    let (p, q) = (p as u64, q as u64);
+                    sa += p;
+                    sb += q;
+                    saa += p * p;
+                    sbb += q * q;
+                    sab += p * q;
+                }
+            }
+            let n = 64.0;
+            let (ma, mb) = (sa as f64 / n, sb as f64 / n);
+            let va = saa as f64 / n - ma * ma;
+            let vb = sbb as f64 / n - mb * mb;
+            let cov = sab as f64 / n - ma * mb;
+            total += (2.0 * ma * mb + C1) * (2.0 * cov + C2)
+                / ((ma * ma + mb * mb + C1) * (va + vb + C2));
+            windows += 1;
+        }
+    }
+    total / windows as f64
+}

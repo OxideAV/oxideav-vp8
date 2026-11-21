@@ -32,15 +32,14 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::effort::EncodeEffort;
+use super::tape::TokenTape;
 use super::wavefront::lock;
 use super::{
-    BoolEncoder, BoolSink, BranchCounts, CoeffProbs, EncodeError, I420Frame,
-    InterSegmentationConfig, IntraUvMode, IntraYMode, MbCoeffs, MbEntropyCtx, MbPixels,
-    SplitMvCandidate, TrellisRateTables, TrellisStrength, bool_bits, classify_segment,
-    clear_skip_ctx, encode_mb_tokens, mb_luma_variance, pick_intra_mb_all, pick_mb_for_ref,
-    ref_frame_tree_bits,
+    CoeffProbs, EncodeError, I420Frame, InterSegmentationConfig, IntraUvMode, IntraYMode, MbCoeffs,
+    MbEntropyCtx, MbPixels, SplitMvCandidate, TrellisRateTables, TrellisStrength, bool_bits,
+    classify_segment, clear_skip_ctx, encode_mb_tokens, mb_luma_variance, pick_intra_mb_all,
+    pick_mb_for_ref, ref_frame_tree_bits,
 };
-use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 use crate::dequant::MbDequantFactors;
 use crate::frame::KeyframePlanes;
 use crate::loop_filter::MAX_MB_SEGMENTS;
@@ -48,6 +47,7 @@ use crate::motion_comp::{RefFrame, ReferencePlanes};
 use crate::motion_vector::{Mv, MvContexts};
 use crate::near_mv::{InterMode, MbInfo};
 use crate::reconstruct::{MbNeighbors, ReconstructedMb};
+use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 
 /// Speed controls of one inter-frame encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,66 +62,9 @@ pub(crate) struct InterSpeed {
     /// decisions do not depend on the shipped table, so no second
     /// analysis pass is needed).
     pub(crate) fit_token_probs: bool,
-}
-
-/// §13.3 token decisions of one macroblock row, in coding order.
-///
-/// An entry with bit 15 set is a coefficient-tree decision: the flat
-/// index of its probability in the `[4][8][3][11]` table in bits 0..=10
-/// and the bit in bit 11. Any other entry is a decision at a fixed
-/// probability (extra bits, sign): the probability in the low byte, the
-/// bit in bit 8.
-#[derive(Debug, Default, Clone)]
-pub(super) struct TokenTape(Vec<u16>);
-
-const TAPE_TREE: u16 = 0x8000;
-const TAPE_TREE_BIT: u16 = 0x0800;
-const TAPE_SLOT_MASK: u16 = 0x07FF;
-
-impl BoolSink for TokenTape {
-    #[inline]
-    fn put(&mut self, prob: u8, value: bool) {
-        self.0.push(prob as u16 | (value as u16) << 8);
-    }
-
-    #[inline]
-    fn put_tree(&mut self, slot: u16, _prob: u8, value: bool) {
-        self.0
-            .push(TAPE_TREE | slot | if value { TAPE_TREE_BIT } else { 0 });
-    }
-}
-
-impl TokenTape {
-    /// Code the tape into `enc` with the coefficient probabilities
-    /// `probs`.
-    pub(super) fn replay(&self, enc: &mut BoolEncoder, probs: &CoeffProbs) {
-        let flat = probs.as_flattened().as_flattened().as_flattened();
-        for &d in &self.0 {
-            if d & TAPE_TREE != 0 {
-                enc.write_bool(flat[(d & TAPE_SLOT_MASK) as usize], d & TAPE_TREE_BIT != 0);
-            } else {
-                enc.write_bool(d as u8, d >> 8 != 0);
-            }
-        }
-    }
-
-    /// Add the tape's coefficient-tree decisions to `counts`.
-    pub(super) fn tally(&self, counts: &mut BranchCounts) {
-        let flat = counts
-            .as_flattened_mut()
-            .as_flattened_mut()
-            .as_flattened_mut();
-        for &d in &self.0 {
-            if d & TAPE_TREE != 0 {
-                let slot = &mut flat[(d & TAPE_SLOT_MASK) as usize];
-                if d & TAPE_TREE_BIT != 0 {
-                    slot.1 += 1;
-                } else {
-                    slot.0 += 1;
-                }
-            }
-        }
-    }
+    /// §13.4 updates the search prices tokens against when the caller
+    /// passes none to ship (`None` = the §13.5 defaults).
+    pub(crate) search_token_probs: Option<crate::coded_header::TokenProbUpdates>,
 }
 
 /// One available reference picture.
@@ -417,7 +360,7 @@ fn analyse_row(
     let y_stride = mb_cols * 16;
     let uv_stride = mb_cols * 8;
     let mut records = Vec::with_capacity(mb_cols);
-    let mut tape = TokenTape(Vec::with_capacity(mb_cols * 64));
+    let mut tape = TokenTape::with_capacity(mb_cols * 64);
     let mut segment_counts = [0u32; MAX_MB_SEGMENTS];
     let mut left_ctx = MbEntropyCtx::default();
     let mut left: Option<ReconstructedMb> = None;

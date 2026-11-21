@@ -274,7 +274,6 @@
 #![warn(missing_debug_implementations)]
 
 pub mod arnr;
-mod rowsync;
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;
@@ -296,6 +295,7 @@ pub mod motion_search;
 pub mod motion_vector;
 pub mod near_mv;
 pub mod reconstruct;
+mod rowsync;
 pub mod state;
 pub mod stream;
 
@@ -425,10 +425,11 @@ pub fn decode_frame(
 pub use dequant::{MbDequantFactors, UV_DC_MAX, Y2_AC_MIN, decode_and_dequantize_mb};
 pub use encoder::{
     AdaptiveQuantConfig, BoolEncoder, BranchCounts, CopyBufferSelector, EncodeEffort, EncodeError,
-    EncodedMb, I420Frame, InterCodingOptions, InterSegmentationConfig, KeyframeCodingOptions,
-    KeyframeEncodeOptions, KeyframeParams, LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels,
-    RefreshControls, ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams,
-    TokenEncodeError, TokenEncoder, TrellisStrength, UpdateSegmentationLayer, classify_coeff_token,
+    EncodedMb, I420Frame, InterCodingOptions, InterEncoded, InterSegmentationConfig,
+    KeyframeCodingOptions, KeyframeEncodeOptions, KeyframeEncoded, KeyframeParams,
+    LoopFilterDeltaSlot, LoopFilterDeltas, MbPixels, RefreshControls,
+    ScaleCode as EncoderScaleCode, SilentKeyframeEncoder, SilentKeyframeParams, TokenEncodeError,
+    TokenEncoder, TrellisStrength, UpdateSegmentationLayer, classify_coeff_token,
     count_block_branches, count_inter_frame_branches, count_keyframe_branches, count_mb_branches,
     empty_branch_counts, encode_coeff_block, encode_invisible_altref_update,
     encode_invisible_altref_update_with_coding_options, encode_keyframe,
@@ -437,14 +438,14 @@ pub use encoder::{
     encode_keyframe_adaptive_quant_with_segment_lf_deltas,
     encode_keyframe_adaptive_quant_with_segment_lf_deltas_and_trellis,
     encode_keyframe_adaptive_quant_with_trellis, encode_keyframe_auto_loop_filter,
-    encode_keyframe_auto_loop_filter_with_reconstruction,
+    encode_keyframe_auto_loop_filter_with_reconstruction, encode_keyframe_detailed,
     encode_keyframe_with_fitted_token_prob_updates, encode_keyframe_with_options,
     encode_keyframe_with_reconstruction, encode_keyframe_with_reconstruction_and_coding_options,
     encode_keyframe_with_reconstruction_and_fitted_token_prob_updates,
     encode_keyframe_with_reconstruction_and_options,
     encode_keyframe_with_reconstruction_and_token_updates, encode_keyframe_with_token_prob_updates,
     encode_mb_block_set, encode_mb_block_set_with_neighbors,
-    encode_mb_block_set_with_neighbors_strength, encode_p_frame_multi_ref,
+    encode_mb_block_set_with_neighbors_strength, encode_p_frame_detailed, encode_p_frame_multi_ref,
     encode_p_frame_multi_ref_adaptive_quant, encode_p_frame_multi_ref_auto_loop_filter,
     encode_p_frame_multi_ref_with_fitted_token_prob_updates,
     encode_p_frame_multi_ref_with_intra_pick, encode_p_frame_multi_ref_with_refresh,

@@ -69,9 +69,10 @@ fn decoded_i420(bytes: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn default_options_reproduce_the_plain_front_doors() {
-    let default = KeyframeEncodeOptions::default();
+fn exhaustive_options_reproduce_the_plain_front_doors() {
+    let default = KeyframeEncodeOptions::exhaustive();
     assert_eq!(default.effort, EncodeEffort::Thorough);
+    assert!(!default.token_prob_fit);
     for (w, h) in SIZES {
         let (y, u, v) = picture(w, h);
         let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
@@ -137,6 +138,152 @@ fn default_options_reproduce_the_plain_front_doors() {
                 "both {w}x{h}"
             );
         }
+    }
+}
+
+/// Luma PSNR of a decode against the source plane.
+fn psnr_y(bytes: &[u8], y: &[u8]) -> f64 {
+    let decoded = decode_vp8(bytes).expect("own decoder accepts the frame");
+    let sse: u64 = decoded
+        .y
+        .iter()
+        .zip(y)
+        .map(|(&a, &b)| {
+            let d = a as i64 - b as i64;
+            (d * d) as u64
+        })
+        .sum();
+    10.0 * (255.0f64 * 255.0 * y.len() as f64 / sse.max(1) as f64).log10()
+}
+
+/// The default options — the `Balanced` search with the token
+/// probabilities fitted inside the one search — against the exhaustive
+/// option-less encode: no larger, no worse, and decodable to exactly the
+/// reconstruction the encoder reports.
+#[test]
+fn default_options_beat_the_exhaustive_encode_on_size_at_equal_quality() {
+    let default = KeyframeEncodeOptions::default();
+    assert_eq!(default, KeyframeEncodeOptions::new());
+    assert_eq!(default.effort, EncodeEffort::Balanced);
+    assert!(default.token_prob_fit && !default.fitted_token_prob_updates);
+    assert_eq!(default.threads, 0);
+    let (w, h) = (320usize, 240usize);
+    let (y, u, v) = photo::photo_like_i420(w, h);
+    let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
+    for qi in [10u8, 25, 60, 100] {
+        let params = KeyframeParams::default().with_y_ac_qi(qi);
+        let plain = encode_keyframe(&frame, &params).unwrap();
+        let tuned = oxideav_vp8::encode_keyframe_detailed(&frame, &params, &default).unwrap();
+        assert!(
+            tuned.bytes.len() < plain.len(),
+            "qi {qi}: default {} bytes, exhaustive {}",
+            tuned.bytes.len(),
+            plain.len()
+        );
+        // Quality within a few hundredths of a dB of the exhaustive
+        // encode (measured: ahead of it at the mid quantisers).
+        let (got, want) = (psnr_y(&tuned.bytes, &y), psnr_y(&plain, &y));
+        assert!(got > want - 0.15, "qi {qi}: {got:.3} dB vs {want:.3} dB");
+        // What the encoder reports is what a decoder sees.
+        assert!(
+            tuned.token_prob_updates.is_some(),
+            "qi {qi}: no fit shipped"
+        );
+        assert_eq!((tuned.loop_filter_level, tuned.sharpness_level), (0, 0));
+        let decoded = decode_vp8(&tuned.bytes).unwrap();
+        for row in 0..h {
+            assert_eq!(
+                decoded.y[row * w..(row + 1) * w],
+                tuned.reconstruction.y[row * tuned.reconstruction.y_stride..][..w],
+                "qi {qi} row {row}"
+            );
+        }
+    }
+}
+
+/// The in-search fit never costs bytes: at every level the fitted stream
+/// is no larger than the same search coded against the §13.5 defaults,
+/// and the stream it produces reports the table it carries.
+#[test]
+fn token_prob_fit_only_ever_shrinks_the_stream() {
+    for (w, h) in SIZES {
+        let (y, u, v) = picture(w, h);
+        let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
+        for effort in EncodeEffort::ALL {
+            for qi in [6u8, 40, 110] {
+                let params = KeyframeParams::default().with_y_ac_qi(qi);
+                let base = KeyframeEncodeOptions::new().with_effort(effort);
+                // Same search table on both sides (the caller's), so the
+                // only difference is the table the tokens are coded with.
+                let seed = oxideav_vp8::encode_keyframe_detailed(&frame, &params, &base)
+                    .unwrap()
+                    .token_prob_updates;
+                let fitted = oxideav_vp8::encode_keyframe_detailed(
+                    &frame,
+                    &params,
+                    &base.with_search_token_probs(seed),
+                )
+                .unwrap();
+                let Some(seed) = seed else {
+                    continue;
+                };
+                let unfitted = encode_keyframe_with_options(
+                    &frame,
+                    &params,
+                    &base
+                        .with_search_token_probs(Some(seed))
+                        .with_token_prob_fit(false),
+                )
+                .unwrap();
+                assert!(
+                    fitted.bytes.len() <= unfitted.len() + 8,
+                    "{w}x{h} {effort:?} qi {qi}: fitted {} vs seeded {}",
+                    fitted.bytes.len(),
+                    unfitted.len()
+                );
+                assert_eq!(
+                    decoded_i420(&fitted.bytes),
+                    decoded_i420(&unfitted),
+                    "{w}x{h} {effort:?} qi {qi}: the fit changed the picture"
+                );
+            }
+        }
+    }
+}
+
+/// The sampled loop-filter choice: a level and sharpness in range, the
+/// header and the reconstruction agreeing with a decode, and a picture
+/// at least as close to the source as the unfiltered one.
+#[test]
+fn sampled_loop_filter_improves_on_no_filter() {
+    let (w, h) = (320usize, 240usize);
+    let (y, u, v) = photo::photo_like_i420(w, h);
+    let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
+    for qi in [25u8, 70] {
+        let params = KeyframeParams::default().with_y_ac_qi(qi);
+        let off =
+            encode_keyframe_with_options(&frame, &params, &KeyframeEncodeOptions::new()).unwrap();
+        let mut digests = Vec::new();
+        for threads in [1usize, 3] {
+            let options = KeyframeEncodeOptions::new()
+                .with_sampled_loop_filter(true)
+                .with_threads(threads);
+            let on = oxideav_vp8::encode_keyframe_detailed(&frame, &params, &options).unwrap();
+            assert!(on.loop_filter_level <= 63 && on.sharpness_level <= 7);
+            assert!(on.loop_filter_level > 0, "qi {qi}: filter left off");
+            assert!(
+                psnr_y(&on.bytes, &y) > psnr_y(&off, &y),
+                "qi {qi}: filtered picture is not closer to the source"
+            );
+            let decoded = decode_vp8(&on.bytes).unwrap();
+            assert_eq!(
+                decoded.y[..w],
+                on.reconstruction.y[..w],
+                "qi {qi}: reconstruction differs from the decode"
+            );
+            digests.push(on.bytes);
+        }
+        assert_eq!(digests[0], digests[1], "qi {qi}: threads changed the bytes");
     }
 }
 
@@ -308,21 +455,30 @@ fn black_box_decoder_agrees_at_every_effort() {
                     .with_y_ac_qi(25)
                     .with_loop_filter_level(lf)
                     .with_nbr_of_dct_partitions(partitions);
-                let bytes = encode_keyframe_with_options(
-                    &frame,
-                    &params,
-                    &KeyframeEncodeOptions::new()
-                        .with_effort(effort)
-                        .with_threads(4),
-                )
-                .unwrap();
-                let mut stream = ivf::write_header(&ivf::IvfHeader::vp8(w as u32, h as u32, 30, 1));
-                ivf::write_frame(&mut stream, 0, &bytes);
-                assert_eq!(
-                    validator_decode(&stream),
-                    decoded_i420(&bytes),
-                    "{w}x{h} {effort:?} lf {lf} partitions {partitions}"
-                );
+                // The default options (in-search probability fit), the
+                // same with the sampled loop filter, and the search
+                // coded against the §13.5 defaults.
+                let fit = KeyframeEncodeOptions::new()
+                    .with_effort(effort)
+                    .with_threads(4);
+                for (n, options) in [
+                    fit,
+                    fit.with_sampled_loop_filter(true),
+                    fit.with_token_prob_fit(false),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let bytes = encode_keyframe_with_options(&frame, &params, &options).unwrap();
+                    let mut stream =
+                        ivf::write_header(&ivf::IvfHeader::vp8(w as u32, h as u32, 30, 1));
+                    ivf::write_frame(&mut stream, 0, &bytes);
+                    assert_eq!(
+                        validator_decode(&stream),
+                        decoded_i420(&bytes),
+                        "{w}x{h} {effort:?} lf {lf} partitions {partitions} options {n}"
+                    );
+                }
             }
         }
     }
@@ -338,7 +494,7 @@ fn stream_configurations_carry_the_effort() {
         let want = encode_keyframe_with_options(
             &frame,
             &params,
-            &KeyframeEncodeOptions::new().with_effort(effort),
+            &KeyframeEncodeOptions::exhaustive().with_effort(effort),
         )
         .unwrap();
 
@@ -439,7 +595,7 @@ mod registry {
             let want = encode_keyframe_with_options(
                 &source,
                 &KeyframeParams::default().with_y_ac_qi(40),
-                &KeyframeEncodeOptions::new().with_effort(effort),
+                &KeyframeEncodeOptions::exhaustive().with_effort(effort),
             )
             .unwrap();
 
@@ -479,7 +635,7 @@ mod registry {
                 &KeyframeParams::default()
                     .with_y_ac_qi(oxideav_vp8::encoder::quality_to_qindex(80.0))
                     .with_trellis_strength(oxideav_vp8::encoder::quality_to_trellis_strength(80.0)),
-                &KeyframeEncodeOptions::new().with_effort(EncodeEffort::Fast),
+                &KeyframeEncodeOptions::exhaustive().with_effort(EncodeEffort::Fast),
             )
             .unwrap()
         );

@@ -2204,8 +2204,13 @@ struct FilterSample<'a> {
     planes: KeyframePlanes,
     modes: &'a [MacroblockModes],
     has_coeffs: &'a [bool],
-    ref_frames: &'a [Option<crate::motion_comp::RefFrame>],
-    inter_modes: &'a [Option<crate::near_mv::InterMode>],
+    /// The band's slice of the inter-frame decisions (`None` on a key
+    /// frame).
+    #[allow(clippy::type_complexity)] // two parallel per-macroblock slices
+    inter: Option<(
+        &'a [Option<crate::motion_comp::RefFrame>],
+        &'a [Option<crate::near_mv::InterMode>],
+    )>,
     /// First macroblock row of the band in the frame.
     first_row: usize,
 }
@@ -2213,14 +2218,8 @@ struct FilterSample<'a> {
 /// Choose the §9.4 `loop_filter_level` of an inter frame from a sample
 /// of the picture (clean-room; the level is the encoder's choice).
 ///
-/// Bands of two macroblock rows are taken every `every_rows` rows; each
-/// candidate level filters copies of the bands (a band's first row
-/// without its top edge) and is scored by the bands' visible-window SSD
-/// against the source. The level is found coarse to fine: every eighth
-/// level, then ±4, ±2 and ±1 around the running best — 15 candidates
-/// against the full search's ~30 full-frame passes. Sharpness stays at
-/// the base value. Candidates are scored on up to `threads` threads; the
-/// choice does not depend on the budget.
+/// [`select_filter_params_sampled`] with the sharpness left at the base
+/// value.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_filter_level_sampled(
     planes: &KeyframePlanes,
@@ -2232,10 +2231,74 @@ pub(crate) fn select_filter_level_sampled(
     every_rows: usize,
     threads: usize,
 ) -> u8 {
+    let sample = FilterSampling {
+        every_rows,
+        sweep_sharpness: false,
+    };
+    select_filter_params_sampled(
+        planes,
+        modes,
+        has_coeffs,
+        base,
+        src,
+        Some(inter),
+        sample,
+        threads,
+    )
+    .0
+}
+
+/// How [`select_filter_params_sampled`] samples the picture.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FilterSampling {
+    /// A band of two macroblock rows is taken every this many rows.
+    pub(crate) every_rows: usize,
+    /// Also try the other seven sharpness values at the chosen level.
+    pub(crate) sweep_sharpness: bool,
+}
+
+impl FilterSampling {
+    /// The sampling the key-frame encoder uses for a picture of
+    /// `mb_rows` macroblock rows: three bands spread over the height of
+    /// a small picture (a fifth of it), up to six on a large one (a
+    /// sixteenth of a 12-megapixel picture — in macroblocks the sample
+    /// also grows with the picture's width), with the sharpness sweep.
+    pub(crate) fn for_key_frame(mb_rows: usize) -> Self {
+        let bands = (mb_rows / 32).clamp(3, 6);
+        FilterSampling {
+            every_rows: (mb_rows / bands).max(2),
+            sweep_sharpness: true,
+        }
+    }
+}
+
+/// Choose the §9.4 `loop_filter_level` (and optionally the sharpness) of
+/// a frame from a sample of the picture (clean-room; both are the
+/// encoder's choice).
+///
+/// Bands of two macroblock rows are taken every `every_rows` rows; each
+/// candidate filters copies of the bands (a band's first row without its
+/// top edge) and is scored by the bands' visible-window SSD against the
+/// source. The level is found coarse to fine: every eighth level, then
+/// ±4, ±2 and ±1 around the running best — 15 candidates against the
+/// full search's ~30 full-frame passes — and the sharpness sweep adds
+/// seven more. Candidates are scored on up to `threads` threads; the
+/// choice does not depend on the budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_filter_params_sampled(
+    planes: &KeyframePlanes,
+    modes: &[MacroblockModes],
+    has_coeffs: &[bool],
+    base: &FrameFilterConfig,
+    src: &SourcePlanes<'_>,
+    inter: Option<&InterFilterInfo<'_>>,
+    sampling: FilterSampling,
+    threads: usize,
+) -> (u8, u8) {
     const BAND_ROWS: usize = 2;
     let (mb_cols, mb_rows) = (planes.mb_cols, planes.mb_rows);
     let (ys, cs) = (planes.y_stride, planes.uv_stride);
-    let every_rows = every_rows.max(BAND_ROWS);
+    let every_rows = sampling.every_rows.max(BAND_ROWS);
     let mut samples: Vec<FilterSample<'_>> = Vec::new();
     let mut first_row = 0usize;
     while first_row < mb_rows {
@@ -2253,17 +2316,15 @@ pub(crate) fn select_filter_level_sampled(
             },
             modes: &modes[mbs.clone()],
             has_coeffs: &has_coeffs[mbs.clone()],
-            ref_frames: &inter.ref_frames[mbs.clone()],
-            inter_modes: &inter.inter_modes[mbs],
+            inter: inter.map(|info| (&info.ref_frames[mbs.clone()], &info.inter_modes[mbs])),
             first_row,
         });
         first_row += every_rows;
     }
     let base_sharp = base.sharpness_level.min(7);
-    let score = |level: u8| -> u64 {
+    let score = |(level, sharpness): (u8, u8)| -> u64 {
         let mut total = 0u64;
         for sample in &samples {
-            // The band's rows of the source (visible part only).
             let y0 = sample.first_row * 16;
             if y0 >= src.height {
                 continue;
@@ -2284,49 +2345,70 @@ pub(crate) fn select_filter_level_sampled(
             let mut cand = sample.planes.clone();
             let cfg = FrameFilterConfig {
                 loop_filter_level: level,
-                sharpness_level: base_sharp,
+                sharpness_level: sharpness,
                 ..*base
             };
-            filter_inter_frame_flags(
-                &mut cand,
-                sample.modes,
-                sample.has_coeffs,
-                sample.ref_frames,
-                sample.inter_modes,
-                &cfg,
-            );
+            match sample.inter {
+                Some((ref_frames, inter_modes)) => filter_inter_frame_flags(
+                    &mut cand,
+                    sample.modes,
+                    sample.has_coeffs,
+                    ref_frames,
+                    inter_modes,
+                    &cfg,
+                ),
+                None => filter_frame_flags(&mut cand, sample.modes, sample.has_coeffs, &cfg),
+            }
             total += reconstruction_ssd(&cand, &band_src);
         }
         total
     };
 
-    let coarse: Vec<u8> = (0..=56u8).step_by(8).chain([63]).collect();
+    let coarse: Vec<(u8, u8)> = (0..=56u8)
+        .step_by(8)
+        .chain([63])
+        .map(|level| (level, base_sharp))
+        .collect();
     let scores = score_candidates(&coarse, threads, score);
-    let mut best_level = coarse[0];
+    let mut best_level = coarse[0].0;
     let mut best_ssd = scores[0];
-    for (&level, &s) in coarse.iter().zip(&scores).skip(1) {
+    for (&(level, _), &s) in coarse.iter().zip(&scores).skip(1) {
         if s < best_ssd {
             best_ssd = s;
             best_level = level;
         }
     }
     for step in [4u8, 2, 1] {
-        let mut around: Vec<u8> = Vec::with_capacity(2);
+        let mut around: Vec<(u8, u8)> = Vec::with_capacity(2);
         if best_level >= step {
-            around.push(best_level - step);
+            around.push((best_level - step, base_sharp));
         }
         if best_level + step <= 63 {
-            around.push(best_level + step);
+            around.push((best_level + step, base_sharp));
         }
         let scores = score_candidates(&around, threads, score);
-        for (&level, &s) in around.iter().zip(&scores) {
+        for (&(level, _), &s) in around.iter().zip(&scores) {
             if s < best_ssd {
                 best_ssd = s;
                 best_level = level;
             }
         }
     }
-    best_level
+    let mut best_sharp = base_sharp;
+    if sampling.sweep_sharpness && best_level != 0 {
+        let sweep: Vec<(u8, u8)> = (0u8..=7)
+            .filter(|&sharp| sharp != base_sharp)
+            .map(|sharp| (best_level, sharp))
+            .collect();
+        let scores = score_candidates(&sweep, threads, score);
+        for (&(_, sharp), &s) in sweep.iter().zip(&scores) {
+            if s < best_ssd {
+                best_ssd = s;
+                best_sharp = sharp;
+            }
+        }
+    }
+    (best_level, best_sharp)
 }
 
 /// The per-macroblock filter decisions of a key frame (`None` = level 0).

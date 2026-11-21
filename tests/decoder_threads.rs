@@ -16,8 +16,9 @@ mod photo;
 mod clip;
 
 use oxideav_vp8::{
-    AltrefStreamConfig, EncodeEffort, I420Frame, InterSegmentationConfig, KeyframeParams,
-    Vp8AltrefStreamEncoder, Vp8DecoderState,
+    AltrefStreamConfig, EncodeEffort, I420Frame, InterSegmentationConfig, KeyframeEncodeOptions,
+    KeyframeParams, Vp8AltrefStreamEncoder, Vp8DecodeOptions, Vp8DecoderState, decode_vp8,
+    decode_vp8_with_options, encode_keyframe_with_options,
 };
 
 const BUDGETS: [usize; 4] = [2, 3, 4, 8];
@@ -258,4 +259,77 @@ fn damaged_streams_fare_alike_at_every_budget() {
             );
         }
     }
+}
+
+/// The one-shot key-frame decode under options — the row-at-a-time
+/// decoder, serial or on a thread budget — against `decode_vp8`, which
+/// decodes the whole frame's residuals before reconstructing: the same
+/// picture for every stream, and the same verdict on a damaged one.
+#[test]
+fn one_shot_decode_options_match_the_plain_decode() {
+    assert_eq!(Vp8DecodeOptions::default(), Vp8DecodeOptions::new());
+    assert_eq!(Vp8DecodeOptions::new().threads, 0);
+    let mut streams: Vec<Vec<u8>> = Vec::new();
+    for (w, h) in [(16usize, 16usize), (97, 41), (320, 240)] {
+        let (y, u, v) = photo::photo_like_i420(w, h);
+        let frame = I420Frame::packed(w as u32, h as u32, &y, &u, &v);
+        for (qi, partitions, simple) in [(20u8, 1u8, false), (60, 4, false), (90, 8, true)] {
+            let params = KeyframeParams::default()
+                .with_y_ac_qi(qi)
+                .with_nbr_of_dct_partitions(partitions)
+                .with_filter_type(simple)
+                .with_loop_filter_level(18);
+            for options in [
+                KeyframeEncodeOptions::new(),
+                KeyframeEncodeOptions::new().with_sampled_loop_filter(true),
+                KeyframeEncodeOptions::exhaustive(),
+            ] {
+                streams.push(encode_keyframe_with_options(&frame, &params, &options).unwrap());
+            }
+        }
+    }
+    for vector in [
+        &include_bytes!("fixtures/i-only-64x64/input.ivf")[..],
+        &include_bytes!("fixtures/segment-4-partitions/input.ivf")[..],
+        &include_bytes!("fixtures/i-only-loopfilter-high/input.ivf")[..],
+    ] {
+        streams.push(ivf_frames(vector)[0].to_vec());
+    }
+    for (n, stream) in streams.iter().enumerate() {
+        let want = decode_vp8(stream).expect("plain decode");
+        for threads in [0usize, 1, 2, 4, 8] {
+            let options = Vp8DecodeOptions::new().with_threads(threads);
+            assert_eq!(
+                decode_vp8_with_options(stream, &options).expect("decode under options"),
+                want,
+                "stream {n}, {threads} thread(s)"
+            );
+        }
+        // Damage: truncations and a flipped byte are accepted or refused
+        // alike, with the same picture when accepted.
+        let mut damaged: Vec<Vec<u8>> = [stream.len() / 2, stream.len() * 9 / 10, 12, 3]
+            .into_iter()
+            .map(|keep| stream[..keep.min(stream.len())].to_vec())
+            .collect();
+        let mut flipped = stream.clone();
+        let at = flipped.len() * 2 / 3;
+        flipped[at] ^= 0x5A;
+        damaged.push(flipped);
+        for (d, bytes) in damaged.iter().enumerate() {
+            let want = decode_vp8(bytes).ok();
+            for threads in [1usize, 3] {
+                let options = Vp8DecodeOptions::new().with_threads(threads);
+                assert_eq!(
+                    decode_vp8_with_options(bytes, &options).ok(),
+                    want,
+                    "stream {n}, damage {d}, {threads} thread(s)"
+                );
+            }
+        }
+    }
+    // The pixel cap is honoured before anything is allocated.
+    let tight = Vp8DecodeOptions::new()
+        .with_threads(2)
+        .with_max_pixels_per_frame(64);
+    assert!(decode_vp8_with_options(&streams[3], &tight).is_err());
 }

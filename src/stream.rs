@@ -2825,6 +2825,7 @@ impl Vp8AltrefStreamEncoder {
             fitted_token_prob_updates: self.config.fitted_token_prob_updates,
             effort: Some(self.config.inter_effort),
             threads: self.config.threads,
+            search_token_probs: None,
         };
         let p_options = crate::encoder::InterCodingOptions {
             intra_pick: self.config.intra_pick,
@@ -2832,6 +2833,7 @@ impl Vp8AltrefStreamEncoder {
             fitted_token_prob_updates: self.config.fitted_token_prob_updates,
             effort: Some(self.config.inter_effort),
             threads: self.config.threads,
+            search_token_probs: None,
         };
 
         // Key frame: scheduled, scene-cut-forced, or forced because
@@ -2846,7 +2848,7 @@ impl Vp8AltrefStreamEncoder {
                     let trial = crate::encoder::encode_keyframe_with_options(
                         &group[0].as_i420(),
                         &key_params,
-                        &crate::encoder::KeyframeEncodeOptions::new()
+                        &crate::encoder::KeyframeEncodeOptions::exhaustive()
                             .with_effort(crate::encoder::EncodeEffort::Fastest)
                             .with_threads(self.config.threads),
                     )?;
@@ -2858,7 +2860,7 @@ impl Vp8AltrefStreamEncoder {
             let (bytes, recon) = crate::encoder::encode_keyframe_with_reconstruction_and_options(
                 &group[0].as_i420(),
                 &key_params,
-                &crate::encoder::KeyframeEncodeOptions::new()
+                &crate::encoder::KeyframeEncodeOptions::exhaustive()
                     .with_effort(self.config.effort)
                     .with_threads(self.config.threads)
                     .with_auto_loop_filter(kf_options.auto_loop_filter)

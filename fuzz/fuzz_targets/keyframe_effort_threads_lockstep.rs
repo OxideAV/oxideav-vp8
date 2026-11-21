@@ -20,9 +20,15 @@
 //!    encoder's post-§15 reconstruction over the visible window, at every
 //!    effort level (the reduced levels predict from their own
 //!    reconstruction exactly as the exhaustive search does).
-//! 3. **Default identity** — at `Thorough` with no switches the bytes
-//!    equal the option-less `encode_keyframe`.
-//! 4. No encode or decode error for in-range parameters.
+//! 3. **Exhaustive identity** — at `Thorough` with no switches (which is
+//!    `KeyframeEncodeOptions::exhaustive()`) the bytes equal the
+//!    option-less `encode_keyframe`.
+//! 4. **Row decode** — `decode_vp8_with_options`, serial and on the
+//!    fuzz-chosen budget, returns the picture `decode_vp8` returns.
+//! 5. No encode or decode error for in-range parameters.
+//!
+//! Bits 5 and 6 of byte 6 switch the in-search token-probability fit
+//! and the sampled loop-filter choice.
 //!
 //! Input layout:
 //!
@@ -41,8 +47,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp8::{
-    decode_vp8, encode_keyframe, encode_keyframe_with_reconstruction_and_options, EncodeEffort,
-    I420Frame, KeyframeEncodeOptions, KeyframeParams, TrellisStrength,
+    decode_vp8, decode_vp8_with_options, encode_keyframe,
+    encode_keyframe_with_reconstruction_and_options, EncodeEffort, I420Frame,
+    KeyframeEncodeOptions, KeyframeParams, TrellisStrength, Vp8DecodeOptions,
 };
 use oxideav_vp8_fuzz::accept_dimensions;
 
@@ -69,10 +76,14 @@ fuzz_target!(|data: &[u8]| {
     let effort = EncodeEffort::from_level(data[6] & 0x03);
     let auto_loop_filter = (data[6] & 0x08) != 0;
     let fitted = (data[6] & 0x10) != 0;
+    let fit_in_search = (data[6] & 0x20) != 0;
+    let sampled_loop_filter = (data[6] & 0x40) != 0;
     let options = KeyframeEncodeOptions::new()
         .with_effort(effort)
         .with_auto_loop_filter(auto_loop_filter)
-        .with_fitted_token_prob_updates(fitted);
+        .with_fitted_token_prob_updates(fitted)
+        .with_token_prob_fit(fit_in_search)
+        .with_sampled_loop_filter(sampled_loop_filter);
 
     let w = width as usize;
     let h = height as usize;
@@ -147,9 +158,36 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // 3. The default options are the option-less encoder.
-    if effort == EncodeEffort::Thorough && !auto_loop_filter && !fitted {
+    // 3. The exhaustive options are the option-less encoder.
+    if effort == EncodeEffort::Thorough
+        && !auto_loop_filter
+        && !fitted
+        && !fit_in_search
+        && !sampled_loop_filter
+    {
         let plain = encode_keyframe(&frame, &params).expect("plain encode");
-        assert_eq!(plain, bytes, "default options drifted from encode_keyframe");
+        assert_eq!(
+            plain, bytes,
+            "exhaustive options drifted from encode_keyframe"
+        );
+        let exhaustive = encode_keyframe_with_reconstruction_and_options(
+            &frame,
+            &params,
+            &KeyframeEncodeOptions::exhaustive(),
+        )
+        .expect("exhaustive encode");
+        assert_eq!(exhaustive.0, bytes, "exhaustive() is not the plain encode");
+    }
+
+    // 4. The row-at-a-time decode, serial and threaded, is the plain
+    //    decode.
+    for budget in [1usize, threads] {
+        let rows = decode_vp8_with_options(&bytes, &Vp8DecodeOptions::new().with_threads(budget))
+            .unwrap_or_else(|e| panic!("row decode refused the frame: {e:?} ({budget} threads)"));
+        assert!(
+            rows == decoded,
+            "row decode differs from the plain decode ({budget} threads, {width}x{height}, \
+             {params:?}, {options:?})"
+        );
     }
 });

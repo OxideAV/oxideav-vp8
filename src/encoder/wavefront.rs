@@ -32,17 +32,17 @@
 //! depend on the number of threads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 use super::effort::{BmodeContext, EncodeEffort, analyze_mb_model};
+use super::tape::TokenTape;
 use super::{
     BMODE_CANDIDATES, BoolEncoder, EncodeError, I420Frame, IntraBmode, IntraYMode, MacroblockModes,
-    MbCoeffs, MbEntropyCtx, MbRdCtx, RecordedBools, analyze_mb_exhaustive, clear_skip_ctx,
-    encode_mb_tokens,
+    MbEntropyCtx, MbRdCtx, analyze_mb_exhaustive, clear_skip_ctx, encode_mb_tokens,
 };
-use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 use crate::frame::KeyframePlanes;
 use crate::reconstruct::{MbNeighbors, ReconstructedMb};
+use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 
 /// Frame-constant inputs of the per-macroblock search.
 pub(super) struct KeyframeSearch<'a> {
@@ -53,6 +53,14 @@ pub(super) struct KeyframeSearch<'a> {
     pub(super) mb_rows: usize,
     /// §9.5 token partition count (1 / 2 / 4 / 8).
     pub(super) num_partitions: usize,
+    /// Leave the arithmetic coding of the token tapes to the caller
+    /// (who fits the §13.4 probabilities to them first) instead of
+    /// coding them against `rd.coeff_probs` as the rows complete.
+    pub(super) defer_token_coding: bool,
+    /// Length of the longest row tape recorded so far — what the next
+    /// row reserves, so that a tape rarely has to grow (and be copied)
+    /// while it is recorded. Never affects what is recorded.
+    pub(super) tape_hint: AtomicUsize,
 }
 
 /// Result of the analysis + token pass over a whole frame.
@@ -62,18 +70,100 @@ pub(super) struct AnalysedFrame {
     /// Per-macroblock "has any non-zero coefficient" flag, raster order
     /// — all the §15 loop filter needs of the residual.
     pub(super) has_coeffs: Vec<bool>,
-    /// Per-macroblock raw-quantised coefficients, one `Vec` per
-    /// macroblock row (see [`AnalysedFrame::flat_coeffs`]).
-    pub(super) coeff_rows: Vec<Vec<MbCoeffs>>,
-    /// The finished §9.5 token partitions.
-    pub(super) partitions: Vec<Vec<u8>>,
+    /// The §13.3 token decisions of each macroblock row.
+    pub(super) tapes: Vec<TokenTape>,
+    /// The finished §9.5 token partitions, coded against the search's
+    /// probabilities — `None` when the search deferred the coding.
+    pub(super) partitions: Option<Vec<Vec<u8>>>,
 }
 
 impl AnalysedFrame {
-    /// The coefficients as one raster-order vector (a copy — only the
-    /// §13.4 branch-count walk needs this shape).
-    pub(super) fn flat_coeffs(&self) -> Vec<MbCoeffs> {
-        self.coeff_rows.iter().flatten().copied().collect()
+    /// The §13.4 branch counts of the frame's token decisions, on up to
+    /// `threads` threads (a sum, so the same in any order).
+    pub(super) fn tally(&self, counts: &mut super::BranchCounts, threads: usize) {
+        let workers = threads.clamp(1, self.tapes.len().max(1));
+        if workers == 1 {
+            for tape in &self.tapes {
+                tape.tally(counts);
+            }
+            return;
+        }
+        let share = self.tapes.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .tapes
+                .chunks(share)
+                .map(|tapes| {
+                    scope.spawn(move || {
+                        let mut part = super::empty_branch_counts();
+                        for tape in tapes {
+                            tape.tally(&mut part);
+                        }
+                        part
+                    })
+                })
+                .collect();
+            let flat = counts
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut();
+            for handle in handles {
+                let part = match handle.join() {
+                    Ok(part) => part,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                };
+                let part = part.as_flattened().as_flattened().as_flattened();
+                for (sum, add) in flat.iter_mut().zip(part) {
+                    sum.0 += add.0;
+                    sum.1 += add.1;
+                }
+            }
+        });
+    }
+
+    /// Arithmetic-code the tapes against `probs`: macroblock row `r`
+    /// into partition `r % partitions` (§20.4), each partition through
+    /// its own boolean encoder.
+    ///
+    /// The partitions are independent bitstreams, so with a thread
+    /// budget they are coded side by side.
+    pub(super) fn code_partitions(
+        &self,
+        probs: &super::CoeffProbs,
+        partitions: usize,
+        threads: usize,
+    ) -> Vec<Vec<u8>> {
+        let code_one = |partition: usize| {
+            let mut encoder = BoolEncoder::new();
+            for tape in self.tapes.iter().skip(partition).step_by(partitions) {
+                tape.replay(&mut encoder, probs);
+            }
+            encoder.finish()
+        };
+        if threads <= 1 || partitions == 1 {
+            return (0..partitions).map(code_one).collect();
+        }
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Vec<u8>>> = (0..partitions).map(|_| Mutex::new(Vec::new())).collect();
+        let worker = || {
+            loop {
+                let partition = next.fetch_add(1, Ordering::Relaxed);
+                if partition >= partitions {
+                    break;
+                }
+                *lock(&slots[partition]) = code_one(partition);
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..threads.min(partitions) {
+                scope.spawn(worker);
+            }
+            worker();
+        });
+        slots
+            .into_iter()
+            .map(|slot| slot.into_inner().unwrap_or_else(|p| p.into_inner()))
+            .collect()
     }
 }
 
@@ -114,9 +204,8 @@ impl RowBottom {
 struct RowOutput {
     modes: Vec<MacroblockModes>,
     has_coeffs: Vec<bool>,
-    coeffs: Vec<MbCoeffs>,
     /// The row's §13.3 token decisions, in coding order.
-    tokens: RecordedBools,
+    tokens: TokenTape,
 }
 
 /// What a row shares with other workers.
@@ -208,7 +297,9 @@ pub(super) fn analyse_and_tokenize(
                 break;
             }
             // Advance the token pass if nobody else is on it.
-            if let Ok(mut pass) = tokens.try_lock() {
+            if !search.defer_token_coding
+                && let Ok(mut pass) = tokens.try_lock()
+            {
                 advance_tokens(search, &shared, &mut pass);
             }
         }
@@ -229,12 +320,14 @@ pub(super) fn analyse_and_tokenize(
         return Err(e);
     }
     let mut pass = tokens.into_inner().unwrap_or_else(|p| p.into_inner());
-    advance_tokens(search, &shared, &mut pass);
-    debug_assert_eq!(pass.next_row, mb_rows);
+    if !search.defer_token_coding {
+        advance_tokens(search, &shared, &mut pass);
+        debug_assert_eq!(pass.next_row, mb_rows);
+    }
 
     let mut modes = Vec::with_capacity(mb_rows * mb_cols);
     let mut has_coeffs = Vec::with_capacity(mb_rows * mb_cols);
-    let mut coeff_rows = Vec::with_capacity(mb_rows);
+    let mut tapes = Vec::with_capacity(mb_rows);
     for row in shared {
         let output = row
             .output
@@ -243,13 +336,15 @@ pub(super) fn analyse_and_tokenize(
             .expect("every row was analysed");
         modes.extend(output.modes);
         has_coeffs.extend(output.has_coeffs);
-        coeff_rows.push(output.coeffs);
+        tapes.push(output.tokens);
     }
+    let partitions = (!search.defer_token_coding)
+        .then(|| pass.partitions.into_iter().map(|p| p.finish()).collect());
     Ok(AnalysedFrame {
         modes,
         has_coeffs,
-        coeff_rows,
-        partitions: pass.partitions.into_iter().map(|p| p.finish()).collect(),
+        tapes,
+        partitions,
     })
 }
 
@@ -263,7 +358,10 @@ fn advance_tokens(search: &KeyframeSearch, shared: &[RowShared], pass: &mut Toke
         let Some(output) = guard.as_ref() else {
             break;
         };
-        pass.partitions[pass.next_row % search.num_partitions].write_recorded(&output.tokens);
+        output.tokens.replay(
+            &mut pass.partitions[pass.next_row % search.num_partitions],
+            search.rd.coeff_probs,
+        );
         pass.next_row += 1;
     }
 }
@@ -283,11 +381,11 @@ fn analyse_row(
     let uv_stride = mb_cols * 8;
     let mut modes = Vec::with_capacity(mb_cols);
     let mut has_coeffs = Vec::with_capacity(mb_cols);
-    let mut coeffs = Vec::with_capacity(mb_cols);
     // §13.3 token decisions of the row. The "left" non-zero context
     // resets at each row start; the "above" context of a macroblock is
     // what the macroblock over it left behind.
-    let mut tokens = RecordedBools::with_capacity(mb_cols * 256);
+    let hint = search.tape_hint.load(Ordering::Relaxed);
+    let mut tokens = TokenTape::with_capacity((hint + hint / 4).max(mb_cols * 64));
     let mut left_ctx = MbEntropyCtx::default();
     let mut left: Option<ReconstructedMb> = None;
     // §11.3 sub-block-mode contexts from the neighbouring macroblocks:
@@ -418,14 +516,13 @@ fn analyse_row(
             uv_mode: analysis.uv_mode,
         });
         has_coeffs.push(crate::loop_filter::mb_has_coeffs(&analysis.coeffs));
-        coeffs.push(analysis.coeffs);
         left = Some(recon);
     }
 
+    search.tape_hint.fetch_max(tokens.len(), Ordering::Relaxed);
     *lock(&this_row.output) = Some(RowOutput {
         modes,
         has_coeffs,
-        coeffs,
         tokens,
     });
     Ok(())

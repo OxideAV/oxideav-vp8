@@ -29,8 +29,8 @@ use oxideav_vp8::frame::KeyframePlanes;
 use oxideav_vp8::{
     AltrefPacketKind, AltrefStreamConfig, EncodeEffort, I420Frame, InterCodingOptions,
     InterSegmentationConfig, KeyframeParams, RefreshControls, Vp8AltrefStreamEncoder,
-    Vp8DecoderState, encode_keyframe_with_reconstruction, encode_p_frame_multi_ref_adaptive_quant,
-    encode_p_frame_multi_ref_with_refresh,
+    Vp8DecoderState, encode_keyframe_with_reconstruction, encode_p_frame_detailed,
+    encode_p_frame_multi_ref_adaptive_quant, encode_p_frame_multi_ref_with_refresh,
     encode_p_frame_multi_ref_with_refresh_and_coding_options, ivf,
 };
 
@@ -470,4 +470,95 @@ fn one_pass_rate_control_hits_the_target_at_every_effort() {
     )
     .unwrap();
     assert_eq!(fixed.next_qindex(), 33);
+}
+
+/// The detailed inter entry point: the bytes and reconstruction of the
+/// plain options call, the §13.4 table the frame carries, and that table
+/// accepted as the next frame's search table — every stream decoding to
+/// the encoder's reconstruction.
+#[test]
+fn detailed_inter_encode_reports_and_accepts_token_probabilities() {
+    let (w, h) = (96usize, 80usize);
+    let source = clip::moving_clip(w, h, 5);
+    let params = KeyframeParams::default().with_y_ac_qi(36);
+    let refresh = RefreshControls::default();
+    for effort in [None, Some(EncodeEffort::Fast), Some(EncodeEffort::Balanced)] {
+        for fitted in [false, true] {
+            let options = with_search(
+                InterCodingOptions::default().with_fitted_token_prob_updates(fitted),
+                effort,
+            );
+            let (key_bytes, key_planes) =
+                encode_keyframe_with_reconstruction(&view(&source[0], w, h), &params).unwrap();
+            let golden = key_planes.clone();
+            let mut last = key_planes;
+            let mut packets = vec![key_bytes];
+            let mut recons = vec![cropped(&last, w, h)];
+            let mut carried = None;
+            let mut reported_any = false;
+            for planes in &source[1..] {
+                let frame = view(planes, w, h);
+                let plain = encode_p_frame_multi_ref_with_refresh_and_coding_options(
+                    &frame,
+                    &last,
+                    Some(&golden),
+                    None,
+                    &params,
+                    &refresh,
+                    &options,
+                )
+                .unwrap();
+                let detailed = encode_p_frame_detailed(
+                    &frame,
+                    &last,
+                    Some(&golden),
+                    None,
+                    &params,
+                    &refresh,
+                    &options,
+                )
+                .unwrap();
+                assert_eq!(detailed.bytes, plain.0, "{effort:?} fitted {fitted}");
+                assert_eq!(detailed.reconstruction.y, plain.1.y);
+                assert!(
+                    fitted || detailed.token_prob_updates.is_none(),
+                    "{effort:?}: updates reported without a fit"
+                );
+                reported_any |= detailed.token_prob_updates.is_some();
+
+                // The same frame searched against the previous frame's
+                // table.
+                let seeded = encode_p_frame_detailed(
+                    &frame,
+                    &last,
+                    Some(&golden),
+                    None,
+                    &params,
+                    &refresh,
+                    &options.with_search_token_probs(carried),
+                )
+                .unwrap();
+                if !fitted {
+                    // Without a fit the table given is the table shipped.
+                    assert_eq!(
+                        seeded.token_prob_updates, carried,
+                        "{effort:?}: the given table was not shipped as given"
+                    );
+                }
+                carried = seeded.token_prob_updates.or(detailed.token_prob_updates);
+                packets.push(seeded.bytes);
+                recons.push(cropped(&seeded.reconstruction, w, h));
+                last = seeded.reconstruction;
+            }
+            assert!(
+                !fitted || reported_any,
+                "{effort:?}: a fitted chain never reported a table"
+            );
+            assert_eq!(
+                decode_chain(&packets),
+                recons,
+                "{effort:?} fitted {fitted}: decode differs from the reconstruction"
+            );
+        }
+    }
 }

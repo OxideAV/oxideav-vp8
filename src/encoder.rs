@@ -302,23 +302,23 @@ impl BoolEncoder {
         // split = 1 + (((range - 1) * prob) >> 8) — the same formula as
         // §7.3's decoder so the value→bit split is exact.
         let split = 1 + (((self.range - 1) * prob as u32) >> 8);
-        let (mut range, mut bottom) = if value {
+        let (range, mut bottom) = if value {
             (self.range - split, self.bottom.wrapping_add(split))
         } else {
             (split, self.bottom)
         };
-        if range < 128 {
-            let shift = range.leading_zeros() - 24;
-            range <<= shift;
-            let count = self.bit_count as u32;
-            if shift < count {
-                bottom <<= shift;
-                self.bit_count -= shift as i32;
-            } else {
-                bottom = self.emit_byte(bottom, shift, count);
-            }
+        // Renormalise: `range` is in 1..=255, so the shift is 0..=7 —
+        // zero when no renormalisation is due, which the arithmetic
+        // below handles without a branch of its own.
+        let shift = range.leading_zeros() - 24;
+        let count = self.bit_count as u32;
+        if shift < count {
+            bottom <<= shift;
+            self.bit_count -= shift as i32;
+        } else {
+            bottom = self.emit_byte(bottom, shift, count);
         }
-        self.range = range;
+        self.range = range << shift;
         self.bottom = bottom;
     }
 
@@ -1888,9 +1888,9 @@ pub fn encode_coeff_block(
 }
 
 /// Where the §13 token walk sends its §7.3 boolean decisions: straight
-/// into a [`BoolEncoder`], or into a [`RecordedBools`] list that is
-/// replayed into one later (the threaded key-frame driver tokenises rows
-/// in its workers and leaves only the arithmetic coding in order).
+/// into a [`BoolEncoder`], or onto a token tape (`tape.rs`) that is
+/// coded into one later (the frame drivers tokenise rows in their
+/// workers and leave only the arithmetic coding in order).
 trait BoolSink {
     /// One decision: `value` at probability-of-zero `prob / 256`.
     fn put(&mut self, prob: u8, value: bool);
@@ -1908,27 +1908,6 @@ impl BoolSink for BoolEncoder {
     #[inline]
     fn put(&mut self, prob: u8, value: bool) {
         self.write_bool(prob, value);
-    }
-}
-
-/// Recorded §7.3 decisions in coding order — the probability in the low
-/// byte, the bit in bit 8.
-type RecordedBools = Vec<u16>;
-
-impl BoolSink for RecordedBools {
-    #[inline]
-    fn put(&mut self, prob: u8, value: bool) {
-        self.push(prob as u16 | (value as u16) << 8);
-    }
-}
-
-impl BoolEncoder {
-    /// Code a recorded decision list — the same `write_bool` calls, in
-    /// order, the recording walk would have made directly.
-    fn write_recorded(&mut self, decisions: &[u16]) {
-        for &d in decisions {
-            self.write_bool(d as u8, d >> 8 != 0);
-        }
     }
 }
 
@@ -2120,9 +2099,11 @@ use crate::macroblock::{
 mod effort;
 mod inter;
 mod inter_search;
+mod pilot;
+mod tape;
 mod wavefront;
 
-pub use effort::{EncodeEffort, KeyframeEncodeOptions};
+pub use effort::{EncodeEffort, KeyframeEncodeOptions, KeyframeEncoded};
 
 /// Round-half-away-from-zero integer division — the natural inverse of
 /// the §14.1 `q * factor` dequant multiply. Used by the encoder to
@@ -2892,6 +2873,49 @@ struct TrellisRateTables {
     /// tokens (`cat = token − Cat1`): the running sum that function holds
     /// before it adds the value-dependent extra bits and the sign bit.
     cat_path: [[[[[f64; 6]; 2]; 3]; 8]; 4],
+    /// `zero_run[plane][k]` — the bits of literal `DCT_0` tokens at scan
+    /// positions `0..k`, each following another `DCT_0` (context 0, no
+    /// end-of-block branch): the prefix sums of
+    /// `small[plane][band(j)][0][1][0]`. A run of zeros inside a block
+    /// costs the difference of two entries.
+    zero_run: [[f64; 17]; 4],
+    /// `small` and `eob` already multiplied by the trellis's per-bit
+    /// price — built on the first trellis call of the frame, for that
+    /// call's price (one frame has one, or one per segment; any other
+    /// price takes the multiply-as-you-go path, with the same products).
+    priced: std::sync::OnceLock<Box<PricedRates>>,
+}
+
+/// [`TrellisRateTables::small`] and [`TrellisRateTables::eob`] times a
+/// per-bit price `lambda`: every entry is the `lambda * rate` product
+/// the trellis step would otherwise form on each visit.
+struct PricedRates {
+    lambda: f64,
+    small: [[[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
+    eob: [[[f64; 3]; 8]; 4],
+}
+
+impl PricedRates {
+    fn new(tables: &TrellisRateTables, lambda: f64) -> Box<Self> {
+        let mut priced = Box::new(PricedRates {
+            lambda,
+            small: tables.small,
+            eob: tables.eob,
+        });
+        let small = priced
+            .small
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut()
+            .as_flattened_mut();
+        for rate in small.iter_mut() {
+            *rate *= lambda;
+        }
+        for rate in priced.eob.as_flattened_mut().as_flattened_mut() {
+            *rate *= lambda;
+        }
+        priced
+    }
 }
 
 impl TrellisRateTables {
@@ -2914,6 +2938,8 @@ impl TrellisRateTables {
             eob: [[[0.0; 3]; 8]; 4],
             step: [[[[[0.0; 2]; 11]; 3]; 8]; 4],
             cat_path: [[[[[0.0; 6]; 2]; 3]; 8]; 4],
+            zero_run: [[0.0; 17]; 4],
+            priced: std::sync::OnceLock::new(),
         };
         for plane in 0..4 {
             for (band, &i) in band_pos.iter().enumerate() {
@@ -2940,6 +2966,12 @@ impl TrellisRateTables {
                         }
                     }
                 }
+            }
+        }
+        for plane in 0..4 {
+            for k in 0..16 {
+                tables.zero_run[plane][k + 1] =
+                    tables.zero_run[plane][k] + tables.small[plane][COEFF_BANDS[k]][0][1][0];
             }
         }
         tables
@@ -3072,7 +3104,26 @@ fn trellis_quantize_block(
         return;
     }
     match tables {
-        Some(tables) => trellis_scan_tabled(block, spec, tables, lambda),
+        Some(tables) => {
+            let priced = tables
+                .priced
+                .get_or_init(|| PricedRates::new(tables, lambda));
+            if priced.lambda == lambda {
+                trellis_scan_tabled::<true>(
+                    block,
+                    spec,
+                    (&priced.small, &priced.eob, &tables.cat_path),
+                    lambda,
+                )
+            } else {
+                trellis_scan_tabled::<false>(
+                    block,
+                    spec,
+                    (&tables.small, &tables.eob, &tables.cat_path),
+                    lambda,
+                )
+            }
+        }
         None => trellis_scan_direct(block, spec, coeff_probs, lambda),
     }
 }
@@ -3136,6 +3187,29 @@ fn select<T: Copy>(take: bool, a: T, b: T) -> T {
     if take { a } else { b }
 }
 
+/// `cost(c)` for each context `c` in the `ALIVE` set (bit `c`), infinity
+/// for the others — the costs of a dead context, without forming them.
+#[inline(always)]
+fn alive_costs<const ALIVE: u8>(cost: impl Fn(usize) -> f64) -> [f64; 3] {
+    [
+        if ALIVE & 1 != 0 {
+            cost(0)
+        } else {
+            f64::INFINITY
+        },
+        if ALIVE & 2 != 0 {
+            cost(1)
+        } else {
+            f64::INFINITY
+        },
+        if ALIVE & 4 != 0 {
+            cost(2)
+        } else {
+            f64::INFINITY
+        },
+    ]
+}
+
 /// The first minimum of three costs and its index: a later entry wins
 /// only when strictly smaller.
 #[inline(always)]
@@ -3170,12 +3244,23 @@ fn first_min3(c: [f64; 3]) -> (f64, u8) {
 /// A survivor in context 0 always arrived through a literal zero except
 /// before the first position, so the "previous token was `DCT_0`" flag
 /// needs no per-survivor storage.
-fn trellis_scan_tabled(
+///
+/// `PRICED` says the `small` / `eob` tables handed in already hold
+/// `lambda * rate` ([`PricedRates`]); the products are the same `f64`s
+/// either way.
+#[allow(clippy::type_complexity)] // the three table shapes, spelled out once
+fn trellis_scan_tabled<const PRICED: bool>(
     block: &mut [i16; 16],
     spec: TrellisBlockSpec,
-    tables: &TrellisRateTables,
+    (small, eob, cat_path): (
+        &[[[[[f64; (TRELLIS_SMALL_LEVEL_MAX + 1) as usize]; 2]; 3]; 8]; 4],
+        &[[[f64; 3]; 8]; 4],
+        &[[[[[f64; 6]; 2]; 3]; 8]; 4],
+    ),
     lambda: f64,
 ) {
+    // The price of a tabled rate.
+    let price = |rate: f64| if PRICED { rate } else { lambda * rate };
     let TrellisBlockSpec {
         dc,
         ac,
@@ -3221,9 +3306,9 @@ fn trellis_scan_tabled(
         norms[k] * (err * err) as f64
     };
 
-    let small = &tables.small[plane];
-    let cat_path = &tables.cat_path[plane];
-    let eob = &tables.eob[plane];
+    let small = &small[plane];
+    let cat_path = &cat_path[plane];
+    let eob = &eob[plane];
 
     const INF: f64 = f64::INFINITY;
     let mut surv = [INF, INF, INF];
@@ -3235,101 +3320,121 @@ fn trellis_scan_tabled(
     let mut choice_level2 = [0u16; 16];
 
     let mut best_term_cost =
-        0.0 + lambda * eob[COEFF_BANDS[first_coeff]][entry_ctx3] + suffix_zero_dist[first_coeff];
+        0.0 + price(eob[COEFF_BANDS[first_coeff]][entry_ctx3]) + suffix_zero_dist[first_coeff];
     let mut best_term_pos = usize::MAX;
     let mut best_term_ctx = entry_ctx3;
 
-    for k in first_coeff..=last {
-        let m = m_rounds[k];
-        let band = COEFF_BANDS[k];
-        let q = if k == 0 { dc_q } else { ac_q };
-        let band_small = &small[band];
-        let rows = [
-            &band_small[0][zero_run],
-            &band_small[1][0],
-            &band_small[2][0],
-        ];
-        let [s0, s1, s2] = surv;
+    // Which carried contexts hold a survivor (bit `c` for context `c`).
+    // A position leaves context 0 alive always, context 1 only when its
+    // rounded level is 1 or 2, context 2 only when it is 2 or more — so
+    // after a zero a single context is alive, and the step below is
+    // instantiated per alive set to price only the transitions that
+    // exist. A dead context's cost stays infinite, exactly what the
+    // sums over it would have produced.
+    let mut alive = 1u8 << entry_ctx3;
 
-        // Context 0: first minimum of the level-0 costs.
-        let d_zero = zero_dist[k];
-        let (n0, p0) = first_min3([
-            s0 + d_zero + lambda * rows[0][0],
-            s1 + d_zero + lambda * rows[1][0],
-            s2 + d_zero + lambda * rows[2][0],
-        ]);
-        // The costs of coding one non-zero `level` from each context.
-        let level_costs = |level: u32| -> [f64; 3] {
-            let d = dist(k, level, q);
-            if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
-                [
-                    s0 + d + lambda * rows[0][level as usize],
-                    s1 + d + lambda * rows[1][level as usize],
-                    s2 + d + lambda * rows[2][level as usize],
-                ]
-            } else {
-                let rates = TrellisRateTables::cat_level_rates(&cat_path[band], zero_run, level);
-                [
-                    s0 + d + lambda * rates[0],
-                    s1 + d + lambda * rates[1],
-                    s2 + d + lambda * rates[2],
-                ]
-            }
-        };
-        let (n1, p1, n2, p2, l2) = match m {
-            0 => (INF, 0, INF, 0, 0),
-            1 => {
-                let (n1, p1) = first_min3(level_costs(1));
-                (n1, p1, INF, 0, 0)
-            }
-            2 => {
-                let (n2, p2) = first_min3(level_costs(2));
-                let (n1, p1) = first_min3(level_costs(1));
-                (n1, p1, n2, p2, 2)
-            }
-            _ => {
-                // `m` then `m − 1` per incoming context, then across
-                // contexts.
-                let high = level_costs(m);
-                let low = level_costs(m - 1);
-                let take_low = [low[0] < high[0], low[1] < high[1], low[2] < high[2]];
-                let (n2, p2) = first_min3([
-                    select(take_low[0], low[0], high[0]),
-                    select(take_low[1], low[1], high[1]),
-                    select(take_low[2], low[2], high[2]),
-                ]);
-                (INF, 0, n2, p2, m - take_low[p2 as usize] as u32)
-            }
-        };
-        choice_prev[k] = [p0, p1, p2];
-        choice_level2[k] = l2 as u16;
+    macro_rules! step {
+        ($alive:literal, $k:expr) => {{
+            let k: usize = $k;
+            let m = m_rounds[k];
+            let band = COEFF_BANDS[k];
+            let q = if k == 0 { dc_q } else { ac_q };
+            let band_small = &small[band];
+            let rows = [
+                &band_small[0][zero_run],
+                &band_small[1][0],
+                &band_small[2][0],
+            ];
+            let [s0, s1, s2] = surv;
+            let s = [s0, s1, s2];
 
-        // Terminating after position k needs a non-zero level there:
-        // carried context 1, then 2. A dead survivor's infinite cost
-        // never beats the (finite) running best.
-        if m != 0 {
-            let (t1, t2) = if k + 1 < 16 {
-                let eob_next = &eob[COEFF_BANDS[k + 1]];
-                let tail = suffix_zero_dist[k + 1];
-                (
-                    n1 + lambda * eob_next[1] + tail,
-                    n2 + lambda * eob_next[2] + tail,
-                )
-            } else {
-                (n1, n2)
+            // Context 0: first minimum of the level-0 costs.
+            let d_zero = zero_dist[k];
+            let (n0, p0) = first_min3(alive_costs::<$alive>(|i| s[i] + d_zero + price(rows[i][0])));
+            // The costs of coding one non-zero `level` from each
+            // context.
+            let level_costs = |level: u32| -> [f64; 3] {
+                let d = dist(k, level, q);
+                if level <= TRELLIS_SMALL_LEVEL_MAX as u32 {
+                    alive_costs::<$alive>(|i| s[i] + d + price(rows[i][level as usize]))
+                } else {
+                    let rates =
+                        TrellisRateTables::cat_level_rates(&cat_path[band], zero_run, level);
+                    alive_costs::<$alive>(|i| s[i] + d + lambda * rates[i])
+                }
             };
-            let better = t1 < best_term_cost;
-            best_term_cost = select(better, t1, best_term_cost);
-            best_term_pos = select(better, k, best_term_pos);
-            best_term_ctx = select(better, 1, best_term_ctx);
-            let better = t2 < best_term_cost;
-            best_term_cost = select(better, t2, best_term_cost);
-            best_term_pos = select(better, k, best_term_pos);
-            best_term_ctx = select(better, 2, best_term_ctx);
-        }
+            let (n1, p1, n2, p2, l2) = match m {
+                0 => (INF, 0, INF, 0, 0),
+                1 => {
+                    let (n1, p1) = first_min3(level_costs(1));
+                    (n1, p1, INF, 0, 0)
+                }
+                2 => {
+                    let (n2, p2) = first_min3(level_costs(2));
+                    let (n1, p1) = first_min3(level_costs(1));
+                    (n1, p1, n2, p2, 2)
+                }
+                _ => {
+                    // `m` then `m − 1` per incoming context, then across
+                    // contexts.
+                    let high = level_costs(m);
+                    let low = level_costs(m - 1);
+                    let take_low = [low[0] < high[0], low[1] < high[1], low[2] < high[2]];
+                    let (n2, p2) = first_min3([
+                        select(take_low[0], low[0], high[0]),
+                        select(take_low[1], low[1], high[1]),
+                        select(take_low[2], low[2], high[2]),
+                    ]);
+                    (INF, 0, n2, p2, m - take_low[p2 as usize] as u32)
+                }
+            };
+            choice_prev[k] = [p0, p1, p2];
+            choice_level2[k] = l2 as u16;
 
-        surv = [n0, n1, n2];
-        zero_run = 1;
+            // Terminating after position k needs a non-zero level there:
+            // carried context 1, then 2. A dead survivor's infinite cost
+            // never beats the (finite) running best.
+            if m != 0 {
+                let (t1, t2) = if k + 1 < 16 {
+                    let eob_next = &eob[COEFF_BANDS[k + 1]];
+                    let tail = suffix_zero_dist[k + 1];
+                    (
+                        n1 + price(eob_next[1]) + tail,
+                        n2 + price(eob_next[2]) + tail,
+                    )
+                } else {
+                    (n1, n2)
+                };
+                let better = t1 < best_term_cost;
+                best_term_cost = select(better, t1, best_term_cost);
+                best_term_pos = select(better, k, best_term_pos);
+                best_term_ctx = select(better, 1, best_term_ctx);
+                let better = t2 < best_term_cost;
+                best_term_cost = select(better, t2, best_term_cost);
+                best_term_pos = select(better, k, best_term_pos);
+                best_term_ctx = select(better, 2, best_term_ctx);
+            }
+
+            surv = [n0, n1, n2];
+            zero_run = 1;
+            alive = match m {
+                0 => 0b001,
+                1 => 0b011,
+                2 => 0b111,
+                _ => 0b101,
+            };
+        }};
+    }
+
+    for k in first_coeff..=last {
+        match alive {
+            0b001 => step!(0b001, k),
+            0b010 => step!(0b010, k),
+            0b100 => step!(0b100, k),
+            0b011 => step!(0b011, k),
+            0b101 => step!(0b101, k),
+            _ => step!(0b111, k),
+        }
     }
 
     *block = [0i16; 16];
@@ -6054,31 +6159,109 @@ pub fn encode_keyframe_with_reconstruction_and_options(
     params: &KeyframeParams,
     options: &KeyframeEncodeOptions,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
-    let (effort, threads, auto_lf) = (options.effort, options.threads, options.auto_loop_filter);
+    encode_keyframe_under_options(frame, params, options).map(|out| (out.bytes, out.planes))
+}
+
+/// [`encode_keyframe_with_options`] returning, next to the bitstream and
+/// its reconstruction, what the encoder settled on: the §13.4
+/// token-probability updates the frame carries and its §9.4 loop-filter
+/// level / sharpness.
+///
+/// The returned updates are what
+/// [`KeyframeEncodeOptions::with_search_token_probs`] takes: an encoder
+/// of many similar pictures (animation frames, tiles of one picture)
+/// hands each encode the table the previous one came out with, so the
+/// search prices tokens against statistics close to its own from the
+/// first macroblock on.
+///
+/// ```
+/// use oxideav_vp8::{
+///     I420Frame, KeyframeEncodeOptions, KeyframeParams, encode_keyframe_detailed,
+/// };
+/// # let (width, height) = (64u32, 48u32);
+/// # let y_plane: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
+/// # let u_plane = vec![128u8; ((width / 2) * (height / 2)) as usize];
+/// # let v_plane = u_plane.clone();
+/// let frame = I420Frame::packed(width, height, &y_plane, &u_plane, &v_plane);
+/// let params = KeyframeParams::default();
+/// let first = encode_keyframe_detailed(&frame, &params, &KeyframeEncodeOptions::new())?;
+/// // The next similar picture searches against the first one's table.
+/// let options = KeyframeEncodeOptions::new().with_search_token_probs(first.token_prob_updates);
+/// let second = encode_keyframe_detailed(&frame, &params, &options)?;
+/// assert!(second.bytes.len() <= first.bytes.len() + first.bytes.len() / 50);
+/// # Ok::<(), oxideav_vp8::EncodeError>(())
+/// ```
+pub fn encode_keyframe_detailed(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeEncodeOptions,
+) -> Result<KeyframeEncoded, EncodeError> {
+    let out = encode_keyframe_under_options(frame, params, options)?;
+    Ok(KeyframeEncoded {
+        bytes: out.bytes,
+        reconstruction: out.planes,
+        token_prob_updates: out.shipped_updates,
+        loop_filter_level: out.loop_filter.0,
+        sharpness_level: out.loop_filter.1,
+    })
+}
+
+/// One key-frame encode as [`KeyframeEncodeOptions`] describes it.
+fn encode_keyframe_under_options(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    options: &KeyframeEncodeOptions,
+) -> Result<KeyframeDriven, EncodeError> {
+    let drive = KeyframeDrive {
+        search_updates: options.search_token_probs.as_ref(),
+        fit_in_place: options.token_prob_fit,
+        // The pilot costs about as much as a tenth of the lowest level's
+        // whole search for a third of a percent of its bytes; from `Fast`
+        // up it is a few percent of the time for up to a percent.
+        pilot_stride: (options.effort != EncodeEffort::Fastest).then_some(4),
+        loop_filter: if options.auto_loop_filter {
+            LoopFilterPick::Search
+        } else if options.sampled_loop_filter {
+            LoopFilterPick::Sampled
+        } else {
+            LoopFilterPick::Fixed
+        },
+        effort: options.effort,
+        threads: options.threads,
+    };
     if !options.fitted_token_prob_updates {
-        return encode_keyframe_tuned(frame, params, None, None, auto_lf, effort, threads);
+        return encode_keyframe_driven(frame, params, None, &drive);
     }
+    // Second search against the table fitted to the first one. With the
+    // fit in place the first pass already shipped that table; without
+    // it the table comes from the first pass's branch counts (2.0 bits
+    // of slack, the search of pass two shifting the statistics a
+    // little).
     let mut counts = empty_branch_counts();
-    let (bytes_default, planes_default) = encode_keyframe_tuned(
+    let first = encode_keyframe_driven(frame, params, Some(&mut counts), &drive)?;
+    let fitted = if drive.fit_in_place {
+        first.shipped_updates
+    } else {
+        let fitted = fit_token_prob_updates(&counts, 2.0);
+        any_token_prob_update(&fitted).then_some(fitted)
+    };
+    let Some(fitted) = fitted else {
+        return Ok(first);
+    };
+    let second = encode_keyframe_driven(
         frame,
         params,
         None,
-        Some(&mut counts),
-        auto_lf,
-        effort,
-        threads,
+        &KeyframeDrive {
+            search_updates: Some(&fitted),
+            ..drive
+        },
     )?;
-    let fitted = fit_token_prob_updates(&counts, 2.0);
-    if !any_token_prob_update(&fitted) {
-        return Ok((bytes_default, planes_default));
-    }
-    let (bytes_fitted, planes_fitted) =
-        encode_keyframe_tuned(frame, params, Some(&fitted), None, auto_lf, effort, threads)?;
-    if bytes_fitted.len() <= bytes_default.len() {
-        Ok((bytes_fitted, planes_fitted))
+    Ok(if second.bytes.len() <= first.bytes.len() {
+        second
     } else {
-        Ok((bytes_default, planes_default))
-    }
+        first
+    })
 }
 
 /// Encode a key frame and return both the bitstream bytes **and** the
@@ -6170,6 +6353,72 @@ fn encode_keyframe_tuned(
     effort: EncodeEffort,
     threads: usize,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    let drive = KeyframeDrive {
+        search_updates: token_updates,
+        fit_in_place: false,
+        pilot_stride: None,
+        loop_filter: if auto_lf {
+            LoopFilterPick::Search
+        } else {
+            LoopFilterPick::Fixed
+        },
+        effort,
+        threads,
+    };
+    encode_keyframe_driven(frame, params, counts, &drive).map(|out| (out.bytes, out.planes))
+}
+
+/// How a key-frame encode settles its §9.4 loop-filter level and
+/// sharpness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopFilterPick {
+    /// `KeyframeParams::loop_filter_level` / `sharpness_level` as given.
+    Fixed,
+    /// The search run on a sample of the picture (bands of macroblock
+    /// rows), coarse to fine.
+    Sampled,
+    /// Measure every candidate on the reconstruction and keep the best.
+    Search,
+}
+
+/// Everything that steers one run of the key-frame driver.
+struct KeyframeDrive<'a> {
+    /// §13.4 updates the mode search prices tokens against (`None` = the
+    /// §13.5 defaults). They are also what ships, unless `fit_in_place`.
+    search_updates: Option<&'a TokenProbUpdates>,
+    /// Fit the §13.4 updates to the recorded token decisions of this
+    /// very search and code the tokens against the fitted table.
+    fit_in_place: bool,
+    /// With `fit_in_place` and no `search_updates`: derive the search's
+    /// table from a pilot pass over every this-many-th macroblock row.
+    pilot_stride: Option<usize>,
+    loop_filter: LoopFilterPick,
+    effort: EncodeEffort,
+    threads: usize,
+}
+
+/// What one run of the key-frame driver produced.
+struct KeyframeDriven {
+    bytes: Vec<u8>,
+    /// Macroblock-aligned post-§15 reconstruction.
+    planes: crate::frame::KeyframePlanes,
+    /// The §13.4 updates in the stream (`None` = none, the §13.5
+    /// defaults are in force).
+    shipped_updates: Option<TokenProbUpdates>,
+    /// The §9.4 level and sharpness in the stream.
+    loop_filter: (u8, u8),
+}
+
+/// The key-frame driver proper.
+fn encode_keyframe_driven(
+    frame: &I420Frame,
+    params: &KeyframeParams,
+    counts: Option<&mut BranchCounts>,
+    drive: &KeyframeDrive,
+) -> Result<KeyframeDriven, EncodeError> {
+    let (effort, threads) = (drive.effort, drive.threads);
+    let token_updates = drive.search_updates;
+    let auto_lf = drive.loop_filter == LoopFilterPick::Search;
     let width = frame.width;
     let height = frame.height;
     if width == 0 || width > 0x3FFF || height == 0 || height > 0x3FFF {
@@ -6210,15 +6459,10 @@ fn encode_keyframe_tuned(
     // rebuilds the same merged table, so the bitstream stays sound on
     // either path. `None` (or an all-`None` array) preserves the
     // round-154 wire byte-for-byte.
-    let coeff_probs = match token_updates {
+    let mut coeff_probs = match token_updates {
         Some(u) => crate::dct_tokens::merge_default_token_probs(u),
         None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
     };
-    // Per-frame §13 trellis rate tables for the resolved `coeff_probs`
-    // (see `TrellisRateTables`) — built once here so the per-MB mode
-    // search prices tokens from lookups instead of re-walking the §13.2
-    // tree per candidate. Values (and bytes) are identical either way.
-    let trellis_rate_tables = Some(TrellisRateTables::for_probs(&coeff_probs));
     let factors = crate::dequant::MbDequantFactors::from_base_and_deltas(
         params.y_ac_qi as i32,
         0,
@@ -6227,6 +6471,30 @@ fn encode_keyframe_tuned(
         0,
         0,
     );
+    // With the fit in place the search's table never ships, so when the
+    // caller brought none it is taken from a pilot look at the picture
+    // (see `pilot.rs`) rather than left at the §13.5 defaults.
+    if let (Some(stride), None) = (drive.pilot_stride, token_updates)
+        && drive.fit_in_place
+    {
+        let defaults = crate::dct_tokens::DEFAULT_COEFF_PROBS;
+        let default_tables = TrellisRateTables::for_probs(&defaults);
+        let pilot_rd = MbRdCtx {
+            factors: &factors,
+            coeff_probs: &defaults,
+            rate_tables: Some(&default_tables),
+            lambda: rd_lambda(&factors),
+            trellis: params.trellis_strength,
+        };
+        let seen =
+            pilot::pilot_branch_counts(frame, &pilot_rd, (mb_cols, mb_rows), stride, threads);
+        coeff_probs = pilot::blend_into_defaults(&seen);
+    }
+    // Per-frame §13 trellis rate tables for the resolved `coeff_probs`
+    // (see `TrellisRateTables`) — built once here so the per-MB mode
+    // search prices tokens from lookups instead of re-walking the §13.2
+    // tree per candidate. Values (and bytes) are identical either way.
+    let trellis_rate_tables = Some(TrellisRateTables::for_probs(&coeff_probs));
 
     // Running reconstruction buffer — identical layout to the decoder's
     // `decode_keyframe` output. Each MB's neighbours are gathered from
@@ -6271,11 +6539,34 @@ fn encode_keyframe_tuned(
         mb_cols,
         mb_rows,
         num_partitions,
+        defer_token_coding: drive.fit_in_place,
+        tape_hint: std::sync::atomic::AtomicUsize::new(0),
     };
-    let analysed = wavefront::analyse_and_tokenize(&search, &mut planes, threads)?;
+    let mut analysed = wavefront::analyse_and_tokenize(&search, &mut planes, threads)?;
+    // §13.4: with the fit in place the updates that ship are fitted to
+    // the decisions the search just recorded, and the tapes are coded
+    // against the fitted table — the search itself priced tokens against
+    // `coeff_probs`, which the decoder never needs to know. The fit's
+    // saving is exact for these counts, so it needs no slack.
+    let shipped_updates: Option<TokenProbUpdates> = if drive.fit_in_place {
+        let mut observed = empty_branch_counts();
+        analysed.tally(&mut observed, threads);
+        let fitted = fit_token_prob_updates(&observed, 0.0);
+        any_token_prob_update(&fitted).then_some(fitted)
+    } else {
+        token_updates.copied()
+    };
+    let coded_in_search = analysed.partitions.take();
+    let code_tapes = |analysed: &wavefront::AnalysedFrame, threads: usize| {
+        let emit_probs = match &shipped_updates {
+            Some(u) => crate::dct_tokens::merge_default_token_probs(u),
+            None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
+        };
+        analysed.code_partitions(&emit_probs, num_partitions, threads)
+    };
+    let token_updates = shipped_updates.as_ref();
     let modes = &analysed.modes;
     let has_coeffs = &analysed.has_coeffs;
-    let dct_partitions = &analysed.partitions;
 
     // ---- §15 loop-filter post-pass --------------------------------------
     //
@@ -6303,35 +6594,38 @@ fn encode_keyframe_tuned(
     // The §15 base config (level filled in below). Segmentation off and
     // `mode_ref_lf_delta_enabled = false`, so every per-MB override is 0
     // and each MB's effective level reduces to the frame base.
-    let mut lf_config = crate::loop_filter::FrameFilterConfig {
-        // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
-        // simple. Mirrors the bit `write_loop_filter` writes below;
-        // the encoder's own post-walk filter must match what the
-        // decoder will run.
-        simple: params.filter_type,
-        key_frame: true,
-        loop_filter_level: params.loop_filter_level,
-        sharpness_level: params.sharpness_level,
-        segmentation_enabled: false,
-        segment_abs: false,
-        segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
-        delta_enabled: false,
-        ref_delta_current: 0,
-        bpred_mode_delta: 0,
-        ref_delta_last: 0,
-        ref_delta_golden: 0,
-        ref_delta_altref: 0,
-        zero_mv_mode_delta: 0,
-        other_mv_mode_delta: 0,
-        split_mv_mode_delta: 0,
-    };
-    // §9.4 effective loop-filter level + sharpness. When `auto_lf` is set
-    // the RD selector jointly replaces `params.loop_filter_level` /
-    // `params.sharpness_level` with the distortion-minimising pair
-    // (clean-room; RFC 6386 is silent on the encoder's choice). Both
-    // chosen values are written to the header below so the decoder runs
-    // the identical §15 pass.
-    let (eff_lf_level, eff_sharpness) = if auto_lf {
+    // The token coding and the loop filter do not depend on each other:
+    // with a thread budget the tapes are coded on a thread of their own
+    // while this one settles and applies the filter.
+    let filter_stage = |planes: &mut crate::frame::KeyframePlanes| {
+        let mut lf_config = crate::loop_filter::FrameFilterConfig {
+            // §9.4 `filter_type`: `false` ⇒ §15.3 normal, `true` ⇒ §15.2
+            // simple. Mirrors the bit `write_loop_filter` writes below;
+            // the encoder's own post-walk filter must match what the
+            // decoder will run.
+            simple: params.filter_type,
+            key_frame: true,
+            loop_filter_level: params.loop_filter_level,
+            sharpness_level: params.sharpness_level,
+            segmentation_enabled: false,
+            segment_abs: false,
+            segment_lf_level: [0; crate::loop_filter::MAX_MB_SEGMENTS],
+            delta_enabled: false,
+            ref_delta_current: 0,
+            bpred_mode_delta: 0,
+            ref_delta_last: 0,
+            ref_delta_golden: 0,
+            ref_delta_altref: 0,
+            zero_mv_mode_delta: 0,
+            other_mv_mode_delta: 0,
+            split_mv_mode_delta: 0,
+        };
+        // §9.4 effective loop-filter level + sharpness. When `auto_lf` is set
+        // the RD selector jointly replaces `params.loop_filter_level` /
+        // `params.sharpness_level` with the distortion-minimising pair
+        // (clean-room; RFC 6386 is silent on the encoder's choice). Both
+        // chosen values are written to the header below so the decoder runs
+        // the identical §15 pass.
         let src = crate::loop_filter::SourcePlanes {
             width: width as usize,
             height: height as usize,
@@ -6341,23 +6635,48 @@ fn encode_keyframe_tuned(
             y_stride: frame.y_stride,
             uv_stride: frame.uv_stride,
         };
-        crate::loop_filter::select_filter_params_threaded(
-            &planes, modes, has_coeffs, &lf_config, &src, None, threads,
-        )
-    } else {
-        (params.loop_filter_level, params.sharpness_level)
+        let (eff_lf_level, eff_sharpness) = if auto_lf {
+            crate::loop_filter::select_filter_params_threaded(
+                planes, modes, has_coeffs, &lf_config, &src, None, threads,
+            )
+        } else if drive.loop_filter == LoopFilterPick::Sampled {
+            crate::loop_filter::select_filter_params_sampled(
+                planes,
+                modes,
+                has_coeffs,
+                &lf_config,
+                &src,
+                None,
+                crate::loop_filter::FilterSampling::for_key_frame(mb_rows),
+                threads,
+            )
+        } else {
+            (params.loop_filter_level, params.sharpness_level)
+        };
+        lf_config.loop_filter_level = eff_lf_level;
+        lf_config.sharpness_level = eff_sharpness;
+        if eff_lf_level != 0 {
+            crate::loop_filter::filter_frame_flags_threaded(
+                planes, modes, has_coeffs, &lf_config, threads,
+            );
+        }
+        (eff_lf_level, eff_sharpness)
     };
-    lf_config.loop_filter_level = eff_lf_level;
-    lf_config.sharpness_level = eff_sharpness;
-    if eff_lf_level != 0 {
-        crate::loop_filter::filter_frame_flags_threaded(
-            &mut planes,
-            modes,
-            has_coeffs,
-            &lf_config,
-            threads,
-        );
-    }
+    let ((eff_lf_level, eff_sharpness), dct_partitions) = match coded_in_search {
+        Some(coded) => (filter_stage(&mut planes), coded),
+        None if threads > 1 => std::thread::scope(|scope| {
+            let coder = scope.spawn(|| code_tapes(&analysed, threads));
+            let filter = filter_stage(&mut planes);
+            match coder.join() {
+                Ok(coded) => (filter, coded),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }),
+        None => {
+            let coded = code_tapes(&analysed, 1);
+            (filter_stage(&mut planes), coded)
+        }
+    };
     // `planes` is the macroblock-aligned post-§15 reconstruction. It is
     // returned to the caller alongside the bitstream below so a
     // multi-frame keyframe driver can install it into the §9
@@ -6438,7 +6757,7 @@ fn encode_keyframe_tuned(
     // the bytes in `dct_partitions` carry. With `counts = None`
     // this is a no-op.
     if let Some(c) = counts {
-        count_keyframe_branches(modes, &analysed.flat_coeffs(), mb_cols, mb_rows, c);
+        analysed.tally(c, threads);
     }
     let dct_total: usize = dct_partitions.iter().map(|p| p.len()).sum();
     let size_table_len = (num_partitions - 1) * 3;
@@ -6467,11 +6786,16 @@ fn encode_keyframe_tuned(
         out.push(((sz >> 8) & 0xff) as u8);
         out.push(((sz >> 16) & 0xff) as u8);
     }
-    for part in dct_partitions {
+    for part in &dct_partitions {
         out.extend_from_slice(part);
     }
 
-    Ok((out, planes))
+    Ok(KeyframeDriven {
+        bytes: out,
+        planes,
+        shipped_updates,
+        loop_filter: (eff_lf_level, eff_sharpness),
+    })
 }
 
 /// Configuration for the §9.3 / §10 segment-based adaptive-quant key-frame
@@ -9777,6 +10101,30 @@ pub struct InterCodingOptions {
     /// macroblock-row wavefront on up to `n` scoped threads that end
     /// with the call. The output bytes are the same for every budget.
     pub threads: usize,
+    /// §13.4 updates the search prices tokens against instead of the
+    /// §13.5 defaults — typically the
+    /// [`InterEncoded::token_prob_updates`] of the previous frame. With
+    /// an [`effort`](Self::effort) level and
+    /// [`fitted_token_prob_updates`](Self::fitted_token_prob_updates)
+    /// they only steer the search and the frame ships its own fit;
+    /// without the fit they are shipped as given. (The two-pass fit of
+    /// the original search — `fitted_token_prob_updates` without an
+    /// effort level — ignores them.)
+    pub search_token_probs: Option<TokenProbUpdates>,
+}
+
+/// A finished inter-frame encode with the §13.4 table it carries — the
+/// result of [`encode_p_frame_detailed`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct InterEncoded {
+    /// The VP8 inter frame.
+    pub bytes: Vec<u8>,
+    /// The macroblock-aligned post-§15 reconstruction.
+    pub reconstruction: crate::frame::KeyframePlanes,
+    /// The §13.4 token-probability updates the frame carries (`None`
+    /// when it codes against the §13.5 defaults).
+    pub token_prob_updates: Option<TokenProbUpdates>,
 }
 
 impl InterCodingOptions {
@@ -9800,7 +10148,15 @@ impl InterCodingOptions {
             effort: self.effort,
             threads: self.threads,
             fit_token_probs: self.fitted_token_prob_updates,
+            search_token_probs: self.search_token_probs,
         }
+    }
+
+    /// Set `search_token_probs`.
+    #[must_use]
+    pub fn with_search_token_probs(mut self, v: Option<TokenProbUpdates>) -> Self {
+        self.search_token_probs = v;
+        self
     }
 
     /// Set `intra_pick`.
@@ -9993,6 +10349,70 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
     options: &InterCodingOptions,
     segmentation: Option<&InterSegmentationConfig>,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_options_reporting(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        options,
+        segmentation,
+        &mut None,
+    )
+}
+
+/// Encode an inter frame under [`InterCodingOptions`] and return, next
+/// to the bitstream and its reconstruction, the §13.4 token-probability
+/// updates the frame carries — the table to hand the next frame's
+/// [`InterCodingOptions::with_search_token_probs`], so that its search
+/// prices tokens against statistics close to its own.
+///
+/// The bytes and the reconstruction are those of
+/// [`encode_p_frame_multi_ref_with_refresh_and_coding_options`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_p_frame_detailed(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    options: &InterCodingOptions,
+) -> Result<InterEncoded, EncodeError> {
+    let mut shipped = None;
+    let (bytes, reconstruction) = encode_p_frame_options_reporting(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        options,
+        None,
+        &mut shipped,
+    )?;
+    Ok(InterEncoded {
+        bytes,
+        reconstruction,
+        token_prob_updates: shipped,
+    })
+}
+
+/// [`encode_p_frame_options_and_segmentation`], reporting the §13.4
+/// updates of the returned frame in `shipped`.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_options_reporting(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    options: &InterCodingOptions,
+    segmentation: Option<&InterSegmentationConfig>,
+    shipped: &mut Option<TokenProbUpdates>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     // §9.3: the loop-filter feature value is a signed 6-bit magnitude.
     if let Some(d) = segmentation.and_then(|s| s.lf_delta)
@@ -10004,7 +10424,7 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
     }
 
     if !options.fitted_token_prob_updates || options.effort.is_some() {
-        return encode_p_frame_multi_ref_inner_full(
+        return encode_p_frame_multi_ref_inner_driven(
             frame,
             last,
             golden,
@@ -10020,14 +10440,22 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
             options.auto_loop_filter,
             segmentation,
             options.speed(),
+            Some(&mut *shipped),
         );
     }
 
     // Pass 1 — §13.5 defaults + observed branch counts, with the
     // requested picker / auto-LF / segmentation switches active so the
     // recorded counts reflect the MB mix pass 2 will re-produce.
+    // The two-pass fit searches pass one against the §13.5 defaults and
+    // pass two against its own fit; a search-only table has no place in
+    // it.
+    let two_pass_speed = inter::InterSpeed {
+        search_token_probs: None,
+        ..options.speed()
+    };
     let mut counts = empty_branch_counts();
-    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_full(
+    let (bytes_default, planes_default) = encode_p_frame_multi_ref_inner_driven(
         frame,
         last,
         golden,
@@ -10042,7 +10470,8 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
         options.intra_pick,
         options.auto_loop_filter,
         segmentation,
-        options.speed(),
+        two_pass_speed,
+        None,
     )?;
 
     // 2.0 bits of slack — matches every other inter fitter.
@@ -10052,7 +10481,7 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
     }
 
     // Pass 2 — re-encode against the merged table.
-    let (bytes_fitted, planes_fitted) = encode_p_frame_multi_ref_inner_full(
+    let (bytes_fitted, planes_fitted) = encode_p_frame_multi_ref_inner_driven(
         frame,
         last,
         golden,
@@ -10067,13 +10496,15 @@ pub(crate) fn encode_p_frame_options_and_segmentation(
         options.intra_pick,
         options.auto_loop_filter,
         segmentation,
-        options.speed(),
+        two_pass_speed,
+        None,
     )?;
 
     // Bytes-vs-default guard; the shipped planes always match the
     // shipped wire so a streaming caller's slots stay in decoder
     // lockstep.
     if bytes_fitted.len() <= bytes_default.len() {
+        *shipped = Some(fitted);
         Ok((bytes_fitted, planes_fitted))
     } else {
         Ok((bytes_default, planes_default))
@@ -10282,6 +10713,47 @@ fn encode_p_frame_multi_ref_inner_full(
     segmentation: Option<&InterSegmentationConfig>,
     speed: inter::InterSpeed,
 ) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
+    encode_p_frame_multi_ref_inner_driven(
+        frame,
+        last,
+        golden,
+        altref,
+        params,
+        refresh,
+        lf_deltas,
+        carried_ref_deltas,
+        carried_mode_deltas,
+        token_updates,
+        counts,
+        pick_intra,
+        auto_lf,
+        segmentation,
+        speed,
+        None,
+    )
+}
+
+/// [`encode_p_frame_multi_ref_inner_full`], reporting the §13.4 updates
+/// the frame ships in `shipped_out`.
+#[allow(clippy::too_many_arguments)]
+fn encode_p_frame_multi_ref_inner_driven(
+    frame: &I420Frame,
+    last: &crate::frame::KeyframePlanes,
+    golden: Option<&crate::frame::KeyframePlanes>,
+    altref: Option<&crate::frame::KeyframePlanes>,
+    params: &KeyframeParams,
+    refresh: &RefreshControls,
+    lf_deltas: &LoopFilterDeltas,
+    carried_ref_deltas: [i16; 4],
+    carried_mode_deltas: [i16; 4],
+    token_updates: Option<&TokenProbUpdates>,
+    counts: Option<&mut BranchCounts>,
+    pick_intra: bool,
+    auto_lf: bool,
+    segmentation: Option<&InterSegmentationConfig>,
+    speed: inter::InterSpeed,
+    shipped_out: Option<&mut Option<TokenProbUpdates>>,
+) -> Result<(Vec<u8>, crate::frame::KeyframePlanes), EncodeError> {
     refresh.validate()?;
     lf_deltas.validate()?;
     let width = frame.width;
@@ -10359,7 +10831,10 @@ fn encode_p_frame_multi_ref_inner_full(
     // byte-identical to the §13.5 defaults and the §13.4 sub-block
     // reduces to the 1056-zero-flag wire — i.e. the round-155 inter
     // wire byte-for-byte.
-    let coeff_probs = match token_updates {
+    // The table the search prices tokens against: the caller's updates
+    // to ship, else its search-only seed, else the §13.5 defaults.
+    let search_updates = token_updates.or(speed.search_token_probs.as_ref());
+    let coeff_probs = match search_updates {
         Some(u) => crate::dct_tokens::merge_default_token_probs(u),
         None => crate::dct_tokens::DEFAULT_COEFF_PROBS,
     };
@@ -10512,22 +10987,32 @@ fn encode_p_frame_multi_ref_inner_full(
     // The reduced search's decisions do not depend on the token
     // probabilities that ship, so the §13.4 fit runs on the recorded
     // decisions directly (2.0 bits of slack, as every other fitter).
-    let fitted_in_place: Option<TokenProbUpdates> =
-        if reduced_search && speed.fit_token_probs && token_updates.is_none() {
-            let mut observed = empty_branch_counts();
-            for tape in &analysis.tapes {
-                tape.tally(&mut observed);
-            }
-            let fitted = fit_token_prob_updates(&observed, 2.0);
-            any_token_prob_update(&fitted).then_some(fitted)
-        } else {
-            None
-        };
-    let token_updates = token_updates.or(fitted_in_place.as_ref());
-    let emit_probs = match &fitted_in_place {
-        Some(u) => crate::dct_tokens::merge_default_token_probs(u),
-        None => coeff_probs,
+    let fit_in_place = reduced_search && speed.fit_token_probs && token_updates.is_none();
+    let fitted_in_place: Option<TokenProbUpdates> = if fit_in_place {
+        let mut observed = empty_branch_counts();
+        for tape in &analysis.tapes {
+            tape.tally(&mut observed);
+        }
+        let fitted = fit_token_prob_updates(&observed, 2.0);
+        any_token_prob_update(&fitted).then_some(fitted)
+    } else {
+        None
     };
+    // What ships: the fit when it ran (possibly nothing), else the table
+    // the search used. The tapes are coded against exactly that.
+    let token_updates = if fit_in_place {
+        fitted_in_place.as_ref()
+    } else {
+        search_updates
+    };
+    let emit_probs = match token_updates {
+        Some(u) if fit_in_place => crate::dct_tokens::merge_default_token_probs(u),
+        None if fit_in_place => crate::dct_tokens::DEFAULT_COEFF_PROBS,
+        _ => coeff_probs,
+    };
+    if let Some(out) = shipped_out {
+        *out = token_updates.filter(|u| any_token_prob_update(u)).copied();
+    }
     let seg_counts = analysis.segment_counts;
     let records = &analysis.records;
     // Per-macroblock views of the decisions for the §15 loop filter and
@@ -12025,7 +12510,7 @@ mod factory {
             } else {
                 self.context_threads
             };
-            KeyframeEncodeOptions::new()
+            KeyframeEncodeOptions::exhaustive()
                 .with_effort(self.effort)
                 .with_threads(threads)
                 .with_auto_loop_filter(self.auto_lf)
@@ -12468,7 +12953,7 @@ impl Vp8EncoderConfig {
 
     /// The key-frame speed options this configuration implies.
     fn keyframe_options(&self) -> KeyframeEncodeOptions {
-        KeyframeEncodeOptions::new()
+        KeyframeEncodeOptions::exhaustive()
             .with_effort(self.effort)
             .with_threads(self.threads)
             .with_auto_loop_filter(self.auto_loop_filter)

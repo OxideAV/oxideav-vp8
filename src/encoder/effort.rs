@@ -3,7 +3,7 @@
 //!
 //! RFC 6386 specifies decoding only; how much work an encoder spends
 //! choosing among the §12 prediction modes is its own business. The
-//! exhaustive search ([`EncodeEffort::Thorough`], the default) carries
+//! exhaustive search ([`EncodeEffort::Thorough`]) carries
 //! every candidate mode through transform, §13 trellis quantisation,
 //! reconstruction and exact token pricing. The reduced levels replace
 //! that per-candidate chain with a closed-form cost model:
@@ -33,6 +33,7 @@ use super::{
     reconstruct_block_4x4, rounded_level, transform_chroma_plane_rd, transform_whole_block_luma_rd,
     treed_bits_cached, trellis_quantize_block,
 };
+use crate::coded_header::TokenProbUpdates;
 use crate::intra_predict::DEFAULT_ABOVE_PIXEL;
 use crate::reconstruct::MbNeighbors;
 
@@ -41,9 +42,10 @@ use crate::reconstruct::MbNeighbors;
 /// The levels trade output size for encode time; all of them emit a
 /// conformant RFC 6386 key frame that this crate's decoder (and any
 /// other) reconstructs to exactly the picture the encoder predicted
-/// from. [`Thorough`](Self::Thorough) is the default and reproduces the
-/// bytes of the option-less entry points. See `BENCHMARKS.md` §Round 486
-/// for the measured time / size of each level.
+/// from. [`Balanced`](Self::Balanced) is the default;
+/// [`Thorough`](Self::Thorough) is the search of the option-less entry
+/// points. See the crate README for the measured time / size / quality
+/// of each level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[non_exhaustive]
 pub enum EncodeEffort {
@@ -58,13 +60,16 @@ pub enum EncodeEffort {
     /// best four sub-block modes and all §12.2 luma / chroma modes, and
     /// the winners are trellis-quantised.
     Fast,
-    /// Level 2. Every candidate mode is compared with the cost model;
-    /// only the winners go through the trellis and reconstruction.
-    Balanced,
-    /// Level 3 (default). Exhaustive rate-distortion search: every
-    /// candidate is transformed, trellis-quantised, reconstructed and
-    /// priced exactly.
+    /// Level 2 (default). Every candidate mode is compared with the cost
+    /// model; only the winners go through the trellis and
+    /// reconstruction. About half the time of
+    /// [`Thorough`](Self::Thorough) for the same picture quality within
+    /// a percent of its size.
     #[default]
+    Balanced,
+    /// Level 3. Exhaustive rate-distortion search: every candidate is
+    /// transformed, trellis-quantised, reconstructed and priced exactly
+    /// — the search of the option-less entry points.
     Thorough,
 }
 
@@ -147,14 +152,17 @@ impl EncodeEffort {
     }
 }
 
-/// Speed controls for one key-frame encode — the options the
+/// Controls for one key-frame encode — the options the
 /// `encode_keyframe_with_options` family takes next to
 /// [`KeyframeParams`](super::KeyframeParams).
 ///
-/// `Default` is the exhaustive single-threaded encode with a fixed loop
-/// filter and no token-probability fit, i.e. exactly
-/// [`encode_keyframe`](super::encode_keyframe).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `Default` is the recommended still-picture encode: the default
+/// [`EncodeEffort`], serial, the loop filter of the `KeyframeParams`,
+/// and the §13.4 token probabilities fitted to the picture within the
+/// one search ([`token_prob_fit`](Self::token_prob_fit)).
+/// [`KeyframeEncodeOptions::exhaustive`] is the option-less
+/// [`encode_keyframe`](super::encode_keyframe), byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyframeEncodeOptions {
     /// Mode-search effort.
@@ -165,20 +173,71 @@ pub struct KeyframeEncodeOptions {
     /// `std::thread`s that end with the call). The output bytes are the
     /// same for every budget.
     pub threads: usize,
-    /// RD-select the §9.4 loop-filter level / sharpness (ignoring
+    /// Measure every §9.4 loop-filter level / sharpness candidate on the
+    /// reconstruction and keep the best (ignoring
     /// `KeyframeParams::loop_filter_level`), as
     /// [`encode_keyframe_auto_loop_filter`](super::encode_keyframe_auto_loop_filter) does.
     pub auto_loop_filter: bool,
-    /// Fit the §13.4 token-probability updates in a second pass, as
+    /// Run the mode search a second time against the token probabilities
+    /// fitted to the first search, and keep the smaller stream (roughly
+    /// doubles the encode time for a further few tenths of a percent;
     /// [`encode_keyframe_with_fitted_token_prob_updates`](super::encode_keyframe_with_fitted_token_prob_updates)
-    /// does (roughly doubles the encode time).
+    /// is this with the exhaustive search).
     pub fitted_token_prob_updates: bool,
+    /// Fit the §13.4 token-probability updates to the token statistics
+    /// of the search itself and code the tokens against the fitted
+    /// table (on by default). The search records its token decisions
+    /// instead of bits, so this costs one walk over the recorded
+    /// decisions — no second search — and never enlarges the stream:
+    /// an update ships only where it saves more bits than it costs.
+    pub token_prob_fit: bool,
+    /// §13.4 updates the mode search prices tokens against instead of
+    /// the §13.5 defaults — typically the
+    /// [`KeyframeEncoded::token_prob_updates`] a similar picture (the
+    /// previous frame, a neighbouring tile, a first quick encode) came
+    /// out with. With [`token_prob_fit`](Self::token_prob_fit) they only
+    /// steer the search and the stream carries this picture's own fit;
+    /// without it they are shipped as given.
+    pub search_token_probs: Option<TokenProbUpdates>,
+    /// Choose the §9.4 loop-filter level and sharpness on a sample of
+    /// the picture (three to six bands of macroblock rows spread over
+    /// its height, searched coarse to fine), ignoring
+    /// `KeyframeParams::loop_filter_level` — most of the gain of
+    /// [`auto_loop_filter`](Self::auto_loop_filter) for a small fraction
+    /// of its time. `auto_loop_filter` takes precedence when both are
+    /// set.
+    pub sampled_loop_filter: bool,
+}
+
+impl Default for KeyframeEncodeOptions {
+    fn default() -> Self {
+        KeyframeEncodeOptions {
+            effort: EncodeEffort::default(),
+            threads: 0,
+            auto_loop_filter: false,
+            fitted_token_prob_updates: false,
+            token_prob_fit: true,
+            search_token_probs: None,
+            sampled_loop_filter: false,
+        }
+    }
 }
 
 impl KeyframeEncodeOptions {
-    /// The defaults: [`EncodeEffort::Thorough`], serial.
+    /// The defaults: the default [`EncodeEffort`], serial, token
+    /// probabilities fitted in the one search.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The exhaustive encode of the option-less entry points:
+    /// [`EncodeEffort::Thorough`], serial, the §13.5 default token
+    /// probabilities — the bytes of
+    /// [`encode_keyframe`](super::encode_keyframe).
+    pub fn exhaustive() -> Self {
+        Self::default()
+            .with_effort(EncodeEffort::Thorough)
+            .with_token_prob_fit(false)
     }
 
     /// Set `effort`.
@@ -208,6 +267,49 @@ impl KeyframeEncodeOptions {
         self.fitted_token_prob_updates = v;
         self
     }
+
+    /// Set `token_prob_fit`.
+    #[must_use]
+    pub fn with_token_prob_fit(mut self, v: bool) -> Self {
+        self.token_prob_fit = v;
+        self
+    }
+
+    /// Set `search_token_probs`.
+    #[must_use]
+    pub fn with_search_token_probs(mut self, v: Option<TokenProbUpdates>) -> Self {
+        self.search_token_probs = v;
+        self
+    }
+
+    /// Set `sampled_loop_filter`.
+    #[must_use]
+    pub fn with_sampled_loop_filter(mut self, v: bool) -> Self {
+        self.sampled_loop_filter = v;
+        self
+    }
+}
+
+/// A finished key-frame encode with what the encoder settled on along
+/// the way — the result of
+/// [`encode_keyframe_detailed`](super::encode_keyframe_detailed).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct KeyframeEncoded {
+    /// The VP8 key frame.
+    pub bytes: Vec<u8>,
+    /// The macroblock-aligned post-§15 reconstruction — the planes a
+    /// decoder rebuilds from `bytes`.
+    pub reconstruction: crate::frame::KeyframePlanes,
+    /// The §13.4 token-probability updates the frame carries (`None`
+    /// when it codes against the §13.5 defaults). Feed them to
+    /// [`KeyframeEncodeOptions::with_search_token_probs`] for the next
+    /// similar picture.
+    pub token_prob_updates: Option<TokenProbUpdates>,
+    /// The §9.4 `loop_filter_level` in the frame header.
+    pub loop_filter_level: u8,
+    /// The §9.4 `sharpness_level` in the frame header.
+    pub sharpness_level: u8,
 }
 
 /// Shape of the model-driven search at one reduced effort level.
@@ -362,17 +464,97 @@ pub(super) fn model_block_parts(
     }
 }
 
-/// [`model_block_parts`] folded into one cost `D + lambda·R`, together
-/// with whether any level is non-zero.
-fn model_quantize_block(
-    block: &mut [i16; 16],
+/// The cost `D + lambda·R` [`model_block_parts`] models for a block and
+/// whether any level is non-zero, without writing the levels — the form
+/// the key-frame search compares candidates with.
+///
+/// Same model, evaluated through the block's sparsity: a position whose
+/// magnitude rounds to zero contributes its full squared magnitude to
+/// the distortion and a `DCT_0` token to the rate, so the all-zero
+/// totals are formed first (one branch-free pass that also marks the
+/// positions that round to a level), and only the marked positions are
+/// then visited to exchange their zero terms for the real ones. The
+/// zeros between two levels are priced from the per-plane run table.
+/// (The rate is summed in a different order than `model_block_parts`
+/// sums it, so the two agree to rounding, not bit for bit.)
+#[inline]
+pub(super) fn model_block_cost(
+    block: &[i16; 16],
     spec: TrellisBlockSpec,
     weights: &[u64; 16],
     tables: &TrellisRateTables,
     lambda: f64,
 ) -> (f64, bool) {
-    let m = model_block_parts(block, spec, weights, tables);
-    (m.dist as f64 / WEIGHT_SCALE + lambda * m.rate, m.nonzero)
+    let first = spec.first_coeff;
+    debug_assert!(first <= 1, "§13.3 blocks start at coefficient 0 or 1");
+    let (dc_q, ac_q) = (spec.dc as u32, spec.ac as u32);
+    let mut magnitude = [0u32; 16];
+    for (m, &pos) in magnitude.iter_mut().zip(crate::dct_tokens::ZIGZAG.iter()) {
+        *m = block[pos].unsigned_abs() as u32;
+    }
+    if first != 0 {
+        magnitude[0] = 0;
+    }
+    // `|x| + q/2 >= q` ⇔ the magnitude rounds to a level.
+    let mut thresholds = [ac_q - ac_q / 2; 16];
+    thresholds[0] = dc_q - dc_q / 2;
+    let mut dist = 0u64;
+    let mut coded = 0u32;
+    for k in 0..16 {
+        let ax = magnitude[k];
+        dist += weights[k] * (ax as u64 * ax as u64);
+        coded |= ((ax >= thresholds[k]) as u32) << k;
+    }
+    let plane = spec.plane;
+    let eob = &tables.eob[plane];
+    let mut ctx3 = spec.entry_ctx3;
+    if coded == 0 {
+        let rate = eob[COEFF_BANDS[first]][ctx3];
+        return (dist as f64 / WEIGHT_SCALE + lambda * rate, false);
+    }
+    let small = &tables.small[plane];
+    let zero_run = &tables.zero_run[plane];
+    let mut rate = 0.0;
+    let mut pos = first;
+    let mut after_zero = 0usize;
+    let mut pending = coded;
+    while pending != 0 {
+        let k = pending.trailing_zeros() as usize;
+        pending &= pending - 1;
+        if k > pos {
+            // The first zero of the run sees the carried context; the
+            // rest follow a zero.
+            rate += small[COEFF_BANDS[pos]][ctx3][after_zero][0];
+            rate += zero_run[k] - zero_run[pos + 1];
+            ctx3 = 0;
+            after_zero = 1;
+        }
+        let ax = magnitude[k];
+        let q = if k == 0 { dc_q } else { ac_q };
+        let level = rounded_level(ax, q);
+        let err = (ax as i64 - level as i64 * q as i64).unsigned_abs();
+        // `|err| <= q/2 <= ax`, so the exchange never underflows.
+        dist -= weights[k] * (ax as u64 * ax as u64 - err * err);
+        let band = COEFF_BANDS[k];
+        rate += if level <= super::TRELLIS_SMALL_LEVEL_MAX as u32 {
+            small[band][ctx3][after_zero][level as usize]
+        } else {
+            TrellisRateTables::level_rate(
+                &small[band],
+                &tables.cat_path[plane][band],
+                ctx3,
+                after_zero == 1,
+                level,
+            )
+        };
+        ctx3 = (level as usize).min(2);
+        after_zero = 0;
+        pos = k + 1;
+    }
+    if pos < 16 {
+        rate += eob[COEFF_BANDS[pos]][ctx3];
+    }
+    (dist as f64 / WEIGHT_SCALE + lambda * rate, true)
 }
 
 /// Forward-DCT the 4×4 residual `src − pred` at `(row, col)` of two
@@ -399,13 +581,17 @@ pub(super) fn residual_dct(
 
 /// Model cost of coding the luma plane with one §12.2 whole-block
 /// prediction (mode-signal bits excluded), and whether any luma AC
-/// level survives rounding.
+/// level survives rounding — or `None` as soon as the running cost
+/// reaches `budget` (block costs are non-negative, so the total could
+/// only be at or above it: the candidate cannot win a strict comparison
+/// against a cost of `budget`).
 fn model_whole_luma(
     src: &[u8; 256],
     pred: &[u8; 256],
     rd: &MbRdCtx,
     tables: &TrellisRateTables,
-) -> (f64, bool) {
+    budget: f64,
+) -> Option<(f64, bool)> {
     let factors = rd.factors;
     let dct_weights = &*DCT_WEIGHTS;
     let mut dcs = [0i16; 16];
@@ -418,8 +604,8 @@ fn model_whole_luma(
             let mut coeffs = residual_dct(src, pred, 16, i * 4, j * 4);
             dcs[i * 4 + j] = coeffs[0];
             coeffs[0] = 0;
-            let (c, nonzero) = model_quantize_block(
-                &mut coeffs,
+            let (c, nonzero) = model_block_cost(
+                &coeffs,
                 TrellisBlockSpec {
                     dc: factors.y1_dc,
                     ac: factors.y1_ac,
@@ -436,11 +622,14 @@ fn model_whole_luma(
             left[i] = nonzero;
             any_ac |= nonzero;
         }
+        if cost >= budget {
+            return None;
+        }
     }
     let mut y2 = [0i16; 16];
     forward_wht_4x4(&dcs, &mut y2);
-    let (c, _) = model_quantize_block(
-        &mut y2,
+    let (c, _) = model_block_cost(
+        &y2,
         TrellisBlockSpec {
             dc: factors.y2_dc,
             ac: factors.y2_ac,
@@ -452,7 +641,7 @@ fn model_whole_luma(
         tables,
         rd.lambda,
     );
-    (cost + c, any_ac)
+    Some((cost + c, any_ac))
 }
 
 /// Model cost of coding one 8×8 chroma plane against `pred`.
@@ -469,9 +658,9 @@ fn model_chroma_plane(
     let mut cost = 0.0;
     for (i, left_nonzero) in left.iter_mut().enumerate() {
         for (j, above_nonzero) in above.iter_mut().enumerate() {
-            let mut coeffs = residual_dct(src, pred, 8, i * 4, j * 4);
-            let (c, nonzero) = model_quantize_block(
-                &mut coeffs,
+            let coeffs = residual_dct(src, pred, 8, i * 4, j * 4);
+            let (c, nonzero) = model_block_cost(
+                &coeffs,
                 TrellisBlockSpec {
                     dc: factors.uv_dc,
                     ac: factors.uv_ac,
@@ -515,7 +704,8 @@ struct ModelBpred {
 /// prediction error plus mode-signal cost) are compared by model cost;
 /// the winner is then quantised for real against the §13.3 neighbour
 /// context, reconstructed, and written back so later sub-blocks predict
-/// from the pixels the decoder will hold.
+/// from the pixels the decoder will hold. Returns `None` as soon as the
+/// running cost reaches `budget` (sub-block costs are non-negative).
 fn model_bpred_luma(
     src: &[u8; 256],
     neighbors: &MbNeighbors,
@@ -523,7 +713,8 @@ fn model_bpred_luma(
     rd: &MbRdCtx,
     tables: &TrellisRateTables,
     search: ModelSearch,
-) -> ModelBpred {
+    budget: f64,
+) -> Option<ModelBpred> {
     let factors = rd.factors;
     let mut buf = build_enc_bpred_buffer(neighbors);
     let mut modes = [IntraBmode::Dc; 16];
@@ -607,7 +798,6 @@ fn model_bpred_luma(
             let mut best_n = order[0];
             let mut best_cost = f64::INFINITY;
             let mut best_dct = [0i16; 16];
-            let mut best_levels = [0i16; 16];
             for &n in &order[..considered] {
                 let mut residual = [0i16; 16];
                 for k in 0..16 {
@@ -615,18 +805,18 @@ fn model_bpred_luma(
                 }
                 let mut dct = [0i16; 16];
                 forward_dct_4x4(&residual, &mut dct);
-                let mut levels = dct;
-                let (c, _) =
-                    model_quantize_block(&mut levels, spec, dct_weights, tables, rd.lambda);
+                let (c, _) = model_block_cost(&dct, spec, dct_weights, tables, rd.lambda);
                 let cost = c + mode_cost[n];
                 if cost < best_cost {
                     best_cost = cost;
                     best_n = n;
                     best_dct = dct;
-                    best_levels = levels;
                 }
             }
 
+            if total + best_cost >= budget {
+                return None;
+            }
             // Quantise the winner for real.
             let coeffs = if trellis {
                 let mut c = best_dct;
@@ -639,7 +829,9 @@ fn model_bpred_luma(
                 );
                 c
             } else {
-                best_levels
+                let mut c = best_dct;
+                super::enc_quantize_block_range(&mut c, spec.dc, spec.ac, spec.first_coeff);
+                c
             };
             let recon =
                 reconstruct_block_4x4(&preds[best_n], &coeffs, factors.y1_dc, factors.y1_ac);
@@ -655,11 +847,11 @@ fn model_bpred_luma(
             }
         }
     }
-    ModelBpred {
+    Some(ModelBpred {
         modes,
         y_coeffs,
         cost: total,
-    }
+    })
 }
 
 /// The model-driven per-macroblock search of the reduced effort levels.
@@ -718,13 +910,21 @@ pub(super) fn analyze_mb_model(
                 whole_n = n;
             }
         }
-        let (c, has_ac) = model_whole_luma(&pixels.y, &y_preds[whole_n], rd, tables);
+        let (c, has_ac) = model_whole_luma(&pixels.y, &y_preds[whole_n], rd, tables, f64::INFINITY)
+            .expect("no budget");
         whole_cost = c + y_mode_cost(Y_MODES[whole_n]);
         whole_has_ac = has_ac;
     } else {
         for (n, &mode) in Y_MODES.iter().enumerate() {
-            let (c, has_ac) = model_whole_luma(&pixels.y, &y_preds[n], rd, tables);
-            let cost = c + y_mode_cost(mode);
+            // A mode whose partial cost already reaches the best total
+            // cannot replace it.
+            let signal = y_mode_cost(mode);
+            let Some((c, has_ac)) =
+                model_whole_luma(&pixels.y, &y_preds[n], rd, tables, whole_cost - signal)
+            else {
+                continue;
+            };
+            let cost = c + signal;
             if cost < whole_cost {
                 whole_cost = cost;
                 whole_n = n;
@@ -737,9 +937,19 @@ pub(super) fn analyze_mb_model(
     let bpred = if search.skip_bpred_without_luma_ac && !whole_has_ac {
         None
     } else {
-        let pass = model_bpred_luma(&pixels.y, neighbors, bmode_ctx, final_rd, tables, search);
-        let total = pass.cost + y_mode_cost(IntraYMode::B);
-        (total < whole_cost).then_some(pass)
+        // `B_PRED` must come in strictly under the whole-block winner;
+        // the pass stops as soon as its running cost rules that out.
+        let signal = y_mode_cost(IntraYMode::B);
+        model_bpred_luma(
+            &pixels.y,
+            neighbors,
+            bmode_ctx,
+            final_rd,
+            tables,
+            search,
+            whole_cost - signal,
+        )
+        .filter(|pass| pass.cost + signal < whole_cost)
     };
 
     // ---- §12.2 chroma ----------------------------------------------
@@ -775,8 +985,13 @@ pub(super) fn analyze_mb_model(
             + if search.whole_modes_by_prediction_error {
                 (block_ssd(&u_preds[n], &pixels.u) + block_ssd(&v_preds[n], &pixels.v)) as f64
             } else {
-                model_chroma_plane(&pixels.u, &u_preds[n], rd, tables)
-                    + model_chroma_plane(&pixels.v, &v_preds[n], rd, tables)
+                // The second plane is only worth modelling while the
+                // mode can still come in under the best one.
+                let u_cost = model_chroma_plane(&pixels.u, &u_preds[n], rd, tables);
+                if mode_cost + u_cost >= uv_best {
+                    continue;
+                }
+                u_cost + model_chroma_plane(&pixels.v, &v_preds[n], rd, tables)
             };
         if cost < uv_best {
             uv_best = cost;
@@ -822,7 +1037,7 @@ mod tests {
             assert_eq!(EncodeEffort::parse(&n.to_string()), Some(effort));
         }
         assert_eq!(EncodeEffort::from_level(200), EncodeEffort::Thorough);
-        assert_eq!(EncodeEffort::default(), EncodeEffort::Thorough);
+        assert_eq!(EncodeEffort::default(), EncodeEffort::Balanced);
         assert_eq!(EncodeEffort::parse("turbo"), None);
         assert!(EncodeEffort::Fastest < EncodeEffort::Thorough);
     }
@@ -851,8 +1066,28 @@ mod tests {
                 }
                 enc_quantize_block(&mut want, dc, ac);
                 let mut got = block;
-                let (cost, nonzero) = model_quantize_block(
+                let parts = model_block_parts(
                     &mut got,
+                    TrellisBlockSpec {
+                        dc,
+                        ac,
+                        first_coeff: first,
+                        entry_ctx3: case % 3,
+                        plane: block_type.plane_index(),
+                    },
+                    &DCT_WEIGHTS,
+                    &tables,
+                );
+                let (cost, nonzero) = (
+                    parts.dist as f64 / WEIGHT_SCALE + 7.5 * parts.rate,
+                    parts.nonzero,
+                );
+                assert_eq!(got, want);
+                assert_eq!(nonzero, want.iter().any(|&v| v != 0));
+                assert!(cost.is_finite() && cost >= 0.0);
+                // The sparse form prices the same model.
+                let (sparse, sparse_nonzero) = model_block_cost(
+                    &block,
                     TrellisBlockSpec {
                         dc,
                         ac,
@@ -864,9 +1099,11 @@ mod tests {
                     &tables,
                     7.5,
                 );
-                assert_eq!(got, want);
-                assert_eq!(nonzero, want.iter().any(|&v| v != 0));
-                assert!(cost.is_finite() && cost >= 0.0);
+                assert_eq!(sparse_nonzero, nonzero);
+                assert!(
+                    (sparse - cost).abs() <= 1e-9 * cost.max(1.0),
+                    "sparse {sparse} vs reference {cost}"
+                );
             }
         }
     }

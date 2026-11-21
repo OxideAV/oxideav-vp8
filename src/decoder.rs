@@ -305,6 +305,96 @@ pub fn decode_vp8(bytes: &[u8]) -> Result<Vp8DecodedFrame, DecodeError> {
     decode_vp8_with_max_pixels(bytes, DEFAULT_MAX_PIXELS_PER_FRAME)
 }
 
+/// Controls for a one-shot key-frame decode
+/// ([`decode_vp8_with_options`]).
+///
+/// `Default` is [`decode_vp8`]: serial, [`DEFAULT_MAX_PIXELS_PER_FRAME`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Vp8DecodeOptions {
+    /// Thread budget. `0` and `1` both mean serial (the default); with
+    /// `n > 1` token rows, reconstruction rows and the loop filter run
+    /// on up to `n` scoped threads that end with the call. The picture
+    /// is the same at every budget.
+    pub threads: usize,
+    /// Reject a declared `width × height` above this before any
+    /// allocation (see [`decode_vp8_with_max_pixels`]).
+    pub max_pixels_per_frame: u64,
+}
+
+impl Default for Vp8DecodeOptions {
+    fn default() -> Self {
+        Vp8DecodeOptions {
+            threads: 0,
+            max_pixels_per_frame: DEFAULT_MAX_PIXELS_PER_FRAME,
+        }
+    }
+}
+
+impl Vp8DecodeOptions {
+    /// The defaults: serial, [`DEFAULT_MAX_PIXELS_PER_FRAME`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `threads`.
+    #[must_use]
+    pub fn with_threads(mut self, v: usize) -> Self {
+        self.threads = v;
+        self
+    }
+
+    /// Set `max_pixels_per_frame`.
+    #[must_use]
+    pub fn with_max_pixels_per_frame(mut self, v: u64) -> Self {
+        self.max_pixels_per_frame = v;
+        self
+    }
+}
+
+/// Decode one VP8 key frame under [`Vp8DecodeOptions`] — [`decode_vp8`]
+/// with a caller-granted thread budget and pixel cap. This is the entry
+/// point for a still-picture container that wants its decode to follow
+/// the caller's thread budget.
+///
+/// The picture is bit-identical to [`decode_vp8`]'s at every budget.
+/// Like `decode_vp8` it is stateless and decodes key frames only. It
+/// works a macroblock row at a time — a row's coefficients are decoded,
+/// reconstructed and dropped — where `decode_vp8` holds the dequantised
+/// coefficients of the whole frame (800 bytes per macroblock, 38 MiB
+/// for a 12-megapixel picture) until reconstruction is over; the serial
+/// speed of the two is the same.
+///
+/// ```
+/// use oxideav_vp8::{Vp8DecodeOptions, decode_vp8, decode_vp8_with_options};
+/// # use oxideav_vp8::{I420Frame, KeyframeParams, encode_keyframe};
+/// # let (w, h) = (64u32, 48u32);
+/// # let y: Vec<u8> = (0..w * h).map(|i| (i * 5 % 253) as u8).collect();
+/// # let c = vec![128u8; ((w / 2) * (h / 2)) as usize];
+/// # let vp8_keyframe_bytes =
+/// #     encode_keyframe(&I420Frame::packed(w, h, &y, &c, &c), &KeyframeParams::default())?;
+/// let options = Vp8DecodeOptions::new().with_threads(4);
+/// let picture = decode_vp8_with_options(&vp8_keyframe_bytes, &options)?;
+/// assert_eq!(picture, decode_vp8(&vp8_keyframe_bytes)?);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn decode_vp8_with_options(
+    bytes: &[u8],
+    options: &Vp8DecodeOptions,
+) -> Result<Vp8DecodedFrame, DecodeError> {
+    let header = Vp8FrameHeader::parse(bytes)?;
+    if !header.key_frame {
+        return Err(DecodeError::Unsupported(
+            "VP8 inter-frame (§16) decoding needs the carried state of \
+             `Vp8DecoderState` — this entry point decodes key frames only",
+        ));
+    }
+    crate::state::Vp8DecoderState::new()
+        .with_max_pixels_per_frame(options.max_pixels_per_frame)
+        .with_threads(options.threads)
+        .decode_frame(bytes)
+}
+
 /// Decode one VP8 key frame, rejecting a declared `width × height` larger
 /// than `max_pixels_per_frame` before any allocation.
 ///

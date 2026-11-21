@@ -1,38 +1,147 @@
-//! Waiting on another worker's progress.
+//! What the rows of a wavefront share: progress they wait on, and small
+//! strips of data handed from one row to the next.
 //!
 //! The wavefront passes of this crate (macroblock rows of an encode, a
-//! decode or the loop filter, each a couple of macroblocks behind the
-//! row above) wait for progress that normally arrives within
-//! microseconds, far below what parking a thread costs. They poll an
-//! atomic counter and call [`Backoff::pause`] between polls: it spins for
-//! a while and only then starts handing the processor to other threads,
-//! so a short wait stays cheap on an idle machine and a long one (the
-//! other worker was descheduled) does not monopolise a core.
+//! decode or the loop filter) each run a couple of macroblocks behind
+//! the row above. A row that catches up with the one above **blocks**:
+//! it registers the progress it wants to be woken at and sleeps on a
+//! condition variable; the row above wakes it when it gets there. Nobody
+//! polls.
+//!
+//! Waking a thread costs far more than a macroblock does, so a row that
+//! has to wait asks for more than it needs right now — a batch of
+//! macroblocks ([`Wave::wait`]). It then runs that batch without
+//! touching the lock again, and the row above pays for a wake-up once
+//! per batch instead of once per macroblock. In steady state every row
+//! trails the one above by a batch and nobody blocks at all.
 
-/// Polls spent spinning before the waiter starts yielding. A poll is a
-/// few nanoseconds, so this bounds the spinning to tens of microseconds
-/// — longer than a macroblock row takes in any of the passes.
-const SPIN_POLLS: u32 = 4096;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::{Condvar, Mutex};
 
-/// Spin-then-yield waiting state for one wait.
-#[derive(Debug, Default)]
-pub(crate) struct Backoff {
-    polls: u32,
+/// How far one row has got (in macroblocks), with the progress the
+/// nearest waiter wants to be woken at.
+#[derive(Debug)]
+pub(crate) struct Progress {
+    done: AtomicUsize,
+    /// `usize::MAX` while nobody waits on this row.
+    wake_at: AtomicUsize,
 }
 
-impl Backoff {
+impl Progress {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Progress {
+            done: AtomicUsize::new(0),
+            wake_at: AtomicUsize::new(usize::MAX),
+        }
     }
 
-    /// Pause before polling again.
+    /// The published progress.
     #[inline]
-    pub(crate) fn pause(&mut self) {
-        if self.polls < SPIN_POLLS {
-            self.polls += 1;
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
+    pub(crate) fn get(&self) -> usize {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+/// The shared state of one wavefront pass: the lock and condition
+/// variable its rows sleep on, and the flag that calls the pass off.
+#[derive(Debug)]
+pub(crate) struct Wave {
+    aborted: AtomicBool,
+    gate: Mutex<()>,
+    moved: Condvar,
+    /// Macroblocks a waiting row asks for beyond the ones it needs.
+    batch: usize,
+    /// Macroblocks per row — the most a row can ask for.
+    row_len: usize,
+}
+
+impl Wave {
+    /// The state of a pass over rows of `row_len` macroblocks.
+    pub(crate) fn new(row_len: usize) -> Self {
+        Wave {
+            aborted: AtomicBool::new(false),
+            gate: Mutex::new(()),
+            moved: Condvar::new(),
+            batch: (row_len / 16).clamp(2, 16),
+            row_len,
+        }
+    }
+
+    fn gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.gate.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether the pass was called off.
+    #[inline]
+    pub(crate) fn aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Call the pass off and wake every waiting row.
+    pub(crate) fn abort(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        let _gate = self.gate();
+        self.moved.notify_all();
+    }
+
+    /// Publish that `row` has finished `done` macroblocks, waking the
+    /// rows that asked for that much.
+    #[inline]
+    pub(crate) fn advance(&self, row: &Progress, done: usize) {
+        // Store, then look for a waiter; a waiter registers, then looks
+        // at the progress (`wait`). Sequentially consistent, so at least
+        // one side sees the other.
+        row.done.store(done, Ordering::SeqCst);
+        if done >= row.wake_at.load(Ordering::SeqCst) {
+            self.wake(row);
+        }
+    }
+
+    #[cold]
+    fn wake(&self, row: &Progress) {
+        let _gate = self.gate();
+        row.wake_at.store(usize::MAX, Ordering::SeqCst);
+        self.moved.notify_all();
+    }
+
+    /// Return once `row` has finished `need` macroblocks; `false` if the
+    /// pass was called off instead.
+    ///
+    /// When the row is not there yet the caller sleeps until it is a
+    /// batch further (or complete), so that it does not have to come
+    /// back for every macroblock.
+    #[inline]
+    pub(crate) fn wait(&self, row: &Progress, need: usize) -> bool {
+        if row.get() >= need {
+            return !self.aborted();
+        }
+        self.sleep_until(row, (need + self.batch).min(self.row_len).max(need))
+    }
+
+    #[cold]
+    fn sleep_until(&self, row: &Progress, target: usize) -> bool {
+        let mut gate = self.gate();
+        loop {
+            if self.aborted() {
+                return false;
+            }
+            row.wake_at.fetch_min(target, Ordering::SeqCst);
+            if row.done.load(Ordering::SeqCst) >= target {
+                return true;
+            }
+            gate = self.moved.wait(gate).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+/// Calls the pass off if the thread unwinds, so nobody sleeps on this
+/// thread's row forever.
+pub(crate) struct AbortOnUnwind<'a>(pub(crate) &'a Wave);
+
+impl Drop for AbortOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.abort();
         }
     }
 }
@@ -210,6 +319,43 @@ impl SharedPixelLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A follower never observes less progress than it asked for, sleeps
+    /// rather than polls, and is released by an abort.
+    #[test]
+    fn follower_blocks_until_the_leader_is_there() {
+        const ROW: usize = 200;
+        let wave = Wave::new(ROW);
+        let leader = Progress::new();
+        let follower = Progress::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for done in 1..=ROW {
+                    assert!(wave.wait(&leader, (done + 2).min(ROW)));
+                    assert!(leader.get() >= (done + 2).min(ROW));
+                    wave.advance(&follower, done);
+                }
+            });
+            for done in 1..=ROW {
+                if done % 7 == 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                wave.advance(&leader, done);
+            }
+        });
+        assert_eq!(follower.get(), ROW);
+
+        // A row that never moves: the waiter is released by the abort.
+        let wave = Wave::new(ROW);
+        let stuck = Progress::new();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| wave.wait(&stuck, 1));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            wave.abort();
+            assert!(!waiter.join().expect("waiter"));
+        });
+        assert!(!wave.wait(&stuck, 0), "an aborted pass reports it");
+    }
 
     #[test]
     fn shared_bytes_round_trip() {

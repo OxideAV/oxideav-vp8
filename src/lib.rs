@@ -274,7 +274,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod arnr;
-mod backoff;
+mod rowsync;
 pub mod bool_decoder;
 pub mod coded_header;
 pub mod dct_tokens;
@@ -396,8 +396,8 @@ pub use dct_tokens::{
     merge_default_token_probs,
 };
 pub use decoder::{
-    DEFAULT_MAX_PIXELS_PER_FRAME, DecodeError, Vp8DecodedFrame, decode_vp8,
-    decode_vp8_with_max_pixels,
+    DEFAULT_MAX_PIXELS_PER_FRAME, DecodeError, Vp8DecodeOptions, Vp8DecodedFrame, decode_vp8,
+    decode_vp8_with_max_pixels, decode_vp8_with_options,
 };
 
 /// 0.1.13 alias for [`decoder::Vp8DecodedFrame`] — the per-frame

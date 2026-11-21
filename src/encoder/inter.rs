@@ -29,10 +29,10 @@
 //! the output does not depend on the number of threads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::effort::EncodeEffort;
-use super::wavefront::{AbortOnUnwind, lock};
+use super::wavefront::lock;
 use super::{
     BoolEncoder, BoolSink, BranchCounts, CoeffProbs, EncodeError, I420Frame,
     InterSegmentationConfig, IntraUvMode, IntraYMode, MbCoeffs, MbEntropyCtx, MbPixels,
@@ -40,7 +40,7 @@ use super::{
     clear_skip_ctx, encode_mb_tokens, mb_luma_variance, pick_intra_mb_all, pick_mb_for_ref,
     ref_frame_tree_bits,
 };
-use crate::backoff::{SharedEntropy, SharedPixelLine};
+use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 use crate::dequant::MbDequantFactors;
 use crate::frame::KeyframePlanes;
 use crate::loop_filter::MAX_MB_SEGMENTS;
@@ -210,7 +210,7 @@ pub(super) struct InterAnalysis {
 }
 
 /// What a finished macroblock leaves for the row below — lock-free, as
-/// both rows touch it once per macroblock (see `backoff.rs`).
+/// both rows touch it once per macroblock (see `rowsync.rs`).
 struct RowBottom {
     pixels: SharedPixelLine,
     infos: SharedMbInfos,
@@ -218,7 +218,7 @@ struct RowBottom {
 }
 
 /// One §16.3 neighbour record ([`MbInfo`]) per macroblock column, shared
-/// like [`crate::backoff::SharedBytes`]: nine words per macroblock — the
+/// like [`crate::rowsync::SharedBytes`]: nine words per macroblock — the
 /// reference, flags and whole-block vector, then the sixteen sub-block
 /// vectors two to a word.
 struct SharedMbInfos {
@@ -304,7 +304,7 @@ struct RowOutput {
 struct RowShared {
     /// Valid for macroblock columns `< done`.
     bottom: RowBottom,
-    done: AtomicUsize,
+    done: Progress,
     output: Mutex<Option<RowOutput>>,
 }
 
@@ -330,7 +330,7 @@ pub(super) fn analyse_inter_frame(
                 infos: SharedMbInfos::new(mb_cols),
                 entropy: SharedEntropy::new(mb_cols),
             },
-            done: AtomicUsize::new(0),
+            done: Progress::new(),
             output: Mutex::new(None),
         })
         .collect();
@@ -343,13 +343,13 @@ pub(super) fn analyse_inter_frame(
         .map(|(mb_row, ((y, u), v))| RowJob { mb_row, y, u, v })
         .collect();
     let jobs = Mutex::new(jobs.into_iter());
-    let abort = AtomicBool::new(false);
+    let abort = Wave::new(mb_cols);
     let first_error: Mutex<Option<(usize, EncodeError)>> = Mutex::new(None);
 
     let worker = || {
         let _guard = AbortOnUnwind(&abort);
         loop {
-            if abort.load(Ordering::Acquire) {
+            if abort.aborted() {
                 break;
             }
             let Some(job) = lock(&jobs).next() else {
@@ -361,7 +361,7 @@ pub(super) fn analyse_inter_frame(
                 if slot.as_ref().is_none_or(|(row, _)| mb_row < *row) {
                     *slot = Some((mb_row, e));
                 }
-                abort.store(true, Ordering::Release);
+                abort.abort();
                 break;
             }
         }
@@ -408,7 +408,7 @@ fn analyse_row(
     search: &InterSearch,
     job: RowJob,
     shared: &[RowShared],
-    abort: &AtomicBool,
+    abort: &Wave,
 ) -> Result<(), EncodeError> {
     let mb_cols = search.mb_cols;
     let mb_row = job.mb_row;
@@ -431,12 +431,8 @@ fn analyse_row(
         let mut above_ctx = MbEntropyCtx::default();
         if let Some(above) = above_row {
             let need = (mb_col + 2).min(mb_cols);
-            let mut backoff = crate::backoff::Backoff::new();
-            while above.done.load(Ordering::Acquire) < need {
-                if abort.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                backoff.pause();
+            if !abort.wait(&above.done, need) {
+                return Ok(());
             }
             let bottom = &above.bottom;
             above_info = bottom.infos.load(mb_col);
@@ -546,7 +542,7 @@ fn analyse_row(
         this_row.bottom.infos.store(mb_col, &info);
         this_row.bottom.entropy.store(mb_col, &above_ctx);
         this_row.bottom.pixels.store(mb_col, recon);
-        this_row.done.store(mb_col + 1, Ordering::Release);
+        abort.advance(&this_row.done, mb_col + 1);
 
         records.push(MbRecord {
             segment_id,

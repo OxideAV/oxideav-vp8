@@ -29,9 +29,8 @@
 //! thread count.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::backoff::{SharedEntropy, SharedPixelLine};
 use crate::bool_decoder::BoolDecoder;
 use crate::dct_tokens::{CoeffProbs, MbEntropyCtx};
 use crate::decoder::DecodeError;
@@ -42,6 +41,7 @@ use crate::macroblock::{IntraYMode, MacroblockModes};
 use crate::motion_comp::{ReferencePlanes, reconstruct_inter_mb, reconstruct_split_mv_mb};
 use crate::motion_vector::Mv;
 use crate::reconstruct::{MbNeighbors, ReconstructedMb};
+use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 
 /// How one macroblock is predicted.
 #[derive(Clone, Copy)]
@@ -62,8 +62,9 @@ pub(super) struct RowDecode<'a> {
     /// Per-macroblock modes (segment, skip flag, intra modes), raster
     /// order.
     pub(super) modes: &'a [MacroblockModes],
-    /// Per-macroblock prediction, raster order.
-    pub(super) predictions: &'a [Prediction],
+    /// Per-macroblock prediction, raster order; `None` on a key frame,
+    /// where every macroblock is [`Prediction::Intra`].
+    pub(super) predictions: Option<&'a [Prediction]>,
     /// The reference pictures [`Prediction`] indexes.
     pub(super) references: &'a [ReferencePlanes<'a>],
     /// The §9.5 DCT partitions.
@@ -75,17 +76,28 @@ pub(super) struct RowDecode<'a> {
     pub(super) filters: &'a [[i32; 6]; 8],
 }
 
+impl RowDecode<'_> {
+    /// How macroblock `raster` is predicted.
+    #[inline]
+    fn prediction(&self, raster: usize) -> &Prediction {
+        match self.predictions {
+            Some(predictions) => &predictions[raster],
+            None => &Prediction::Intra,
+        }
+    }
+}
+
 /// What a row publishes while it is worked on.
 struct RowShared {
     /// Macroblocks of this row whose tokens are decoded.
-    tokens_done: AtomicUsize,
+    tokens_done: Progress,
     /// "Above" non-zero context each macroblock leaves for the one below
     /// (valid for columns `< tokens_done`).
     entropy: SharedEntropy,
     /// The row's dequantised coefficients, once its tokens are complete.
     coeffs: Mutex<Option<Vec<MbCoeffs>>>,
     /// Macroblocks of this row that are reconstructed.
-    pixels_done: AtomicUsize,
+    pixels_done: Progress,
     /// Bottom pixel line of the reconstruction (valid for columns
     /// `< pixels_done`).
     bottom: SharedPixelLine,
@@ -101,35 +113,10 @@ struct RowStrips<'p> {
     v: &'p mut [u8],
 }
 
-/// Raises the abort flag if the thread unwinds, so nobody waits on this
-/// thread's row forever.
-struct AbortOnUnwind<'a>(&'a AtomicBool);
-
-impl Drop for AbortOnUnwind<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Spin, then yield, until `ready()`; `false` if the decode was aborted
-/// meanwhile.
-fn wait_until(abort: &AtomicBool, ready: impl Fn() -> bool) -> bool {
-    let mut backoff = crate::backoff::Backoff::new();
-    while !ready() {
-        if abort.load(Ordering::Acquire) {
-            return false;
-        }
-        backoff.pause();
-    }
-    true
 }
 
 /// Decode the residuals of every macroblock and reconstruct the frame
@@ -152,10 +139,10 @@ pub(super) fn decode_rows(
     };
     let shared: Vec<RowShared> = (0..mb_rows)
         .map(|_| RowShared {
-            tokens_done: AtomicUsize::new(0),
+            tokens_done: Progress::new(),
             entropy: SharedEntropy::new(mb_cols),
             coeffs: Mutex::new(None),
-            pixels_done: AtomicUsize::new(0),
+            pixels_done: Progress::new(),
             bottom: SharedPixelLine::new(mb_cols),
             has_coeffs: Mutex::new(Vec::new()),
         })
@@ -179,14 +166,14 @@ pub(super) fn decode_rows(
             .map(|(mb_row, ((y, u), v))| RowStrips { mb_row, y, u, v }),
     );
     let next_token_row = AtomicUsize::new(0);
-    let abort = AtomicBool::new(false);
+    let abort = Wave::new(mb_cols);
     let first_error: Mutex<Option<(usize, DecodeError)>> = Mutex::new(None);
     let fail = |index: usize, error: DecodeError| {
         let mut slot = lock(&first_error);
         if slot.as_ref().is_none_or(|(at, _)| index < *at) {
             *slot = Some((index, error));
         }
-        abort.store(true, Ordering::Release);
+        abort.abort();
     };
 
     // A worker first takes token rows (if it is one of the token
@@ -195,7 +182,7 @@ pub(super) fn decode_rows(
         let _guard = AbortOnUnwind(&abort);
         if tokens_first {
             loop {
-                if abort.load(Ordering::Acquire) {
+                if abort.aborted() {
                     return;
                 }
                 let mb_row = next_token_row.fetch_add(1, Ordering::Relaxed);
@@ -211,7 +198,7 @@ pub(super) fn decode_rows(
             }
         }
         loop {
-            if abort.load(Ordering::Acquire) {
+            if abort.aborted() {
                 return;
             }
             let Some(row) = lock(&strips).next() else {
@@ -231,7 +218,21 @@ pub(super) fn decode_rows(
     let token_workers = decoders.len().min(workers.div_ceil(3)).max(1);
     let workers = workers.min(3 * token_workers);
     if workers == 1 {
-        worker(true);
+        // Serial: each row's tokens, then its pixels, so one row of
+        // coefficients is alive at a time and is still in cache when it
+        // is reconstructed.
+        let _guard = AbortOnUnwind(&abort);
+        for mb_row in 0..mb_rows {
+            let Some(row) = lock(&strips).next() else {
+                break;
+            };
+            let step = decode_token_row(frame, mb_row, &shared, &decoders, &abort)
+                .and_then(|()| reconstruct_row(frame, row, &shared, &abort));
+            if let Err((index, error)) = step {
+                fail(index, error);
+                break;
+            }
+        }
     } else {
         std::thread::scope(|scope| {
             for n in 1..workers {
@@ -259,15 +260,13 @@ fn decode_token_row(
     mb_row: usize,
     shared: &[RowShared],
     decoders: &[Mutex<BoolDecoder<'_>>],
-    abort: &AtomicBool,
+    abort: &Wave,
 ) -> Result<(), (usize, DecodeError)> {
     let mb_cols = frame.mb_cols;
     let partition = mb_row % decoders.len();
     // The partition's previous row must have released the decoder.
     if let Some(previous) = mb_row.checked_sub(decoders.len())
-        && !wait_until(abort, || {
-            shared[previous].tokens_done.load(Ordering::Acquire) >= mb_cols
-        })
+        && !abort.wait(&shared[previous].tokens_done, mb_cols)
     {
         return Ok(());
     }
@@ -281,13 +280,13 @@ fn decode_token_row(
         let raster = mb_row * mb_cols + mb_col;
         let mut above_ctx = MbEntropyCtx::default();
         if let Some(above) = above_row {
-            if !wait_until(abort, || above.tokens_done.load(Ordering::Acquire) > mb_col) {
+            if !abort.wait(&above.tokens_done, mb_col + 1) {
                 return Ok(());
             }
             above_ctx = above.entropy.load(mb_col);
         }
         let mb = &frame.modes[raster];
-        let has_y2 = match frame.predictions[raster] {
+        let has_y2 = match *frame.prediction(raster) {
             Prediction::Intra => mb.y_mode != IntraYMode::B,
             Prediction::Whole { .. } => true,
             Prediction::Split { .. } => false,
@@ -319,7 +318,7 @@ fn decode_token_row(
             *lock(&this_row.has_coeffs) = core::mem::take(&mut has_coeffs);
             *lock(&this_row.coeffs) = Some(core::mem::take(&mut coeffs));
         }
-        this_row.tokens_done.store(mb_col + 1, Ordering::Release);
+        abort.advance(&this_row.tokens_done, mb_col + 1);
     }
     Ok(())
 }
@@ -329,13 +328,11 @@ fn reconstruct_row(
     frame: &RowDecode,
     RowStrips { mb_row, y, u, v }: RowStrips,
     shared: &[RowShared],
-    abort: &AtomicBool,
+    abort: &Wave,
 ) -> Result<(), (usize, DecodeError)> {
     let mb_cols = frame.mb_cols;
     let this_row = &shared[mb_row];
-    if !wait_until(abort, || {
-        this_row.tokens_done.load(Ordering::Acquire) >= mb_cols
-    }) {
+    if !abort.wait(&this_row.tokens_done, mb_cols) {
         return Ok(());
     }
     let coeffs = lock(&this_row.coeffs)
@@ -350,14 +347,12 @@ fn reconstruct_row(
         let mb = &frame.modes[raster];
         // Only intra prediction reads the row above.
         if let Some(above) = above_row
-            && matches!(frame.predictions[raster], Prediction::Intra)
-            && !wait_until(abort, || {
-                above.pixels_done.load(Ordering::Acquire) >= (mb_col + 2).min(mb_cols)
-            })
+            && matches!(*frame.prediction(raster), Prediction::Intra)
+            && !abort.wait(&above.pixels_done, (mb_col + 2).min(mb_cols))
         {
             return Ok(());
         }
-        let recon = match &frame.predictions[raster] {
+        let recon = match frame.prediction(raster) {
             Prediction::Whole { reference, mv } => reconstruct_inter_mb(
                 &frame.references[*reference],
                 mb_col,
@@ -448,7 +443,7 @@ fn reconstruct_row(
             v[dst..dst + 8].copy_from_slice(&recon.v[r * 8..r * 8 + 8]);
         }
         this_row.bottom.store(mb_col, &recon);
-        this_row.pixels_done.store(mb_col + 1, Ordering::Release);
+        abort.advance(&this_row.pixels_done, mb_col + 1);
         left = Some(recon);
     }
     Ok(())

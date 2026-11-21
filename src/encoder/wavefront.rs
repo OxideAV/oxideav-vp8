@@ -32,7 +32,7 @@
 //! depend on the number of threads.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use super::effort::{BmodeContext, EncodeEffort, analyze_mb_model};
 use super::{
@@ -40,7 +40,7 @@ use super::{
     MbCoeffs, MbEntropyCtx, MbRdCtx, RecordedBools, analyze_mb_exhaustive, clear_skip_ctx,
     encode_mb_tokens,
 };
-use crate::backoff::{SharedEntropy, SharedPixelLine};
+use crate::rowsync::{AbortOnUnwind, Progress, SharedEntropy, SharedPixelLine, Wave};
 use crate::frame::KeyframePlanes;
 use crate::reconstruct::{MbNeighbors, ReconstructedMb};
 
@@ -123,10 +123,10 @@ struct RowOutput {
 struct RowShared {
     /// Bottom pixel line and contexts, valid for macroblock columns
     /// `< done`; lock-free, as both rows touch it once per macroblock
-    /// (see `backoff.rs`).
+    /// (see `rowsync.rs`).
     bottom: RowBottom,
     /// Number of macroblocks of this row whose bottom line is published.
-    done: AtomicUsize,
+    done: Progress,
     /// The row's decisions, set once the whole row is analysed.
     output: Mutex<Option<RowOutput>>,
 }
@@ -144,18 +144,6 @@ struct TokenPass {
     /// Next row to code.
     next_row: usize,
     partitions: Vec<BoolEncoder>,
-}
-
-/// Raises the abort flag if the thread unwinds, so workers waiting on
-/// this thread's row stop instead of spinning forever.
-pub(super) struct AbortOnUnwind<'a>(pub(super) &'a AtomicBool);
-
-impl Drop for AbortOnUnwind<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.store(true, Ordering::Release);
-        }
-    }
 }
 
 pub(super) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -179,7 +167,7 @@ pub(super) fn analyse_and_tokenize(
                 bmodes: (0..mb_cols).map(|_| AtomicU16::new(0)).collect(),
                 entropy: SharedEntropy::new(mb_cols),
             },
-            done: AtomicUsize::new(0),
+            done: Progress::new(),
             output: Mutex::new(None),
         })
         .collect();
@@ -192,7 +180,7 @@ pub(super) fn analyse_and_tokenize(
         .map(|(mb_row, ((y, u), v))| RowJob { mb_row, y, u, v })
         .collect();
     let jobs = Mutex::new(jobs.into_iter());
-    let abort = AtomicBool::new(false);
+    let abort = Wave::new(mb_cols);
     let first_error: Mutex<Option<(usize, EncodeError)>> = Mutex::new(None);
     let tokens = Mutex::new(TokenPass {
         next_row: 0,
@@ -204,7 +192,7 @@ pub(super) fn analyse_and_tokenize(
     let worker = || {
         let _guard = AbortOnUnwind(&abort);
         loop {
-            if abort.load(Ordering::Acquire) {
+            if abort.aborted() {
                 break;
             }
             let Some(job) = lock(&jobs).next() else {
@@ -216,7 +204,7 @@ pub(super) fn analyse_and_tokenize(
                 if slot.as_ref().is_none_or(|(row, _)| mb_row < *row) {
                     *slot = Some((mb_row, e));
                 }
-                abort.store(true, Ordering::Release);
+                abort.abort();
                 break;
             }
             // Advance the token pass if nobody else is on it.
@@ -285,7 +273,7 @@ fn analyse_row(
     search: &KeyframeSearch,
     job: RowJob,
     shared: &[RowShared],
-    abort: &AtomicBool,
+    abort: &Wave,
 ) -> Result<(), EncodeError> {
     let mb_cols = search.mb_cols;
     let mb_row = job.mb_row;
@@ -316,12 +304,8 @@ fn analyse_row(
         if let Some(above) = above_row {
             // The above-right macroblock must be reconstructed too.
             let need = (mb_col + 2).min(mb_cols);
-            let mut backoff = crate::backoff::Backoff::new();
-            while above.done.load(Ordering::Acquire) < need {
-                if abort.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                backoff.pause();
+            if !abort.wait(&above.done, need) {
+                return Ok(());
             }
             let bottom = &above.bottom;
             bottom.pixels.load_above(mb_col, mb_cols, &mut neighbors);
@@ -424,7 +408,7 @@ fn analyse_row(
         this_row.bottom.entropy.store(mb_col, &above_ctx);
         this_row.bottom.store_bmodes(mb_col, &edge_bottom);
         this_row.bottom.pixels.store(mb_col, &recon);
-        this_row.done.store(mb_col + 1, Ordering::Release);
+        abort.advance(&this_row.done, mb_col + 1);
 
         modes.push(MacroblockModes {
             segment_id: None,

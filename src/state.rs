@@ -41,9 +41,9 @@ use crate::coded_header::Vp8CodedHeader;
 use crate::dct_tokens::{CoeffProbs, MbEntropyCtx, merge_default_token_probs};
 use crate::decoder::{DecodeError, Vp8DecodedFrame};
 use crate::dequant::{MbDequantFactors, decode_and_dequantize_mb};
-use crate::frame::{FrameError, KeyframePlanes, MbCoeffs, decode_keyframe};
+use crate::frame::{FrameError, KeyframePlanes, MbCoeffs};
 use crate::frame_header::{ScaleCode, Vp8FrameHeader};
-use crate::loop_filter::{FrameFilterConfig, MAX_MB_SEGMENTS, filter_frame};
+use crate::loop_filter::{FrameFilterConfig, MAX_MB_SEGMENTS};
 use crate::macroblock::{
     InterFrameIntraProbs, IntraYMode, MacroblockModes, parse_inter_frame_intra_macroblock_modes,
     parse_key_frame_macroblock_modes,
@@ -560,16 +560,17 @@ impl Vp8DecoderState {
         let frame_coeff_probs: CoeffProbs = merge_default_token_probs(&coded.token_prob_updates);
 
         let lf_config = FrameFilterConfig::keyframe(&coded);
-        let planes = if self.threads > 1 {
-            // Token decoding and reconstruction as row units on the
-            // thread budget (see `rows.rs`), then the row-band filter.
-            let predictions = vec![rows::Prediction::Intra; modes.len()];
+        let planes = {
+            // Token decoding and reconstruction as row units (see
+            // `rows.rs`) — on the thread budget, or serially row by row
+            // so that one row of coefficients is alive at a time — then
+            // the row-band filter.
             let (mut planes, has_coeffs) = rows::decode_rows(
                 &rows::RowDecode {
                     mb_cols,
                     mb_rows,
                     modes: &modes,
-                    predictions: &predictions,
+                    predictions: None,
                     references: &[],
                     partitions: &partitions,
                     coeff_probs: &frame_coeff_probs,
@@ -587,20 +588,6 @@ impl Vp8DecoderState {
                     &lf_config,
                     self.threads,
                 );
-            }
-            planes
-        } else {
-            let coeffs = decode_intra_residuals(
-                &modes,
-                &partitions,
-                &frame_coeff_probs,
-                &dequant_factors,
-                mb_rows,
-                mb_cols,
-            )?;
-            let mut planes = decode_keyframe(mb_cols, mb_rows, &modes, &coeffs)?;
-            if lf_config.loop_filter_level != 0 {
-                filter_frame(&mut planes, &modes, &coeffs, &lf_config);
             }
             planes
         };
@@ -1416,7 +1403,7 @@ impl Vp8DecoderState {
                 mb_cols,
                 mb_rows,
                 modes: &modes_out,
-                predictions: &predictions,
+                predictions: Some(&predictions),
                 references: &references,
                 partitions,
                 coeff_probs: frame_coeff_probs,
@@ -1550,80 +1537,6 @@ fn overlay_token_probs(
         }
     }
     out
-}
-
-/// Per-row residual decode for an all-intra (key) frame — copy of the
-/// `decoder::decode_residuals` body, inlined here so the keyframe path
-/// in [`Vp8DecoderState::decode_key_frame`] doesn't depend on the
-/// private helper.
-fn decode_intra_residuals(
-    modes: &[MacroblockModes],
-    partitions: &[&[u8]],
-    coeff_probs: &CoeffProbs,
-    dequant_factors: &[MbDequantFactors; MAX_MB_SEGMENTS],
-    mb_rows: usize,
-    mb_cols: usize,
-) -> Result<Vec<MbCoeffs>, DecodeError> {
-    let num_partitions = partitions.len();
-    debug_assert!(num_partitions >= 1);
-
-    // §13: each macroblock's coefficients are decoded exactly once, in
-    // raster order (`mb_row` outer, `mb_col` inner), and appended. Reserve
-    // the full frame's worth of slots up front and `push` each MB's coeffs
-    // as it is decoded, rather than `vec![default(); N]` + indexed write:
-    // every slot is overwritten before it is read, so the bulk
-    // default-zeroing of the whole `Vec<MbCoeffs>` (800 bytes per MB) is
-    // dead work. `push` after `with_capacity` reproduces the identical
-    // raster-ordered contents with no reallocation and no wasted memset.
-    let mut coeffs: Vec<MbCoeffs> = Vec::with_capacity(mb_rows * mb_cols);
-    let mut above: Vec<MbEntropyCtx> = vec![MbEntropyCtx::default(); mb_cols];
-
-    let mut partition_decoders: Vec<Option<BoolDecoder<'_>>> =
-        (0..num_partitions).map(|_| None).collect();
-    for mb_row in 0..mb_rows {
-        let part_idx = mb_row % num_partitions;
-        if partition_decoders[part_idx].is_none() {
-            // Tolerant init: a tiny key-frame DCT partition that rounds to
-            // <2 bytes (uncommon but spec-legal) still decodes — see the
-            // matching reasoning in the interframe path.
-            let bd = BoolDecoder::init_partition(partitions[part_idx]);
-            partition_decoders[part_idx] = Some(bd);
-        }
-    }
-
-    for mb_row in 0..mb_rows {
-        let mut left = MbEntropyCtx::default();
-        let part_idx = mb_row % num_partitions;
-        let dec = partition_decoders[part_idx]
-            .as_mut()
-            .expect("partition decoder initialised above");
-
-        for (mb_col, above_ctx) in above.iter_mut().enumerate() {
-            let raster = mb_row * mb_cols + mb_col;
-            let mb = &modes[raster];
-            let has_y2 = mb.y_mode != IntraYMode::B;
-            let seg = mb.segment_id.unwrap_or(0) as usize;
-            let seg = seg.min(MAX_MB_SEGMENTS - 1);
-            let factors = &dequant_factors[seg];
-            let mb_coeffs = decode_and_dequantize_mb(
-                dec,
-                has_y2,
-                mb.mb_skip_coeff,
-                coeff_probs,
-                factors,
-                above_ctx,
-                &mut left,
-            )
-            .map_err(|source| DecodeError::MbCoeffs {
-                index: raster,
-                source,
-            })?;
-            debug_assert_eq!(coeffs.len(), raster, "coeffs pushed in raster order");
-            coeffs.push(mb_coeffs);
-        }
-    }
-
-    Ok(coeffs)
 }
 
 /// Resolve the per-MB inter-mode after the caller has already read the

@@ -36,9 +36,8 @@
 //! (`banded_filter_matches_serial`).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::backoff::SharedBytes;
+use crate::rowsync::{AbortOnUnwind, Progress, SharedBytes, Wave};
 
 use super::{
     LoopFilterParams, filter_h_edge_normal, filter_h_edge_simple, filter_v_edge_normal,
@@ -164,7 +163,7 @@ struct RowShared {
     /// columns of macroblock `c` are final for the upper row once
     /// `done >= min(c + 2, mb_cols)`: the next macroblock's left edge
     /// rewrites the last three columns of `c`.
-    done: AtomicUsize,
+    done: Progress,
 }
 
 /// One macroblock row of work with the picture strips it owns: the
@@ -176,16 +175,6 @@ struct RowJob<'p> {
     above: Option<[&'p mut [u8]; 3]>,
     body: [&'p mut [u8]; 3],
     tail: Option<[&'p mut [u8]; 3]>,
-}
-
-struct AbortOnUnwind<'a>(&'a AtomicBool);
-
-impl Drop for AbortOnUnwind<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.store(true, Ordering::Release);
-        }
-    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -256,7 +245,7 @@ pub(crate) fn filter_banded(
                     u: SharedBytes::from_bytes(&planes.u[c0..c0 + 4 * cs]),
                     v: SharedBytes::from_bytes(&planes.v[c0..c0 + 4 * cs]),
                 },
-                done: AtomicUsize::new(0),
+                done: Progress::new(),
             }
         })
         .collect();
@@ -280,7 +269,7 @@ pub(crate) fn filter_banded(
         })
         .collect();
     let jobs = Mutex::new(jobs.into_iter());
-    let abort = AtomicBool::new(false);
+    let abort = Wave::new(mb_cols);
 
     let worker = || {
         let _guard = AbortOnUnwind(&abort);
@@ -289,7 +278,7 @@ pub(crate) fn filter_banded(
         let mut buf_u = vec![0u8; 12 * cs];
         let mut buf_v = vec![0u8; 12 * cs];
         loop {
-            if abort.load(Ordering::Acquire) {
+            if abort.aborted() {
                 break;
             }
             let Some(job) = lock(&jobs).next() else {
@@ -325,7 +314,7 @@ fn filter_row(
     mb_cols: usize,
     (ys, cs): (usize, usize),
     [buf_y, buf_u, buf_v]: [&mut Vec<u8>; 3],
-    abort: &AtomicBool,
+    abort: &Wave,
 ) {
     let mb_row = job.mb_row;
     let this_row = &shared[mb_row];
@@ -343,12 +332,8 @@ fn filter_row(
     for mb_col in 0..mb_cols {
         if let Some(above) = above_row {
             let need = (mb_col + 2).min(mb_cols);
-            let mut backoff = crate::backoff::Backoff::new();
-            while above.done.load(Ordering::Acquire) < need {
-                if abort.load(Ordering::Acquire) {
-                    return;
-                }
-                backoff.pause();
+            if !abort.wait(&above.done, need) {
+                return;
             }
             let boundary = &above.boundary;
             let (yx, cx) = (mb_col * 16, mb_col * 8);
@@ -403,7 +388,7 @@ fn filter_row(
                 &buf_v[(8 + r) * cs + from_c..(8 + r) * cs + to_c],
             );
         }
-        this_row.done.store(mb_col + 1, Ordering::Release);
+        abort.advance(&this_row.done, mb_col + 1);
     }
 
     // Write back: the boundary rows above (final now), this row's body,
